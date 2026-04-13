@@ -103,3 +103,39 @@
 
 - UDP broadcast tests use `AtomicU16` port allocation to avoid conflicts when tests run in parallel. If tests are run across multiple concurrent cargo test invocations, port conflicts could still occur.
 - The two-runner localhost coordination test depends on UDP broadcast working on the test machine. Some CI environments may block UDP broadcast.
+
+---
+
+## E3: Concrete Variant Implementations
+
+| Variant | Status | Worker | Notes |
+|---------|--------|--------|-------|
+| E3a: Zenoh | in-progress | worker-zenoh | Native Rust, Zenoh pub/sub |
+| E3b: Custom UDP | in-progress | worker-custom-udp | Raw UDP, all 4 QoS manual |
+| E3c: Aeron | blocked | worker-aeron | Scaffold complete; rusteron-client build fails (see below) |
+| E3d: QUIC | in-progress | worker-quic | quinn crate, async-to-sync bridge |
+| E3e: Hybrid UDP/TCP | in-progress | worker-hybrid | UDP for L1-2, TCP for L3-4 |
+
+### E3c: Aeron -- Blocker Report
+
+**Status:** blocked -- scaffold committed, build fails on `rusteron-client` C FFI compilation.
+
+**What was implemented (scaffold):**
+
+- `Cargo.toml`: binary crate depending on `variant-base`, `rusteron-client`, `anyhow`.
+- `src/main.rs`: CLI extra-arg parsing (`--aeron-dir`, `--channel`, `--stream-id` with defaults), constructs `AeronVariant`, calls `run_protocol`. Includes 5 unit tests for arg parsing.
+- `src/aeron.rs`: `AeronVariant` struct implementing `Variant` trait with full `connect`, `publish`, `poll_receive`, `disconnect` methods. `FragmentReceiver` implementing `AeronFragmentHandlerCallback`. Message serialization/deserialization (compact binary wire format). Includes 6 unit tests for serialization and struct construction.
+- `STRUCT.md`: file layout documentation.
+
+**Build error:**
+
+`rusteron-client v0.1.162` fails during its build script. The crate uses `bindgen` to generate Rust FFI bindings from the Aeron C headers, and `cmake` to compile the Aeron C library from source. On this Windows machine, `bindgen`/`clang-sys` picks up an LLVM MinGW toolchain (`llvm-mingw-20260324-ucrt-x86_64`) whose headers are incompatible with the MSVC target (`x86_64-pc-windows-msvc`). The MinGW `stdlib.h` uses GCC-specific `__attribute__` syntax that the bindgen clang parser rejects, producing hundreds of parse errors and ultimately "fatal error: too many errors emitted."
+
+**Root cause:** Toolchain mismatch -- bindgen's clang is resolving system headers from an LLVM MinGW installation rather than the MSVC Windows SDK headers. This is an environment configuration issue, not a code issue.
+
+**To unblock:**
+
+1. Ensure `LIBCLANG_PATH` points to an MSVC-compatible LLVM/Clang installation (e.g., LLVM from Visual Studio or the official LLVM release for Windows).
+2. Alternatively, set `BINDGEN_EXTRA_CLANG_ARGS` to include the correct MSVC SDK include paths (e.g., `--target=x86_64-pc-windows-msvc -isystem "C:/Program Files/.../include"`).
+3. Or remove/relocate the MinGW toolchain from the PATH so bindgen does not find it.
+4. On Linux/macOS, this crate is expected to build without issues if clang and cmake are installed.
