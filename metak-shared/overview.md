@@ -20,13 +20,20 @@ side-by-side under identical conditions.
    in lockstep. Runners have no IPC with variants; they only spawn, monitor,
    and collect exit codes. See `metak-shared/BENCHMARK.md`.
 
-3. **Variant implementations** (Rust binaries) — standalone executables that
-   each implement the replication design using a different stack (e.g. Zenoh,
-   custom UDP). Variants receive configuration via CLI args, discover peers
-   autonomously, execute the test protocol (connect, stabilize, operate,
-   silent), log events to JSONL, and exit. See `metak-shared/BENCHMARK.md` S5.
+3. **Variant base crate** (Rust library) — shared foundation providing the
+   `Variant` trait, common CLI parsing, test protocol driver (connect,
+   stabilize, operate, silent), JSONL logger, resource monitor, and workload
+   profiles. Each concrete variant only implements transport-specific logic.
+   Includes `VariantDummy` — a no-network implementation using an in-process
+   data board, used for base crate testing, runner harness testing, and as a
+   zero-network performance baseline.
 
-4. **Analysis tool** (Python script) — ingests JSONL logs from all nodes,
+4. **Variant implementations** (Rust binaries) — thin executables that
+   implement the `Variant` trait using a specific transport stack. Candidates
+   are selected through a research/exploration phase (E0) before any code is
+   written. See `metak-shared/BENCHMARK.md` S5.
+
+5. **Analysis tool** (Python script) — ingests JSONL logs from all nodes,
    variants, and runs; verifies data integrity; computes performance metrics
    (latency percentiles, throughput, jitter, loss, resource usage); and
    produces CLI summary tables and PNG diagrams for comparison.
@@ -41,11 +48,12 @@ side-by-side under identical conditions.
 
 ## What's next
 
-1. Finalize architecture and API contracts (runner-variant CLI contract,
+1. Research and select variant candidates (E0) — survey transport libraries
+   and protocols, produce `variant-candidates.md`.
+2. Finalize architecture and API contracts (runner-variant CLI contract,
    JSONL log schema, runner coordination protocol, TOML config schema).
-2. Create sub-repos: `runner/`, `variants/zenoh/`, `variants/custom-udp/`,
-   `analysis/`.
-3. Implement the runner (Epic 1).
-4. Implement the first variant — Zenoh (Epic 2).
-5. Implement the analysis tool — Phase 1 foundation (Epic 3).
-6. Run the first end-to-end benchmark.
+3. Implement the variant base crate with `Variant` trait + `VariantDummy` (E1).
+4. Implement the benchmark runner, tested against `VariantDummy` (E2).
+5. Implement the first concrete variant (E3, chosen from E0 results).
+6. Implement the analysis tool — Phase 1 foundation (E4).
+7. Run the first end-to-end benchmark.

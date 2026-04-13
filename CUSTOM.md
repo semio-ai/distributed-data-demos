@@ -31,9 +31,13 @@ ANALYSIS.md) are the source of truth for requirements.
 
 ```
 runner/              -- benchmark runner (Rust)
-variants/zenoh/      -- Zenoh-based replication variant (Rust)
-variants/custom-udp/ -- custom UDP replication variant (Rust)
+variant-base/        -- shared Variant trait + test protocol driver (Rust lib)
+variants/zenoh/      -- Zenoh-based replication variant (Rust bin, placeholder)
+variants/custom-udp/ -- custom UDP replication variant (Rust bin, placeholder)
+variants/...         -- additional variants chosen during E0 exploration
 analysis/            -- analysis tool (Python)
 ```
 
-Sub-repos will be created as epics begin. Use `metak add` to scaffold them.
+Concrete variant repos are placeholders until E0 (variant exploration)
+determines the final candidate list. Sub-repos will be created as epics
+begin. Use `metak add` to scaffold them.

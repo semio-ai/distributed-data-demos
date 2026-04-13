@@ -41,12 +41,27 @@ consumes logs offline.
 - **Input**: `--name <name> --config <path.toml>`
 - **Output**: exit code per variant (success/failure/timeout).
 
+### variant-base (Rust library crate)
+
+- **Repo**: `variant-base/`
+- **Responsibility**: Shared foundation for all variant implementations.
+  Provides the `Variant` trait, common CLI parsing, test protocol driver
+  (connect -> stabilize -> operate -> silent), JSONL logger, resource
+  monitor, workload profiles, and sequence number generation. Does NOT
+  handle networking or peer discovery — that is the variant's job.
+- **Interfaces**:
+  - `Variant` trait that each implementation must fulfill (connect, publish,
+    poll_receive, disconnect).
+  - Workload profile abstraction (pluggable, starting with `scalar-flood`).
+  - Structured JSONL logger enforcing the log schema contract.
+
 ### variant (Rust binary, one per implementation)
 
 - **Repos**: `variants/zenoh/`, `variants/custom-udp/`, etc.
-- **Responsibility**: Implements the distributed data replication system
-  described in DESIGN.md. Connects to peers, runs the test protocol
-  (connect -> stabilize -> operate -> silent), logs all events, exits.
+- **Responsibility**: Thin binary implementing the `Variant` trait from
+  `variant-base`. Provides only transport-specific logic: peer discovery,
+  channel setup, publish/receive over the chosen transport. Everything
+  else (phases, logging, workload, CLI) comes from the base crate.
 - **Interfaces**:
   - CLI arguments from the runner (common + specific config).
   - Peer-to-peer: implementation-specific networking (Zenoh, raw UDP, etc.).
@@ -94,7 +109,8 @@ consumes logs offline.
 | Component | Language | Key dependencies |
 |-----------|----------|------------------|
 | runner | Rust | `arora_types`, UDP sockets, TOML parsing |
-| variants | Rust | `arora_types`, variant-specific libs (e.g. Zenoh) |
+| variant-base | Rust (lib) | `arora_types`, `serde_json`, `clap` |
+| variants | Rust (bin) | `variant-base`, variant-specific libs (e.g. Zenoh) |
 | analysis | Python | Standard lib, matplotlib (diagrams), pickle (cache) |
 
 ## Key Design Decisions

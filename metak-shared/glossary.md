@@ -13,6 +13,9 @@
 | Latest-Value (QoS 2) | UDP with sequence tracking. Receiver discards stale values. Loss-tolerant. |
 | Reliable-UDP (QoS 3) | UDP with gap detection and NACK-based recovery. Strict ordering, loss-intolerant. |
 | Reliable-TCP (QoS 4) | Standard TCP. Strict ordering, loss-intolerant. Subject to head-of-line blocking. |
+| Variant trait | Rust trait defined in `variant-base` that each concrete variant must implement. Covers connect, publish, poll_receive, and disconnect. All other behavior (phases, logging, workload) is handled by the base crate. |
+| VariantDummy | A no-network `Variant` implementation included in the base crate. Uses an in-process data board instead of real networking. Used for base crate testing, runner harness testing on a single machine, and as a zero-network performance baseline. Ships as the `variant-dummy` binary. |
+| variant-base | Rust library crate providing the shared foundation for all variants: `Variant` trait, CLI parsing, test protocol driver, JSONL logger, resource monitor, workload profiles, sequence generator. |
 | Runner | Rust binary that coordinates benchmark execution across machines. Discovers peers, barrier-syncs, spawns variant processes, monitors exit codes. |
 | Variant | A standalone Rust binary implementing the replication design using a specific stack (e.g. Zenoh, custom UDP). The system under test. |
 | Barrier sync | Symmetric synchronization between runners. All runners must reach the same phase before any proceeds. Used for ready/done gates around each variant. |
