@@ -256,6 +256,10 @@ A single TOML file represents a complete benchmark run. It is the only file
 that needs to be copied to each machine.
 
 ```toml
+# Unique identifier for this benchmark run (e.g. "run01", "run02").
+# Included in every log line so repeated runs are distinguishable.
+run = "run01"
+
 # Runners expected in this benchmark
 runners = ["a", "b", "c"]
 
@@ -366,20 +370,23 @@ phase):
 ### 8.8 Log Format
 
 Every variant process produces a single structured log file (JSON Lines).
-Each line is one event:
+Every line includes `variant`, `runner`, and `run` fields so that if all
+log files from all nodes, variants, and runs were concatenated into a single
+file, the full dataset could be recovered by grouping on any combination of
+these three keys.
 
 ```jsonl
-{"ts":"2026-04-12T14:00:00.500000000Z","runner":"a","event":"connected","elapsed_ms":487.3}
-{"ts":"2026-04-12T14:00:01.123456789Z","runner":"a","event":"write","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
-{"ts":"2026-04-12T14:00:01.124001234Z","runner":"b","event":"receive","writer":"a","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
-{"ts":"2026-04-12T14:00:01.200000000Z","runner":"b","event":"gap_detected","writer":"a","missing_seq":41}
-{"ts":"2026-04-12T14:00:01.300000000Z","runner":"b","event":"gap_filled","writer":"a","recovered_seq":41}
-{"ts":"2026-04-12T14:00:01.000000000Z","runner":"a","event":"phase","phase":"operate","profile":"scalar-flood"}
-{"ts":"2026-04-12T14:00:01.100000000Z","runner":"a","event":"resource","cpu_percent":12.5,"memory_mb":48.3}
+{"ts":"2026-04-12T14:00:00.500000000Z","variant":"zenoh-replication","runner":"a","run":"run01","event":"connected","elapsed_ms":487.3}
+{"ts":"2026-04-12T14:00:01.123456789Z","variant":"zenoh-replication","runner":"a","run":"run01","event":"write","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
+{"ts":"2026-04-12T14:00:01.124001234Z","variant":"zenoh-replication","runner":"b","run":"run01","event":"receive","writer":"a","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
+{"ts":"2026-04-12T14:00:01.200000000Z","variant":"zenoh-replication","runner":"b","run":"run01","event":"gap_detected","writer":"a","missing_seq":41}
+{"ts":"2026-04-12T14:00:01.300000000Z","variant":"zenoh-replication","runner":"b","run":"run01","event":"gap_filled","writer":"a","recovered_seq":41}
+{"ts":"2026-04-12T14:00:01.000000000Z","variant":"zenoh-replication","runner":"a","run":"run01","event":"phase","phase":"operate","profile":"scalar-flood"}
+{"ts":"2026-04-12T14:00:01.100000000Z","variant":"zenoh-replication","runner":"a","run":"run01","event":"resource","cpu_percent":12.5,"memory_mb":48.3}
 ```
 
-Log files are named `<variant>-<runner-name>-<run-id>.jsonl` so that
-multiple runs and implementations can coexist in a single collection folder.
+Log files are named `<variant>-<runner>-<run>.jsonl` for convenience, but the
+file name is not authoritative — the fields inside each line are.
 
 ### 8.9 Clock Synchronization
 
