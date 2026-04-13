@@ -42,9 +42,13 @@ side-by-side under identical conditions.
 ## Current state
 
 - Design documents are complete: DESIGN.md, BENCHMARK.md, ANALYSIS.md.
-- The metak orchestration scaffold is in place.
-- No application code has been written yet. No sub-repos for the runner,
-  variants, or analysis tool exist.
+- E0 (variant exploration) complete: 18 candidates evaluated, 4 selected
+  (Zenoh, custom UDP, Aeron, QUIC). See `variant-candidates.md`.
+- E1 (variant-base crate) complete: `Variant` trait, protocol driver,
+  JSONL logger, VariantDummy, 29 tests passing. Trait confirmed compatible
+  with all four chosen variants (no changes needed).
+- Sub-repos created: `variant-base/`.
+- Still needed: runner, concrete variants, analysis tool.
 
 ## What's next
 

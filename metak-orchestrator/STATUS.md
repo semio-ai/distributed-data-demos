@@ -35,3 +35,32 @@
 **Open concerns:**
 
 - None. All acceptance criteria met.
+
+---
+
+## E0: Variant Exploration
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Research: pub/sub and middleware frameworks | done | Zenoh, CycloneDDS, RTI Connext, ZeroMQ, NATS, Redis |
+| Research: raw protocol approaches | done | UDP multicast/unicast, raw TCP, QUIC, io_uring, mio |
+| Research: shared memory and IPC | done | Iceoryx2, Aeron, Dust DDS, DPDK, Cap'n Proto, shared_memory |
+| Synthesize into variant-candidates.md | done | 18 candidates evaluated, 4 selected |
+| Update EPICS.md E3+ with final list | done | E3a Zenoh, E3b Custom UDP, E3c Aeron, E3d QUIC |
+| Review E1 trait compatibility | done | No changes needed (D5) |
+
+### Completion Report
+
+**Deliverables:**
+- `metak-shared/variant-candidates.md` — full research with per-candidate
+  assessment, comparison matrix, and E1 trait compatibility analysis.
+- EPICS.md updated with concrete E3a-E3d variant epics.
+- Decisions D4 (variant selection) and D5 (trait unchanged) logged.
+
+**Selected variants:**
+1. Zenoh (E3a) — framework, native Rust, <10 us
+2. Custom UDP (E3b) — raw protocol, all 4 QoS, 2-5 ms
+3. Aeron (E3c) — finance-grade, C bindings, 21-57 us
+4. QUIC/quinn (E3d) — modern protocol, native Rust, 2-12 ms
+
+**E1 impact:** None. Sync trait works for all four candidates.

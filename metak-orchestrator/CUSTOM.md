@@ -6,13 +6,17 @@
    (variant-cli, jsonl-log-schema, runner-coordination, toml-config-schema)
    must be reviewed and agreed before spawning any implementation workers.
 
-2. **Runner before variants.** E1 (runner) must be functional before E2/E4
-   (variants) can be tested end-to-end. The runner is the harness; variants
-   are the systems under test.
+2. **Variant base before runner.** E1 (variant-base) validates the trait,
+   logging, and protocol driver in isolation. E2 (runner) uses VariantDummy
+   from E1 for harness testing. See decision D3.
 
 3. **One workload profile at a time.** Start with `scalar-flood` everywhere.
    Additional profiles (`multi-writer`, `mixed-types`, etc.) are stretch
    goals.
+
+4. **After E0 completes**, review E1 trait for compatibility with the
+   chosen variant candidates. Flag any trait changes needed before
+   starting concrete variant implementations.
 
 ## Review Gates
 

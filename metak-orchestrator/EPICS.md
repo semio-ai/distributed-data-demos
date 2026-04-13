@@ -126,35 +126,120 @@ variant CLI contract must be finalized first.
 
 ---
 
-## E3+: Concrete Variant Implementations
-
-**Goal**: Implement one variant per chosen candidate from E0. Each variant
-is a thin binary that implements the `Variant` trait from E1 and provides
-transport-specific logic.
-
-Specific variant epics will be defined after E0 completes. Placeholder
-examples based on the design docs:
-
-### E3a: Zenoh Variant (placeholder)
+## E3a: Zenoh Variant
 
 **Repo**: `variants/zenoh/`
-- Implements `Variant` trait using Zenoh pub/sub.
-- Peer discovery via Zenoh scouting.
-- Maps key paths to Zenoh key expressions.
-- Zenoh-specific CLI args (`zenoh_mode`, `zenoh_listen`).
+**Goal**: Implement a replication variant using Eclipse Zenoh as the transport.
+Represents the "high-level framework" approach.
 
-### E3b: Custom UDP Variant (placeholder)
+Scope:
+- Implements `Variant` trait from `variant-base`.
+- Peer discovery via Zenoh scouting (zero-conf multicast).
+- Maps key paths to Zenoh key expressions for pub/sub.
+- Zenoh peer-to-peer mode (no router).
+- Zenoh-specific CLI args: `zenoh_mode`, `zenoh_listen`.
+- Dependencies: `zenoh` crate. Use blocking API wrappers (sync trait).
+- Start with `scalar-flood` workload profile.
+
+Dependencies: E1 (base crate), E2 (runner to spawn it).
+
+---
+
+## E3b: Custom UDP Variant
 
 **Repo**: `variants/custom-udp/`
-- Implements `Variant` trait using raw UDP sockets.
-- Multicast for discovery and data distribution.
-- Manual serialization, sequence numbers, optional NACK recovery.
-- Custom-specific CLI args (`buffer_size`, `multicast_group`).
+**Goal**: Implement a replication variant using raw UDP sockets with manual
+protocol logic. Represents the "from scratch" approach.
 
-### E3c-z: (additional variants from E0 research)
+Scope:
+- Implements `Variant` trait from `variant-base`.
+- Peer discovery via mDNS (`mdns-sd` crate).
+- UDP multicast for data fan-out.
+- Implements all four QoS levels manually:
+  - L1: fire-and-forget multicast
+  - L2: sequence tracking, receiver discards stale
+  - L3: sequence gaps + NACK-based retransmit
+  - L4: TCP connection per peer pair
+- Custom CLI args: `buffer_size`, `multicast_group`.
+- Dependencies: `std::net::UdpSocket`, `socket2`, `mdns-sd`.
+- Application-layer fragmentation for payloads > 1472 bytes.
 
-Dependencies per variant: E1 (base crate to build on), E2 (runner to spawn
-it), variant CLI contract, JSONL log schema.
+Dependencies: E1 (base crate), E2 (runner to spawn it).
+
+---
+
+## E3c: Aeron Variant
+
+**Repo**: `variants/aeron/`
+**Goal**: Implement a replication variant using Adaptive Aeron. Represents
+the "finance-grade" performance ceiling.
+
+Scope:
+- Implements `Variant` trait from `variant-base`.
+- Uses `rusteron-client` crate (C bindings to Aeron).
+- Aeron media driver handles peer coordination.
+- UDP multicast for data distribution.
+- Aeron-specific CLI args: `aeron_dir`, `channel`, `stream_id`.
+- Buffer callbacks into internal queue, drain via `poll_receive`.
+
+Dependencies: E1 (base crate), E2 (runner to spawn it). Aeron media
+driver must be running on each machine.
+
+Note: C bindings introduce unsafe Rust. Extra review needed.
+
+---
+
+## E3d: QUIC Variant
+
+**Repo**: `variants/quic/`
+**Goal**: Implement a replication variant using QUIC via the quinn crate.
+Represents the "modern protocol" approach.
+
+Scope:
+- Implements `Variant` trait from `variant-base`.
+- Peer discovery via mDNS (`mdns-sd` crate).
+- One QUIC connection per peer. Multiplexed streams for data.
+- Maps QoS levels to QUIC features:
+  - L1/L2: unreliable datagrams
+  - L3/L4: reliable streams
+- Internal tokio runtime, bridged to sync trait via `block_on`.
+- QUIC-specific CLI args: `cert_path`, `bind_addr`.
+- Self-signed certificates for LAN benchmarking.
+
+Dependencies: E1 (base crate), E2 (runner to spawn it).
+
+---
+
+## E3e: Hybrid UDP/TCP Variant
+
+**Repo**: `variants/hybrid/`
+**Goal**: Implement a replication variant that uses UDP for best-effort
+traffic and TCP for reliable traffic. Represents the "simplest correct"
+approach — avoids all application-layer reliability logic by delegating
+to the kernel's TCP stack for QoS levels that require ordering and
+completeness.
+
+Scope:
+- Implements `Variant` trait from `variant-base`.
+- Peer discovery via mDNS (`mdns-sd` crate).
+- Transport split by QoS level:
+  - L1 (best-effort): UDP multicast, fire-and-forget
+  - L2 (latest-value): UDP multicast, receiver-side sequence filtering
+  - L3 (reliable-ordered): TCP connection per peer pair
+  - L4 (reliable-TCP): TCP connection per peer pair (same as L3)
+- No NACK protocol, no gap detection, no retransmit buffers.
+  Reliable delivery is handled entirely by the kernel TCP stack.
+- CLI args: `multicast_group`, `tcp_base_port`.
+- Dependencies: `std::net::{UdpSocket, TcpStream, TcpListener}`, `socket2`,
+  `mdns-sd`.
+
+The key benchmark question this variant answers: **is NACK-based
+reliable-UDP (QoS 3 in E3b) worth the implementation complexity, or does
+TCP's kernel-managed reliability perform equally well on a LAN where
+packet loss is rare?** Comparing E3b vs E3e at QoS 3 directly tests
+whether head-of-line blocking matters at our throughput targets.
+
+Dependencies: E1 (base crate), E2 (runner to spawn it).
 
 ---
 
