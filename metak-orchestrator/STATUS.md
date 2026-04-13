@@ -110,7 +110,7 @@
 
 | Variant | Status | Worker | Notes |
 |---------|--------|--------|-------|
-| E3a: Zenoh | in-progress | worker-zenoh | Native Rust, Zenoh pub/sub |
+| E3a: Zenoh | done | worker-zenoh | Native Rust, Zenoh pub/sub |
 | E3b: Custom UDP | done | worker-custom-udp | Raw UDP, all 4 QoS levels implemented |
 | E3c: Aeron | blocked | worker-aeron | Scaffold complete; rusteron-client build fails (see below) |
 | E3d: QUIC | done | worker-quic | quinn crate, async-to-sync bridge |
@@ -236,6 +236,34 @@
 
 - No `discovery.rs` module: mDNS discovery was deferred per task instructions ("skip mDNS for now"), using `--peers` explicit peer list instead.
 - `local_addr` method on `TcpTransport` omitted (was dead code, would fail clippy -D warnings).
+
+**Open concerns:**
+
+- None. All acceptance criteria met.
+
+### E3a: Zenoh -- Completion Report
+
+**What was implemented:**
+
+- `Cargo.toml`: binary crate depending on `variant-base` (path), `zenoh` (1.x), `anyhow`, `clap`.
+- `src/main.rs`: CLI parsing via `variant_base::cli::CliArgs`, constructs `ZenohVariant` with runner name and extra args, calls `run_protocol`.
+- `src/zenoh.rs`: `ZenohVariant` struct implementing `Variant` trait. `ZenohArgs` parser for `--zenoh-mode` (default: peer) and `--zenoh-listen` (optional endpoint). `MessageCodec` with compact binary wire format (writer_len + writer + seq + qos + path_len + path + payload, all little-endian). Session opened via `zenoh::open` with JSON5 config injection. Subscriber on `bench/**` wildcard key expression. Blocking API via `zenoh::Wait` trait. Includes 8 unit tests for codec roundtrip, args parsing, and struct construction.
+- `tests/loopback.rs`: Integration test spawning the `variant-zenoh` binary as a subprocess with full protocol driver (1s operate, 1s silent). Verifies JSONL log file creation, phase events, write events, receive events (loopback), and correct writer attribution.
+- `STRUCT.md`: file layout documentation.
+
+**Test results:**
+
+- 8 unit tests pass (codec: 4, args: 3, name: 1)
+- 1 integration test passes (loopback full protocol)
+- `cargo clippy --all-targets -- -D warnings`: clean
+- `cargo fmt -- --check`: clean
+
+**Design decisions:**
+
+- Used `zenoh::Config::insert_json5` for mode and listen endpoint configuration, since `zenoh::Config` wraps `zenoh_config::Config` with `pub(crate)` visibility and does not expose `set_mode` or field access directly.
+- Zenoh ZResult errors (`Box<dyn IError>`) converted to anyhow via `anyhow::anyhow!("{}", e)` helper since `IError` does not implement `std::error::Error`.
+- Subscriber stored as `Subscriber<FifoChannelHandler<Sample>>` (not extracted handler) to keep the subscription alive. Subscriber derefs to handler, so `try_recv()` is called directly.
+- Key expressions use `bench/{path}` format with leading slash stripped from paths.
 
 **Open concerns:**
 
