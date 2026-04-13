@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    // Add per-repo launch configurations here.
+    // Use ${workspaceFolder:FolderName} to reference specific roots.
+    // Example:
+    // {
+    //   "name": "Repo A: Dev Server",
+    //   "type": "node",
+    //   "request": "launch",
+    //   "cwd": "${workspaceFolder:🖥 Repo A}",
+    //   "program": "${workspaceFolder:🖥 Repo A}/src/index.ts"
+    // }
+  ],
+  "compounds": [
+    // Compound configs run multiple services at once.
+    // Example:
+    // {
+    //   "name": "🚀 Start All Services",
+    //   "configurations": ["Repo A: Dev Server", "Repo B: Dev Server"]
+    // }
+  ]
+}
