@@ -1,207 +1,248 @@
 # Task Board
 
-## Current Sprint — E1: Variant Base Crate
+## Completed — E1: Variant Base Crate
 
-### T1: Core types, Variant trait, and crate scaffold
-
-**Repo**: `variant-base/`
-**Status**: pending
-**Depends on**: nothing
-
-Scaffold the Rust crate and implement the foundational types and trait.
-
-Scope:
-1. Initialize `Cargo.toml` with library + `variant-dummy` binary targets.
-   Add dependencies: `clap` (derive), `serde`, `serde_json`, `chrono`,
-   `anyhow`, `thiserror`, `sysinfo`.
-2. Define shared types in `src/types.rs`:
-   - `Qos` enum (BestEffort=1, LatestValue=2, ReliableUdp=3, ReliableTcp=4)
-   - `Phase` enum (Connect, Stabilize, Operate, Silent)
-   - `ReceivedUpdate` struct (writer: String, seq: u64, path: String,
-     qos: Qos, payload: Vec<u8>)
-3. Define `Variant` trait in `src/trait.rs`:
-   - `fn name(&self) -> &str` — human-readable name for logging
-   - `fn connect(&mut self) -> Result<()>` — establish transport
-   - `fn publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<()>`
-   - `fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>>`
-   - `fn disconnect(&mut self) -> Result<()>`
-4. Define common CLI args struct in `src/cli.rs` using clap derive:
-   - All common args from `api-contracts/variant-cli.md`
-   - Runner-injected args (`--launch-ts`, `--variant`, `--runner`, `--run`)
-   - A pass-through mechanism for variant-specific args (e.g.
-     `Vec<String>` trailing args, or `clap` allow_external_subcommands)
-5. Wire up `src/lib.rs` with public re-exports.
-6. `cargo build` and `cargo clippy -- -D warnings` must pass.
-
-Acceptance criteria:
-- [ ] `Cargo.toml` has lib + bin targets, all listed dependencies
-- [ ] `Qos`, `Phase`, `ReceivedUpdate` types are defined and public
-- [ ] `Variant` trait is defined and public
-- [ ] CLI args struct parses all common + runner-injected args
-- [ ] `cargo build` succeeds, `cargo clippy -- -D warnings` is clean
+All tasks done. See STATUS.md for completion report.
 
 ---
 
-### T2: JSONL logger
+## Current Sprint — E2: Benchmark Runner
 
-**Repo**: `variant-base/`
+### T1: Crate scaffold + TOML config parsing + CLI arg construction
+
+**Repo**: `runner/`
 **Status**: pending
-**Depends on**: T1 (needs types)
+**Depends on**: nothing
 
-Implement the structured JSONL log writer per `api-contracts/jsonl-log-schema.md`.
+Scaffold the Rust binary crate and implement config parsing and the CLI arg
+builder that converts TOML config sections into variant CLI arguments.
 
 Scope:
-1. Create `src/logger.rs`.
-2. `Logger` struct that holds a `BufWriter<File>` and the identity fields
-   (variant, runner, run).
-3. Constructor takes log_dir, variant name, runner name, run id. Creates
-   the output file as `<variant>-<runner>-<run>.jsonl`.
-4. Methods for each event type:
-   - `log_connected(launch_ts: &str, elapsed_ms: f64)`
-   - `log_phase(phase: Phase, profile: Option<&str>)`
-   - `log_write(seq: u64, path: &str, qos: Qos, bytes: usize)`
-   - `log_receive(writer: &str, seq: u64, path: &str, qos: Qos, bytes: usize)`
-   - `log_gap_detected(writer: &str, missing_seq: u64)`
-   - `log_gap_filled(writer: &str, recovered_seq: u64)`
-   - `log_resource(cpu_percent: f64, memory_mb: f64)`
-5. Each method serializes a JSON object with:
-   - `ts`: current wall-clock time (RFC 3339, nanosecond precision)
-   - `variant`, `runner`, `run`: from the stored identity
-   - `event`: the event type string
-   - Event-specific fields
-6. `flush()` method to force-flush the writer.
-7. Unit tests: write events, read back the JSONL, verify all fields present
-   and correctly typed.
+1. Initialize `Cargo.toml` as a binary crate. Add dependencies: `clap`
+   (derive), `toml`, `serde`, `serde_json`, `sha2`, `chrono`, `anyhow`,
+   `socket2`.
+2. CLI (`src/main.rs`): `runner --name <name> --config <path.toml>`.
+   Validate that `--name` matches one of the runner names in the config.
+3. Config struct (`src/config.rs`):
+   - Top-level: `run` (String), `runners` (Vec<String>),
+     `default_timeout_secs` (u64).
+   - `[[variant]]`: `name` (String), `binary` (String),
+     `timeout_secs` (Option<u64>), `common` (toml::Table),
+     `specific` (Option<toml::Table>).
+   - Parse from TOML file path. Run validation rules from the
+     `toml-config-schema.md` contract.
+   - `config_hash()` method: SHA-256 of the raw file bytes, hex-encoded.
+4. CLI arg builder (`src/cli_args.rs`):
+   - `fn build_variant_args(variant: &VariantConfig, run: &str, runner_name: &str, launch_ts: &str) -> Vec<String>`
+   - Iterates `variant.common` table: for each key-value, converts
+     `snake_case` key to `--kebab-case`, formats value as string.
+   - Appends `variant.specific` entries the same way.
+   - Appends runner-injected args: `--launch-ts`, `--variant`, `--runner`,
+     `--run`.
+   - Must match `api-contracts/variant-cli.md` exactly.
+5. Unit tests:
+   - Parse a sample TOML config, verify all fields.
+   - Verify config hash is deterministic.
+   - Verify CLI arg construction: given known config, produce expected
+     arg vector. Check kebab-case conversion, value formatting, ordering.
+   - Verify validation rejects: empty `run`, empty `runners`, duplicate
+     variant names, missing `binary`.
 
 Acceptance criteria:
-- [ ] All 7 event types produce valid JSONL matching the schema contract
-- [ ] `ts` field uses RFC 3339 with nanosecond precision
-- [ ] Every line contains `ts`, `variant`, `runner`, `run`, `event`
-- [ ] File is named `<variant>-<runner>-<run>.jsonl`
+- [ ] `Cargo.toml` with all listed dependencies
+- [ ] CLI parses --name and --config, validates name is in runners list
+- [ ] Config struct matches TOML schema contract exactly
+- [ ] config_hash() returns deterministic SHA-256 hex
+- [ ] CLI arg builder converts snake_case to --kebab-case correctly
+- [ ] Runner-injected args (--launch-ts, --variant, --runner, --run) appended
+- [ ] Validation catches invalid configs
 - [ ] Unit tests pass, cargo clippy clean
 
 ---
 
-### T3: Sequence generator, resource monitor, workload profiles
+### T2: Child process spawning and monitoring
 
-**Repo**: `variant-base/`
+**Repo**: `runner/`
 **Status**: pending
-**Depends on**: T1 (needs types), T2 (resource monitor uses logger)
+**Depends on**: T1 (needs config and CLI arg builder)
 
-Implement the three smaller support modules.
+Implement child process lifecycle: spawn, monitor, timeout, collect exit code.
 
 Scope:
-1. **Sequence generator** (`src/seq.rs`):
-   - `SeqGenerator` struct with `next() -> u64` returning monotonically
-     increasing values starting from 1.
-   - Simple, no-frills. Just an atomic or plain counter.
+1. Create `src/spawn.rs`.
+2. `ChildOutcome` enum: `Success`, `Failed(i32)`, `Timeout`.
+3. `fn spawn_and_monitor(binary: &str, args: &[String], timeout: Duration) -> Result<ChildOutcome>`:
+   - Validate binary path exists before spawning.
+   - Record `launch_ts` as RFC 3339 nanosecond timestamp immediately
+     before `Command::new(binary).args(args).spawn()`.
+   - Return the `launch_ts` alongside the outcome (caller needs it for
+     the done barrier).
+   - Wait for child exit. Use a separate thread or `child.try_wait()`
+     polling loop to implement timeout.
+   - On timeout: kill the child process (platform-appropriate), return
+     `Timeout`.
+   - On normal exit: return `Success` if exit code 0, `Failed(code)`
+     otherwise.
+4. Unit/integration test:
+   - Spawn `variant-dummy` (from variant-base) with valid args, verify
+     `Success` outcome.
+   - Spawn a nonexistent binary, verify error.
+   - Test timeout by spawning a process that sleeps longer than the
+     timeout (e.g. `sleep 999` or a small script), verify `Timeout`.
+     Use a very short timeout (2-3 seconds) to keep tests fast.
 
-2. **Resource monitor** (`src/resource.rs`):
-   - Uses `sysinfo` crate to sample current process CPU% and memory (MB).
-   - `ResourceMonitor` struct with `sample() -> (f64, f64)` returning
-     `(cpu_percent, memory_mb)`.
-   - The driver will call this periodically and pass results to the logger.
-
-3. **Workload profiles** (`src/workload.rs`):
-   - `Workload` trait with `fn generate(&mut self, values_per_tick: u32) -> Vec<WriteOp>`
-     where `WriteOp` is `{ path: String, payload: Vec<u8> }`.
-   - `ScalarFlood` implementation: generates `values_per_tick` writes to
-     paths like `/bench/0`, `/bench/1`, ... with small fixed-size payloads
-     (e.g. 8 bytes representing an f64).
-   - Factory function: `fn create_workload(name: &str) -> Box<dyn Workload>`
-     that maps `"scalar-flood"` to `ScalarFlood`. Returns an error for
-     unknown names.
-
-4. Unit tests for all three modules.
+Note: the `variant-dummy` binary must be pre-built. The test should check
+for its existence and skip with a clear message if not found.
 
 Acceptance criteria:
-- [ ] SeqGenerator produces 1, 2, 3, ... on successive calls
-- [ ] ResourceMonitor returns plausible CPU/memory values
-- [ ] ScalarFlood generates the correct number of WriteOps per call
-- [ ] Unknown workload name returns an error
-- [ ] cargo test passes, cargo clippy clean
+- [ ] spawn_and_monitor returns Success/Failed/Timeout correctly
+- [ ] launch_ts is recorded immediately before spawn
+- [ ] Binary path is validated before spawning
+- [ ] Timeout kills the child process
+- [ ] Integration test with variant-dummy passes
+- [ ] Timeout test passes (short timeout, child killed)
+- [ ] cargo clippy clean
 
 ---
 
-### T4: Test protocol driver
+### T3: UDP coordination protocol
 
-**Repo**: `variant-base/`
+**Repo**: `runner/`
 **Status**: pending
-**Depends on**: T1, T2, T3 (uses trait, logger, seq gen, resource monitor, workload)
+**Depends on**: T1 (needs config for runner names and config hash)
 
-Implement the protocol driver that orchestrates the four phases.
+Implement the leaderless discovery and barrier sync protocol over UDP
+broadcast.
 
 Scope:
-1. Create `src/driver.rs`.
-2. `run_protocol(variant: &mut dyn Variant, config: &CliArgs) -> Result<()>`
-   function (or generic `impl Variant`).
-3. Phase execution:
-   - **Connect**: log `phase` event (connect), call `variant.connect()`,
-     compute `elapsed_ms` from `config.launch_ts`, log `connected` event.
-   - **Stabilize**: log `phase` event (stabilize), sleep for
-     `config.stabilize_secs`.
-   - **Operate**: log `phase` event (operate, with workload profile name).
-     Run a tick loop at `config.tick_rate_hz`:
-     - Each tick: call workload to generate writes, for each write call
-       `variant.publish()` and `logger.log_write()`, then drain
-       `variant.poll_receive()` and `logger.log_receive()` for each.
-     - Every ~100ms sample resource monitor and `logger.log_resource()`.
-     - Run for `config.operate_secs` total.
-   - **Silent**: log `phase` event (silent). Drain remaining receives for
-     `config.silent_secs`, flush logger.
-4. Return `Ok(())` on success. The binary main will exit 0.
+1. Message types (`src/message.rs`):
+   ```rust
+   enum Message {
+       Discover { name: String, config_hash: String },
+       Ready { name: String, variant: String },
+       Done { name: String, variant: String, status: String, exit_code: i32 },
+   }
+   ```
+   Serialize/deserialize as JSON. Keep it simple.
+
+2. Coordination engine (`src/protocol.rs`):
+   - `Coordinator` struct holding a UDP broadcast socket (send + receive),
+     this runner's name, the set of expected runner names, and the config
+     hash.
+   - **Port**: default 19876, configurable via `--port` CLI arg
+     (add to clap struct).
+   - **Bind**: `0.0.0.0:<port>`, broadcast to `255.255.255.255:<port>`.
+     Use `socket2` for `SO_BROADCAST` and `SO_REUSEADDR`.
+
+3. `discover(&mut self) -> Result<()>`:
+   - Periodically broadcast `Discover` message (every 500ms).
+   - Listen for `Discover` from other runners.
+   - Verify config_hash matches; abort with clear error if mismatch.
+   - Complete when all runner names seen with matching hash.
+   - **Single-runner optimization**: if `runners` has only this runner's
+     name, return immediately without any network I/O.
+
+4. `ready_barrier(&mut self, variant_name: &str) -> Result<()>`:
+   - Broadcast `Ready` for this variant, listen for Ready from all others.
+   - Re-broadcast every 500ms until all runners have reported ready.
+   - Single-runner: return immediately.
+
+5. `done_barrier(&mut self, variant_name: &str, status: &str, exit_code: i32) -> Result<HashMap<String, (String, i32)>>`:
+   - Broadcast `Done` for this variant with own status, listen for Done
+     from all others.
+   - Return a map of runner_name -> (status, exit_code) for reporting.
+   - Single-runner: return immediately with own result.
+
+6. Unit tests:
+   - Serialize/deserialize each message type.
+   - Single-runner discover, ready, done all return immediately.
+   - Two-coordinator test on localhost: spawn two Coordinator instances
+     on different ports (or same port with SO_REUSEADDR), verify they
+     discover each other and complete barriers. Use threads.
 
 Acceptance criteria:
-- [ ] All four phases execute in order
-- [ ] Tick loop runs at approximately the configured rate
-- [ ] Write and receive events are logged during operate phase
-- [ ] Resource events are logged periodically during operate phase
-- [ ] Phase events are logged at each transition
-- [ ] Connected event includes launch_ts and elapsed_ms
-- [ ] cargo test passes, cargo clippy clean
+- [ ] Message types serialize/deserialize correctly as JSON
+- [ ] Single-runner mode completes all protocol steps without network I/O
+- [ ] Discovery detects config hash mismatch and aborts
+- [ ] Barriers complete when all runners have reported
+- [ ] Re-broadcast handles UDP packet loss
+- [ ] Two-runner localhost test passes
+- [ ] cargo clippy clean
 
 ---
 
-### T5: VariantDummy + integration tests
+### T4: Main loop + integration tests
 
-**Repo**: `variant-base/`
+**Repo**: `runner/`
 **Status**: pending
-**Depends on**: T4 (needs the driver to run end-to-end)
+**Depends on**: T1, T2, T3
 
-Implement the dummy variant and validate the full pipeline.
+Wire everything together and validate the full runner lifecycle.
 
 Scope:
-1. Create `src/dummy.rs`:
-   - `VariantDummy` struct with an internal `VecDeque<ReceivedUpdate>`.
-   - `connect` — no-op, returns Ok immediately.
-   - `publish` — creates a `ReceivedUpdate` from the args (writer = own
-     runner name) and pushes it to the internal queue.
-   - `poll_receive` — pops from the queue if non-empty, else returns None.
-   - `disconnect` — no-op.
-2. Create `src/bin/variant_dummy.rs`:
-   - Parse CLI args using the common CLI parser.
-   - Instantiate `VariantDummy`.
-   - Call `run_protocol(&mut dummy, &args)`.
-   - Exit 0 on Ok, exit 1 on Err (print error to stderr).
-3. Integration test (`tests/integration.rs`):
-   - Run the protocol driver with `VariantDummy`, short durations (1s
-     stabilize, 2s operate, 1s silent), low tick rate (10 Hz), small
-     workload (10 values/tick).
-   - Read the generated JSONL file.
-   - Verify: phase events appear in order (connect, stabilize, operate,
-     silent), connected event exists with elapsed_ms, write events have
-     monotonic seq numbers, receive events exist for each write, resource
-     events exist.
-   - Verify the file can be parsed as valid JSONL (every line is valid JSON).
-4. Run `variant-dummy` binary as a subprocess in a test, passing CLI args,
-   verify exit code 0 and JSONL file is produced.
+1. Main loop (`src/main.rs`):
+   - Parse CLI, load and validate config.
+   - Create Coordinator, run discovery.
+   - For each variant in config order:
+     a. Run ready barrier.
+     b. Build CLI args from config.
+     c. Spawn variant binary, monitor with timeout.
+     d. Run done barrier with outcome.
+     e. Print summary line (variant name, status, exit code per runner).
+   - Exit 0 if all variants completed, exit 1 if any failed.
+
+2. Sample config file (`tests/fixtures/single-runner.toml`):
+   ```toml
+   run = "test01"
+   runners = ["local"]
+   default_timeout_secs = 30
+
+   [[variant]]
+   name = "dummy"
+   binary = "../variant-base/target/release/variant-dummy"
+
+     [variant.common]
+     tick_rate_hz = 10
+     stabilize_secs = 0
+     operate_secs = 2
+     silent_secs = 0
+     workload = "scalar-flood"
+     values_per_tick = 5
+     qos = 1
+     log_dir = "./test-logs"
+
+     [variant.specific]
+   ```
+
+3. Integration tests (`tests/integration.rs`):
+   - **Single-runner lifecycle**: Run runner with single-runner.toml config
+     and `--name local`. Verify exit 0, JSONL file produced in test-logs/,
+     file contains expected events.
+   - **Timeout handling**: Config with a variant binary that hangs (e.g.
+     `sleep` or a script), short timeout (3s). Verify runner reports
+     timeout and exits non-zero.
+   - **Config validation**: Attempt to run with --name that isn't in
+     runners list, verify error message.
+   - **Multi-variant config**: Config with two variant entries (both
+     pointing at variant-dummy with different names). Verify runner
+     executes both in order, two JSONL files produced.
+
+4. Create STRUCT.md describing the file layout.
+
+5. Print a summary table to stdout after all variants complete:
+   ```
+   Benchmark run: test01
+   Variant                  Runner   Status    Exit
+   dummy                    local    success   0
+   ```
 
 Acceptance criteria:
-- [ ] VariantDummy implements Variant trait correctly
-- [ ] `variant-dummy` binary runs to completion with exit 0
-- [ ] Generated JSONL has all expected event types in correct order
-- [ ] Every write has a corresponding receive (dummy echoes to itself)
-- [ ] Sequence numbers are monotonically increasing
-- [ ] Integration test passes
+- [ ] Single-runner lifecycle test passes end-to-end
+- [ ] Runner spawns variant-dummy, waits for exit, reports success
+- [ ] JSONL log files are produced in the configured log_dir
+- [ ] Timeout test: runner kills hung variant and reports timeout
+- [ ] Config validation: bad --name is rejected with clear error
+- [ ] Multi-variant: both variants executed in order
+- [ ] Summary table printed to stdout
 - [ ] `cargo test` passes, `cargo clippy -- -D warnings` clean, `cargo fmt -- --check` clean
 - [ ] STRUCT.md exists and describes the file layout

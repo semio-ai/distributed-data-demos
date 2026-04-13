@@ -14,6 +14,9 @@
     },
     {
       "path": "variant-base"
+    },
+    {
+      "path": "runner"
     }
   ],
   "settings": {

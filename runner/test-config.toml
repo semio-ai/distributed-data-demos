@@ -1,0 +1,19 @@
+run = "my-first-run"
+runners = ["local"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "dummy"
+binary = "../variant-base/target/release/variant-dummy.exe"  # adjust path
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 2
+  log_dir = "./logs"
+
+  [variant.specific]
