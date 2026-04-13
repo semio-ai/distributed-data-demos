@@ -64,3 +64,42 @@
 4. QUIC/quinn (E3d) — modern protocol, native Rust, 2-12 ms
 
 **E1 impact:** None. Sync trait works for all four candidates.
+
+---
+
+## E2: Benchmark Runner
+
+| Task | Status | Worker | Notes |
+|------|--------|--------|-------|
+| T1: Crate scaffold, config parsing, CLI arg builder | done | worker-e2 | All config fields, validation, SHA-256 hash, CLI arg builder |
+| T2: Child process spawning and monitoring | done | worker-e2 | spawn_and_monitor with timeout, ChildOutcome enum |
+| T3: UDP coordination protocol | done | worker-e2 | Coordinator with discover, ready, done barriers; single-runner optimization |
+| T4: Main loop + integration tests | done | worker-e2 | Full lifecycle, 4 integration tests, summary table |
+
+### Completion Report
+
+**What was implemented:**
+
+- T1: Cargo.toml with all required dependencies (clap, toml, serde, serde_json, sha2, chrono, anyhow, socket2). CLI struct with --name, --config, --port args. BenchConfig/VariantConfig structs matching TOML schema contract. Validation for all rules (empty run, empty runners, duplicate variant names, empty binary, qos range 1-4, positive timeouts). SHA-256 config hash (hex-encoded). CLI arg builder converting snake_case to --kebab-case with runner-injected args appended.
+- T2: spawn_and_monitor() function with try_wait polling loop. ChildOutcome enum (Success, Failed(i32), Timeout). Binary path validation before spawn. Timeout kills child via child.kill(). Platform tested on Windows.
+- T3: Message enum (Discover, Ready, Done) with tagged JSON serde. Coordinator struct with UDP broadcast socket (socket2, SO_BROADCAST, SO_REUSEADDR). 500ms re-broadcast interval for UDP loss resilience. Config hash mismatch detection and abort. Single-runner mode: no socket created, all methods return immediately.
+- T4: Main loop wires config loading, discovery, per-variant ready/spawn/monitor/done barriers. Summary table printed to stdout. Exit code 1 if any variant failed/timed out. Integration tests: single-runner lifecycle with variant-dummy, config validation (bad --name), multi-variant sequential execution (2 variants), timeout handling (sleeper binary killed after 3s). STRUCT.md created.
+
+**Test results:**
+
+- 29 unit tests pass (config: 10, cli_args: 4, message: 6, protocol: 5, spawn: 4)
+- 4 integration tests pass (single-runner lifecycle, config validation, multi-variant, timeout)
+- cargo clippy -- -D warnings: clean
+- cargo fmt -- --check: clean
+
+**Deviations from task spec:**
+
+- The `variant` field in BenchConfig uses `#[serde(default)]` so that configs without `[[variant]]` entries still parse (allows testing top-level validation without needing variant entries).
+- Timeout integration test uses a custom `sleeper` test binary (tiny Rust binary that sleeps forever) instead of a shell script, because shell scripts on Windows do not get properly killed by child.kill().
+- The `sleeper` binary is declared as a `[[bin]]` target in Cargo.toml for test helper purposes.
+- launch_ts is computed in main.rs before calling spawn_and_monitor (not inside spawn_and_monitor) since the timestamp must be passed as a CLI arg to the variant before spawning.
+
+**Open concerns:**
+
+- UDP broadcast tests use `AtomicU16` port allocation to avoid conflicts when tests run in parallel. If tests are run across multiple concurrent cargo test invocations, port conflicts could still occur.
+- The two-runner localhost coordination test depends on UDP broadcast working on the test machine. Some CI environments may block UDP broadcast.
