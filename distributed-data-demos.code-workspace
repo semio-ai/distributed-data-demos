@@ -11,6 +11,9 @@
     {
       "path": "./metak-shared",
       "name": "metak Shared Context"
+    },
+    {
+      "path": "variant-base"
     }
   ],
   "settings": {
