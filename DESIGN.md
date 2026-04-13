@@ -169,50 +169,172 @@ branch owner. A descendant owner may override the QoS for its own sub-branch.
 - **Single-writer paths**: Write traffic flows only from owner to readers,
   never between non-owners.
 
-## 8. Testing and Comparison Framework
+## 8. Benchmark System
 
 The goal is to implement multiple variants of the replication system and
-compare them empirically. The test harness must be implementation-agnostic —
-each implementation plugs into the same test protocol and produces the same
-log format so results are directly comparable.
+compare them empirically. The benchmark system has two layers: a **runner**
+layer that coordinates the benchmark across machines, and the **variant**
+processes that are the actual implementations being tested.
 
-### 8.1 Test Environment
+### 8.1 Architecture Overview
 
-- **Minimum**: 2 nodes on separate machines on a local network.
-- **Recommended**: 3+ nodes to exercise multi-reader fan-out.
-- Nodes are launched manually (one binary per machine). Connection details may
-  be provided via CLI arguments (explicit addresses) or via zero-conf /
-  autodiscovery if the implementation supports it. The framework does not
-  enforce either — this keeps the door open for third-party solutions that
-  may or may not include discovery.
+```
+  Machine A                           Machine B
+ ┌─────────────────────┐            ┌─────────────────────┐
+ │  Runner (name: "a") │◄──coord──►│  Runner (name: "b") │
+ │    │                 │            │    │                 │
+ │    ├─ spawns ──► variant-1       │    ├─ spawns ──► variant-1
+ │    │  (monitor, no IPC)          │    │  (monitor, no IPC)
+ │    │                 │            │    │                 │
+ │    ├─ spawns ──► variant-2       │    ├─ spawns ──► variant-2
+ │    │  ...            │            │    │  ...            │
+ └─────────────────────┘            └─────────────────────┘
+```
 
-### 8.2 Test Protocol
+- One **runner** binary per machine, all given the same config file.
+- Runners coordinate with each other (discovery, barrier sync).
+- Runners have **no IPC** with variant processes — they only spawn, monitor
+  for exit (or timeout), and collect the exit code. This avoids any
+  measurement interference.
+- Variant processes are fully self-contained: they receive their configuration
+  via CLI arguments, connect to their peers independently, execute their
+  workload, log locally, and exit.
 
-Each test run follows a fixed sequence of phases:
+### 8.2 Runner CLI
+
+```
+runner --name <runner-name> --config <path-to-config.toml>
+```
+
+- `--name`: This runner's identity. Must match one of the names listed in the
+  config file.
+- `--config`: Path to the single benchmark config file.
+
+### 8.3 Runner Coordination Protocol
+
+Runners are **leaderless** — no runner is special. They progress through the
+config in lockstep using symmetric barrier synchronization.
+
+#### Phase 1: Discovery and Handshake
+
+1. Runners discover each other on the local network via UDP broadcast (or a
+   third-party discovery library). Each runner announces its name.
+2. During handshake, each runner also broadcasts a **hash of the config file
+   contents**. If any runner's hash does not match, all runners abort with a
+   clear error before anything is launched. This catches mismatched configs
+   from incomplete copies.
+3. Discovery completes when all runner names listed in the config have been
+   seen and their config hashes match.
+
+#### Phase 2: Per-Variant Execution (repeated for each variant in config)
+
+```
+  All runners                All runners               All runners
+ ┌──────────┐  barrier     ┌──────────┐  barrier     ┌──────────┐
+ │  Ready   │────────────►│  Launch  │────────────►│  Done    │──► next
+ │  for V_i │  (all ACK)   │  V_i     │  (all ACK)   │  with V_i│     variant
+ └──────────┘              └──────────┘              └──────────┘
+```
+
+1. **Ready barrier**: Each runner broadcasts "ready for variant V_i". Waits
+   until all runners have signaled ready.
+2. **Launch**: Each runner spawns the variant binary as a child process,
+   passing configuration via CLI arguments (common section + variant-specific
+   section from the config).
+3. **Monitor**: The runner waits for the child to exit. No IPC — just
+   `waitpid` (or equivalent). If the child does not exit within the
+   per-variant timeout specified in the config, the runner kills it and
+   records a timeout.
+4. **Done barrier**: Each runner broadcasts "done with variant V_i" along
+   with the exit status (success / failure / timeout). Waits until all
+   runners have reported done.
+5. Proceed to the next variant, or finish if all variants are complete.
+
+### 8.4 Config File
+
+A single TOML file represents a complete benchmark run. It is the only file
+that needs to be copied to each machine.
+
+```toml
+# Runners expected in this benchmark
+runners = ["a", "b", "c"]
+
+# Default timeout for variants (can be overridden per variant)
+default_timeout_secs = 120
+
+# Variant definitions — executed in order
+[[variant]]
+name = "zenoh-replication"
+binary = "./variants/zenoh-variant"
+timeout_secs = 180                     # override default
+
+  # Common section — passed to all variant instances
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 5
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 2
+  log_dir = "./logs"
+
+  # Variant-specific options — only this implementation uses these
+  [variant.specific]
+  zenoh_mode = "peer"
+  zenoh_listen = "udp/0.0.0.0:7447"
+
+[[variant]]
+name = "custom-udp-replication"
+binary = "./variants/custom-variant"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 5
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 2
+  log_dir = "./logs"
+
+  [variant.specific]
+  buffer_size = 65536
+  multicast_group = "239.0.0.1:9000"
+```
+
+The runner parses the config, and for each variant, constructs CLI arguments
+from both `variant.common` and `variant.specific` to pass to the child
+process.
+
+### 8.5 Variant Process Contract
+
+Each variant binary is a standalone executable that:
+
+1. **Receives** all configuration via CLI arguments (derived from the config
+   file by the runner).
+2. **Discovers or connects** to its peers autonomously — how it does so is
+   implementation-specific (zero-conf, explicit addresses in specific config,
+   etc.).
+3. **Executes** the test protocol phases internally:
 
 ```
 ┌───────────┐   ┌──────────────┐   ┌───────────┐   ┌─────────┐
-│ Connect   │──▶│ Stabilize    │──▶│ Operate   │──▶│ Silent  │──▶ (repeat or end)
-│           │   │ (e.g. 3-5s)  │   │ (measured) │   │ (pause) │
+│ Connect   │──▶│ Stabilize    │──▶│ Operate   │──▶│ Silent  │──▶ exit 0
+│           │   │ (e.g. 3-5s)  │   │ (measured) │   │ (drain) │
 └───────────┘   └──────────────┘   └───────────┘   └─────────┘
 ```
 
-1. **Connect** — Nodes discover or connect to each other. The phase ends when
-   all expected nodes are visible.
-2. **Stabilize** — A configurable quiet period (e.g. 3–5 seconds) to let
-   connections settle, buffers warm up, and clocks align. No application-level
-   writes occur.
-3. **Operate** — A predefined workload runs. Every write and every observed
-   replication event is logged with high-resolution timestamps. Multiple
-   operation phases may run sequentially with different workload profiles.
-4. **Silent** — A configurable pause between operation phases. Allows
-   in-flight data to drain and provides a clear boundary in the logs.
+   - **Connect** — find peers, establish channels.
+   - **Stabilize** — quiet period (duration from config). No writes.
+   - **Operate** — run the workload, log all events.
+   - **Silent** — drain in-flight data, flush logs.
 
-Phase durations and workload parameters are defined in a shared test
-configuration (e.g. a TOML or JSON file) so that every implementation runs the
-exact same scenario.
+4. **Logs** all events to a local JSONL file (see §8.8).
+5. **Exits 0** on success. Non-zero indicates failure. The runner records
+   the exit code.
 
-### 8.3 Workload Profiles
+### 8.6 Workload Profiles
 
 Each operation phase runs a named workload profile. Planned profiles:
 
@@ -224,7 +346,7 @@ Each operation phase runs a named workload profile. Planned profiles:
 | `burst-recovery` | Sustained writes followed by a deliberate pause, then a burst. Measures buffering and recovery behavior under load spikes. |
 | `qos-ladder` | Same data written under each QoS level sequentially. Directly compares QoS latency/loss characteristics. |
 
-### 8.4 Metrics
+### 8.7 Metrics
 
 Each node measures locally (no coordination required during the operation
 phase):
@@ -233,31 +355,31 @@ phase):
 |---|---|---|
 | **Write timestamp** | Writer | Wall-clock time when the write was committed locally |
 | **Receive timestamp** | Reader | Wall-clock time when the replicated value was delivered to the application |
-| **Replication latency** | Analysis | `receive_timestamp − write_timestamp` (requires synchronized clocks — see §8.6) |
+| **Replication latency** | Analysis | `receive_timestamp − write_timestamp` (requires synchronized clocks — see §8.9) |
 | **Throughput** | Per node | Values written/sec and values received/sec |
 | **Packet loss** | Reader | Gaps in sequence numbers (for QoS levels that track sequences) |
 | **Recovery time** | Reader | Time from gap detection to gap fill (QoS levels 3 and 4) |
 | **Jitter** | Analysis | Standard deviation of replication latency over a window |
 | **CPU / memory** | Per node | Sampled periodically (e.g. every 100 ms) during operation phases |
 
-### 8.5 Log Format
+### 8.8 Log Format
 
-Every node produces a single structured log file (JSON Lines). Each line is
-one event:
+Every variant process produces a single structured log file (JSON Lines).
+Each line is one event:
 
 ```jsonl
-{"ts":"2026-04-12T14:00:01.123456789Z","node":"<node-uuid>","event":"write","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
-{"ts":"2026-04-12T14:00:01.124001234Z","node":"<node-uuid>","event":"receive","writer":"<writer-uuid>","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
-{"ts":"2026-04-12T14:00:01.200000000Z","node":"<node-uuid>","event":"gap_detected","writer":"<writer-uuid>","missing_seq":41}
-{"ts":"2026-04-12T14:00:01.300000000Z","node":"<node-uuid>","event":"gap_filled","writer":"<writer-uuid>","recovered_seq":41}
-{"ts":"2026-04-12T14:00:01.000000000Z","node":"<node-uuid>","event":"phase","phase":"operate","profile":"scalar-flood"}
-{"ts":"2026-04-12T14:00:01.100000000Z","node":"<node-uuid>","event":"resource","cpu_percent":12.5,"memory_mb":48.3}
+{"ts":"2026-04-12T14:00:01.123456789Z","runner":"a","event":"write","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
+{"ts":"2026-04-12T14:00:01.124001234Z","runner":"b","event":"receive","writer":"a","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
+{"ts":"2026-04-12T14:00:01.200000000Z","runner":"b","event":"gap_detected","writer":"a","missing_seq":41}
+{"ts":"2026-04-12T14:00:01.300000000Z","runner":"b","event":"gap_filled","writer":"a","recovered_seq":41}
+{"ts":"2026-04-12T14:00:01.000000000Z","runner":"a","event":"phase","phase":"operate","profile":"scalar-flood"}
+{"ts":"2026-04-12T14:00:01.100000000Z","runner":"a","event":"resource","cpu_percent":12.5,"memory_mb":48.3}
 ```
 
-Log files are named `<implementation>-<node-uuid>-<run-id>.jsonl` so that
+Log files are named `<variant>-<runner-name>-<run-id>.jsonl` so that
 multiple runs and implementations can coexist in a single collection folder.
 
-### 8.6 Clock Synchronization
+### 8.9 Clock Synchronization
 
 Cross-node latency measurement depends on synchronized clocks. Options in
 order of preference:
@@ -274,19 +396,19 @@ order of preference:
 The analysis tool should report which synchronization method was used and flag
 results where clock uncertainty exceeds a configurable threshold (e.g. > 1 ms).
 
-### 8.7 Analysis Pipeline
+### 8.10 Analysis Pipeline
 
 After a test session, log files from all nodes (potentially across multiple
 runs) are gathered into a single directory:
 
 ```
 results/
-├── zenoh-nodeA-run01.jsonl
-├── zenoh-nodeB-run01.jsonl
-├── zenoh-nodeA-run02.jsonl
-├── zenoh-nodeB-run02.jsonl
-├── custom-nodeA-run01.jsonl
-├── custom-nodeB-run01.jsonl
+├── zenoh-replication-a-run01.jsonl
+├── zenoh-replication-b-run01.jsonl
+├── zenoh-replication-a-run02.jsonl
+├── zenoh-replication-b-run02.jsonl
+├── custom-udp-replication-a-run01.jsonl
+├── custom-udp-replication-b-run01.jsonl
 └── ...
 ```
 
