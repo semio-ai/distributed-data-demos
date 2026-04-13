@@ -1,0 +1,17 @@
+[package]
+name = "variant-custom-udp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "variant-custom-udp"
+path = "src/main.rs"
+
+[dependencies]
+variant-base = { path = "../../variant-base" }
+socket2 = "0.5"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -204,3 +204,39 @@
 **Open concerns:**
 
 - None. All acceptance criteria met.
+
+### E3e: Hybrid UDP/TCP -- Completion Report
+
+**What was implemented:**
+
+- `Cargo.toml`: binary crate depending on `variant-base`, `socket2`, `anyhow`, `clap`.
+- `src/main.rs`: CLI parsing, constructs `HybridVariant` from extra args, calls `run_protocol`.
+- `src/hybrid.rs`: `HybridVariant` struct implementing `Variant` trait. `HybridConfig` for parsing variant-specific args (`--multicast-group`, `--tcp-base-port`, `--bind-addr`, `--peers`). QoS 2 stale-discard tracking via `HashMap<(writer, path), seq>`.
+- `src/protocol.rs`: compact binary wire format -- `encode`/`decode` for UDP, `encode_framed` with 4-byte length prefix for TCP stream framing.
+- `src/udp.rs`: `UdpTransport` using `socket2` for multicast group join, SO_REUSEADDR, multicast loopback, non-blocking recv.
+- `src/tcp.rs`: `TcpTransport` with `TcpListener` (non-blocking), outbound/inbound `TcpPeer` connections, TCP_NODELAY, length-prefix framing with partial-read buffer.
+- `STRUCT.md`: file layout documentation.
+
+**Transport mapping:**
+
+- QoS 1 (best-effort): UDP multicast fire-and-forget.
+- QoS 2 (latest-value): UDP multicast with seq-based stale discard.
+- QoS 3 (reliable-ordered): TCP to each peer (kernel handles reliability).
+- QoS 4 (reliable-TCP): TCP to each peer (identical to QoS 3).
+
+**Test results:**
+
+- 13 unit tests pass (hybrid: 5 config/stale/name, protocol: 8 encode/decode/framing)
+- 2 integration tests pass (UDP multicast loopback subprocess, TCP self-connect subprocess)
+- cargo clippy -- -D warnings: clean
+- cargo fmt -- --check: clean
+- cargo build: clean (no warnings)
+
+**Deviations from CUSTOM.md:**
+
+- No `discovery.rs` module: mDNS discovery was deferred per task instructions ("skip mDNS for now"), using `--peers` explicit peer list instead.
+- `local_addr` method on `TcpTransport` omitted (was dead code, would fail clippy -D warnings).
+
+**Open concerns:**
+
+- None. All acceptance criteria met.
