@@ -139,14 +139,18 @@ binary = "./variants/custom-variant"
 
 The runner parses the config, and for each variant, constructs CLI arguments
 from both `variant.common` and `variant.specific` to pass to the child
-process.
+process. The runner also passes:
+
+- `--launch-ts <RFC3339>` — the wall-clock timestamp recorded by the runner
+  immediately before spawning the child. The variant uses this to compute
+  connection time (`connected_ts − launch_ts`) without needing IPC.
 
 ## 5. Variant Process Contract
 
 Each variant binary is a standalone executable that:
 
 1. **Receives** all configuration via CLI arguments (derived from the config
-   file by the runner).
+   file by the runner), including `--launch-ts`.
 2. **Discovers or connects** to its peers autonomously — how it does so is
    implementation-specific (zero-conf, explicit addresses in specific config,
    etc.).
@@ -187,7 +191,7 @@ phase):
 
 | Metric | Measured at | Description |
 |---|---|---|
-| **Connection time** | Per node | Time from process launch to all peers connected (end of Connect phase). Logged as a `connected` event with elapsed duration. |
+| **Connection time** | Per node | Time from launch to all peers connected. The runner passes `--launch-ts` before spawning; the variant logs a `connected` event with both `launch_ts` and `elapsed_ms` computed as `connected_ts − launch_ts`. |
 | **Write timestamp** | Writer | Wall-clock time when the write was committed locally |
 | **Receive timestamp** | Reader | Wall-clock time when the replicated value was delivered to the application |
 | **Replication latency** | Analysis | `receive_timestamp − write_timestamp` (requires synchronized clocks — see section 9) |
@@ -206,7 +210,7 @@ file, the full dataset could be recovered by grouping on any combination of
 these three keys.
 
 ```jsonl
-{"ts":"2026-04-12T14:00:00.500000000Z","variant":"zenoh-replication","runner":"a","run":"run01","event":"connected","elapsed_ms":487.3}
+{"ts":"2026-04-12T14:00:00.500000000Z","variant":"zenoh-replication","runner":"a","run":"run01","event":"connected","launch_ts":"2026-04-12T14:00:00.012700000Z","elapsed_ms":487.3}
 {"ts":"2026-04-12T14:00:01.123456789Z","variant":"zenoh-replication","runner":"a","run":"run01","event":"write","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
 {"ts":"2026-04-12T14:00:01.124001234Z","variant":"zenoh-replication","runner":"b","run":"run01","event":"receive","writer":"a","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
 {"ts":"2026-04-12T14:00:01.200000000Z","variant":"zenoh-replication","runner":"b","run":"run01","event":"gap_detected","writer":"a","missing_seq":41}
