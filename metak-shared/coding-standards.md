@@ -17,10 +17,34 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`
 - At least one human approval required before merge.
 - CI must pass.
 
+## Language: Rust (runner, variants)
+
+- Use `cargo fmt` and `cargo clippy` before committing. No warnings allowed.
+- Use `arora_types::Value` for all replicated data — do not define custom
+  value enums.
+- Timestamps must use RFC 3339 with nanosecond precision.
+- Log output uses JSONL format per `metak-shared/api-contracts/jsonl-log-schema.md`.
+- CLI argument parsing: use `clap` (derive style preferred).
+- Error handling: use `anyhow` for applications (runner, variants). Use
+  `thiserror` for library crates if any are extracted.
+- Serialization: use `serde` + `serde_json` for JSONL output.
+- TOML parsing: use the `toml` crate.
+
+## Language: Python (analysis tool)
+
+- Target Python 3.10+.
+- Use type hints throughout.
+- Format with `ruff format`, lint with `ruff check`.
+- Use standard library where possible; `matplotlib` for diagrams.
+- No `pandas` unless justified — the data model is simple enough for
+  plain dicts/dataclasses.
+
 ## Testing
 
 - All code must have tests that pass before committing.
 - Integration test conventions are project-specific — define them in the `tests/CUSTOM.md` file.
+- Rust: `cargo test` must pass. Use `#[test]` for unit tests, `tests/` directory for integration tests.
+- Python: use `pytest`. Tests live in `tests/` alongside the source.
 
 ## Documentation
 
