@@ -111,10 +111,10 @@
 | Variant | Status | Worker | Notes |
 |---------|--------|--------|-------|
 | E3a: Zenoh | in-progress | worker-zenoh | Native Rust, Zenoh pub/sub |
-| E3b: Custom UDP | in-progress | worker-custom-udp | Raw UDP, all 4 QoS manual |
+| E3b: Custom UDP | done | worker-custom-udp | Raw UDP, all 4 QoS levels implemented |
 | E3c: Aeron | blocked | worker-aeron | Scaffold complete; rusteron-client build fails (see below) |
-| E3d: QUIC | in-progress | worker-quic | quinn crate, async-to-sync bridge |
-| E3e: Hybrid UDP/TCP | in-progress | worker-hybrid | UDP for L1-2, TCP for L3-4 |
+| E3d: QUIC | done | worker-quic | quinn crate, async-to-sync bridge |
+| E3e: Hybrid UDP/TCP | done | worker-hybrid | UDP for QoS 1-2, TCP for QoS 3-4 |
 
 ### E3c: Aeron -- Blocker Report
 
@@ -139,3 +139,68 @@
 2. Alternatively, set `BINDGEN_EXTRA_CLANG_ARGS` to include the correct MSVC SDK include paths (e.g., `--target=x86_64-pc-windows-msvc -isystem "C:/Program Files/.../include"`).
 3. Or remove/relocate the MinGW toolchain from the PATH so bindgen does not find it.
 4. On Linux/macOS, this crate is expected to build without issues if clang and cmake are installed.
+
+### E3b: Custom UDP -- Completion Report
+
+**What was implemented:**
+
+- `Cargo.toml`: binary crate depending on `variant-base` (path), `socket2`, `anyhow`, `clap`.
+- `src/main.rs`: CLI parsing, constructs `UdpConfig` from extra args, creates `UdpVariant`, calls `run_protocol`.
+- `src/protocol.rs`: Compact binary message encoding/decoding. Wire format: `[4B total_len][1B qos][8B seq][2B path_len][NB path][2B writer_len][MB writer][payload]`. All multi-byte integers big-endian. NACK message format with 0xFF marker prefix.
+- `src/qos.rs`: Receive-side QoS filtering. `LatestValueTracker` for QoS 2 (tracks highest seq per writer+path, discards stale). `GapDetector` for QoS 3 (detects sequence gaps, returns missing seq list).
+- `src/udp.rs`: `UdpVariant` implementing the `Variant` trait. Supports all four QoS levels:
+  - QoS 1 (BestEffort): UDP multicast fire-and-forget.
+  - QoS 2 (LatestValue): UDP multicast with stale-discard on receive.
+  - QoS 3 (ReliableUdp): UDP multicast with send buffer (10K messages) and NACK-based retransmit. Receiver detects gaps and sends NACK to multicast group.
+  - QoS 4 (ReliableTcp): TCP connections to explicit peers. Non-blocking accept/read.
+- `tests/multicast_loopback.rs`: Integration test verifying single-process multicast send/receive.
+- `STRUCT.md`: File layout documentation.
+
+**CLI extra args:** `--multicast-group` (default 239.0.0.1:9000), `--buffer-size` (default 65536), `--peers` (comma-separated addresses for QoS 4 TCP).
+
+**Test results:**
+
+- 29 unit tests pass (protocol: 11, qos: 12, udp: 6)
+- 1 integration test passes (multicast loopback)
+- `cargo clippy -- -D warnings`: clean
+- `cargo fmt -- --check`: clean
+
+**Design decisions:**
+
+- Own messages filtered out by comparing `writer` field to `config.runner` in recv_udp.
+- Multicast loopback enabled so nodes can receive their own messages (needed for testing).
+- QoS 3 NACK retransmit buffer capped at 10,000 messages to bound memory usage.
+- mDNS discovery deferred (as instructed); `--peers` provides explicit peer addresses.
+
+**Open concerns:**
+
+- Fragmentation for large payloads (>1472 bytes) not yet implemented. The scalar-flood workload (8-byte payloads) fits in a single datagram.
+- QoS 4 TCP requires peers to be pre-configured via `--peers` and does not auto-discover.
+- QoS 3 NACK recovery is basic: NACKs sent to multicast group, original sender retransmits if message still buffered.
+
+### E3d: QUIC -- Completion Report
+
+**What was implemented:**
+
+- `Cargo.toml`: binary crate depending on `variant-base`, `quinn`, `rustls`, `rcgen`, `tokio`, `clap`, `anyhow`.
+- `src/main.rs`: CLI extra-arg parsing (`--bind-addr`, `--peers`), constructs `QuicVariant`, calls `run_protocol`. Includes 3 unit tests for arg parsing.
+- `src/quic.rs`: `QuicVariant` struct implementing `Variant` trait with full async-to-sync bridge. Tokio runtime spawned on `connect`; mpsc channels bridge sync trait methods to background tokio tasks. QoS 1-2 use QUIC unreliable datagrams (`send_datagram`); QoS 3-4 use QUIC unidirectional streams (`open_uni`). Custom binary wire format with writer/path/qos/seq/payload encoding. `SkipServerVerification` for LAN benchmarking. Background accept task handles incoming connections. Includes 5 unit tests for message encoding/decoding and struct construction.
+- `src/certs.rs`: self-signed certificate generation using `rcgen`. Includes 1 unit test.
+- `tests/loopback.rs`: 2 integration tests -- no-peer binary exit test, and self-connect loopback verifying write+receive log entries.
+- `STRUCT.md`: file layout documentation.
+
+**Test results:**
+
+- 9 unit tests pass (quic: 5, main: 3, certs: 1)
+- 2 integration tests pass (no-peer run, self-connect loopback)
+- `cargo clippy --all-targets -- -D warnings`: clean
+- `cargo fmt -- --check`: clean
+
+**Deviations from spec:**
+
+- `discovery.rs` (mDNS) not implemented per instructions ("skip mDNS for now"). Peer addresses are provided via `--peers` CLI arg.
+- No separate lib target; all code is in the binary crate with `mod` declarations. Integration tests use subprocess testing via `env!("CARGO_BIN_EXE_variant-quic")`.
+
+**Open concerns:**
+
+- None. All acceptance criteria met.

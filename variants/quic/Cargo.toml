@@ -1,0 +1,20 @@
+[package]
+name = "variant-quic"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "variant-quic"
+path = "src/main.rs"
+
+[dependencies]
+variant-base = { path = "../../variant-base" }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
