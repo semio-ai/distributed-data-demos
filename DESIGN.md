@@ -353,6 +353,7 @@ phase):
 
 | Metric | Measured at | Description |
 |---|---|---|
+| **Connection time** | Per node | Time from process launch to all peers connected (end of Connect phase). Logged as a `connected` event with elapsed duration. |
 | **Write timestamp** | Writer | Wall-clock time when the write was committed locally |
 | **Receive timestamp** | Reader | Wall-clock time when the replicated value was delivered to the application |
 | **Replication latency** | Analysis | `receive_timestamp − write_timestamp` (requires synchronized clocks — see §8.9) |
@@ -368,6 +369,7 @@ Every variant process produces a single structured log file (JSON Lines).
 Each line is one event:
 
 ```jsonl
+{"ts":"2026-04-12T14:00:00.500000000Z","runner":"a","event":"connected","elapsed_ms":487.3}
 {"ts":"2026-04-12T14:00:01.123456789Z","runner":"a","event":"write","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
 {"ts":"2026-04-12T14:00:01.124001234Z","runner":"b","event":"receive","writer":"a","seq":42,"path":"/sensors/lidar","qos":2,"bytes":128}
 {"ts":"2026-04-12T14:00:01.200000000Z","runner":"b","event":"gap_detected","writer":"a","missing_seq":41}
