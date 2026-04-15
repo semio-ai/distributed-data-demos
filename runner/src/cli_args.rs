@@ -35,15 +35,9 @@ pub fn build_variant_args(
         args.push(toml_value_to_string(val));
     }
 
-    // Specific args from [variant.specific] table (if present).
-    if let Some(ref specific) = variant.specific {
-        for (key, val) in specific {
-            args.push(to_kebab_flag(key));
-            args.push(toml_value_to_string(val));
-        }
-    }
-
-    // Runner-injected args (always last).
+    // Runner-injected args (before specific args, because specific args
+    // are passed as trailing args after `--` and clap would absorb
+    // runner-injected args if they came after unknown specific args).
     args.push("--launch-ts".to_string());
     args.push(launch_ts.to_string());
     args.push("--variant".to_string());
@@ -52,6 +46,18 @@ pub fn build_variant_args(
     args.push(runner_name.to_string());
     args.push("--run".to_string());
     args.push(run.to_string());
+
+    // Specific args from [variant.specific] table (if present).
+    // Separated by `--` so clap treats them as trailing/extra args.
+    if let Some(ref specific) = variant.specific {
+        if !specific.is_empty() {
+            args.push("--".to_string());
+            for (key, val) in specific {
+                args.push(to_kebab_flag(key));
+                args.push(toml_value_to_string(val));
+            }
+        }
+    }
 
     args
 }

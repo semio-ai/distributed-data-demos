@@ -45,10 +45,13 @@ side-by-side under identical conditions.
 - E0 (variant exploration) complete: 18 candidates evaluated, 4 selected
   (Zenoh, custom UDP, Aeron, QUIC). See `variant-candidates.md`.
 - E1 (variant-base crate) complete: `Variant` trait, protocol driver,
-  JSONL logger, VariantDummy, 29 tests passing. Trait confirmed compatible
-  with all four chosen variants (no changes needed).
-- Sub-repos created: `variant-base/`.
-- Still needed: runner, concrete variants, analysis tool.
+  JSONL logger, VariantDummy, 29 tests passing.
+- E2 (benchmark runner) complete: TOML config, UDP coordination, child
+  spawning, barrier sync, 33 tests passing.
+- E3 variants: 4 of 5 complete and tested:
+  - Zenoh (9 tests), Custom UDP (30 tests), QUIC (11 tests), Hybrid (15 tests).
+  - Aeron: scaffolded but blocked on C FFI build (Windows toolchain issue).
+- Still needed: analysis tool (E4-E6), end-to-end validation (E7).
 
 ## What's next
 

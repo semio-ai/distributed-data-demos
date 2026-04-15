@@ -9,6 +9,9 @@ const BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_MSG_SIZE: usize = 4096;
 
+/// Multicast group for runner coordination (organization-local scope).
+const COORDINATION_MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 77, 66, 55);
+
 /// Coordinator manages the UDP coordination protocol for runner synchronization.
 pub struct Coordinator {
     /// This runner's name.
@@ -19,8 +22,10 @@ pub struct Coordinator {
     config_hash: String,
     /// UDP socket (None in single-runner mode since no network I/O is needed).
     socket: Option<Socket>,
-    /// Broadcast address.
-    broadcast_addr: SocketAddr,
+    /// Addresses of all peer runners (including self for multicast, excluding
+    /// self for unicast fallback). Each runner gets its own port to avoid
+    /// Windows same-port delivery issues.
+    peer_addrs: Vec<SocketAddr>,
     /// Whether this is single-runner mode.
     single_runner: bool,
 }
@@ -33,12 +38,37 @@ impl Coordinator {
     pub fn new(name: String, runners: &[String], config_hash: String, port: u16) -> Result<Self> {
         let expected: HashSet<String> = runners.iter().cloned().collect();
         let single_runner = runners.len() == 1 && runners[0] == name;
-        let broadcast_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, port));
+
+        // Each runner gets its own port: base_port + index in runners list.
+        // This avoids Windows issues where multiple processes on the same
+        // UDP port don't reliably deliver packets to each other.
+        let my_index = runners.iter().position(|r| r == &name).unwrap_or(0);
+        let my_port = port + my_index as u16;
+
+        // Build the list of all peer addresses to send to.
+        // Each runner gets its own port (base + index). We send to each
+        // peer's port via:
+        //   1. Multicast group (works cross-machine on any LAN)
+        //   2. Localhost fallback (always works for same-machine)
+        let mut peer_addrs: Vec<SocketAddr> = Vec::new();
+        for i in 0..runners.len() {
+            let peer_port = port + i as u16;
+            // Multicast for cross-machine discovery.
+            peer_addrs.push(SocketAddr::V4(SocketAddrV4::new(
+                COORDINATION_MULTICAST,
+                peer_port,
+            )));
+            // Localhost fallback for same-machine runners.
+            peer_addrs.push(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                peer_port,
+            )));
+        }
 
         let socket = if single_runner {
             None
         } else {
-            Some(create_broadcast_socket(port)?)
+            Some(create_coordination_socket(my_port)?)
         };
 
         Ok(Coordinator {
@@ -46,7 +76,7 @@ impl Coordinator {
             expected,
             config_hash,
             socket,
-            broadcast_addr,
+            peer_addrs,
             single_runner,
         })
     }
@@ -54,7 +84,11 @@ impl Coordinator {
     /// Run the discovery phase.
     ///
     /// Broadcasts Discover messages until all expected runners have been seen
-    /// with matching config hashes. In single-runner mode, returns immediately.
+    /// with matching config hashes. After all peers are found, continues
+    /// broadcasting for a linger period so slower peers can also complete
+    /// their discovery.
+    ///
+    /// In single-runner mode, returns immediately.
     pub fn discover(&self) -> Result<()> {
         if self.single_runner {
             return Ok(());
@@ -74,22 +108,44 @@ impl Coordinator {
 
             let deadline = std::time::Instant::now() + BROADCAST_INTERVAL;
             while std::time::Instant::now() < deadline {
-                if let Some(Message::Discover { name, config_hash }) = self.recv(socket) {
-                    if self.expected.contains(&name) {
-                        if config_hash != self.config_hash {
-                            bail!(
-                                "config hash mismatch from runner '{}': expected {}, got {}",
-                                name,
-                                &self.config_hash[..8],
-                                &config_hash[..config_hash.len().min(8)]
-                            );
+                if let Some(received) = self.recv(socket) {
+                    // Accept any message type as proof that a peer exists.
+                    // This handles the race where a fast peer has already
+                    // moved past discovery and is sending Ready/Done messages.
+                    let peer_name = match &received {
+                        Message::Discover { name, config_hash } => {
+                            if self.expected.contains(name) && *config_hash != self.config_hash {
+                                bail!(
+                                    "config hash mismatch from runner '{}': expected {}, got {}",
+                                    name,
+                                    &self.config_hash[..8],
+                                    &config_hash[..config_hash.len().min(8)]
+                                );
+                            }
+                            Some(name.clone())
                         }
-                        seen.insert(name);
+                        Message::Ready { name, .. } => Some(name.clone()),
+                        Message::Done { name, .. } => Some(name.clone()),
+                    };
+                    if let Some(name) = peer_name {
+                        if self.expected.contains(&name) {
+                            seen.insert(name);
+                        }
                     }
                 }
             }
 
             if seen == self.expected {
+                // Linger: keep broadcasting Discover for 2 more seconds so
+                // slower peers can complete their discovery phase.
+                let linger_end = std::time::Instant::now() + Duration::from_secs(2);
+                while std::time::Instant::now() < linger_end {
+                    self.send(socket, &msg)?;
+                    // Also drain incoming messages during linger to keep
+                    // the socket buffer clean.
+                    let _ = self.recv(socket);
+                    std::thread::sleep(BROADCAST_INTERVAL);
+                }
                 return Ok(());
             }
         }
@@ -181,12 +237,13 @@ impl Coordinator {
         }
     }
 
-    /// Send a message via UDP broadcast.
+    /// Send a message to all peer runner ports via UDP broadcast.
     fn send(&self, socket: &Socket, msg: &Message) -> Result<()> {
         let data = msg.to_bytes();
-        socket
-            .send_to(&data, &self.broadcast_addr.into())
-            .map_err(|e| anyhow::anyhow!("UDP send failed: {e}"))?;
+        for addr in &self.peer_addrs {
+            // Ignore send errors for individual peers (they may not be up yet).
+            let _ = socket.send_to(&data, &(*addr).into());
+        }
         Ok(())
     }
 
@@ -208,16 +265,25 @@ impl Coordinator {
     }
 }
 
-/// Create a UDP broadcast socket bound to the given port.
-fn create_broadcast_socket(port: u16) -> Result<Socket> {
+/// Create a UDP socket for runner coordination.
+///
+/// Each runner gets a unique port (base + index), so there is no port
+/// contention between processes. The socket joins a multicast group for
+/// cross-machine discovery and also accepts localhost datagrams for
+/// same-machine fallback.
+fn create_coordination_socket(port: u16) -> Result<Socket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
-    socket.set_broadcast(true)?;
     socket.set_read_timeout(Some(RECV_TIMEOUT))?;
     socket.set_nonblocking(false)?;
 
+    // Bind to INADDR_ANY so we receive both multicast and localhost traffic.
     let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     socket.bind(&addr.into())?;
+
+    // Join the coordination multicast group to receive cross-machine messages.
+    socket.join_multicast_v4(&COORDINATION_MULTICAST, &Ipv4Addr::UNSPECIFIED)?;
+    socket.set_multicast_loop_v4(true)?;
 
     Ok(socket)
 }
