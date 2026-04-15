@@ -41,26 +41,24 @@ side-by-side under identical conditions.
 
 ## Current state
 
-- Design documents are complete: DESIGN.md, BENCHMARK.md, ANALYSIS.md.
-- E0 (variant exploration) complete: 18 candidates evaluated, 4 selected
-  (Zenoh, custom UDP, Aeron, QUIC). See `variant-candidates.md`.
-- E1 (variant-base crate) complete: `Variant` trait, protocol driver,
-  JSONL logger, VariantDummy, 29 tests passing.
-- E2 (benchmark runner) complete: TOML config, UDP coordination, child
-  spawning, barrier sync, 33 tests passing.
-- E3 variants: 4 of 5 complete and tested:
+- Design documents complete: DESIGN.md, BENCHMARK.md, ANALYSIS.md.
+- E0 complete: 18 candidates evaluated, 5 selected. See `variant-candidates.md`.
+- E1 complete: `Variant` trait, protocol driver, JSONL logger, VariantDummy.
+  29 tests. See `variant-base/`.
+- E2 complete: TOML config, multicast coordination protocol (per-runner
+  ports + localhost fallback), child spawning with timeout, barrier sync.
+  33 tests. Two-runner same-machine coordination verified. See `runner/`.
+- E3 variants: 4 of 5 complete and tested (127 total tests across all crates):
   - Zenoh (9 tests), Custom UDP (30 tests), QUIC (11 tests), Hybrid (15 tests).
   - Aeron: scaffolded but blocked on C FFI build (Windows toolchain issue).
-- Still needed: analysis tool (E4-E6), end-to-end validation (E7).
+- End-to-end verified: two runners + custom-udp on same machine.
+- Usage guide available: `metak-shared/usage-guide.md`.
+- Ready-to-use config: `two-runner-test.toml`.
 
 ## What's next
 
-1. Research and select variant candidates (E0) — survey transport libraries
-   and protocols, produce `variant-candidates.md`.
-2. Finalize architecture and API contracts (runner-variant CLI contract,
-   JSONL log schema, runner coordination protocol, TOML config schema).
-3. Implement the variant base crate with `Variant` trait + `VariantDummy` (E1).
-4. Implement the benchmark runner, tested against `VariantDummy` (E2).
-5. Implement the first concrete variant (E3, chosen from E0 results).
-6. Implement the analysis tool — Phase 1 foundation (E4).
-7. Run the first end-to-end benchmark.
+1. Implement the analysis tool (E4) — can start now, JSONL logs already
+   available from variant runs.
+2. Add diagram generation (E5) and time-series charts (E6).
+3. Run end-to-end validation across two LAN machines (E7).
+4. Unblock Aeron variant on Linux (E3c).
