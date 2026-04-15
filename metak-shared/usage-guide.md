@@ -158,13 +158,27 @@ Per `[[variant]]`:
 `[variant.specific]` — variant-specific options passed as extra CLI args.
 Currently unused by `variant-dummy`.
 
+## Project Layout
+
+```
+configs/           -- benchmark config files (checked into git)
+logs/              -- benchmark output: JSONL logs, analysis cache (gitignored)
+runner/            -- runner binary (Rust)
+variant-base/      -- shared Variant trait + VariantDummy (Rust)
+variants/          -- concrete variant implementations (Rust)
+analysis/          -- analysis tool (Python)
+```
+
+Configs are inputs you version-control. Logs are artifacts you regenerate.
+
 ## Running
+
+All commands are run from the **repo root**.
 
 ### Single machine
 
 ```bash
-cd runner
-./target/release/runner --name local --config my-config.toml
+runner/target/release/runner --name local --config configs/my-config.toml
 ```
 
 Output:
@@ -189,13 +203,13 @@ On each machine, run the runner with the same config file but a different
 
 ```bash
 # Machine A
-./runner --name machine-a --config bench.toml
+runner/target/release/runner --name machine-a --config configs/bench.toml
 
 # Machine B
-./runner --name machine-b --config bench.toml
+runner/target/release/runner --name machine-b --config configs/bench.toml
 ```
 
-Runners discover each other via UDP broadcast on port 19876 (configurable
+Runners discover each other via UDP multicast on port 19876 (configurable
 with `--port`). They verify that all machines have identical config files
 (SHA-256 hash check). Once all runners are discovered, they proceed through
 variants in lockstep.
@@ -258,6 +272,16 @@ dummy                    local    success   0
 
 Exit code: 0 if all variants succeeded, 1 if any failed or timed out.
 
+### Analysing results
+
+```bash
+cd analysis
+python analyze.py ../logs --summary
+```
+
+Add `--clear` to force a full re-parse if you regenerate logs. The pickle
+cache (`logs/.analysis_cache.pkl`) makes repeated runs instant.
+
 ## Tuning parameters
 
 | Parameter | Effect | Typical range |
@@ -285,8 +309,13 @@ passed doesn't match any entry in the `runners` array in the config.
 identical. Copy the exact same file to all machines (byte-for-byte).
 
 **Runner hangs at discovery**: The other runner(s) haven't started yet, or
-UDP broadcast is blocked by a firewall. Check that all runners are on the
-same subnet and UDP port 19876 is open.
+UDP multicast is blocked by a firewall. Check that all runners are on the
+same subnet and UDP port 19876+ is open. Each runner uses port
+`base_port + index` (e.g. alice=19876, bob=19877).
+
+**Windows Firewall**: On first run, Windows will prompt to allow
+`runner.exe` and variant binaries through the firewall. You must allow
+them for both same-machine and cross-machine operation.
 
 **Variant times out**: The variant didn't exit within `timeout_secs`. The
 runner kills it and reports "timeout". Increase the timeout or reduce the

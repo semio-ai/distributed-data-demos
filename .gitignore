@@ -22,6 +22,8 @@ target
 # Benchmark artifacts — all output goes to /logs/
 /logs/
 
+# Benchmark configs are checked in — do NOT ignore /configs/
+
 # Stray artifacts that should never be committed
 *.log
 *.jsonl
