@@ -12,10 +12,10 @@
 | E3c: Aeron | blocked | — | Scaffold complete, rusteron-client won't compile on Windows |
 | E3d: QUIC | done | 11 (9 unit + 2 integration) | quinn, async-to-sync bridge |
 | E3e: Hybrid UDP/TCP | done | 15 (13 unit + 2 integration) | UDP for QoS 1-2, TCP for QoS 3-4 |
-| E4: Analysis Tool | not started | — | |
+| E4: Analysis Tool | done | 51 (42 unit + 9 integration) | Phase 1 complete: parse, cache, correlate, integrity, performance, CLI tables |
 | E5-E7 | not started | — | |
 
-**Total passing tests: 127** (across 6 crates)
+**Total passing tests: 178** (127 Rust across 6 crates + 51 Python in analysis)
 
 **End-to-end verified**: Two-runner coordination with custom-udp variant
 on same machine — both runners discover each other, barrier-sync, spawn
@@ -127,11 +127,32 @@ complexity vs kernel TCP.
 
 ---
 
+## E4: Analysis Tool Phase 1 — done
+
+51 tests (42 unit + 9 integration). ruff format and ruff check clean.
+
+Python analysis tool that ingests JSONL log files, caches parsed data in
+a pickle file, correlates write-receive events, runs integrity verification,
+computes performance metrics, and prints CLI summary tables.
+
+Modules: `analyze.py` (CLI), `cache.py` (pickle caching with mtime-based
+change detection), `parse.py` (JSONL parsing, Event/DeliveryRecord dataclasses),
+`correlate.py` (write-receive correlation), `integrity.py` (QoS-aware integrity
+checks: completeness, ordering, duplicates, gap recovery), `performance.py`
+(connection time, latency percentiles, throughput, jitter, loss, resource usage),
+`tables.py` (CLI table formatting).
+
+Verified against real logs from two-runner-logs/: custom-udp (alice+bob,
+bidirectional, 255 writes each, 100% delivery) and dummy (alice loopback,
+255 writes, near-zero latency). Diagrams placeholder for E5.
+
+---
+
 ## What's next
 
 | Epic | Status | Can start now? |
 |------|--------|----------------|
-| E4: Analysis Tool Phase 1 | not started | Yes — JSONL logs already available |
-| E5: Analysis Tool Phase 2 (diagrams) | not started | After E4 |
+| E4: Analysis Tool Phase 1 | done | -- |
+| E5: Analysis Tool Phase 2 (diagrams) | not started | Yes — E4 complete |
 | E6: Analysis Tool Phase 3 (time-series) | not started | After E5 |
 | E7: End-to-End Validation | not started | After E4 + at least one E3 on two machines |

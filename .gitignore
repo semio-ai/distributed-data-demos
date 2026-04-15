@@ -24,3 +24,5 @@ target
 /runner/test-logs
 *.log
 *.jsonl
+*.pyc
+*.pkl

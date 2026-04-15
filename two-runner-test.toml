@@ -1,20 +1,20 @@
-run = "local-test-01"
+run = "full-rate-01"
 runners = ["alice", "bob"]
-default_timeout_secs = 30
+default_timeout_secs = 60
 
 [[variant]]
 name = "custom-udp"
 binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
   [variant.common]
-  tick_rate_hz = 10
-  stabilize_secs = 1
-  operate_secs = 5
-  silent_secs = 1
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
   workload = "scalar-flood"
-  values_per_tick = 5
-  qos = 1
-  log_dir = "./two-runner-logs"
+  values_per_tick = 1000
+  qos = 2
+  log_dir = "./full-rate-logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19500"

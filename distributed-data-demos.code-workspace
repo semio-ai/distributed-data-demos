@@ -32,6 +32,9 @@
     },
     {
       "path": "variants/hybrid"
+    },
+    {
+      "path": "analysis"
     }
   ],
   "settings": {
