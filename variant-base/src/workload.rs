@@ -54,7 +54,7 @@ impl Workload for ScalarFlood {
 /// Returns an error for unknown workload names.
 pub fn create_workload(name: &str) -> Result<Box<dyn Workload>> {
     match name {
-        "scalar-flood" => Ok(Box::new(ScalarFlood::new())),
+        "scalar-flood" | "max-throughput" => Ok(Box::new(ScalarFlood::new())),
         _ => bail!("unknown workload profile: {}", name),
     }
 }

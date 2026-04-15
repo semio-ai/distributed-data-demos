@@ -52,7 +52,7 @@ side-by-side under identical conditions.
   - Zenoh (9 tests), Custom UDP (30 tests), QUIC (11 tests), Hybrid (15 tests).
   - Aeron: scaffolded but blocked on C FFI build (Windows toolchain issue).
 - End-to-end verified: two runners + custom-udp on same machine.
-- Usage guide available: `metak-shared/usage-guide.md`.
+- Usage guide available: `usage-guide.md` (repo root).
 - Ready-to-use config: `two-runner-test.toml`.
 
 ## What's next

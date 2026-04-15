@@ -6,7 +6,7 @@ fn to_kebab_flag(key: &str) -> String {
 }
 
 /// Format a TOML value as a CLI argument string.
-fn toml_value_to_string(val: &toml::Value) -> String {
+pub(crate) fn toml_value_to_string(val: &toml::Value) -> String {
     match val {
         toml::Value::String(s) => s.clone(),
         toml::Value::Integer(i) => i.to_string(),
@@ -26,13 +26,22 @@ pub fn build_variant_args(
     run: &str,
     runner_name: &str,
     launch_ts: &str,
+    log_dir_override: Option<&str>,
 ) -> Vec<String> {
     let mut args = Vec::new();
 
     // Common args from [variant.common] table.
     for (key, val) in &variant.common {
         args.push(to_kebab_flag(key));
-        args.push(toml_value_to_string(val));
+        if key == "log_dir" {
+            if let Some(override_val) = log_dir_override {
+                args.push(override_val.to_string());
+            } else {
+                args.push(toml_value_to_string(val));
+            }
+        } else {
+            args.push(toml_value_to_string(val));
+        }
     }
 
     // Runner-injected args (before specific args, because specific args
@@ -118,7 +127,7 @@ timeout_secs = 30
     fn build_args_includes_all_sections() {
         let config = sample_config();
         let v = &config.variant[0];
-        let args = build_variant_args(v, "run01", "a", "2025-01-01T00:00:00Z");
+        let args = build_variant_args(v, "run01", "a", "2025-01-01T00:00:00Z", None);
 
         // Common args should be present as --kebab-case.
         assert!(args.contains(&"--tick-rate-hz".to_string()));
@@ -127,6 +136,10 @@ timeout_secs = 30
         assert!(args.contains(&"scalar-flood".to_string()));
         assert!(args.contains(&"--qos".to_string()));
         assert!(args.contains(&"2".to_string()));
+
+        // log_dir should use the config value when no override is given.
+        assert!(args.contains(&"--log-dir".to_string()));
+        assert!(args.contains(&"./logs".to_string()));
 
         // Specific args should be present.
         assert!(args.contains(&"--zenoh-mode".to_string()));
@@ -154,6 +167,25 @@ timeout_secs = 30
     }
 
     #[test]
+    fn build_args_log_dir_override() {
+        let config = sample_config();
+        let v = &config.variant[0];
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            Some("./logs/run01-20260415_143022"),
+        );
+
+        // --log-dir should use the override value, not the config value.
+        let log_dir_idx = args.iter().position(|a| a == "--log-dir").unwrap();
+        assert_eq!(args[log_dir_idx + 1], "./logs/run01-20260415_143022");
+        // The original config value should not be present.
+        assert!(!args.contains(&"./logs".to_string()));
+    }
+
+    #[test]
     fn build_args_without_specific() {
         let toml_str = r#"
 run = "run01"
@@ -170,7 +202,7 @@ binary = "./simple"
 "#;
         let config: BenchConfig = toml::from_str(toml_str).unwrap();
         let v = &config.variant[0];
-        let args = build_variant_args(v, "run01", "a", "2025-01-01T00:00:00Z");
+        let args = build_variant_args(v, "run01", "a", "2025-01-01T00:00:00Z", None);
 
         // Should still have common args and injected args, no specific section.
         assert!(args.contains(&"--tick-rate-hz".to_string()));

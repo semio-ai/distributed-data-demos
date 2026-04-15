@@ -48,6 +48,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // -- Phase 3: Operate --
     logger.log_phase(Phase::Operate, Some(&config.workload))?;
 
+    let max_throughput = config.workload == "max-throughput";
     let tick_interval = Duration::from_secs_f64(1.0 / f64::from(config.tick_rate_hz));
     let operate_duration = Duration::from_secs(config.operate_secs);
     let resource_interval = Duration::from_millis(100);
@@ -57,12 +58,14 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     let mut next_tick = Instant::now();
 
     while operate_start.elapsed() < operate_duration {
-        // Wait for the next tick.
-        let now = Instant::now();
-        if now < next_tick {
-            std::thread::sleep(next_tick - now);
+        // In max-throughput mode, skip the tick sleep entirely.
+        if !max_throughput {
+            let now = Instant::now();
+            if now < next_tick {
+                std::thread::sleep(next_tick - now);
+            }
+            next_tick += tick_interval;
         }
-        next_tick += tick_interval;
 
         // Generate and publish writes.
         let ops = workload.generate(config.values_per_tick);

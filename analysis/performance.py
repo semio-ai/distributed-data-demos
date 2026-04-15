@@ -49,8 +49,10 @@ class PerformanceResult:
     # Throughput
     writes_per_sec: float
     receives_per_sec: float
-    # Jitter (std-dev of latency)
+    # Jitter (std-dev of latency per 1-second window)
     jitter_ms: float
+    # Jitter p95 (95th percentile of per-window std-devs, filters outlier spikes)
+    jitter_p95_ms: float
     # Loss
     loss_pct: float
     # Resource usage
@@ -80,14 +82,18 @@ def _percentile(data: list[float], p: float) -> float:
     return sorted_data[lo] + frac * (sorted_data[hi] - sorted_data[lo])
 
 
-def _compute_jitter(records: list[DeliveryRecord]) -> float:
+def _compute_jitter(records: list[DeliveryRecord]) -> tuple[float, float]:
     """Compute jitter as std-dev of latency within 1-second windows.
 
-    Returns the mean of per-window std-devs. If there is only one window
-    or not enough data, returns the overall latency std-dev.
+    Returns (mean_jitter, p95_jitter):
+    - mean_jitter: mean of per-window std-devs (includes outlier windows)
+    - p95_jitter: 95th percentile of per-window std-devs (filters spike windows)
+
+    If there is only one window or not enough data, both values are the
+    overall latency std-dev.
     """
     if len(records) < 2:
-        return 0.0
+        return 0.0, 0.0
 
     # Sort by receive timestamp
     sorted_recs = sorted(records, key=lambda r: r.receive_ts)
@@ -111,11 +117,14 @@ def _compute_jitter(records: list[DeliveryRecord]) -> float:
 
     if windows:
         stddevs = [statistics.stdev(w) for w in windows]
-        return statistics.mean(stddevs)
+        mean_jitter = statistics.mean(stddevs)
+        p95_jitter = _percentile(stddevs, 95)
+        return mean_jitter, p95_jitter
 
     # Fallback: overall std-dev
     latencies = [r.latency_ms for r in records]
-    return statistics.stdev(latencies)
+    fallback = statistics.stdev(latencies)
+    return fallback, fallback
 
 
 def _get_operate_duration(events: list[Event], variant: str, run: str) -> float:
@@ -235,7 +244,7 @@ def compute_performance(
         receives_per_sec = r_count / duration if duration > 0 else 0.0
 
         # Jitter
-        jitter = _compute_jitter(pair_records) if pair_records else 0.0
+        jitter, jitter_p95 = _compute_jitter(pair_records) if pair_records else (0.0, 0.0)
 
         # Loss
         total_writes = w_count
@@ -278,6 +287,7 @@ def compute_performance(
                 writes_per_sec=writes_per_sec,
                 receives_per_sec=receives_per_sec,
                 jitter_ms=jitter,
+                jitter_p95_ms=jitter_p95,
                 loss_pct=loss_pct,
                 resources=resources,
             )

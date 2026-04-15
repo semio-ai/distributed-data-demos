@@ -115,7 +115,7 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
 
     lines: list[str] = []
     lines.append("Performance Report")
-    sep = "-" * 110
+    sep = "-" * 120
     lines.append(sep)
 
     # Column widths
@@ -136,7 +136,8 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
         + _rpad("p99", w_lat)
         + _rpad("Max", w_lat)
         + _rpad("Writes/s", w_rate)
-        + _rpad("Jitter", w_jitter)
+        + _rpad("Jitter avg", w_jitter)
+        + _rpad("Jitter p95", w_jitter)
         + _rpad("Loss%", w_loss)
     )
     lines.append(header)
@@ -153,6 +154,7 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
             + _rpad(_fmt_ms(r.latency_max_ms), w_lat)
             + _rpad(_fmt_rate(r.writes_per_sec), w_rate)
             + _rpad(_fmt_ms(r.jitter_ms), w_jitter)
+            + _rpad(_fmt_ms(r.jitter_p95_ms), w_jitter)
             + _rpad(_fmt_pct(r.loss_pct), w_loss)
         )
         lines.append(row)

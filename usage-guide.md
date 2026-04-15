@@ -14,34 +14,37 @@ How to build, configure, and run the benchmark system.
 From the repository root:
 
 ```bash
-# Build the variant-dummy (zero-network test variant)
-cd variant-base
-cargo build --release
-
 # Build the benchmark runner
-cd ../runner
+cd runner
 cargo build --release
+cd ..
+
+# Build one or more variants
+cd variants/custom-udp && cargo build --release && cd ../..
+cd variants/zenoh      && cargo build --release && cd ../..
+cd variants/quic       && cargo build --release && cd ../..
+cd variants/hybrid     && cargo build --release && cd ../..
 ```
 
 Binaries are produced at:
-- `variant-base/target/release/variant-dummy` (`.exe` on Windows)
 - `runner/target/release/runner` (`.exe` on Windows)
+- `variants/<name>/target/release/variant-<name>` (`.exe` on Windows)
 
 ## Configuration
 
 The benchmark is driven by a single TOML config file. This is the only file
 that needs to be copied to each machine.
 
-### Minimal example (single machine)
+### Minimal example (two runners, same machine)
 
 ```toml
 run = "my-first-run"
-runners = ["local"]
+runners = ["alice", "bob"]
 default_timeout_secs = 60
 
 [[variant]]
-name = "dummy"
-binary = "../variant-base/target/release/variant-dummy.exe"  # adjust path
+name = "custom-udp"
+binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -54,6 +57,8 @@ binary = "../variant-base/target/release/variant-dummy.exe"  # adjust path
   log_dir = "./logs"
 
   [variant.specific]
+  multicast_group = "239.0.0.1:19500"
+  buffer_size = 65536
 ```
 
 ### Multi-machine example
@@ -64,8 +69,8 @@ runners = ["machine-a", "machine-b"]
 default_timeout_secs = 120
 
 [[variant]]
-name = "dummy"
-binary = "./variant-dummy"
+name = "custom-udp"
+binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 timeout_secs = 60
 
   [variant.common]
@@ -79,6 +84,8 @@ timeout_secs = 60
   log_dir = "./logs"
 
   [variant.specific]
+  multicast_group = "239.0.0.1:19500"
+  buffer_size = 65536
 ```
 
 Copy the same config file and the same binaries to both machines. Use
@@ -88,43 +95,48 @@ identical paths or adjust `binary` to match each machine's layout.
 
 ```toml
 run = "comparison-01"
-runners = ["local"]
+runners = ["alice", "bob"]
 default_timeout_secs = 120
 
 [[variant]]
-name = "dummy-qos1"
-binary = "./variant-dummy.exe"
+name = "custom-udp"
+binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
   [variant.common]
   tick_rate_hz = 100
   stabilize_secs = 2
-  operate_secs = 10
-  silent_secs = 1
-  workload = "scalar-flood"
-  values_per_tick = 1000
-  qos = 1
-  log_dir = "./logs"
-
-  [variant.specific]
-
-[[variant]]
-name = "dummy-qos2"
-binary = "./variant-dummy.exe"
-
-  [variant.common]
-  tick_rate_hz = 100
-  stabilize_secs = 2
-  operate_secs = 10
-  silent_secs = 1
+  operate_secs = 30
+  silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
   qos = 2
   log_dir = "./logs"
 
   [variant.specific]
+  multicast_group = "239.0.0.1:19500"
+  buffer_size = 65536
+
+[[variant]]
+name = "zenoh"
+binary = "variants/zenoh/target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
 ```
 
 Variants are executed sequentially in the order they appear in the config.
+See `configs/two-runner-all-variants.toml` for a comprehensive example
+running all variants back-to-back.
 
 ### Config reference
 
@@ -142,7 +154,7 @@ Per `[[variant]]`:
 | `binary` | yes | Path to variant executable (relative to runner CWD). |
 | `timeout_secs` | no | Override timeout for this variant. |
 
-`[variant.common]` — passed to all variant instances as CLI args:
+`[variant.common]` -- passed to all variant instances as CLI args:
 
 | Field | Description |
 |-------|-------------|
@@ -155,7 +167,7 @@ Per `[[variant]]`:
 | `qos` | QoS level 1-4 |
 | `log_dir` | Directory for JSONL output files |
 
-`[variant.specific]` — variant-specific options passed as extra CLI args.
+`[variant.specific]` -- variant-specific options passed as extra CLI args.
 Currently unused by `variant-dummy`.
 
 ## Project Layout
@@ -175,23 +187,31 @@ Configs are inputs you version-control. Logs are artifacts you regenerate.
 
 All commands are run from the **repo root**.
 
-### Single machine
+### Same machine (two terminals)
+
+Open two terminals at the repo root and start both runners:
 
 ```bash
-runner/target/release/runner --name local --config configs/my-config.toml
+# Terminal 1
+runner/target/release/runner --name alice --config configs/two-runner-test.toml
+
+# Terminal 2
+runner/target/release/runner --name bob --config configs/two-runner-test.toml
 ```
 
-Output:
+Both runners must be started — they discover each other before proceeding.
+
+Output (per runner):
 ```
-[runner:local] config loaded: run=my-first-run, 1 variant(s), 1 runner(s), hash=9685b7e25f3f
-[runner:local] starting discovery...
-[runner:local] discovery complete
-[runner:local] ready barrier for variant 'dummy'
-[runner:local] spawning variant 'dummy' (timeout: 60s)
-[runner:local] variant 'dummy' finished: status=success, exit_code=0
-Benchmark run: my-first-run
+[runner:alice] config loaded: run=full-rate-01, 1 variant(s), 2 runner(s), hash=9685b7e25f3f
+[runner:alice] starting discovery...
+[runner:alice] discovery complete
+[runner:alice] ready barrier for variant 'custom-udp'
+[runner:alice] spawning variant 'custom-udp' (timeout: 60s)
+[runner:alice] variant 'custom-udp' finished: status=success, exit_code=0
+Benchmark run: full-rate-01
 Variant                  Runner   Status    Exit
-dummy                    local    success   0
+custom-udp               alice    success   0
 ```
 
 JSONL log files appear in the configured `log_dir`.
@@ -217,35 +237,23 @@ variants in lockstep.
 Each machine produces its own JSONL log files. Collect all log files into
 a single directory for analysis.
 
-### Running variant-dummy directly (without the runner)
-
-For quick testing, you can run the variant binary directly:
-
-```bash
-cd variant-base
-./target/release/variant-dummy \
-  --tick-rate-hz 100 \
-  --stabilize-secs 2 \
-  --operate-secs 5 \
-  --silent-secs 1 \
-  --workload scalar-flood \
-  --values-per-tick 1000 \
-  --qos 2 \
-  --log-dir ./logs \
-  --launch-ts "$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" \
-  --variant dummy \
-  --runner local \
-  --run test01
-```
-
 ## Output
 
 ### JSONL log files
 
-Each variant process produces one structured log file:
+Each run creates a timestamped subfolder under the configured `log_dir`:
+`<log_dir>/<run>-<YYYYMMDD_HHMMSS>/`
+
+For example, with `log_dir = "./logs"` and `run = "full-rate-01"`:
+`./logs/full-rate-01-20260415_143022/`
+
+Each variant process produces one structured log file inside that subfolder:
 `<variant>-<runner>-<run>.jsonl`
 
-Example filename: `dummy-local-my-first-run.jsonl`
+Example full path: `./logs/full-rate-01-20260415_143022/custom-udp-alice-full-rate-01.jsonl`
+
+Successive runs of the same config create separate subfolders, so previous
+results are never overwritten.
 
 Each line is a self-describing JSON object with fields: `ts`, `variant`,
 `runner`, `run`, `event`, plus event-specific fields. Event types:
@@ -265,22 +273,24 @@ Each line is a self-describing JSON object with fields: `ts`, `variant`,
 The runner prints a summary table to stdout after all variants complete:
 
 ```
-Benchmark run: my-first-run
+Benchmark run: full-rate-01
 Variant                  Runner   Status    Exit
-dummy                    local    success   0
+custom-udp               alice    success   0
 ```
 
 Exit code: 0 if all variants succeeded, 1 if any failed or timed out.
 
 ### Analysing results
 
+Point the analysis tool at a specific run subfolder:
+
 ```bash
 cd analysis
-python analyze.py ../logs --summary
+python analyze.py ../logs/full-rate-01-20260415_143022/ --summary
 ```
 
 Add `--clear` to force a full re-parse if you regenerate logs. The pickle
-cache (`logs/.analysis_cache.pkl`) makes repeated runs instant.
+cache is stored inside the target directory.
 
 ## Tuning parameters
 

@@ -63,16 +63,28 @@ fn single_runner_lifecycle() {
     assert!(stdout.contains("dummy"), "should contain variant name");
     assert!(stdout.contains("success"), "should show success");
 
-    // Verify JSONL log file was produced.
+    // Verify JSONL log file was produced inside a timestamped subfolder.
     if log_dir.exists() {
-        let jsonl_count = std::fs::read_dir(&log_dir)
+        // The runner now creates a <run>-<YYYYMMDD_HHMMSS> subfolder.
+        let subdirs: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .collect();
+        assert!(
+            !subdirs.is_empty(),
+            "expected a timestamped subfolder in {log_dir:?}"
+        );
+
+        let jsonl_count: usize = subdirs
+            .iter()
+            .flat_map(|d| std::fs::read_dir(d.path()).unwrap())
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
             .count();
         assert!(
             jsonl_count > 0,
-            "expected at least one .jsonl file in {log_dir:?}"
+            "expected at least one .jsonl file in timestamped subfolder"
         );
     }
 
@@ -141,8 +153,20 @@ fn multi_variant_sequential_execution() {
     );
 
     if log_dir.exists() {
-        let jsonl_count = std::fs::read_dir(&log_dir)
+        // The runner now creates a <run>-<YYYYMMDD_HHMMSS> subfolder.
+        let subdirs: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .collect();
+        assert!(
+            !subdirs.is_empty(),
+            "expected a timestamped subfolder in {log_dir:?}"
+        );
+
+        let jsonl_count: usize = subdirs
+            .iter()
+            .flat_map(|d| std::fs::read_dir(d.path()).unwrap())
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
             .count();

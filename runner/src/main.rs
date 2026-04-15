@@ -69,6 +69,12 @@ fn main() -> Result<()> {
     coordinator.discover()?;
     eprintln!("[runner:{}] discovery complete", cli.name);
 
+    // Generate a single UTC timestamp for the run so all variants share the same log subfolder.
+    let run_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let log_subdir = format!("{}-{}", bench_config.run, run_ts);
+
+    eprintln!("[runner:{}] log subfolder: {}", cli.name, log_subdir);
+
     // Track results for summary table.
     let mut summary: Vec<SummaryRow> = Vec::new();
 
@@ -90,7 +96,19 @@ fn main() -> Result<()> {
             .format("%Y-%m-%dT%H:%M:%S%.9fZ")
             .to_string();
 
-        let args = cli_args::build_variant_args(variant, &bench_config.run, &cli.name, &launch_ts);
+        // Resolve the log directory: if the variant config has a log_dir, append the run subfolder.
+        let log_dir_resolved = variant.common.get("log_dir").map(|log_dir_val| {
+            let base = cli_args::toml_value_to_string(log_dir_val);
+            format!("{}/{}", base, log_subdir)
+        });
+
+        let args = cli_args::build_variant_args(
+            variant,
+            &bench_config.run,
+            &cli.name,
+            &launch_ts,
+            log_dir_resolved.as_deref(),
+        );
 
         eprintln!(
             "[runner:{}] spawning variant '{}' (timeout: {}s)",
