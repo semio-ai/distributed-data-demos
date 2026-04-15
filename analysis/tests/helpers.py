@@ -12,7 +12,7 @@ _ANALYSIS_ROOT = Path(__file__).resolve().parent.parent
 if str(_ANALYSIS_ROOT) not in sys.path:
     sys.path.insert(0, str(_ANALYSIS_ROOT))
 
-TWO_RUNNER_LOGS = Path(__file__).resolve().parent.parent.parent / "two-runner-logs"
+TWO_RUNNER_LOGS = Path(__file__).resolve().parent.parent.parent / "logs"
 
 
 def _ts(offset_ms: float = 0.0) -> str:

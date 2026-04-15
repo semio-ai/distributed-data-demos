@@ -20,7 +20,7 @@ analysis/
     test_integrity.py  -- Unit tests for integrity checks across QoS levels 1-4
     test_performance.py -- Unit tests for performance metric computation
     test_cache.py      -- Unit tests for pickle caching pipeline
-    test_integration.py -- Integration tests using real logs from ../two-runner-logs/
+    test_integration.py -- Integration tests using real logs from ../logs/
     fixtures/          -- Directory for synthetic JSONL fixture files
   .claude/
     CLAUDE.md          -- Worker agent instructions

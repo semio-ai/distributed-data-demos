@@ -42,7 +42,7 @@ Event types: `connected`, `phase`, `write`, `receive`, `gap_detected`,
 
 ## Test Data
 
-Real JSONL logs are available at `../two-runner-logs/`:
+Real JSONL logs are available at `../logs/`:
 - `custom-udp-alice-local-test-01.jsonl` — 540 lines, runner "alice"
 - `custom-udp-bob-local-test-01.jsonl` — 540 lines, runner "bob"
 - `dummy-alice-local-test-01.jsonl` — 540 lines, single runner

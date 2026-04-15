@@ -1,4 +1,4 @@
-"""Integration tests using real JSONL log files from two-runner-logs/."""
+"""Integration tests using real JSONL log files from logs/."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from tables import format_integrity_table, format_performance_table
 # Skip if real log files are not available
 pytestmark = pytest.mark.skipif(
     not TWO_RUNNER_LOGS.is_dir(),
-    reason="Real log files not available at two-runner-logs/",
+    reason="Real log files not available at logs/",
 )
 
 
