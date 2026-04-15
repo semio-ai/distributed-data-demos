@@ -404,9 +404,16 @@ impl Variant for UdpVariant {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("UDP socket not connected"))?;
                 let target: SocketAddr = SocketAddr::V4(self.config.multicast_group);
-                socket
-                    .send_to(&encoded, target)
-                    .context("UDP send failed")?;
+                loop {
+                    match socket.send_to(&encoded, target) {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        Err(e) => return Err(e).context("UDP send failed"),
+                    }
+                }
             }
             Qos::ReliableUdp => {
                 // Send via multicast UDP and buffer for NACK retransmit.
@@ -415,9 +422,16 @@ impl Variant for UdpVariant {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("UDP socket not connected"))?;
                 let target: SocketAddr = SocketAddr::V4(self.config.multicast_group);
-                socket
-                    .send_to(&encoded, target)
-                    .context("UDP send failed")?;
+                loop {
+                    match socket.send_to(&encoded, target) {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        Err(e) => return Err(e).context("UDP send failed"),
+                    }
+                }
 
                 // Buffer for retransmit. Limit buffer to last 10000 messages.
                 self.send_buffer.insert(seq, encoded);
