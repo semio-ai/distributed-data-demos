@@ -17,8 +17,8 @@ cd variants/custom-udp && cargo build --release && cd ../..
 runner/target/release/runner --name alice --config configs/two-runner-test.toml
 runner/target/release/runner --name bob   --config configs/two-runner-test.toml
 
-# 3. Analyse (point at the run subfolder created in step 2)
-cd analysis && python analyze.py ../logs/full-rate-01-*/ --summary
+# 3. Analyse (auto-selects the latest run)
+cd analysis && python analyze.py ../logs --summary
 ```
 
 Both runners must be started — they discover each other before proceeding.

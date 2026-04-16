@@ -56,6 +56,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_logs_dir(logs_dir: Path) -> Path:
+    """If logs_dir has no .jsonl files, auto-select the latest run subfolder."""
+    if list(logs_dir.glob("*.jsonl")):
+        return logs_dir
+    # Look for subdirs containing .jsonl files
+    candidates = sorted(
+        d for d in logs_dir.iterdir() if d.is_dir() and list(d.glob("*.jsonl"))
+    )
+    if candidates:
+        selected = candidates[-1]
+        print(f"Auto-selected latest run: {selected.name}", file=sys.stderr)
+        return selected
+    return logs_dir
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the analysis tool."""
     parser = build_parser()
@@ -65,6 +80,8 @@ def main(argv: list[str] | None = None) -> int:
     if not logs_dir.is_dir():
         print(f"Error: {logs_dir} is not a directory.", file=sys.stderr)
         return 1
+
+    logs_dir = resolve_logs_dir(logs_dir)
 
     # Determine what to produce
     do_summary = args.summary or (not args.summary and not args.diagrams)

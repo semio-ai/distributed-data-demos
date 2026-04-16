@@ -18,8 +18,14 @@ pub struct Coordinator {
     name: String,
     /// All expected runner names.
     expected: HashSet<String>,
+    /// The ordered runners list (to determine leader).
+    runners_order: Vec<String>,
     /// Config hash for verification.
     config_hash: String,
+    /// Run identifier for filtering stale messages from previous runs.
+    run: String,
+    /// This runner's proposed log subfolder.
+    proposed_log_subdir: String,
     /// UDP socket (None in single-runner mode since no network I/O is needed).
     socket: Option<Socket>,
     /// Addresses of all peer runners (including self for multicast, excluding
@@ -35,7 +41,18 @@ impl Coordinator {
     ///
     /// In single-runner mode (only this runner in the expected set), no socket
     /// is created and all protocol methods return immediately.
-    pub fn new(name: String, runners: &[String], config_hash: String, port: u16) -> Result<Self> {
+    ///
+    /// `log_subdir` is this runner's proposed log subfolder name. During
+    /// discovery the leader's proposal (first runner in the config list) is
+    /// adopted by all runners.
+    pub fn new(
+        name: String,
+        runners: &[String],
+        config_hash: String,
+        port: u16,
+        log_subdir: String,
+        run: String,
+    ) -> Result<Self> {
         let expected: HashSet<String> = runners.iter().cloned().collect();
         let single_runner = runners.len() == 1 && runners[0] == name;
 
@@ -74,7 +91,10 @@ impl Coordinator {
         Ok(Coordinator {
             name,
             expected,
+            runners_order: runners.to_vec(),
             config_hash,
+            run,
+            proposed_log_subdir: log_subdir,
             socket,
             peer_addrs,
             single_runner,
@@ -88,19 +108,32 @@ impl Coordinator {
     /// broadcasting for a linger period so slower peers can also complete
     /// their discovery.
     ///
-    /// In single-runner mode, returns immediately.
-    pub fn discover(&self) -> Result<()> {
+    /// Returns the agreed-upon log subfolder name. The leader (first runner in
+    /// the config's `runners` list) decides the subfolder; all other runners
+    /// adopt the leader's proposal.
+    ///
+    /// In single-runner mode, returns own proposal immediately.
+    pub fn discover(&self) -> Result<String> {
         if self.single_runner {
-            return Ok(());
+            return Ok(self.proposed_log_subdir.clone());
         }
 
         let socket = self.socket.as_ref().unwrap();
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(self.name.clone());
 
+        // Track the leader's proposed log subfolder.
+        let leader = &self.runners_order[0];
+        let mut leader_log_subdir: Option<String> = if *leader == self.name {
+            Some(self.proposed_log_subdir.clone())
+        } else {
+            None
+        };
+
         let msg = Message::Discover {
             name: self.name.clone(),
             config_hash: self.config_hash.clone(),
+            log_subdir: self.proposed_log_subdir.clone(),
         };
 
         loop {
@@ -113,7 +146,11 @@ impl Coordinator {
                     // This handles the race where a fast peer has already
                     // moved past discovery and is sending Ready/Done messages.
                     let peer_name = match &received {
-                        Message::Discover { name, config_hash } => {
+                        Message::Discover {
+                            name,
+                            config_hash,
+                            log_subdir,
+                        } => {
                             if self.expected.contains(name) && *config_hash != self.config_hash {
                                 bail!(
                                     "config hash mismatch from runner '{}': expected {}, got {}",
@@ -122,10 +159,14 @@ impl Coordinator {
                                     &config_hash[..config_hash.len().min(8)]
                                 );
                             }
+                            // Capture the leader's log subfolder proposal.
+                            if name == leader && leader_log_subdir.is_none() {
+                                leader_log_subdir = Some(log_subdir.clone());
+                            }
                             Some(name.clone())
                         }
-                        Message::Ready { name, .. } => Some(name.clone()),
-                        Message::Done { name, .. } => Some(name.clone()),
+                        Message::Ready { ref name, .. } => Some(name.clone()),
+                        Message::Done { ref name, .. } => Some(name.clone()),
                     };
                     if let Some(name) = peer_name {
                         if self.expected.contains(&name) {
@@ -146,7 +187,13 @@ impl Coordinator {
                     let _ = self.recv(socket);
                     std::thread::sleep(BROADCAST_INTERVAL);
                 }
-                return Ok(());
+
+                // Return the leader's log subfolder. We always have it at
+                // this point because (a) if we are the leader we set it
+                // above, or (b) we received the leader's Discover message.
+                return Ok(
+                    leader_log_subdir.expect("leader log_subdir should be known after discovery")
+                );
             }
         }
     }
@@ -167,6 +214,7 @@ impl Coordinator {
         let msg = Message::Ready {
             name: self.name.clone(),
             variant: variant_name.to_string(),
+            run: self.run.clone(),
         };
 
         loop {
@@ -174,14 +222,23 @@ impl Coordinator {
 
             let deadline = std::time::Instant::now() + BROADCAST_INTERVAL;
             while std::time::Instant::now() < deadline {
-                if let Some(Message::Ready { name, variant }) = self.recv(socket) {
-                    if variant == variant_name && self.expected.contains(&name) {
+                if let Some(Message::Ready { name, variant, run }) = self.recv(socket) {
+                    if variant == variant_name && run == self.run && self.expected.contains(&name) {
                         seen.insert(name);
                     }
                 }
             }
 
             if seen == self.expected {
+                // Linger: keep broadcasting Ready for 2 more seconds so
+                // slower peers can complete their barrier.
+                let linger_end = std::time::Instant::now() + Duration::from_secs(2);
+                while std::time::Instant::now() < linger_end {
+                    self.send(socket, &msg)?;
+                    // Drain incoming messages to keep the socket buffer clean.
+                    let _ = self.recv(socket);
+                    std::thread::sleep(BROADCAST_INTERVAL);
+                }
                 return Ok(());
             }
         }
@@ -209,6 +266,7 @@ impl Coordinator {
         let msg = Message::Done {
             name: self.name.clone(),
             variant: variant_name.to_string(),
+            run: self.run.clone(),
             status: status.to_string(),
             exit_code,
         };
@@ -221,17 +279,27 @@ impl Coordinator {
                 if let Some(Message::Done {
                     name,
                     variant,
+                    run,
                     status: s,
                     exit_code: c,
                 }) = self.recv(socket)
                 {
-                    if variant == variant_name && self.expected.contains(&name) {
+                    if variant == variant_name && run == self.run && self.expected.contains(&name) {
                         results.insert(name, (s, c));
                     }
                 }
             }
 
             if results.len() == self.expected.len() {
+                // Linger: keep broadcasting Done for 2 more seconds so
+                // slower peers can complete their barrier.
+                let linger_end = std::time::Instant::now() + Duration::from_secs(2);
+                while std::time::Instant::now() < linger_end {
+                    self.send(socket, &msg)?;
+                    // Drain incoming messages to keep the socket buffer clean.
+                    let _ = self.recv(socket);
+                    std::thread::sleep(BROADCAST_INTERVAL);
+                }
                 return Ok(results);
             }
         }
@@ -306,23 +374,40 @@ mod tests {
             &["local".to_string()],
             "somehash".into(),
             0, // port unused in single-runner
+            "run01-20260415_120000".into(),
+            "run01".into(),
         )
         .unwrap();
         assert!(coord.single_runner);
-        coord.discover().unwrap();
+        let log_subdir = coord.discover().unwrap();
+        assert_eq!(log_subdir, "run01-20260415_120000");
     }
 
     #[test]
     fn single_runner_ready_barrier_is_immediate() {
-        let coord =
-            Coordinator::new("local".into(), &["local".to_string()], "somehash".into(), 0).unwrap();
+        let coord = Coordinator::new(
+            "local".into(),
+            &["local".to_string()],
+            "somehash".into(),
+            0,
+            "run01-20260415_120000".into(),
+            "run01".into(),
+        )
+        .unwrap();
         coord.ready_barrier("test-variant").unwrap();
     }
 
     #[test]
     fn single_runner_done_barrier_returns_own_result() {
-        let coord =
-            Coordinator::new("local".into(), &["local".to_string()], "somehash".into(), 0).unwrap();
+        let coord = Coordinator::new(
+            "local".into(),
+            &["local".to_string()],
+            "somehash".into(),
+            0,
+            "run01-20260415_120000".into(),
+            "run01".into(),
+        )
+        .unwrap();
         let results = coord.done_barrier("test-variant", "success", 0).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results.get("local"), Some(&("success".to_string(), 0)));
@@ -338,25 +423,47 @@ mod tests {
         let hash_a = hash.clone();
         let runners_a = runners.clone();
         let thread_a = std::thread::spawn(move || {
-            let coord = Coordinator::new("runner_a".into(), &runners_a, hash_a, port).unwrap();
+            let coord = Coordinator::new(
+                "runner_a".into(),
+                &runners_a,
+                hash_a,
+                port,
+                "run-a-20260415_120000".into(),
+                "test-run".into(),
+            )
+            .unwrap();
 
-            coord.discover().unwrap();
+            let log_subdir = coord.discover().unwrap();
             coord.ready_barrier("v1").unwrap();
-            coord.done_barrier("v1", "success", 0).unwrap()
+            let results = coord.done_barrier("v1", "success", 0).unwrap();
+            (log_subdir, results)
         });
 
         let hash_b = hash;
         let runners_b = runners;
         let thread_b = std::thread::spawn(move || {
-            let coord = Coordinator::new("runner_b".into(), &runners_b, hash_b, port).unwrap();
+            let coord = Coordinator::new(
+                "runner_b".into(),
+                &runners_b,
+                hash_b,
+                port,
+                "run-b-20260415_120001".into(),
+                "test-run".into(),
+            )
+            .unwrap();
 
-            coord.discover().unwrap();
+            let log_subdir = coord.discover().unwrap();
             coord.ready_barrier("v1").unwrap();
-            coord.done_barrier("v1", "success", 0).unwrap()
+            let results = coord.done_barrier("v1", "success", 0).unwrap();
+            (log_subdir, results)
         });
 
-        let results_a = thread_a.join().unwrap();
-        let results_b = thread_b.join().unwrap();
+        let (log_subdir_a, results_a) = thread_a.join().unwrap();
+        let (log_subdir_b, results_b) = thread_b.join().unwrap();
+
+        // Both runners must agree on the leader's (runner_a) log subfolder.
+        assert_eq!(log_subdir_a, "run-a-20260415_120000");
+        assert_eq!(log_subdir_b, "run-a-20260415_120000");
 
         assert_eq!(results_a.len(), 2);
         assert_eq!(results_b.len(), 2);
@@ -371,13 +478,29 @@ mod tests {
 
         let runners_a = runners.clone();
         let thread_a = std::thread::spawn(move || {
-            let coord = Coordinator::new("a".into(), &runners_a, "hash_AAAA".into(), port).unwrap();
+            let coord = Coordinator::new(
+                "a".into(),
+                &runners_a,
+                "hash_AAAA".into(),
+                port,
+                "run-20260415_120000".into(),
+                "test-run".into(),
+            )
+            .unwrap();
             coord.discover()
         });
 
         let runners_b = runners;
         let thread_b = std::thread::spawn(move || {
-            let coord = Coordinator::new("b".into(), &runners_b, "hash_BBBB".into(), port).unwrap();
+            let coord = Coordinator::new(
+                "b".into(),
+                &runners_b,
+                "hash_BBBB".into(),
+                port,
+                "run-20260415_120001".into(),
+                "test-run".into(),
+            )
+            .unwrap();
             coord.discover()
         });
 
@@ -393,5 +516,147 @@ mod tests {
         if let Err(e) = &result_b {
             assert!(e.to_string().contains("config hash mismatch"));
         }
+    }
+
+    #[test]
+    fn stale_ready_from_different_run_is_ignored() {
+        use std::sync::{Arc, Barrier};
+
+        let port = next_test_port();
+        let runners = vec!["runner_a".to_string(), "runner_b".to_string()];
+
+        // runner_a binds on port + 0.
+        let runner_a_port = port;
+
+        // Use a barrier to synchronize: the thread creates the Coordinator
+        // (binding the socket), then signals so we can inject the stale
+        // message before calling ready_barrier.
+        let sync = Arc::new(Barrier::new(2));
+        let sync_clone = Arc::clone(&sync);
+
+        let runners_for_a = runners.clone();
+        let barrier_handle = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "runner_a".into(),
+                &runners_for_a,
+                "hash".into(),
+                port,
+                "log-subdir".into(),
+                "new-run".into(),
+            )
+            .unwrap();
+
+            // Signal that the socket is bound and ready to receive.
+            sync_clone.wait();
+
+            coord.ready_barrier("v1")
+        });
+
+        // Wait until the Coordinator's socket is bound.
+        sync.wait();
+
+        // Phase 1: Send a stale Ready from runner_b with old run ID.
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let stale_msg = Message::Ready {
+            name: "runner_b".into(),
+            variant: "v1".into(),
+            run: "old-run".into(),
+        };
+        sender
+            .send_to(&stale_msg.to_bytes(), format!("127.0.0.1:{runner_a_port}"))
+            .unwrap();
+
+        // Phase 2: Wait long enough that the barrier would have completed
+        // if the stale message was incorrectly accepted.
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            !barrier_handle.is_finished(),
+            "barrier should NOT have completed from stale message with different run ID"
+        );
+
+        // Phase 3: Send the correct Ready to unblock the barrier.
+        let correct_msg = Message::Ready {
+            name: "runner_b".into(),
+            variant: "v1".into(),
+            run: "new-run".into(),
+        };
+        sender
+            .send_to(
+                &correct_msg.to_bytes(),
+                format!("127.0.0.1:{runner_a_port}"),
+            )
+            .unwrap();
+
+        // The barrier should now complete within a reasonable time.
+        let result = barrier_handle.join().unwrap();
+        assert!(result.is_ok(), "barrier should succeed after correct Ready");
+    }
+
+    #[test]
+    fn barrier_linger_prevents_slow_peer_hang() {
+        // Verify that the linger period in ready_barrier and done_barrier
+        // allows a slow peer to complete even when the fast peer finishes
+        // the barrier first. Without linger, the fast peer would stop
+        // broadcasting and the slow peer would hang forever.
+        let port = next_test_port();
+        let hash = "lingerhash".to_string();
+        let runners = vec!["a".to_string(), "b".to_string()];
+
+        let hash_a = hash.clone();
+        let runners_a = runners.clone();
+        // Runner "b" starts immediately; runner "a" is delayed so "b" will
+        // see all peers first. The linger on "b" must keep it broadcasting
+        // long enough for the delayed "a" to also complete.
+        let thread_b = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "b".into(),
+                &runners_a,
+                hash_a,
+                port,
+                "log-sub".into(),
+                "linger-run".into(),
+            )
+            .unwrap();
+
+            coord.ready_barrier("v1").unwrap();
+            coord.done_barrier("v1", "success", 0).unwrap();
+        });
+
+        let hash_b = hash;
+        let runners_b = runners;
+        let thread_a = std::thread::spawn(move || {
+            // Delay so "b" enters and potentially completes the barrier first.
+            std::thread::sleep(Duration::from_millis(800));
+
+            let coord = Coordinator::new(
+                "a".into(),
+                &runners_b,
+                hash_b,
+                port,
+                "log-sub".into(),
+                "linger-run".into(),
+            )
+            .unwrap();
+
+            coord.ready_barrier("v1").unwrap();
+            coord.done_barrier("v1", "success", 0).unwrap();
+        });
+
+        // Use a timeout to detect hangs: both threads must finish within 10 seconds.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+        let result_b = thread_b.join();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "runner b hung past the 10-second deadline"
+        );
+        result_b.expect("runner b thread panicked");
+
+        let result_a = thread_a.join();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "runner a hung past the 10-second deadline"
+        );
+        result_a.expect("runner a thread panicked");
     }
 }

@@ -49,7 +49,7 @@ def format_integrity_table(results: list[IntegrityResult]) -> str:
 
     lines: list[str] = []
     lines.append("Integrity Report")
-    sep = "-" * 90
+    sep = "-" * 126
     lines.append(sep)
 
     # Column widths
@@ -57,6 +57,8 @@ def format_integrity_table(results: list[IntegrityResult]) -> str:
     w_run = 16
     w_path = 20
     w_qos = 5
+    w_sent = 8
+    w_rcvd = 8
     w_deliv = 10
     w_ooo = 14
     w_dupes = 7
@@ -67,6 +69,8 @@ def format_integrity_table(results: list[IntegrityResult]) -> str:
         + _pad("Run", w_run)
         + _pad("Path", w_path)
         + _rpad("QoS", w_qos)
+        + _rpad("Sent", w_sent)
+        + _rpad("Rcvd", w_rcvd)
         + _rpad("Delivery%", w_deliv)
         + _rpad("Out-of-order", w_ooo)
         + _rpad("Dupes", w_dupes)
@@ -95,6 +99,8 @@ def format_integrity_table(results: list[IntegrityResult]) -> str:
             + _pad(r.run, w_run)
             + _pad(path_str, w_path)
             + _rpad(str(r.qos), w_qos)
+            + _rpad(f"{r.write_count:,}", w_sent)
+            + _rpad(f"{r.receive_count:,}", w_rcvd)
             + _rpad(_fmt_pct(r.delivery_pct), w_deliv)
             + _rpad(str(r.out_of_order), w_ooo)
             + _rpad(str(r.duplicates), w_dupes)
@@ -115,17 +121,17 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
 
     lines: list[str] = []
     lines.append("Performance Report")
-    sep = "-" * 120
+    sep = "-" * 148
     lines.append(sep)
 
     # Column widths
     w_variant = 22
     w_run = 16
     w_conn = 13
-    w_lat = 12
-    w_rate = 10
-    w_jitter = 10
-    w_loss = 8
+    w_lat = 13
+    w_rate = 12
+    w_jitter = 12
+    w_loss = 9
 
     header = (
         _pad("Variant", w_variant)
@@ -164,11 +170,11 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     if has_resources:
         lines.append("")
         lines.append("Resource Usage")
-        res_sep = "-" * 80
+        res_sep = "-" * 100
         lines.append(res_sep)
         w_runner = 12
-        w_cpu = 10
-        w_mem = 12
+        w_cpu = 12
+        w_mem = 13
 
         res_header = (
             _pad("Variant", w_variant)

@@ -57,21 +57,25 @@ fn main() -> Result<()> {
         &config_hash[..12]
     );
 
+    // Generate a proposed log subfolder name before discovery so it can be
+    // negotiated with other runners. The leader (first in the runners list)
+    // decides the final name so all runners use the same subfolder.
+    let run_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let proposed_log_subdir = format!("{}-{}", bench_config.run, run_ts);
+
     // Create coordinator and run discovery.
     let coordinator = protocol::Coordinator::new(
         cli.name.clone(),
         &bench_config.runners,
         config_hash,
         cli.port,
+        proposed_log_subdir,
+        bench_config.run.clone(),
     )?;
 
     eprintln!("[runner:{}] starting discovery...", cli.name);
-    coordinator.discover()?;
+    let log_subdir = coordinator.discover()?;
     eprintln!("[runner:{}] discovery complete", cli.name);
-
-    // Generate a single UTC timestamp for the run so all variants share the same log subfolder.
-    let run_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-    let log_subdir = format!("{}-{}", bench_config.run, run_ts);
 
     eprintln!("[runner:{}] log subfolder: {}", cli.name, log_subdir);
 

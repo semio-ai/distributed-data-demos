@@ -282,10 +282,15 @@ Exit code: 0 if all variants succeeded, 1 if any failed or timed out.
 
 ### Analysing results
 
-Point the analysis tool at a specific run subfolder:
-
 ```bash
 cd analysis
+python analyze.py ../logs --summary
+```
+
+When pointed at the base logs directory, the tool auto-selects the latest
+timestamped run subfolder. You can also target a specific run directly:
+
+```bash
 python analyze.py ../logs/full-rate-01-20260415_143022/ --summary
 ```
 
