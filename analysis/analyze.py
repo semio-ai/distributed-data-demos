@@ -3,8 +3,8 @@
 Usage:
     python analyze.py <logs-dir> [--clear] [--summary] [--diagrams] [--output <dir>]
 
-When neither --summary nor --diagrams is given, both are produced.
-For Phase 1, --diagrams prints a placeholder message and skips.
+By default, both the CLI summary tables and comparison diagrams are produced.
+Pass --summary or --diagrams to produce only one of them.
 """
 
 from __future__ import annotations
@@ -83,9 +83,10 @@ def main(argv: list[str] | None = None) -> int:
 
     logs_dir = resolve_logs_dir(logs_dir)
 
-    # Determine what to produce
-    do_summary = args.summary or (not args.summary and not args.diagrams)
-    do_diagrams = args.diagrams or (not args.summary and not args.diagrams)
+    # Determine what to produce. If neither flag is given, produce both.
+    any_flag = args.summary or args.diagrams
+    do_summary = args.summary or not any_flag
+    do_diagrams = args.diagrams or not any_flag
 
     # Output directory for diagrams
     output_dir: Path = args.output.resolve() if args.output else logs_dir / "analysis"
@@ -101,17 +102,29 @@ def main(argv: list[str] | None = None) -> int:
     # Step 2: Correlation
     records = correlate(events)
 
+    performance_results = compute_performance(events, records)
+
     # Step 3: Summary tables
     if do_summary:
         integrity_results = verify_integrity(events, records)
-        performance_results = compute_performance(events, records)
 
         print(format_integrity_table(integrity_results))
         print(format_performance_table(performance_results))
 
-    # Step 4: Diagrams (Phase 1 placeholder)
+    # Step 4: Diagrams
     if do_diagrams:
-        print(f"Diagrams not yet implemented (E5) -- output dir: {output_dir}")
+        try:
+            from plots import generate_comparison_plot
+        except ImportError:
+            print(
+                "Error: --diagrams requires matplotlib. "
+                "Install with: pip install matplotlib",
+                file=sys.stderr,
+            )
+            return 1
+
+        plot_path = generate_comparison_plot(performance_results, output_dir)
+        print(f"Plot saved to: {plot_path}", file=sys.stderr)
 
     return 0
 
