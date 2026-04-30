@@ -1,4 +1,4 @@
-run = "max-throughput-01"
+run = "udp-max-throughput"
 runners = ["alice", "bob"]
 default_timeout_secs = 120
 

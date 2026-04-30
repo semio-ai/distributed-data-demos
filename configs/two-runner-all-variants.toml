@@ -93,87 +93,87 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
 # ─── Hybrid UDP/TCP ── scalar-flood at 100 Hz ───────────────────────────────
 
-[[variant]]
-name = "hybrid-fixed"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
-
-  [variant.common]
-  tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
-  values_per_tick = 1000
-  qos = 2
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19502"
-  tcp_base_port = 19900
-  peers = "127.0.0.1:19900"
+#[[variant]]
+#name = "hybrid-fixed"
+#binary = "variants/hybrid/target/release/variant-hybrid.exe"
+#
+#  [variant.common]
+#  tick_rate_hz = 100
+#  stabilize_secs = 3
+#  operate_secs = 30
+#  silent_secs = 3
+#  workload = "scalar-flood"
+#  values_per_tick = 1000
+#  qos = 2
+#  log_dir = "./logs"
+#
+#  [variant.specific]
+#  multicast_group = "239.0.0.1:19502"
+#  tcp_base_port = 19900
+#  peers = "127.0.0.1:19900"
 
 # ─── Hybrid UDP/TCP ── max-throughput ────────────────────────────────────────
 
-[[variant]]
-name = "hybrid-max"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
-
-  [variant.common]
-  tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "max-throughput"
-  values_per_tick = 1000
-  qos = 2
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19910
-  peers = "127.0.0.1:19910"
+#[[variant]]
+#name = "hybrid-max"
+#binary = "variants/hybrid/target/release/variant-hybrid.exe"
+#
+#  [variant.common]
+#  tick_rate_hz = 100
+#  stabilize_secs = 3
+#  operate_secs = 30
+#  silent_secs = 3
+#  workload = "max-throughput"
+#  values_per_tick = 1000
+#  qos = 2
+#  log_dir = "./logs"
+#
+#  [variant.specific]
+#  multicast_group = "239.0.0.1:19503"
+#  tcp_base_port = 19910
+#  peers = "127.0.0.1:19910"
 
 # ─── Hybrid UDP/TCP ── 10 vps @ 100 hz ───────────────────────────────────────
 
-[[variant]]
-name = "hybrid-10x100hz"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
-
-  [variant.common]
-  tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
-  values_per_tick = 10
-  qos = 2
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19910
-  peers = "127.0.0.1:19910"
+#[[variant]]
+#name = "hybrid-10x100hz"
+#binary = "variants/hybrid/target/release/variant-hybrid.exe"
+#
+#  [variant.common]
+#  tick_rate_hz = 100
+#  stabilize_secs = 3
+#  operate_secs = 30
+#  silent_secs = 3
+#  workload = "scalar-flood"
+#  values_per_tick = 10
+#  qos = 2
+#  log_dir = "./logs"
+#
+#  [variant.specific]
+#  multicast_group = "239.0.0.1:19503"
+#  tcp_base_port = 19910
+#  peers = "127.0.0.1:19910"
 
 # ─── Hybrid UDP/TCP ── 1000 vps @ 10 hz ──────────────────────────────────────
 
-[[variant]]
-name = "hybrid-1000x10hz"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
-
-  [variant.common]
-  tick_rate_hz = 10
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
-  values_per_tick = 1000
-  qos = 2
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19910
-  peers = "127.0.0.1:19910"
+#[[variant]]
+#name = "hybrid-1000x10hz"
+#binary = "variants/hybrid/target/release/variant-hybrid.exe"
+#
+#  [variant.common]
+#  tick_rate_hz = 10
+#  stabilize_secs = 3
+#  operate_secs = 30
+#  silent_secs = 3
+#  workload = "scalar-flood"
+#  values_per_tick = 1000
+#  qos = 2
+#  log_dir = "./logs"
+#
+#  [variant.specific]
+#  multicast_group = "239.0.0.1:19503"
+#  tcp_base_port = 19910
+#  peers = "127.0.0.1:19910"
 
 # ─── QUIC ── scalar-flood at 100 Hz ─────────────────────────────────────────
 

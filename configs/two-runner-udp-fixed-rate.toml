@@ -1,4 +1,4 @@
-run = "fixed-rate-01"
+run = "udp-1000x100hz"
 runners = ["alice", "bob"]
 default_timeout_secs = 120
 
