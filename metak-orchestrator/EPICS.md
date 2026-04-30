@@ -298,6 +298,36 @@ Dependencies: E5.
 
 ---
 
+## E8: Application-Level Clock Synchronization
+
+**Repos**: `runner/`, `analysis/`, plus contract updates in `metak-shared/`
+**Goal**: Measure pairwise clock offsets between runner machines so that
+cross-machine `receive_ts − write_ts` values logged by variants can be
+corrected to true network latency. Without this, two-machine runs cannot
+report meaningful replication latency: Windows w32time can drift by hundreds
+of ms, dwarfing the 10 ms latency target.
+
+Approach: NTP-style 4-timestamp exchange between every pair of runners,
+N=32 samples, best-sample-by-min-RTT. Run once after discovery and once
+before each variant launch (catches drift). Runner writes a sibling
+`<runner>-clock-sync-<run>.jsonl`. Variant code is unchanged. Analysis
+joins by `(run, runner_pair)` and applies the offset when computing
+cross-machine latency.
+
+Contract: `metak-shared/api-contracts/clock-sync.md`. Cross-references in
+`runner-coordination.md` (Phase 1.5 + per-variant resync) and
+`jsonl-log-schema.md` (new `clock_sync` event type).
+
+What this epic does NOT address:
+- Hardware PTP / IEEE 1588 (out of scope — needs OS + NIC support).
+- Asymmetric-path correction (NTP estimator assumes symmetric delay; on a
+  quiet LAN this is acceptable).
+- Adversarial scenarios where the OS clock jumps mid-run.
+
+Dependencies: E2 (runner exists), E4 (analysis exists).
+
+---
+
 ## E7: End-to-End Validation
 
 **Goal**: Run the full benchmark pipeline across two machines and validate

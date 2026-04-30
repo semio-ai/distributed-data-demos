@@ -1,12 +1,174 @@
 # Task Board
 
+## Current Sprint — E8: Application-Level Clock Synchronization
+
+Cross-machine latency cannot be measured without correcting for clock skew
+between runner machines. See `metak-shared/api-contracts/clock-sync.md`
+for the full protocol.
+
+### T8.1: Runner — clock-sync protocol implementation
+
+**Repo**: `runner/`
+**Status**: pending
+**Depends on**: contract review by user
+
+Implement the NTP-style offset measurement and persist results to a JSONL
+log file. Variants are NOT touched.
+
+Scope:
+1. New module `src/clock_sync.rs`:
+   - Add `ProbeRequest { from, to, id, t1 }` and
+     `ProbeResponse { from, to, id, t1, t2, t3 }` variants to the existing
+     `Message` enum in `src/message.rs`.
+   - `pub struct ClockSyncEngine` holding the existing UDP socket handle
+     plus a counter for probe IDs.
+   - `pub fn measure_offsets(&self, peers: &[String], n_samples: usize) -> HashMap<String, OffsetMeasurement>`
+     where `OffsetMeasurement` carries `offset_ms`, `rtt_ms`, `samples`,
+     `min_rtt_ms`, `max_rtt_ms`.
+   - Per peer: send `n_samples` `ProbeRequest`s with 5 ms inter-sample
+     delay. Wait up to 100 ms per response. Pick the sample with smallest
+     RTT. Compute offset and rtt as defined in `clock-sync.md`.
+   - Always-respond logic: when the runner's UDP receive loop sees a
+     `ProbeRequest` addressed to it, immediately send back a
+     `ProbeResponse` with `t2` (receive time) and `t3` (send time). This
+     must work even when the runner is in a barrier — add probe handling
+     to the existing loops in `src/protocol.rs`.
+
+2. New JSONL writer `src/clock_sync_log.rs`:
+   - `pub fn open_clock_sync_log(log_dir: &Path, runner: &str, run: &str) -> ClockSyncLogger`.
+   - File name: `<runner>-clock-sync-<run>.jsonl`. Same dir as variant logs.
+   - `pub fn write(&mut self, variant: &str, peer: &str, m: &OffsetMeasurement)`.
+   - JSONL schema per `jsonl-log-schema.md` `clock_sync` event.
+
+3. Wire-in in `src/main.rs`:
+   - After discovery completes, before first ready barrier: call
+     `measure_offsets` for all peers, write each result with `variant=""`.
+   - For each variant after its ready barrier and before spawn: call
+     `measure_offsets` again, write with `variant=<name>`.
+   - Single-runner runs skip both calls (no peers).
+
+4. Tests:
+   - Unit: offset math given known timestamps → expected `offset_ms` and
+     `rtt_ms`. Min-RTT selection picks the right sample.
+   - Unit: serialize/deserialize `ProbeRequest`/`ProbeResponse`.
+   - Integration: two `ClockSyncEngine` instances on localhost — same
+     machine so true offset is 0. Verify `|offset_ms| < 1.0` and
+     `rtt_ms > 0`.
+   - Integration: end-to-end runner launch on localhost (same machine) —
+     verify the clock-sync JSONL file appears, has the expected number
+     of entries (1 initial + N variants per peer), and offset is near zero.
+
+Acceptance criteria:
+- [ ] `Message` enum includes `ProbeRequest` and `ProbeResponse`
+- [ ] `ClockSyncEngine::measure_offsets` returns per-peer measurements
+- [ ] Probe responses are sent promptly even while in barrier loops
+- [ ] `<runner>-clock-sync-<run>.jsonl` written with one entry per
+      (peer, measurement_event)
+- [ ] Initial sync runs after discovery; per-variant sync runs after each
+      ready barrier
+- [ ] Single-runner mode produces no clock-sync log (or an empty file)
+- [ ] Localhost integration test: `|offset_ms| < 1.0`
+- [ ] `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` clean
+
+---
+
+### T8.2: Analysis — apply offsets when computing cross-machine latency
+
+**Repo**: `analysis/`
+**Status**: pending
+**Depends on**: contract review by user (can run in parallel with T8.1
+because analysis can be tested with synthetic clock-sync JSONL fixtures
+before T8.1 lands)
+
+Read clock-sync log files and adjust cross-machine latency calculations.
+
+Scope:
+1. Update `parse.py`:
+   - Add `clock_sync` to the recognized event types.
+   - Parsed event-specific fields: `peer`, `offset_ms`, `rtt_ms`, `samples`,
+     `min_rtt_ms`, `max_rtt_ms`. Stored alongside other events in `Event.data`.
+
+2. Update `cache.py` (if needed) to include `*-clock-sync-*.jsonl` in the
+   ingestion glob — should already work since cache scans `*.jsonl` but
+   verify.
+
+3. New module `analysis/clock_sync.py`:
+   - `class OffsetTable` mapping `(run, self_runner, peer_runner) → list[ClockSyncEvent]`
+     sorted by `ts`.
+   - `def lookup(self, run, receiver, writer, before_ts) -> float | None`:
+     return `offset_ms` from the most recent measurement on the receiver's
+     side with `peer=writer` and `ts <= before_ts`. Falls back to the
+     initial sync (variant="") if no per-variant entry exists.
+
+4. Update `correlate.py` and/or `performance.py`:
+   - After delivery records are built, apply correction for cross-runner
+     records: `latency_ms = (receive_ts − write_ts).total_seconds() * 1000 + offset_ms`.
+   - Same-runner records: no adjustment.
+   - If no offset is available (e.g. clock-sync file missing), log a
+     warning to stderr and emit latency without correction. Add a
+     `corrected: bool` flag to the delivery record so the report can
+     surface this.
+
+5. Update `tables.py`:
+   - When any record in a row is uncorrected, append `(uncorrected)` to the
+     latency cells, OR add a column to the integrity report flagging it.
+     (Pick whichever is least invasive — just make it visible.)
+
+6. Tests:
+   - Unit: `OffsetTable.lookup` returns the most recent measurement
+     preceding the given timestamp; falls back to initial sync.
+   - Unit: cross-runner record gets correction applied; same-runner does not.
+   - Unit: missing offset → warning + uncorrected flag.
+   - Integration: synthetic JSONL fixtures with a known +50 ms clock skew
+     between two runners — verify reported latency is the true value, not
+     50 ms higher.
+
+Acceptance criteria:
+- [ ] `parse.py` recognizes `clock_sync` event
+- [ ] `OffsetTable` lookup respects `before_ts` and falls back to initial sync
+- [ ] Cross-runner records get offset correction
+- [ ] Same-runner records are unaffected
+- [ ] Missing-offset case emits warning and flags as uncorrected
+- [ ] Integration test with +50 ms synthetic skew passes
+- [ ] All existing tests still pass
+- [ ] `ruff format --check` and `ruff check` clean on touched files
+
+---
+
+### T8.3: End-to-end two-machine validation
+
+**Repo**: top-level (no code; runs binaries and analysis)
+**Status**: pending
+**Depends on**: T8.1, T8.2
+
+Validate that on a real two-machine setup, latency numbers are no longer
+dominated by clock skew.
+
+Scope:
+1. Run a short benchmark on two machines (e.g. `two-runner-quic-10x100.toml`).
+2. Verify clock-sync log files are produced on both runners.
+3. Verify reported `offset_ms` is reasonable (single-digit ms or less on a
+   quiet LAN; large but consistent if clocks are far apart).
+4. Verify reported latency is in the expected range (< 10 ms target per
+   DESIGN.md), as opposed to the previous behavior where it would reflect
+   the clock skew.
+5. Document findings in `metak-shared/LEARNED.md`.
+
+Acceptance criteria:
+- [ ] Two-machine benchmark completes successfully
+- [ ] Clock-sync logs produced on both machines
+- [ ] Cross-machine latency in reasonable range; not dominated by skew
+- [ ] Findings documented in LEARNED.md
+
+---
+
 ## Completed — E1: Variant Base Crate
 
 All tasks done. See STATUS.md for completion report.
 
 ---
 
-## Current Sprint — E2: Benchmark Runner
+## Completed — E2: Benchmark Runner
 
 ### T1: Crate scaffold + TOML config parsing + CLI arg construction
 

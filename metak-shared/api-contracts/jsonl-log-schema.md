@@ -97,6 +97,25 @@ Logged periodically (e.g. every 100 ms) during operation phases.
 | `cpu_percent` | float | CPU usage percentage |
 | `memory_mb` | float | Memory usage in megabytes |
 
+### `clock_sync`
+
+Logged by the **runner** (not variants) into a sibling log file
+`<runner>-clock-sync-<run>.jsonl`, one entry per peer per measurement.
+Used by analysis to correct cross-machine `receive_ts − write_ts` for
+inter-machine clock skew. See `clock-sync.md` for the measurement protocol.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `peer` | string | Peer runner name (the other side of the pair) |
+| `offset_ms` | float | `peer.clock − self.clock` in milliseconds (best sample) |
+| `rtt_ms` | float | RTT of the selected best sample, in milliseconds |
+| `samples` | integer | Number of samples taken |
+| `min_rtt_ms` | float | Minimum RTT across all samples |
+| `max_rtt_ms` | float | Maximum RTT across all samples |
+
+Note: in clock-sync events, the `variant` common field carries the variant
+about to start (or `""` for the initial sync that runs before any variant).
+
 ## Correlation Key
 
 The analysis tool correlates writes and receives using:

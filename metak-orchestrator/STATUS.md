@@ -14,6 +14,7 @@
 | E3e: Hybrid UDP/TCP | done | 15 (13 unit + 2 integration) | UDP for QoS 1-2, TCP for QoS 3-4 |
 | E4: Analysis Tool | done | 51 (42 unit + 9 integration) | Phase 1 complete: parse, cache, correlate, integrity, performance, CLI tables |
 | E5-E7 | not started | — | |
+| E8: Clock Sync | in planning | — | Contract drafted; awaiting user review before spawning workers |
 
 **Total passing tests: 178** (127 Rust across 6 crates + 51 Python in analysis)
 

@@ -26,6 +26,15 @@ network.
 4. Discovery completes when all runner names listed in the config's `runners`
    array have been seen and their config hashes match.
 
+## Phase 1.5: Initial Clock Sync
+
+After discovery completes (config hashes match) and before the first ready
+barrier, each runner measures pairwise clock offsets against every other
+runner using the protocol defined in `clock-sync.md`. Results are written
+to `<runner>-clock-sync-<run>.jsonl`.
+
+Single-runner runs skip this phase entirely.
+
 ## Phase 2: Per-Variant Execution
 
 For each variant defined in the config (in order):
@@ -34,6 +43,13 @@ For each variant defined in the config (in order):
 
 - Each runner broadcasts: `ready for variant <name>`
 - Waits until all runners have signaled ready for this variant.
+
+### Per-Variant Clock Resync
+
+After the ready barrier and before launch, each runner re-measures clock
+offsets against every other runner (same protocol as Phase 1.5). This
+catches drift across the run. Logged with `variant = <name>` so analysis
+picks the most recent measurement preceding the variant's writes.
 
 ### Launch
 
