@@ -136,14 +136,27 @@ impl Variant for HybridVariant {
         // Set up TCP for QoS 3-4.
         let tcp_listen_addr =
             SocketAddr::new(self.config.bind_addr.into(), self.config.tcp_base_port);
+
+        let tcp_listen_addr = SocketAddr::new(
+            self.config.bind_addr.into(),
+            self.config.tcp_base_port + if self.runner == "bob" { 1 } else { 0 },
+        );
+
         let mut tcp =
             TcpTransport::new(tcp_listen_addr).context("failed to set up TCP transport")?;
 
         // Connect to each configured peer.
         for peer_str in &self.config.peers {
-            let addr: SocketAddr = peer_str
+            let mut addr: SocketAddr = peer_str
                 .parse()
                 .with_context(|| format!("invalid peer address: {}", peer_str))?;
+
+            // Apply the inverse logic: if we are Alice, we look for Bob at port + 1.
+            // If we are Bob, we look for Alice at the base port (+ 0).
+            if self.runner == "alice" {
+                addr.set_port(addr.port() + 1);
+            }
+
             tcp.connect_to_peer(addr)
                 .with_context(|| format!("failed to connect to TCP peer {}", addr))?;
         }

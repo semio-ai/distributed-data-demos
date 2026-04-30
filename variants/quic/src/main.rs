@@ -21,20 +21,34 @@ fn main() {
 fn run() -> Result<()> {
     let args = CliArgs::parse();
 
-    // Parse variant-specific args from the extra pass-through arguments.
-    let bind_addr = parse_extra_arg(&args.extra, "bind-addr")
-        .unwrap_or_else(|| "0.0.0.0:0".to_string())
+    // Map name to an index based on first letter of name in alphabetical order
+    let runner_idx = args.runner
+        .to_lowercase()
+        .chars()
+        .next()
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|c| (c as u8 - b'a') as usize)
+        .context("Runner name must start with an alphabetic character (a-z)")?;
+
+    let bind_addr_raw = parse_extra_arg(&args.extra, "bind-addr")
+        .unwrap_or_else(|| "0.0.0.0:0".to_string());
+
+    let bind_addr = bind_addr_raw
+        .split(',')
+        .nth(runner_idx) // Take the address at our index
+        .context(format!("No bind-addr found for index {}", runner_idx))?
+        .trim()
         .parse::<SocketAddr>()
         .context("invalid --bind-addr")?;
 
-    let peers: Vec<SocketAddr> = match parse_extra_arg(&args.extra, "peers") {
-        Some(peers_str) => peers_str
-            .split(',')
-            .map(|s| s.trim().parse::<SocketAddr>())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("invalid --peers address")?,
-        None => vec![],
-    };
+    let peers: Vec<SocketAddr> = parse_extra_arg(&args.extra, "peers")
+        .unwrap_or_default()
+        .split(',')
+        .enumerate()
+        .filter(|(i, _)| *i != runner_idx) // Skip the address that belongs to me
+        .map(|(_, s)| s.trim().parse::<SocketAddr>())
+        .collect::<Result<Vec<_>, _>>()
+        .context("invalid --peers address")?;
 
     let mut variant = QuicVariant::new(&args.runner, bind_addr, peers);
     run_protocol(&mut variant, &args)?;

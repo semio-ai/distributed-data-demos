@@ -57,7 +57,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   buffer_size = 65536
 
 [[variant]]
-name = "custom-udp-max-64KB-buff"
+name = "custom-udp-max"
 binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
   [variant.common]

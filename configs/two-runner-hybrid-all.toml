@@ -1,10 +1,10 @@
-run = "quic-all"
+run = "hybrid-all"
 runners = ["alice", "bob"]
 default_timeout_secs = 60
 
 [[variant]]
-name = "quic-1000x100hz"
-binary = "variants/quic/target/release/variant-quic.exe"
+name = "hybrid-1000x100hz"
+binary = "variants/hybrid/target/release/variant-hybrid.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -17,30 +17,13 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  multicast_group = "239.0.0.1:19502"
+  tcp_base_port = 19900
+  peers = "127.0.0.1:19900"
 
 [[variant]]
-name = "quic-10x100hz"
-binary = "variants/quic/target/release/variant-quic.exe"
-
-  [variant.common]
-  tick_rate_hz = 100
-  stabilize_secs = 2
-  operate_secs = 10
-  silent_secs = 2
-  workload = "scalar-flood"
-  values_per_tick = 10
-  qos = 2
-  log_dir = "./logs"
-
-  [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
-
-[[variant]]
-name = "quic-100x100hz"
-binary = "variants/quic/target/release/variant-quic.exe"
+name = "hybrid-100x100hz"
+binary = "variants/hybrid/target/release/variant-hybrid.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -53,12 +36,32 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  multicast_group = "239.0.0.1:19502"
+  tcp_base_port = 19900
+  peers = "127.0.0.1:19900"
 
 [[variant]]
-name = "quic-max"
-binary = "variants/quic/target/release/variant-quic.exe"
+name = "hybrid-10x100hz"
+binary = "variants/hybrid/target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 10
+  qos = 2
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19502"
+  tcp_base_port = 19900
+  peers = "127.0.0.1:19900"
+
+[[variant]]
+name = "hybrid-max"
+binary = "variants/hybrid/target/release/variant-hybrid.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -71,5 +74,6 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  multicast_group = "239.0.0.1:19502"
+  tcp_base_port = 19900
+  peers = "127.0.0.1:19900"
