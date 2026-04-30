@@ -360,8 +360,8 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:0"
-  peers = "127.0.0.1:19920"
+  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
+  peers = "127.0.0.1:19930,127.0.0.1:19931"
 
 # ─── QUIC ── 1000 vps @ 10 hz ────────────────────────────────────────────────
 
@@ -380,8 +380,8 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:0"
-  peers = "127.0.0.1:19930"
+  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
+  peers = "127.0.0.1:19930,127.0.0.1:19931"
 
 
 # ─── QUIC ── 100 vps @ 10 hz ────────────────────────────────────────────────
@@ -401,8 +401,8 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:0"
-  peers = "127.0.0.1:19930"
+  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
+  peers = "127.0.0.1:19930,127.0.0.1:19931"
 
 # ─── QUIC ── 100 vps @ 100 hz ────────────────────────────────────────────────
 
@@ -421,8 +421,8 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:0"
-  peers = "127.0.0.1:19930"
+  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
+  peers = "127.0.0.1:19930,127.0.0.1:19931"
 
 # ─── QUIC ── 100 vps @ 1000 hz ────────────────────────────────────────────────
 
@@ -441,8 +441,8 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:0"
-  peers = "127.0.0.1:19930"
+  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
+  peers = "127.0.0.1:19930,127.0.0.1:19931"
 
 # ─── QUIC ── 10 vps @ 100 hz ─────────────────────────────────────────────────
 
@@ -461,8 +461,8 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:0"
-  peers = "127.0.0.1:19930"
+  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
+  peers = "127.0.0.1:19930,127.0.0.1:19931"
 
 # ─── QUIC ── 10 vps @ 1000 hz ─────────────────────────────────────────────────
 
@@ -481,8 +481,8 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:0"
-  peers = "127.0.0.1:19930"
+  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
+  peers = "127.0.0.1:19930,127.0.0.1:19931"
 
 # ─── QUIC ── max-throughput ──────────────────────────────────────────────────
 
@@ -501,8 +501,8 @@ binary = "variants/quic/target/release/variant-quic.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:0"
-  peers = "127.0.0.1:19930"
+  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
+  peers = "127.0.0.1:19930,127.0.0.1:19931"
 
 # ─── Zenoh ── 1000 vps @ 100 Hz ────────────────────────────────────────
 
