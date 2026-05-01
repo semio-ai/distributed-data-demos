@@ -13,9 +13,11 @@ full manual control over transport, implementing all four QoS levels.
 - **Key dependencies**:
   - `variant-base` (path = `../../variant-base`) — Variant trait, types, CLI, driver
   - `socket2` — advanced socket configuration (SO_BROADCAST, SO_REUSEADDR, multicast)
-  - `mdns-sd` — mDNS peer discovery (or manual peer list via CLI args)
   - `anyhow` — error handling
 - Follow `metak-shared/coding-standards.md`.
+- **No discovery library**: peer hosts come from the runner-injected
+  `--peers` arg (since E9). mDNS was never wired up in code; remove the
+  `mdns-sd` dependency from `Cargo.toml` if it is still listed.
 
 ## Build and Test
 
@@ -34,7 +36,6 @@ variants/custom-udp/
     main.rs       -- parse CLI, create UdpVariant, call run_protocol
     udp.rs        -- UdpVariant struct implementing Variant trait
     protocol.rs   -- message framing, header serialization
-    discovery.rs  -- mDNS peer discovery
     qos.rs        -- QoS-specific send/receive logic
   Cargo.toml
 ```
@@ -43,18 +44,75 @@ variants/custom-udp/
 
 ### CLI args (variant-specific)
 
-Expected in `extra` pass-through args:
-- `--multicast-group` (default: `239.0.0.1:9000`)
-- `--buffer-size` (default: `65536`)
-- `--bind-addr` (default: `0.0.0.0:0`)
-- `--peers` (optional: explicit comma-separated peer addresses, skips mDNS)
+As of E9, peer hosts are runner-injected via the standard `--peers`. The
+old variant-specific `--peers` (host:port list) and `--bind-addr` are
+removed. The variant derives its own TCP listen port (for QoS 4) and each
+peer's TCP connect port from `--tcp-base-port`, the `--peers` map, and
+the per-spawn `--qos`.
+
+```toml
+[variant.specific]
+multicast_group = "239.0.0.1:19500"
+buffer_size = 65536
+tcp_base_port = 19800
+```
+
+Variant-specific CLI args:
+
+- `--multicast-group <ip:port>` — required. UDP multicast group address.
+  Same value used by all runners; no runner or QoS stride applied.
+- `--buffer-size <bytes>` — required. UDP receive buffer size.
+- `--tcp-base-port <u16>` — required. Base port that per-runner / per-qos
+  TCP ports are derived from (used only at QoS 4).
+
+The variant also reads (from the standard runner-injected args, see
+`metak-shared/api-contracts/variant-cli.md`):
+
+- `--peers <name1>=<host1>,<name2>=<host2>,...` — full runner→host map.
+  Sort by name for stable indexing.
+- `--runner <name>` — this runner's name; used to look up own index.
+- `--qos <N>` — concrete QoS level for this spawn (1-4).
+
+### Port derivation
+
+For QoS 1-3 (UDP-only paths): bind on `multicast_group` directly. No
+runner stride, no QoS stride. All runners join the same group; sequential
+per-spawn execution + `silent_secs` drain + `inter_qos_grace_ms` provide
+cross-spawn isolation.
+
+For QoS 4 (TCP):
+```
+runner_stride = 1
+qos_stride    = 10  // (qos - 1) * stride; for qos=4 this is 30
+
+runner_index    = sorted_peer_names.position(of: --runner)
+my_tcp_listen   = tcp_base_port + runner_index * runner_stride + (qos - 1) * qos_stride
+
+for each (name, host) in --peers where name != --runner:
+    peer_index    = sorted_peer_names.position(of: name)
+    peer_tcp_port = tcp_base_port + peer_index * runner_stride + (qos - 1) * qos_stride
+    connect_to    = (host, peer_tcp_port)
+```
+
+This is the same convention used by Hybrid (and QUIC for its own bind/connect
+ports). Documented in `metak-shared/api-contracts/toml-config-schema.md` —
+keep the strides consistent if they ever change.
+
+If `--runner` is not present in `--peers`, fail loudly with a clear error.
+
+For QoS 3 (NACK-based reliable UDP): NACKs and retransmits travel on the
+existing UDP socket — no peer-host knowledge required from `--peers`.
 
 ### connect
 
-1. Bind a UDP socket (multicast-capable via socket2).
-2. Join the multicast group.
-3. Run mDNS discovery to find peers (or use `--peers` if provided).
-4. For QoS 4 (TCP): also open TCP listeners/connections to each peer.
+1. Parse `--peers`, `--runner`, `--qos`, `--multicast-group`, `--buffer-size`,
+   `--tcp-base-port`. Resolve `runner_index` and (only at QoS 4) derive
+   `my_tcp_listen` and the list of `(peer_name, peer_host, peer_tcp_port)`
+   tuples per "Port derivation".
+2. Bind a UDP socket (multicast-capable via socket2).
+3. Join the multicast group.
+4. For QoS 4 (TCP): bind a TCP listener on `0.0.0.0:my_tcp_listen` and
+   connect to every peer's `(peer_host, peer_tcp_port)`.
 
 ### publish
 
@@ -94,5 +152,11 @@ For messages larger than 1472 bytes, implement application-layer fragmentation:
 
 - Unit tests for message serialization/deserialization.
 - Unit tests for QoS 2 stale-discard logic.
-- Integration test: single-process (publish to multicast, receive own messages).
+- Integration test: single-process. Synthesize the new CLI shape:
+  `--peers self=127.0.0.1`, `--runner self`, `--multicast-group <ip:port>`,
+  `--buffer-size <bytes>`, `--tcp-base-port <port>`, `--qos <1..4>`. Note
+  that with a single-peer map there are no peers to connect to (self
+  excluded by design); the test exercises bind/listen + framing only.
+  Cross-peer flow on QoS 1-3 (UDP) and QoS 4 (TCP) is validated end-to-end
+  via two runners on localhost during T9.4 acceptance.
 - The binary should work with the runner.

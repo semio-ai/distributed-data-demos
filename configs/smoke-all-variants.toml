@@ -1,0 +1,78 @@
+# T9.4c smoke: every variant family at qos=1 only, short timing, two runners
+# on localhost. Goal is to prove no variant fails-on-launch with the new
+# --peers contract — not to gather perf numbers.
+
+run = "smoke-t94c"
+runners = ["alice", "bob"]
+default_timeout_secs = 30
+
+[[variant]]
+name = "smoke-custom-udp"
+binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+
+  [variant.common]
+  tick_rate_hz = 50
+  stabilize_secs = 1
+  operate_secs = 2
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 5
+  qos = 1
+  log_dir = "./logs-smoke"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19590"
+  buffer_size = 65536
+  tcp_base_port = 19890
+
+[[variant]]
+name = "smoke-hybrid"
+binary = "variants/hybrid/target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 50
+  stabilize_secs = 1
+  operate_secs = 2
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 5
+  qos = 1
+  log_dir = "./logs-smoke"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19591"
+  tcp_base_port = 19990
+
+[[variant]]
+name = "smoke-quic"
+binary = "variants/quic/target/release/variant-quic.exe"
+
+  [variant.common]
+  tick_rate_hz = 50
+  stabilize_secs = 1
+  operate_secs = 2
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 5
+  qos = 1
+  log_dir = "./logs-smoke"
+
+  [variant.specific]
+  base_port = 19992
+
+[[variant]]
+name = "smoke-zenoh"
+binary = "variants/zenoh/target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 50
+  stabilize_secs = 1
+  operate_secs = 2
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 5
+  qos = 1
+  log_dir = "./logs-smoke"
+
+  [variant.specific]
+  zenoh_mode = "peer"

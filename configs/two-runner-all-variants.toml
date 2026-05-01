@@ -29,6 +29,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19500"
   buffer_size = 65536
+  tcp_base_port = 19800
 
 # ─── Custom UDP ── 1000 vps @ 10 hz ────────────────────────────────────────────
 
@@ -48,6 +49,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
+  tcp_base_port = 19800
 
 # ─── Custom UDP ── 100 vps @ 1000 hz ────────────────────────────────────────────
 
@@ -67,6 +69,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
+  tcp_base_port = 19800
 
 # ─── Custom UDP ── 100 vps @ 100 hz ────────────────────────────────────────────
 
@@ -86,6 +89,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
+  tcp_base_port = 19800
 
 # ─── Custom UDP ── 100 vps @ 10 hz ────────────────────────────────────────────
 
@@ -105,6 +109,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
+  tcp_base_port = 19800
 
 # ─── Custom UDP ── 10 vps @ 100 hz ────────────────────────────────────────────
 
@@ -124,6 +129,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
+  tcp_base_port = 19800
 
 # ─── Custom UDP ── 10 vps @ 1000 hz ────────────────────────────────────────────
 
@@ -143,6 +149,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
+  tcp_base_port = 19800
 
 # ─── Custom UDP ── max-throughput ────────────────────────────────────────────
 
@@ -162,6 +169,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
+  tcp_base_port = 19800
 
 
 ##############################################################################

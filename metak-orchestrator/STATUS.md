@@ -529,6 +529,186 @@ Open notes for orchestrator follow-up:
 
 ---
 
+### T9.4a: Zenoh variant — make extra-arg parser lenient — done
+
+`ZenohArgs::parse` in `variants/zenoh/src/zenoh.rs` previously bailed on
+any unknown `--<name>` token, breaking every runner-launched Zenoh spawn
+since T9.1 started injecting `--peers <name=host,...>` into all variants.
+
+Files modified:
+- `variants/zenoh/src/zenoh.rs`:
+  - `ZenohArgs::parse`: replaced the `bail!("unknown Zenoh argument:
+    ...")` arm with a lenient skip. When an unknown token starts with
+    `--`, advance past it AND the following token (treating it as a
+    `--name value` pair, matching the runner's convention). When the
+    token does not start with `--`, just skip the token.
+  - Test `test_zenoh_args_unknown_arg` renamed to
+    `test_zenoh_args_unknown_arg_is_lenient` and inverted: now asserts
+    `parse(&["--unknown"])` succeeds and returns defaults
+    (`mode = "peer"`, `listen = None`).
+  - New test `test_zenoh_args_peers_injection_ignored` asserts
+    `parse(&["--peers", "alice=127.0.0.1,bob=192.168.1.10"])` succeeds
+    and leaves `mode`/`listen` at defaults — the exact shape the runner
+    now injects.
+
+Tests:
+- `cargo fmt --check`: clean.
+- `cargo clippy -- -D warnings`: clean.
+- `cargo test`: 9 unit (8 prior + 1 new) + 1 integration
+  (`loopback_full_protocol`) — all 10 tests pass. The single-process
+  Zenoh integration test still passes.
+
+Acceptance criteria — all ticked:
+- [x] `ZenohArgs::parse` ignores unknown `--<name> <value>` pairs without
+      erroring
+- [x] Test for unknown-arg pass-through added
+      (`test_zenoh_args_peers_injection_ignored`)
+- [x] Existing tests pass with the updated `--unknown` expectation
+- [x] `cargo test`, `cargo clippy`, `cargo fmt --check` clean
+- [x] STATUS.md updated
+
+---
+
+### T9.4b: Custom UDP variant — consume --peers, derive TCP port from tcp_base_port — done
+
+The custom-udp variant had its own `--peers` parser at `src/udp.rs:56-65`
+expecting old-style `host:port,host:port` and ran unconditionally during
+config build. After T9.1 began injecting `--peers <name=host,...>` into
+every variant spawn, that parser failed for ALL QoS levels with
+`invalid peer address: invalid socket address syntax`.
+
+This worker migrated custom-udp to the same shape as Hybrid (T9.3) and
+QUIC (T9.2): the variant parses the runner-injected `--peers` map, looks
+up its own index by `--runner` name, and derives per-runner / per-qos TCP
+ports from a single `--tcp-base-port`. UDP multicast still binds the
+configured group directly with no stride. TCP is only wired up at QoS 4
+but derivation must succeed at all QoS levels because parse runs before
+connect.
+
+Files modified:
+
+- `variants/custom-udp/src/main.rs`: rewritten to mirror
+  `variants/hybrid/src/main.rs`. Adds:
+  - `RUNNER_STRIDE = 1`, `QOS_STRIDE = 10` constants.
+  - `parse_peers(raw)` -> sorted `Vec<(name, host)>` (sort gives stable
+    cross-runner indexing).
+  - `derive_endpoints(peer_map, runner, tcp_base_port, qos)` ->
+    `DerivedTcpEndpoints { tcp_listen_addr, tcp_peers }`. Excludes self
+    from `tcp_peers`. Errors loudly when `--runner` not in `--peers`.
+  - `parse_extra_arg` / `parse_required_extra_arg` helpers (same as
+    Hybrid).
+  - `run()` reads `--multicast-group`, `--buffer-size`, `--tcp-base-port`,
+    `--peers` from extras, derives endpoints, builds `UdpConfig`, and
+    delegates to `run_protocol`.
+- `variants/custom-udp/src/udp.rs`:
+  - `UdpConfig` shape changed: removed `peers: Vec<SocketAddr>`, added
+    `tcp_listen_addr: SocketAddr` + `tcp_peers: Vec<SocketAddr>`.
+  - `UdpConfig::from_extra` removed entirely (parsing moved to main.rs).
+  - `setup_tcp` now binds `self.config.tcp_listen_addr` (instead of
+    `0.0.0.0:0`) and connects to each pre-derived peer in
+    `self.config.tcp_peers`. Sets TCP_NODELAY on both sides.
+  - Stale unit tests for the old `from_extra` shape removed; the three
+    surviving unit tests cover variant name, connect/disconnect lifecycle,
+    and pre-connect `poll_receive` returning None.
+- `variants/custom-udp/tests/integration.rs`: NEW. Subprocess-based
+  integration test mirroring `variants/hybrid/tests/integration.rs`:
+  - `udp_lifecycle_qos1`, `udp_lifecycle_qos2`, `udp_lifecycle_qos3`
+    (UDP path), `tcp_lifecycle_qos4` (TCP path). Each runs the binary
+    with `--peers self=127.0.0.1`, `--runner self`,
+    `--multicast-group <unique>`, `--buffer-size 65536`,
+    `--tcp-base-port <unique>`, and asserts exit 0 + JSONL log produced.
+  - `runner_not_in_peers_fails` asserts loud failure when `--runner`
+    `carol` is not in `--peers`.
+  - `missing_tcp_base_port_fails` and `missing_multicast_group_fails`
+    assert clear error when required extras are absent.
+- `variants/custom-udp/tests/multicast_loopback.rs`: untouched (still
+  passes; tests raw-socket multicast wire format independent of the
+  variant CLI).
+- `variants/custom-udp/STRUCT.md`: updated module responsibilities to
+  reflect the new main.rs surface and the new integration.rs test.
+- `configs/two-runner-all-variants.toml`: added `tcp_base_port = 19800`
+  to all 8 custom-udp `[variant.specific]` blocks (verified with grep:
+  exactly 8 occurrences). Distinct from Hybrid's 19900. The existing
+  `multicast_group` and `buffer_size` were left as-is. `qos` already
+  omitted (T9.3 dropped it).
+
+`Cargo.toml`: no `mdns-sd` was present (T9.3 noted it likely never was).
+No dependency change needed.
+
+Tests:
+- `cargo fmt --check`: clean.
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 41 unit + 7 integration + 1 multicast loopback = 49
+  tests, all pass.
+  - Unit additions cover identity resolution at index 0 and 1, port
+    derivation at qos=1 and qos=4 (`19800 + 1*1 + 3*10 = 19831`
+    asserted), all-qos-levels-disjoint (8 distinct ports across 2
+    runners x 4 qos), runner-not-in-peers loud error, invalid qos
+    rejection, self-only peer-list yielding zero peers to connect to,
+    and "derive_endpoints succeeds at all QoS" (covers the
+    parse-must-succeed-even-when-TCP-isn't-used requirement).
+
+Manual two-runner-on-localhost validation:
+
+- Built `runner.exe` (already from T9.1) and a fresh release
+  `variant-custom-udp.exe`.
+- Used a small custom-udp-only fixture (single `[[variant]]` entry,
+  `tick_rate_hz = 50`, `values_per_tick = 5`, `operate_secs = 4`,
+  `multicast_group = "239.0.0.1:19550"`, `tcp_base_port = 19800`, `qos`
+  omitted -> 4 spawn expansion).
+- Ran `runner.exe --name alice` and `runner.exe --name bob` in
+  parallel against the fixture.
+- Both runners discovered each other (`peer_hosts: {"alice":
+  "127.0.0.1", "bob": "127.0.0.1"}`), cycled through all 4 QoS levels
+  in lockstep, and reported `status=success exit_code=0` for every
+  spawn.
+- 8 JSONL log files produced (4 per runner): qos1/qos2/qos3 (UDP path)
+  + qos4 (TCP path). The QoS 4 spawns also logged the expected
+  `[custom-udp] TCP listener on 0.0.0.0:19830 for QoS 4` (alice,
+  index 0) and `... 0.0.0.0:19831 ...` (bob, index 1) lines, confirming
+  the per-runner port derivation matches the convention.
+- Spot-checked all 8 files:
+  - alice qos1: 1005 receive records with `writer=bob`, all
+    `qos:1` -> UDP best-effort cross-runner delivery confirmed.
+  - alice qos3: 1005 receives with `writer=bob`, all `qos:3` -> UDP
+    NACK-reliable path confirmed.
+  - alice qos4: 1005 receives with `writer=bob`, all `qos:4` -> TCP
+    path confirmed.
+  - bob qos1 / bob qos4: each 1005 receives with `writer=alice` -> the
+    reverse direction works on both transports too.
+  - 1005 = 5 paths x 201 ticks (50 Hz x ~4s operate window).
+- `qos` field in every receive record matches the spawn-name suffix
+  (`-qos1` -> `"qos":1`, etc.).
+- Test fixture and `logs-t94b/` artifacts cleaned up afterwards (kept
+  the run scoped to `variants/custom-udp/target/` and `./logs-t94b/`,
+  both deleted post-validation).
+
+Acceptance criteria - all ticked:
+- [x] Custom UDP `[variant.specific]` reduced to `multicast_group` +
+      `buffer_size` + `tcp_base_port` (no `peers`, no `bind_addr`)
+- [x] Runner-injected `--peers` parsed; `--runner` resolved to an index
+- [x] Parse succeeds for all QoS values; TCP setup only runs at QoS 4
+- [x] TCP bind/connect ports computed per the convention
+- [x] UDP multicast still binds the configured group with no stride
+- [x] Loopback test passes with new CLI shape (added integration.rs;
+      old multicast_loopback.rs still passes)
+- [x] `mdns-sd` dependency removed from `Cargo.toml` if present
+      (verified absent already)
+- [x] `configs/two-runner-all-variants.toml` Custom UDP entries updated
+      (`tcp_base_port = 19800` added to all 8)
+- [x] Two-runner-on-localhost end-to-end: 8 JSONL files, both UDP and
+      TCP paths verified
+- [x] `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`
+      clean
+- [x] STATUS.md updated
+
+Open concerns / deviations:
+- None. The migration mirrors T9.3 exactly per CUSTOM.md guidance,
+  including using the same `runner_stride = 1` / `qos_stride = 10`
+  constants. Cross-machine smoke is owned by T9.4c.
+
+---
+
 ## What's next
 
 | Epic | Status | Can start now? |
@@ -540,3 +720,5 @@ Open notes for orchestrator follow-up:
 | E9: T9.1 Runner peer/qos | done | -- |
 | E9: T9.2 QUIC variant migration | done | -- |
 | E9: T9.3 Hybrid variant migration | done | -- |
+| E9: T9.4a Zenoh lenient parser | done | -- |
+| E9: T9.4b Custom UDP variant migration | done | -- |

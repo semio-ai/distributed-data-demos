@@ -319,6 +319,173 @@ Acceptance criteria:
 
 ---
 
+### T9.4a: Zenoh variant — make extra-arg parser lenient
+
+**Repo**: `variants/zenoh/`
+**Status**: pending
+**Depends on**: T9.1 (runner injects `--peers` to every variant).
+
+Zenoh's `ZenohArgs::parse` at `src/zenoh.rs` currently bails on any
+unknown `--<name>` token in extra args. Since T9.1, the runner injects
+`--peers <name=host,...>` into every variant. Zenoh has its own discovery
+(Zenoh scouting) and does not need peer info — but the strict parser now
+breaks every Zenoh run that goes through the runner.
+
+This was missed during T9.1 because validation only covered the
+already-migrated variants. Caught when the user tried the full
+`two-runner-all-variants.toml` on two real machines and saw Zenoh
+(and custom-udp) fail.
+
+Scope:
+1. In `src/zenoh.rs::ZenohArgs::parse`, replace the `bail!("unknown
+   Zenoh argument: ...")` arm with a lenient skip:
+   - When an unknown `--<name>` token is seen, advance past it AND the
+     following token (treat as a `--name value` pair so the parser stays
+     in sync with the standard convention used by the runner). If the
+     unknown token doesn't start with `--`, just skip it.
+2. Update the existing test that asserts `parse(&["--unknown"])` errors
+   so it now succeeds (returns defaults). Add a new test that asserts
+   `parse(&["--peers", "alice=127.0.0.1,bob=192.168.1.10"])` succeeds and
+   leaves `mode`/`listen` at defaults.
+
+Tests:
+- `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` clean.
+- The existing single-process Zenoh integration test still passes.
+
+Acceptance criteria:
+- [ ] `ZenohArgs::parse` ignores unknown `--<name> <value>` pairs without
+      erroring
+- [ ] Test for unknown-arg pass-through added
+- [ ] Existing tests pass with the updated `--unknown` expectation
+- [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` clean
+- [ ] STATUS.md updated
+
+---
+
+### T9.4b: Custom UDP variant — consume --peers, derive TCP port from tcp_base_port
+
+**Repo**: `variants/custom-udp/`
+**Status**: pending
+**Depends on**: T9.1 (runner injects `--peers` and `--qos` per spawn).
+Independent of T9.4a — can run in parallel.
+
+Same migration shape as T9.3 (Hybrid), applied to the Custom UDP variant.
+Custom UDP currently has its own `--peers` parser at `src/udp.rs:56-65`
+expecting old-style `host:port,host:port`. Now that the runner injects
+`--peers <name=host,...>`, that parser fails on the new format ("invalid
+peer address: invalid socket address syntax"). It triggers regardless of
+QoS because the parser runs unconditionally during config build.
+
+Custom UDP uses TCP for QoS 4 only — for QoS 1-3 it's UDP-only and
+peer-host info is not needed at the transport layer. So peer info is only
+load-bearing for QoS 4, but the parser must succeed for ALL QoS values
+(parse runs before connect).
+
+UDP multicast is left as-is — same group on every runner, no QoS stride
+needed. Only TCP gets per-runner / per-qos port derivation.
+
+Scope:
+1. In `src/udp.rs::UdpConfig::from_extra` (and any related main.rs
+   plumbing):
+   - Remove the old `--peers` (host:port list) and `--bind-addr` arg
+     handling.
+   - Add `--tcp-base-port <u16>` parsing (variant-specific, required).
+   - Parse the runner-injected `--peers <name=host,...>` from extra args.
+2. Identity resolution: parse `--peers`, look up `--runner` to find
+   `runner_index` (0-based, sorted by name). Fail loudly if `--runner`
+   is not in `--peers`.
+3. TCP port derivation per spawn (only consumed at QoS 4):
+   - `runner_stride = 1`, `qos_stride = 10`
+   - `my_tcp_listen = tcp_base_port + runner_index * runner_stride + (qos - 1) * qos_stride`
+   - For each non-self peer:
+     `peer_tcp_port = tcp_base_port + peer_index * runner_stride + (qos - 1) * qos_stride`
+   - Bind TCP listener on `0.0.0.0:my_tcp_listen`. Connect to
+     `(peer_host, peer_tcp_port)` for every peer except self.
+4. UDP multicast: bind on `multicast_group` directly. NO runner stride,
+   NO QoS stride. All runners share the group.
+5. Remove `mdns-sd` from `Cargo.toml` if present.
+6. Update the Custom UDP entries in `configs/two-runner-all-variants.toml`
+   (8 entries):
+   - Add `tcp_base_port = 19800` (or pick another free base — keep it
+     distinct from Hybrid's `19900`).
+   - The existing `multicast_group` and `buffer_size` stay.
+   - `qos` stays omitted (T9.3 already removed it; runner expands to all
+     four levels).
+7. Update the loopback integration test to use the new CLI shape:
+   `--peers self=127.0.0.1`, `--runner self`, `--multicast-group ...`,
+   `--buffer-size ...`, `--tcp-base-port ...`, `--qos <1..4>`. With a
+   single-peer map there are no peers to connect to; test exercises
+   bind/listen + framing only.
+
+Tests:
+- Unit: identity resolution from `--peers alice=127.0.0.1,bob=127.0.0.1`
+  with `--runner alice` returns index 0; `--runner bob` returns index 1.
+- Unit: port derivation with `tcp_base_port=19800`, `runner_index=1`,
+  `qos=4` returns `19800 + 1 + 30 = 19831`.
+- Unit: `--runner` not in `--peers` returns a clear error.
+- Unit: parse succeeds at QoS 1 even though peer info is unused.
+- Existing integration test: update to new CLI shape.
+
+Validation against reality (orchestrator will run the cross-variant smoke
+test in T9.4c — worker only needs to confirm same-machine):
+- Run `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`
+  clean.
+- Use a small Custom-UDP-only test fixture and run two runners on
+  localhost. Verify both runners cycle through all 4 QoS levels and
+  produce 8 JSONL log files. Spot-check at least one QoS 1-3 file (UDP
+  path) and the QoS 4 file (TCP path) — the `qos` field must match the
+  spawn-name suffix and there must be cross-runner receive records.
+
+Acceptance criteria:
+- [ ] Custom UDP `[variant.specific]` reduced to `multicast_group` +
+      `buffer_size` + `tcp_base_port` (no `peers`, no `bind_addr`)
+- [ ] Runner-injected `--peers` parsed; `--runner` resolved to an index
+- [ ] Parse succeeds for all QoS values; TCP setup only runs at QoS 4
+- [ ] TCP bind/connect ports computed per the convention
+- [ ] UDP multicast still binds the configured group with no stride
+- [ ] Loopback test passes with new CLI shape
+- [ ] `mdns-sd` dependency removed from `Cargo.toml` if present
+- [ ] `configs/two-runner-all-variants.toml` Custom UDP entries updated
+      (`tcp_base_port = 19800` added)
+- [ ] Two-runner-on-localhost end-to-end: 8 JSONL files, both UDP and
+      TCP paths verified
+- [ ] `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`
+      clean
+- [ ] STATUS.md updated
+
+---
+
+### T9.4c: Cross-variant smoke run on the user's two-machine setup
+
+**Repo**: top-level (no code; runs binaries)
+**Status**: pending
+**Depends on**: T9.4a, T9.4b, T9.3, T9.2, T9.1 (everything in E9).
+
+Orchestrator-owned validation. Once T9.4a and T9.4b ship, run the full
+`configs/two-runner-all-variants.toml` end-to-end across the user's two
+machines (alice and bob) and confirm every variant × every QoS spawn
+exits successfully and produces the expected JSONL log files.
+
+Scope (orchestrator):
+1. Confirm both `runner` and all four variant binaries (custom-udp,
+   hybrid, quic, zenoh) are built in release on both machines.
+2. Ask the user to run two runners against
+   `configs/two-runner-all-variants.toml` and capture stdout.
+3. Verify all 32 variant entries × QoS expansion produced log files on
+   both machines without parse errors.
+4. Spot-check one log file per variant family for receive records.
+5. Add an entry to `metak-shared/LEARNED.md` summarising the regression
+   uncovered by this run and the fix pattern.
+
+Acceptance criteria:
+- [ ] All-variants run completes without `[variant] error: ...` lines on
+      either machine
+- [ ] Per-variant per-QoS JSONL files appear on both machines
+- [ ] Spot-checks confirm cross-runner delivery on each variant family
+- [ ] Regression + fix pattern documented in LEARNED.md
+
+---
+
 ## Previous Sprint — E8: Application-Level Clock Synchronization
 
 Cross-machine latency cannot be measured without correcting for clock skew

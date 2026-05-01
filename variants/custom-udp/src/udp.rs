@@ -4,81 +4,38 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use variant_base::{Qos, ReceivedUpdate, Variant};
 
 use crate::protocol;
 use crate::qos::{GapCheckResult, GapDetector, LatestValueTracker};
 
-/// Configuration for the UDP variant, parsed from CLI extra args.
+/// Configuration for the UDP variant.
+///
+/// Built by `main::run` from the runner-injected `--peers` map plus the
+/// variant-specific `--multicast-group`, `--buffer-size`, `--tcp-base-port`
+/// extra args. UDP multicast uses `multicast_group` directly with no
+/// per-runner / per-QoS stride; TCP listen / connect addresses are derived in
+/// main per the convention documented in CUSTOM.md and only consumed at
+/// QoS 4.
 #[derive(Debug, Clone)]
 pub struct UdpConfig {
-    /// Multicast group address and port (default: 239.0.0.1:9000).
+    /// Multicast group address and port. Same value on every runner; bound
+    /// directly with no stride.
     pub multicast_group: SocketAddrV4,
-    /// UDP receive buffer size (default: 65536).
+    /// UDP receive buffer size.
     pub buffer_size: usize,
-    /// Explicit peer addresses (comma-separated). If empty, multicast only.
-    pub peers: Vec<SocketAddr>,
-    /// The runner's own name, used as the writer field.
+    /// The runner's own name, used as the writer field in the wire format.
     pub runner: String,
-    /// QoS level for this run.
+    /// QoS level for this spawn.
     pub qos: Qos,
-}
-
-impl UdpConfig {
-    /// Parse variant-specific arguments from the extra CLI args.
-    pub fn from_extra(extra: &[String], runner: &str, qos: Qos) -> Result<Self> {
-        let mut multicast_group: SocketAddrV4 =
-            SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 9000);
-        let mut buffer_size: usize = 65536;
-        let mut peers: Vec<SocketAddr> = Vec::new();
-
-        let mut i = 0;
-        while i < extra.len() {
-            match extra[i].as_str() {
-                "--multicast-group" => {
-                    i += 1;
-                    if i >= extra.len() {
-                        bail!("--multicast-group requires a value");
-                    }
-                    multicast_group = extra[i]
-                        .parse()
-                        .context("invalid --multicast-group value")?;
-                }
-                "--buffer-size" => {
-                    i += 1;
-                    if i >= extra.len() {
-                        bail!("--buffer-size requires a value");
-                    }
-                    buffer_size = extra[i].parse().context("invalid --buffer-size value")?;
-                }
-                "--peers" => {
-                    i += 1;
-                    if i >= extra.len() {
-                        bail!("--peers requires a value");
-                    }
-                    for addr_str in extra[i].split(',') {
-                        let addr: SocketAddr =
-                            addr_str.trim().parse().context("invalid peer address")?;
-                        peers.push(addr);
-                    }
-                }
-                other => {
-                    bail!("unknown variant-specific argument: {}", other);
-                }
-            }
-            i += 1;
-        }
-
-        Ok(Self {
-            multicast_group,
-            buffer_size,
-            peers,
-            runner: runner.to_string(),
-            qos,
-        })
-    }
+    /// Local TCP listen address derived in main from `tcp_base_port` +
+    /// runner_index + (qos - 1) * qos_stride. Only bound at QoS 4.
+    pub tcp_listen_addr: SocketAddr,
+    /// Remote TCP endpoints (one per non-self peer) derived in main. Only
+    /// connected at QoS 4. May be empty (e.g. single-peer self-only test).
+    pub tcp_peers: Vec<SocketAddr>,
 }
 
 /// The UDP variant implementation.
@@ -158,17 +115,25 @@ impl UdpVariant {
 
     /// Set up TCP listener and connections for QoS 4.
     fn setup_tcp(&mut self) -> Result<()> {
-        // Listen on an ephemeral port.
-        let listener = TcpListener::bind("0.0.0.0:0").context("failed to bind TCP listener")?;
+        // Bind on the derived per-runner / per-qos TCP listen address.
+        let listener = TcpListener::bind(self.config.tcp_listen_addr).with_context(|| {
+            format!(
+                "failed to bind TCP listener on {}",
+                self.config.tcp_listen_addr
+            )
+        })?;
         listener.set_nonblocking(true)?;
-        let local_addr = listener.local_addr()?;
-        eprintln!("[custom-udp] TCP listener on {} for QoS 4", local_addr);
+        eprintln!(
+            "[custom-udp] TCP listener on {} for QoS 4",
+            self.config.tcp_listen_addr
+        );
         self.tcp_listener = Some(listener);
 
-        // Connect to peers.
-        for peer_addr in &self.config.peers {
+        // Connect to peers (excluding self — already filtered in main).
+        for peer_addr in &self.config.tcp_peers {
             match TcpStream::connect(peer_addr) {
                 Ok(stream) => {
+                    let _ = stream.set_nodelay(true);
                     stream.set_nonblocking(true)?;
                     self.tcp_out_streams.push(stream);
                 }
@@ -239,6 +204,7 @@ impl UdpVariant {
                 match listener.accept() {
                     Ok((stream, _addr)) => {
                         stream.set_nonblocking(true)?;
+                        let _ = stream.set_nodelay(true);
                         self.tcp_in_streams.push(stream);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -456,7 +422,7 @@ impl Variant for UdpVariant {
                 for &i in failed_indices.iter().rev() {
                     self.tcp_out_streams.remove(i);
                 }
-                if self.tcp_out_streams.is_empty() && !self.config.peers.is_empty() {
+                if self.tcp_out_streams.is_empty() && !self.config.tcp_peers.is_empty() {
                     // All TCP peers disconnected but we had peers configured.
                     // Fall through silently; the runner will detect missing data.
                 }
@@ -506,52 +472,17 @@ impl Variant for UdpVariant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
 
     fn default_config(qos: Qos) -> UdpConfig {
         UdpConfig {
             multicast_group: SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 9000),
             buffer_size: 65536,
-            peers: Vec::new(),
             runner: "test-runner".to_string(),
             qos,
+            tcp_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            tcp_peers: Vec::new(),
         }
-    }
-
-    #[test]
-    fn parse_config_defaults() {
-        let config = UdpConfig::from_extra(&[], "runner-a", Qos::BestEffort).unwrap();
-        assert_eq!(
-            config.multicast_group,
-            SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 9000)
-        );
-        assert_eq!(config.buffer_size, 65536);
-        assert!(config.peers.is_empty());
-    }
-
-    #[test]
-    fn parse_config_custom_values() {
-        let extra = vec![
-            "--multicast-group".to_string(),
-            "239.1.2.3:8000".to_string(),
-            "--buffer-size".to_string(),
-            "32768".to_string(),
-            "--peers".to_string(),
-            "192.168.1.10:5000,192.168.1.11:5000".to_string(),
-        ];
-        let config = UdpConfig::from_extra(&extra, "runner-b", Qos::ReliableTcp).unwrap();
-        assert_eq!(
-            config.multicast_group,
-            SocketAddrV4::new(Ipv4Addr::new(239, 1, 2, 3), 8000)
-        );
-        assert_eq!(config.buffer_size, 32768);
-        assert_eq!(config.peers.len(), 2);
-    }
-
-    #[test]
-    fn parse_config_unknown_arg() {
-        let extra = vec!["--unknown".to_string()];
-        let result = UdpConfig::from_extra(&extra, "r", Qos::BestEffort);
-        assert!(result.is_err());
     }
 
     #[test]

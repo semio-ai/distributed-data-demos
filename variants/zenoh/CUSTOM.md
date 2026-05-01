@@ -49,6 +49,14 @@ variants/zenoh/
 - **Construction**: Parse Zenoh-specific CLI args from `extra` (the pass-through
   args from variant-base CLI). Expected args: `--zenoh-mode` (default: `peer`),
   `--zenoh-listen` (optional, e.g. `udp/0.0.0.0:7447`).
+- **Lenient parser** (E9): the runner now injects `--peers name=host,...`
+  into every variant's extra args (see `variant-cli.md`). Zenoh has its
+  own discovery (Zenoh scouting) and does not need peer info. The Zenoh
+  arg parser MUST silently ignore `--peers` and any other unknown
+  `--<name> <value>` pair instead of erroring. Skip the value token after
+  any unknown `--name` so the parser stays in sync. Update
+  `ZenohArgs::parse` accordingly and update the test that asserts
+  `--unknown` errors — it should now pass through.
 - **connect**: Open a Zenoh session in peer mode. Declare a subscriber on
   `bench/**` (or similar wildcard matching the key paths used by the workload).
   Zenoh scouting handles peer discovery automatically via multicast.

@@ -113,7 +113,13 @@ impl ZenohArgs {
                     listen = Some(extra[i].clone());
                 }
                 other => {
-                    anyhow::bail!("unknown Zenoh argument: {}", other);
+                    // Lenient skip: the runner injects extra args (e.g. --peers)
+                    // that Zenoh does not need. Treat any unknown `--<name>` as
+                    // a `--name value` pair and skip both tokens; otherwise
+                    // skip just the token.
+                    if other.starts_with("--") {
+                        i += 1;
+                    }
                 }
             }
             i += 1;
@@ -307,9 +313,25 @@ mod tests {
     }
 
     #[test]
-    fn test_zenoh_args_unknown_arg() {
+    fn test_zenoh_args_unknown_arg_is_lenient() {
+        // Unknown `--<name>` tokens are silently skipped (treated as a
+        // `--name value` pair if a following token exists) so the runner
+        // can inject extra args like `--peers` without breaking Zenoh.
         let extra = vec!["--unknown".to_string()];
-        assert!(ZenohArgs::parse(&extra).is_err());
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert_eq!(args.mode, "peer");
+        assert!(args.listen.is_none());
+    }
+
+    #[test]
+    fn test_zenoh_args_peers_injection_ignored() {
+        let extra = vec![
+            "--peers".to_string(),
+            "alice=127.0.0.1,bob=192.168.1.10".to_string(),
+        ];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert_eq!(args.mode, "peer");
+        assert!(args.listen.is_none());
     }
 
     #[test]
