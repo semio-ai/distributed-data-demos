@@ -45,8 +45,53 @@ variants/quic/
 
 ### CLI args (variant-specific)
 
-- `--bind-addr` (default: `0.0.0.0:0`)
-- `--peers` (optional: explicit comma-separated peer addresses, skips mDNS)
+As of E9, the QUIC variant derives its bind and connect addresses from the
+runner-injected `--peers` plus the per-spawn `--qos` and a single
+config-supplied `--base-port`. The variant-specific config in TOML is just:
+
+```toml
+[variant.specific]
+base_port = 19930
+```
+
+Variant-specific CLI args:
+
+- `--base-port <u16>` — required. The base port that all per-runner /
+  per-qos ports are derived from.
+
+The variant also reads (from the standard runner-injected args, see
+`metak-shared/api-contracts/variant-cli.md`):
+
+- `--peers <name1>=<host1>,<name2>=<host2>,...` — full runner→host map.
+- `--runner <name>` — this runner's name; used to look up own index.
+- `--qos <N>` — concrete QoS level for this spawn (1-4).
+
+Old `--bind-addr` and the variant-specific `--peers` (explicit
+comma-separated peer addresses) have been removed. mDNS discovery in this
+variant is also retired in favour of runner-driven discovery.
+
+### Port derivation
+
+```
+runner_stride = 1
+qos_stride    = 10
+
+runner_index = sorted_peer_names.position(of: --runner)
+my_bind_port = base_port + runner_index * runner_stride + (qos - 1) * qos_stride
+
+for each (name, host) in --peers where name != --runner:
+    peer_index   = sorted_peer_names.position(of: name)
+    peer_port    = base_port + peer_index * runner_stride + (qos - 1) * qos_stride
+    connect_to   = (host, peer_port)
+```
+
+Sort `--peers` by name for stable indexing. Bind on `0.0.0.0:my_bind_port`.
+Connect to every peer except self. The same convention is documented in
+`metak-shared/api-contracts/toml-config-schema.md` — keep them in sync if
+you change the strides.
+
+If `--runner` is not present in `--peers`, fail loudly with a clear
+error — this indicates a runner/contract bug.
 
 ### Async-to-sync bridge
 
@@ -62,9 +107,11 @@ Quinn is async (tokio). The `Variant` trait is sync. Strategy:
 
 ### connect
 
-1. Generate a self-signed certificate using `rcgen`.
-2. Create a Quinn endpoint with the cert.
-3. Discover peers via mDNS (or use `--peers`).
+1. Parse `--peers`, `--runner`, `--qos`, `--base-port`. Derive `my_bind_port`
+   and the list of `(peer_name, peer_host, peer_port)` tuples per the
+   "Port derivation" section above.
+2. Generate a self-signed certificate using `rcgen`.
+3. Create a Quinn endpoint bound to `0.0.0.0:my_bind_port` with the cert.
 4. Connect to each peer (QUIC client handshake).
 5. Accept incoming connections from peers (QUIC server).
 6. For each peer connection, spawn background send/receive tasks.
@@ -89,4 +136,6 @@ This is a benchmark tool, not production — don't over-engineer TLS.
 - Unit test: certificate generation.
 - Unit test: message serialization.
 - Integration test: single-process loopback (connect to self, send/receive).
-  Use `127.0.0.1` with explicit `--peers` to avoid mDNS in tests.
+  Synthesize the new CLI shape: `--peers self=127.0.0.1`, `--runner self`,
+  `--base-port <free port>`, `--qos 1` (or whichever level the test
+  exercises).

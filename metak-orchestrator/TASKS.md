@@ -1,6 +1,325 @@
 # Task Board
 
-## Current Sprint — E8: Application-Level Clock Synchronization
+## Current Sprint — E9: Peer Discovery Injection + QoS Expansion
+
+See `EPICS.md` E9 for the rationale. Two tasks: T9.1 lands the runner
+changes (new contract surface), T9.2 migrates the QUIC variant to consume
+the new `--peers` arg and `--qos` per-spawn.
+
+### T9.1: Runner — peer source IP capture, --peers injection, qos expansion
+
+**Repo**: `runner/`
+**Status**: pending
+**Depends on**: contract updates in `metak-shared/api-contracts/` (already
+landed: `runner-coordination.md` Phase 1 changes, `variant-cli.md`
+`--peers` and `--qos` semantics, `toml-config-schema.md` qos optional/list
+form + `<name>-qosN` expansion).
+
+Bundles two coupled runner changes. They share spawn-construction code, so
+it's cheaper to land them in one task than to land peer-injection and then
+re-touch the same call sites for qos-expansion.
+
+#### Part A — Peer source IP capture and --peers injection
+
+Scope:
+1. In `src/protocol.rs` discovery loop: switch from `recv` to `recv_from` so
+   the source `SocketAddr` is available. Store `peer_hosts: HashMap<String, String>`
+   on the `Coordinator` keyed by runner name; populate as `Discover` messages
+   arrive.
+2. New helper `src/local_addrs.rs`:
+   - `pub fn local_interface_ips() -> HashSet<IpAddr>` — enumerate this
+     machine's interface addresses. Use the `local-ip-address` crate
+     (`list_afinet_netifas`) or `if-addrs`. Always include `127.0.0.1`.
+   - Cache on first call.
+3. Same-host detection: when storing a peer host, if the captured source IP
+   is in `local_interface_ips()` OR equals `127.0.0.1`, store the string
+   `"127.0.0.1"`. Otherwise store the source IP's string form.
+4. Discovery completion criterion (in addition to existing checks): every
+   name in `runners` has an entry in `peer_hosts`. Single-runner mode:
+   self-populate with `127.0.0.1` and complete immediately.
+5. Pass `peer_hosts` from `Coordinator` through to the spawn call site in
+   `src/main.rs`. Format as `--peers name1=host1,name2=host2,...` (sorted by
+   name for determinism). Inject in `src/cli_args.rs::build_variant_args`
+   alongside the existing `--launch-ts`/`--variant`/`--runner`/`--run`.
+6. Add Cargo dependency: `local-ip-address = "0.6"` (or `if-addrs = "0.13"`
+   if preferred — pick one and document the choice in CUSTOM.md).
+
+Tests:
+- Unit: `local_interface_ips()` returns a non-empty set including
+  `127.0.0.1`.
+- Unit: same-host classifier correctly maps a local IP and a `127.0.0.1`
+  source to `"127.0.0.1"`, and an arbitrary `192.168.x.y` to itself.
+- Unit: `build_variant_args` includes `--peers` with sorted name=host pairs
+  given a populated map.
+- Integration (extend existing two-coordinator-on-localhost test in
+  `tests/integration.rs`): after discovery, verify each coordinator's
+  `peer_hosts` map contains every expected name and every value is
+  `"127.0.0.1"` (since both run on the same host).
+- Integration: end-to-end single-runner lifecycle with `variant-dummy` —
+  verify the variant is invoked with a `--peers <self>=127.0.0.1` argument
+  even though there are no peers.
+
+#### Part B — qos expansion
+
+Scope:
+1. In `src/config.rs`: change `[variant.common].qos` field from `u8` to a
+   custom enum/typed-form that accepts integer, array, or omission. Suggest:
+   `pub enum QosSpec { Single(u8), Multi(Vec<u8>), All }` with a serde
+   helper that maps `qos = N → Single(N)`, `qos = [..] → Multi(..)`,
+   missing key → `All`. Validate elements are 1..=4.
+2. New helper `pub fn QosSpec::levels(&self) -> Vec<u8>`:
+   - `Single(n)` → `vec![n]`
+   - `Multi(v)` → sorted unique copy of `v`
+   - `All` → `vec![1, 2, 3, 4]`
+3. In the main loop (`src/main.rs`), expand each `[[variant]]` entry by
+   `qos_spec.levels()` into one or more "spawn jobs". A spawn job carries:
+   - `effective_name`: original `name` if `levels.len() == 1`, otherwise
+     `format!("{}-qos{}", name, qos)`.
+   - `qos`: the concrete level for this spawn.
+   - All other fields (binary, timeouts, common minus qos, specific) shared
+     from the source entry.
+4. Ready/done barriers and timeouts use `effective_name`. Each spawn is
+   independent and runs the full stabilize/operate/silent cycle.
+5. CLI arg construction in `src/cli_args.rs`: when building args for a spawn
+   job, override `--qos` with the job's concrete level (so `[variant.common]`
+   no longer needs to carry it as an integer) and use `effective_name` as
+   `--variant`.
+6. Sequential execution: spawn jobs from one source `[[variant]]` entry run
+   in ascending QoS order before moving on to the next entry. Insert a small
+   inter-job grace period (e.g. 250 ms) to let TCP/UDP sockets fully release
+   before the next QoS spawn binds the same `base_port + qos_stride` port.
+   Make this configurable via top-level `inter_qos_grace_ms` (optional,
+   default 250).
+
+Tests:
+- Unit: `QosSpec` deserialization for all three forms (integer, array,
+  omitted).
+- Unit: `QosSpec::levels()` produces expected vectors; `Multi([3, 1, 1, 4])`
+  → `[1, 3, 4]` (sorted unique).
+- Unit: spawn-job expansion: a fixture with one entry having `qos = [1, 3]`
+  produces 2 jobs with `effective_name` = `<name>-qos1` and `<name>-qos3`,
+  both with the original `binary` and remaining common fields.
+- Unit: a fixture with `qos = 2` (single integer) produces 1 job with
+  unchanged `effective_name`.
+- Unit: a fixture with `qos` omitted produces 4 jobs.
+- Integration: build a single-runner config with `qos = [1, 2]` against
+  `variant-dummy`, run end-to-end, verify two JSONL log files are
+  produced (one per qos), each with the expected `qos` field in records.
+
+#### Part C — Wiring + docs
+
+1. Update `runner/CUSTOM.md` (orchestrator does this part — see below).
+   Worker should re-read it after orchestrator updates and follow the
+   guidance.
+2. Update `runner/STRUCT.md` to reflect new `local_addrs.rs` module.
+
+#### Validation against reality
+
+- Run `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`
+  clean.
+- Run `runner --name local --config <config-with-qos-omitted>` against a
+  config that uses `variant-dummy` with `qos` omitted, and verify 4 log
+  files appear with the correct `-qosN` naming.
+- Run two runner instances on localhost in two terminals against the same
+  config; verify both progress through all per-qos spawns in lockstep and
+  both peer maps contain `"127.0.0.1"` for each peer.
+
+#### Acceptance criteria
+
+- [ ] `Coordinator` captures peer source IPs into `peer_hosts`
+- [ ] Same-host detection collapses local-interface IPs and `127.0.0.1`
+      sources to `"127.0.0.1"`
+- [ ] `--peers <sorted name=host pairs>` injected into every variant spawn
+- [ ] `QosSpec` accepts integer, array, or omitted; validation rejects
+      out-of-range values
+- [ ] Spawn-job expansion produces one job per QoS level; single-level
+      keeps the original variant name
+- [ ] Effective spawn name `<name>-qosN` used for `--variant`, ready/done
+      barriers, log files
+- [ ] Inter-job grace period applied between consecutive QoS spawns
+- [ ] All unit tests for the new logic pass
+- [ ] Integration test with `qos = [1, 2]` produces 2 distinct log files
+- [ ] Two-runner-on-localhost integration still passes
+- [ ] `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` clean
+- [ ] STATUS.md updated
+
+---
+
+### T9.2: QUIC variant — consume --peers, derive ports from base_port
+
+**Repo**: `variants/quic/`
+**Status**: pending
+**Depends on**: T9.1 (needs the runner to inject `--peers` and pass `--qos`
+per spawn).
+
+Migrate the QUIC variant from explicit `bind_addr` and `peers` config
+fields to a single `base_port` config field, with bind/connect addresses
+derived at runtime from the runner-injected `--peers` and `--runner` args
+plus the per-spawn `--qos`.
+
+Scope:
+1. CLI parsing (likely in `src/main.rs` or wherever QUIC's specific args
+   are parsed): replace `--bind-addr` and `--peers` (the old variant-
+   specific peers) with `--base-port <u16>`. Continue to accept the
+   runner-injected `--peers <name=host,...>` (string).
+2. Identity resolution: parse `--peers`, look up `--runner` to find
+   `runner_index` (0-based, sorted by name). Treat any peer with the same
+   name as self as the local entry. Fail loudly if `--runner` not in
+   `--peers`.
+3. Port derivation:
+   - `runner_stride = 1`, `qos_stride = 10` (constants in code, documented
+     in CUSTOM.md as matching the convention in `toml-config-schema.md`).
+   - `my_bind_port = base_port + runner_index * runner_stride + (qos - 1) * qos_stride`
+   - For each peer (excluding self): `peer_port = base_port + peer_index * runner_stride + (qos - 1) * qos_stride`
+   - Bind on `0.0.0.0:my_bind_port`; connect to `<peer_host>:peer_port` for
+     every other peer.
+4. Update `quic.rs` connect logic accordingly. Remove any code that depends
+   on the old `--bind-addr` or variant-specific `--peers`.
+5. Update `variants/quic/CUSTOM.md` to document `base_port` config and the
+   port-derivation rules. Orchestrator will draft this — worker should
+   re-read after the orchestrator commits the update.
+6. Update the QUIC entries in `configs/two-runner-all-variants.toml`:
+   - Remove `bind_addr` and `peers`.
+   - Add `base_port = 19930`.
+   - Drop the explicit `qos = 3` to let the runner expand to all 4 levels
+     (the all-variants config is meant to be comprehensive). If the user
+     wants only a subset, they can use `qos = [3]` form.
+   - Keep the rest unchanged.
+
+Tests:
+- Unit: identity resolution from `--peers alice=127.0.0.1,bob=127.0.0.1`
+  with `--runner alice` returns index 0; `--runner bob` returns index 1.
+- Unit: port derivation with `base_port=19930`, `runner_index=1`, `qos=3`
+  returns `19930 + 1 + 20 = 19951`.
+- Unit: `--runner` not in `--peers` returns a clear error.
+- Loopback integration test: update the existing `tests/loopback.rs` to use
+  the new CLI shape (synthesize `--peers self=127.0.0.1`, `--runner self`,
+  `--base-port <free>`, `--qos 1` etc.). Verify the variant binds, connects
+  to itself, and exchanges a message.
+
+#### Validation against reality
+
+- Run `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`
+  clean.
+- Build the runner from T9.1 and the new QUIC binary. Run the updated
+  `configs/two-runner-all-variants.toml` for QUIC entries only (e.g. comment
+  out the others or use a small QUIC-only test config) on a single machine
+  with two runners. Verify both runners cycle through QoS levels 1-4 and
+  produce 8 JSONL log files (4 per runner).
+- Spot-check a generated log file to confirm `qos` field matches the spawn
+  name suffix.
+
+#### Acceptance criteria
+
+- [ ] QUIC `[variant.specific]` reduced to `base_port` (no `bind_addr`, no
+      `peers` field)
+- [ ] Runner-injected `--peers` parsed; `--runner` resolved to an index
+- [ ] Bind/connect ports computed per the convention; off-by-one errors
+      checked
+- [ ] Same-host loopback test still passes with new CLI shape
+- [ ] `configs/two-runner-all-variants.toml` QUIC entries updated to
+      `base_port`-only with no explicit `qos`
+- [ ] Two-runner end-to-end QUIC run produces correctly-named per-QoS
+      JSONL files
+- [ ] `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` clean
+- [ ] STATUS.md updated
+
+---
+
+### T9.3: Hybrid variant — consume --peers, derive TCP ports from tcp_base_port
+
+**Repo**: `variants/hybrid/`
+**Status**: pending
+**Depends on**: T9.1 (runner injects `--peers` and `--qos` per spawn).
+
+Same migration shape as T9.2 (QUIC), applied to the Hybrid variant. Hybrid
+currently takes an explicit `peers = "host:port,..."` field in TOML, which
+breaks any inter-machine run (peer IPs hard-coded as `127.0.0.1`). With
+T9.1 landed, the runner already injects `--peers <name=host,...>`; Hybrid
+just needs to consume it and derive its own TCP ports.
+
+UDP multicast is left as-is — same group on every runner, no QoS stride
+needed (sequential per-spawn execution + `silent_secs` drain +
+`inter_qos_grace_ms` provide cross-spawn isolation, and multicast doesn't
+have TIME_WAIT). Only TCP gets per-runner / per-qos port derivation.
+
+Scope:
+1. CLI parsing (`src/hybrid.rs::HybridConfig::from_extra_args` and/or
+   `src/main.rs`):
+   - Remove `--bind-addr` and the variant-specific `--peers` (the
+     comma-separated `host:port` list).
+   - Keep `--multicast-group` and `--tcp-base-port`.
+   - Parse the runner-injected `--peers <name=host,...>` from extra args.
+2. Identity resolution: parse `--peers`, look up `--runner` to find
+   `runner_index` (0-based, sorted by name). Fail loudly if `--runner`
+   is not in `--peers`.
+3. Port derivation (constants in code, mirror QUIC convention):
+   - `runner_stride = 1`, `qos_stride = 10`
+   - `my_tcp_listen = tcp_base_port + runner_index * runner_stride + (qos - 1) * qos_stride`
+   - For each non-self peer:
+     `peer_tcp_port = tcp_base_port + peer_index * runner_stride + (qos - 1) * qos_stride`
+   - Bind TCP listener on `0.0.0.0:my_tcp_listen`. Connect to
+     `(peer_host, peer_tcp_port)` for every peer except self.
+4. UDP multicast: bind on `multicast_group` directly (no stride). All
+   runners share the group.
+5. Remove the now-dead `Cargo.toml` `mdns-sd` dependency if it's still
+   listed (no `discovery.rs` exists, but the dep may be hanging on).
+6. Update `variants/hybrid/CUSTOM.md` reference to `discovery.rs` if any
+   linger — orchestrator already cleaned the main spec, but worker should
+   re-read after orchestrator commits and align if needed.
+7. Update the Hybrid entries in `configs/two-runner-all-variants.toml`:
+   - Remove `peers` lines.
+   - Drop the explicit `qos = 2` so the runner expands to all 4 levels
+     (the all-variants config is meant to be comprehensive — and Hybrid
+     is exactly the variant where comparing UDP-path QoS 1-2 vs TCP-path
+     QoS 3-4 is most interesting).
+   - Keep `multicast_group` and `tcp_base_port`.
+
+Tests:
+- Unit: identity resolution from `--peers alice=127.0.0.1,bob=127.0.0.1`
+  with `--runner alice` returns index 0; `--runner bob` returns index 1.
+- Unit: port derivation with `tcp_base_port=19900`, `runner_index=1`,
+  `qos=4` returns `19900 + 1 + 30 = 19931`.
+- Unit: `--runner` not in `--peers` returns a clear error.
+- Existing integration test: update to the new CLI shape with
+  `--peers self=127.0.0.1`, `--runner self`, `--qos <1..4>`. With a
+  single-peer map there are no peers to connect to (self excluded by
+  design); the test now exercises bind/listen + message framing only.
+  Cross-peer flow is covered by the manual two-runner validation below.
+
+Validation against reality:
+- Run `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`
+  clean.
+- Use a small Hybrid-only test fixture (or temporarily comment out the
+  non-Hybrid entries in `two-runner-all-variants.toml`) and run two
+  runners on localhost in two terminals.
+- Verify both runners cycle through all 4 QoS levels and produce 8 JSONL
+  log files (4 per runner, named e.g. `hybrid-1000x100hz-qos1...`
+  through `...-qos4...`).
+- Spot-check at least one QoS 1-2 file (UDP path) and one QoS 3-4 file
+  (TCP path) to confirm the `qos` field matches the spawn-name suffix
+  and that records are present (i.e. cross-runner delivery worked on both
+  transport paths).
+
+Acceptance criteria:
+- [ ] Hybrid `[variant.specific]` reduced to `multicast_group` + `tcp_base_port`
+      (no `peers`, no `bind_addr`)
+- [ ] Runner-injected `--peers` parsed; `--runner` resolved to an index
+- [ ] TCP bind/connect ports computed per the convention; off-by-one
+      errors checked
+- [ ] UDP multicast still binds the configured group with no stride
+- [ ] Loopback test passes with new CLI shape
+- [ ] `mdns-sd` dependency removed from `Cargo.toml` if present
+- [ ] `configs/two-runner-all-variants.toml` Hybrid entries updated:
+      `peers` removed, `qos` removed
+- [ ] Two-runner end-to-end Hybrid run produces correctly-named per-QoS
+      JSONL files; both UDP and TCP paths verified
+- [ ] `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` clean
+- [ ] STATUS.md updated
+
+---
+
+## Previous Sprint — E8: Application-Level Clock Synchronization
 
 Cross-machine latency cannot be measured without correcting for clock skew
 between runner machines. See `metak-shared/api-contracts/clock-sync.md`

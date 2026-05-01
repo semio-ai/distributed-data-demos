@@ -21,6 +21,8 @@ CLI arguments, monitors for exit (or timeout), and records the result.
   - `chrono` — RFC 3339 timestamps for `--launch-ts`
   - `anyhow` — error handling
   - `socket2` — UDP broadcast socket configuration
+  - `local-ip-address` — enumerate local interface IPs for same-host
+    detection during peer capture (added in E9)
 - **Do NOT depend on `variant-base`**. The runner knows nothing about variant
   internals. It treats variants as opaque child processes. The interface is
   defined by the CLI contract and the TOML config.
@@ -117,3 +119,55 @@ When a variant exceeds its timeout:
 2. Wait briefly (1-2 seconds) for graceful shutdown
 3. Send SIGKILL if still alive
 4. Record status as "timeout" in the done barrier
+
+### Peer host capture (E9 Part A)
+
+The discovery loop must use `recv_from` so the source `SocketAddr` of every
+inbound `Discover` message is available. The runner stores
+`peer_hosts: HashMap<String, String>` keyed by runner name and populated
+during Phase 1.
+
+Same-host classification: a captured source IP that is in this machine's
+local interface set OR is `127.0.0.1` is stored as the literal string
+`"127.0.0.1"`. Anything else is stored as the source IP's `to_string()`
+form. Local interface enumeration lives in `src/local_addrs.rs`
+(`local_interface_ips() -> HashSet<IpAddr>`, cached on first call).
+
+Discovery completes only when every name in `runners` has an entry in
+`peer_hosts`. Single-runner mode self-populates with `127.0.0.1`.
+
+The map is then injected into every variant spawn as
+`--peers <name1>=<host1>,<name2>=<host2>,...` (sorted by name for
+determinism). See `metak-shared/api-contracts/variant-cli.md`.
+
+### QoS expansion (E9 Part B)
+
+`[variant.common].qos` is now optional and may also be an array. Parse it
+via a `QosSpec` enum:
+
+```rust
+enum QosSpec {
+    Single(u8),     // qos = N
+    Multi(Vec<u8>), // qos = [..]
+    All,            // qos omitted
+}
+```
+
+`QosSpec::levels()` returns the concrete QoS levels to run, in ascending
+order, deduplicated. `All` expands to `[1, 2, 3, 4]`.
+
+The main loop expands each `[[variant]]` entry into one or more "spawn
+jobs". Each job has a synthesized `effective_name`: the original `name`
+when there's only one level, or `<name>-qosN` when there are multiple.
+The job's `--variant` arg, ready/done barrier identifier, and JSONL log
+filename all use `effective_name`.
+
+Spawn jobs from one source entry run sequentially in ascending QoS order
+with a small inter-job grace period (default 250 ms, configurable via
+top-level `inter_qos_grace_ms`) to let TCP/UDP sockets release before the
+next QoS spawn binds the same port. Then move on to the next source entry.
+
+The runner does NOT manipulate ports inside `[variant.specific]`. Variants
+that need QoS-disjoint ports use the `base_port + runner_index * runner_stride + (qos - 1) * qos_stride`
+convention documented in `metak-shared/api-contracts/toml-config-schema.md`,
+which they compute themselves from `--peers`, `--runner`, and `--qos`.

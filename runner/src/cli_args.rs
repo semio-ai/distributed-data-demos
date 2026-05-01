@@ -1,4 +1,5 @@
 use crate::config::VariantConfig;
+use std::collections::HashMap;
 
 /// Convert a snake_case key to --kebab-case CLI argument.
 fn to_kebab_flag(key: &str) -> String {
@@ -16,22 +17,53 @@ pub(crate) fn toml_value_to_string(val: &toml::Value) -> String {
     }
 }
 
+/// Format the `--peers` argument value: comma-separated `name=host` pairs,
+/// sorted by name for determinism.
+pub fn format_peers_arg(peer_hosts: &HashMap<String, String>) -> String {
+    let mut entries: Vec<(&String, &String)> = peer_hosts.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+        .into_iter()
+        .map(|(name, host)| format!("{name}={host}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Build the complete CLI argument vector for spawning a variant process.
 ///
-/// Order: common args, specific args, runner-injected args.
-/// This matches the variant-cli.md contract:
-///   <binary> [common args...] [specific args...] --launch-ts <ts> --variant <v> --runner <r> --run <id>
+/// Order: common args, runner-injected args, then specific args after `--`.
+/// This matches the variant-cli.md contract.
+///
+/// `effective_variant_name` is the value passed via `--variant`; it differs
+/// from `variant.name` when QoS expansion synthesizes a `<name>-qosN` name.
+/// `effective_qos` is the concrete QoS level for this spawn; it overrides
+/// the `qos` value in `[variant.common]` (which may be a list or omitted).
+///
+/// `peer_hosts` is the discovery-time map of runner names to host strings
+/// (with same-host peers collapsed to `127.0.0.1`). Always emitted, even
+/// in single-runner mode (the map will contain only this runner).
+#[allow(clippy::too_many_arguments)]
 pub fn build_variant_args(
     variant: &VariantConfig,
     run: &str,
     runner_name: &str,
     launch_ts: &str,
     log_dir_override: Option<&str>,
+    effective_variant_name: &str,
+    effective_qos: u8,
+    peer_hosts: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut args = Vec::new();
 
-    // Common args from [variant.common] table.
+    // Common args from [variant.common] table. Two keys get special handling:
+    //   - log_dir: replaced with log_dir_override if provided.
+    //   - qos: skipped here -- the runner-injected --qos below carries the
+    //     concrete per-spawn level (overrides any common qos which may be a
+    //     list, omitted, or any single integer).
     for (key, val) in &variant.common {
+        if key == "qos" {
+            continue;
+        }
         args.push(to_kebab_flag(key));
         if key == "log_dir" {
             if let Some(override_val) = log_dir_override {
@@ -44,17 +76,23 @@ pub fn build_variant_args(
         }
     }
 
+    // Runner-injected --qos with the per-spawn concrete level.
+    args.push("--qos".to_string());
+    args.push(effective_qos.to_string());
+
     // Runner-injected args (before specific args, because specific args
     // are passed as trailing args after `--` and clap would absorb
     // runner-injected args if they came after unknown specific args).
     args.push("--launch-ts".to_string());
     args.push(launch_ts.to_string());
     args.push("--variant".to_string());
-    args.push(variant.name.clone());
+    args.push(effective_variant_name.to_string());
     args.push("--runner".to_string());
     args.push(runner_name.to_string());
     args.push("--run".to_string());
     args.push(run.to_string());
+    args.push("--peers".to_string());
+    args.push(format_peers_arg(peer_hosts));
 
     // Specific args from [variant.specific] table (if present).
     // Separated by `--` so clap treats them as trailing/extra args.
@@ -120,14 +158,30 @@ timeout_secs = 30
             "hello"
         );
         assert_eq!(toml_value_to_string(&toml::Value::Boolean(true)), "true");
-        assert_eq!(toml_value_to_string(&toml::Value::Float(3.14)), "3.14");
+        assert_eq!(toml_value_to_string(&toml::Value::Float(2.5)), "2.5");
+    }
+
+    fn empty_peers() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("a".into(), "127.0.0.1".into());
+        m
     }
 
     #[test]
     fn build_args_includes_all_sections() {
         let config = sample_config();
         let v = &config.variant[0];
-        let args = build_variant_args(v, "run01", "a", "2025-01-01T00:00:00Z", None);
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "zenoh-replication",
+            2,
+            &peers,
+        );
 
         // Common args should be present as --kebab-case.
         assert!(args.contains(&"--tick-rate-hz".to_string()));
@@ -152,30 +206,37 @@ timeout_secs = 30
         let variant_idx = args.iter().position(|a| a == "--variant").unwrap();
         let runner_idx = args.iter().position(|a| a == "--runner").unwrap();
         let run_idx = args.iter().position(|a| a == "--run").unwrap();
+        let peers_idx = args.iter().position(|a| a == "--peers").unwrap();
 
         // Injected args come after common and specific.
         assert!(launch_idx > 0);
         assert!(variant_idx > launch_idx);
         assert!(runner_idx > variant_idx);
         assert!(run_idx > runner_idx);
+        assert!(peers_idx > run_idx);
 
         // Verify injected values.
         assert_eq!(args[launch_idx + 1], "2025-01-01T00:00:00Z");
         assert_eq!(args[variant_idx + 1], "zenoh-replication");
         assert_eq!(args[runner_idx + 1], "a");
         assert_eq!(args[run_idx + 1], "run01");
+        assert_eq!(args[peers_idx + 1], "a=127.0.0.1");
     }
 
     #[test]
     fn build_args_log_dir_override() {
         let config = sample_config();
         let v = &config.variant[0];
+        let peers = empty_peers();
         let args = build_variant_args(
             v,
             "run01",
             "a",
             "2025-01-01T00:00:00Z",
             Some("./logs/run01-20260415_143022"),
+            "zenoh-replication",
+            2,
+            &peers,
         );
 
         // --log-dir should use the override value, not the config value.
@@ -202,15 +263,97 @@ binary = "./simple"
 "#;
         let config: BenchConfig = toml::from_str(toml_str).unwrap();
         let v = &config.variant[0];
-        let args = build_variant_args(v, "run01", "a", "2025-01-01T00:00:00Z", None);
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "simple",
+            1,
+            &peers,
+        );
 
         // Should still have common args and injected args, no specific section.
         assert!(args.contains(&"--tick-rate-hz".to_string()));
         assert!(args.contains(&"--launch-ts".to_string()));
         assert!(args.contains(&"--variant".to_string()));
+        assert!(args.contains(&"--peers".to_string()));
         assert_eq!(
             args.iter().position(|a| a == "--variant").unwrap() + 1,
             args.iter().position(|a| a == "simple").unwrap()
         );
+    }
+
+    #[test]
+    fn build_args_uses_effective_variant_name_and_qos() {
+        // When QoS expansion synthesizes a name like "v-qos3", build_variant_args
+        // must use it for --variant and override --qos.
+        let config = sample_config();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "zenoh-replication-qos3",
+            3,
+            &peers,
+        );
+
+        let variant_idx = args.iter().position(|a| a == "--variant").unwrap();
+        assert_eq!(args[variant_idx + 1], "zenoh-replication-qos3");
+
+        // --qos should appear exactly once (the runner-injected one with value 3),
+        // not the common-section value of 2.
+        let qos_indices: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--qos")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(qos_indices.len(), 1, "--qos should appear exactly once");
+        assert_eq!(args[qos_indices[0] + 1], "3");
+    }
+
+    #[test]
+    fn format_peers_arg_sorts_by_name() {
+        let mut peers = HashMap::new();
+        peers.insert("charlie".into(), "127.0.0.1".into());
+        peers.insert("alice".into(), "192.168.1.10".into());
+        peers.insert("bob".into(), "127.0.0.1".into());
+        let s = format_peers_arg(&peers);
+        assert_eq!(s, "alice=192.168.1.10,bob=127.0.0.1,charlie=127.0.0.1");
+    }
+
+    #[test]
+    fn format_peers_arg_single_entry() {
+        let mut peers = HashMap::new();
+        peers.insert("solo".into(), "127.0.0.1".into());
+        assert_eq!(format_peers_arg(&peers), "solo=127.0.0.1");
+    }
+
+    #[test]
+    fn build_args_includes_peers_pairs_sorted() {
+        let config = sample_config();
+        let v = &config.variant[0];
+        let mut peers = HashMap::new();
+        peers.insert("zeta".into(), "192.168.1.20".into());
+        peers.insert("alpha".into(), "127.0.0.1".into());
+        let args = build_variant_args(
+            v,
+            "run01",
+            "alpha",
+            "2025-01-01T00:00:00Z",
+            None,
+            "zenoh-replication",
+            1,
+            &peers,
+        );
+        let peers_idx = args.iter().position(|a| a == "--peers").unwrap();
+        assert_eq!(args[peers_idx + 1], "alpha=127.0.0.1,zeta=192.168.1.20");
     }
 }

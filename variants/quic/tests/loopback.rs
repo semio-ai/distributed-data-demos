@@ -1,14 +1,22 @@
 // Integration tests for variant-quic.
 // Since variant-quic is a binary crate, we test via subprocess.
 
-/// Helper: run the variant-quic binary with loopback args and verify it exits 0.
+/// Helper: run the variant-quic binary with the new CLI shape (--peers /
+/// --runner / --base-port) for a single self-only peer, and verify it
+/// exits 0 and produces a log file.
+///
+/// With the new identity-based peer model, a single-runner variant has no
+/// other peers to connect to (self is excluded), so this exercises the
+/// binding/lifecycle path but not bidirectional message flow.
 #[test]
 fn test_binary_loopback_exits_successfully() {
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let log_dir = tmp_dir.path().to_str().unwrap();
 
-    // Build the binary path. cargo test sets OUT_DIR but we can use env.
     let binary = env!("CARGO_BIN_EXE_variant-quic");
+
+    // Pick a high base port unlikely to collide.
+    let base_port = "19440";
 
     let status = std::process::Command::new(binary)
         .args([
@@ -33,10 +41,15 @@ fn test_binary_loopback_exits_successfully() {
             "--variant",
             "quic",
             "--runner",
-            "a",
+            "self",
             "--run",
-            "run01",
-            // No --peers: variant runs with no peers, publishes but nothing to receive.
+            "loopback01",
+            // Runner-injected --peers (synthesized for the test).
+            "--peers",
+            "self=127.0.0.1",
+            "--",
+            "--base-port",
+            base_port,
         ])
         .status()
         .expect("failed to run variant-quic");
@@ -57,31 +70,23 @@ fn test_binary_loopback_exits_successfully() {
     );
 }
 
-/// Test the variant-quic binary with loopback: connect to self, publish, receive.
-///
-/// This test starts a variant-quic with --peers pointing to its own address.
-/// The variant connects to itself, publishes messages, and should receive them back.
+/// Verify the variant fails fast and clearly when --runner is not present
+/// in --peers (a runner/contract bug).
 #[test]
-fn test_binary_self_connect_loopback() {
+fn test_binary_runner_not_in_peers_fails() {
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let log_dir = tmp_dir.path().to_str().unwrap();
 
     let binary = env!("CARGO_BIN_EXE_variant-quic");
 
-    // Bind to a specific port so we can connect to ourselves.
-    // Use port 0 for binding -- we need to discover the actual port.
-    // Since we cannot easily discover the port from outside, we bind to a fixed port.
-    // Pick a high port unlikely to collide.
-    let bind_addr = "127.0.0.1:19443";
-
-    let status = std::process::Command::new(binary)
+    let output = std::process::Command::new(binary)
         .args([
             "--tick-rate-hz",
             "10",
             "--stabilize-secs",
-            "1",
+            "0",
             "--operate-secs",
-            "2",
+            "1",
             "--silent-secs",
             "1",
             "--workload",
@@ -89,7 +94,7 @@ fn test_binary_self_connect_loopback() {
             "--values-per-tick",
             "1",
             "--qos",
-            "3", // Reliable: use streams
+            "1",
             "--log-dir",
             log_dir,
             "--launch-ts",
@@ -97,38 +102,77 @@ fn test_binary_self_connect_loopback() {
             "--variant",
             "quic",
             "--runner",
-            "self-test",
+            "carol",
             "--run",
-            "loopback01",
-            "--",
-            "--bind-addr",
-            bind_addr,
+            "missing01",
             "--peers",
-            bind_addr,
+            "alice=127.0.0.1,bob=127.0.0.1",
+            "--",
+            "--base-port",
+            "19450",
         ])
-        .status()
+        .output()
         .expect("failed to run variant-quic");
 
     assert!(
-        status.success(),
-        "variant-quic self-connect exited with status: {status}"
+        !output.status.success(),
+        "expected variant-quic to fail when runner is not in --peers"
     );
-
-    // Read the log file and verify we have both write and receive entries.
-    let log_file = std::fs::read_dir(tmp_dir.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .find(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-        .expect("no JSONL log file found");
-
-    let content = std::fs::read_to_string(log_file.path()).unwrap();
-    let has_write = content.lines().any(|line| line.contains("\"write\""));
-    let has_receive = content.lines().any(|line| line.contains("\"receive\""));
-
-    assert!(has_write, "expected write entries in log");
-    // In self-connect mode, we should receive our own messages.
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        has_receive,
-        "expected receive entries in log for self-connect"
+        stderr.contains("carol") && stderr.contains("not present"),
+        "expected clear error mentioning the missing runner; stderr was: {stderr}"
+    );
+}
+
+/// Verify the variant fails when --base-port is missing from variant-specific args.
+#[test]
+fn test_binary_missing_base_port_fails() {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let log_dir = tmp_dir.path().to_str().unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_variant-quic");
+
+    let output = std::process::Command::new(binary)
+        .args([
+            "--tick-rate-hz",
+            "10",
+            "--stabilize-secs",
+            "0",
+            "--operate-secs",
+            "1",
+            "--silent-secs",
+            "1",
+            "--workload",
+            "scalar-flood",
+            "--values-per-tick",
+            "1",
+            "--qos",
+            "1",
+            "--log-dir",
+            log_dir,
+            "--launch-ts",
+            "2026-04-12T14:00:00.000000000Z",
+            "--variant",
+            "quic",
+            "--runner",
+            "self",
+            "--run",
+            "missing02",
+            "--peers",
+            "self=127.0.0.1",
+            // No --base-port.
+        ])
+        .output()
+        .expect("failed to run variant-quic");
+
+    assert!(
+        !output.status.success(),
+        "expected variant-quic to fail when --base-port is missing"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("base-port"),
+        "expected error mentioning base-port; stderr was: {stderr}"
     );
 }

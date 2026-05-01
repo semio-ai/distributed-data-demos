@@ -1,0 +1,26 @@
+# QUIC-only two-runner test config used for T9.2 manual validation.
+# Short timings; QoS omitted so the runner expands to all 4 levels.
+#
+# Run from the repo root with two terminals:
+#   runner/target/release/runner --name alice --config variants/quic/tests/fixtures/two-runner-quic-only.toml
+#   runner/target/release/runner --name bob   --config variants/quic/tests/fixtures/two-runner-quic-only.toml
+
+run = "quic-t92-validation"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "quic-1000x100hz"
+binary = "variants/quic/target/release/variant-quic.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 3
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 100
+  log_dir = "./logs-t92"
+
+  [variant.specific]
+  base_port = 19930

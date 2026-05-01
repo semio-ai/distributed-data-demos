@@ -35,7 +35,7 @@ timeout_secs = <integer>                # optional, overrides default_timeout_se
   silent_secs = <integer>               # silent/drain phase duration
   workload = "<string>"                 # workload profile name
   values_per_tick = <integer>           # writes per tick
-  qos = <integer>                       # QoS level (1-4)
+  qos = <integer | array | omitted>     # QoS level(s) — see "QoS Expansion"
   log_dir = "<path>"                    # directory for JSONL output
 
   # Variant-specific options — only this implementation uses these.
@@ -75,7 +75,7 @@ converts `snake_case` keys to `--kebab-case` args.
 | `silent_secs` | yes | integer | Silent phase duration |
 | `workload` | yes | string | Workload profile name |
 | `values_per_tick` | yes | integer | Values written per tick |
-| `qos` | yes | integer | QoS level (1-4) |
+| `qos` | no | integer OR array of integers (1-4) | If omitted, the runner expands the entry into 4 spawn invocations (qos 1, 2, 3, 4). If an array (e.g. `qos = [1, 3]`), the runner expands into one spawn per listed level. If an integer, behaves as before — one spawn at that level. See "QoS Expansion" below. |
 | `log_dir` | yes | string | JSONL output directory |
 
 ### `[variant.specific]`
@@ -85,6 +85,31 @@ args. Examples:
 
 - Zenoh: `zenoh_mode`, `zenoh_listen`
 - Custom UDP: `buffer_size`, `multicast_group`
+- QUIC: `base_port` (single integer; bind/connect ports are derived by the
+  variant from `--peers` + `--runner` + `--qos` per the port-stride rules
+  below)
+
+#### Port stride and QoS expansion
+
+When a variant entry has multiple QoS levels (omitted or array form) AND a
+variant binds ports that must not collide across consecutive QoS runs, the
+runner sequentially executes one full stabilize/operate/silent cycle per QoS
+level. Port reuse across cycles is generally safe (the prior child has
+exited), but variants that hold TCP listeners with TIME_WAIT-prone ports
+may collide.
+
+Convention for variants that need QoS-disjoint ports:
+- The variant's `[variant.specific]` section provides a single `base_port`
+  integer.
+- The variant computes `effective_port = base_port + (runner_index * runner_stride) + ((qos - 1) * qos_stride)`
+  where `runner_stride` defaults to 1 and `qos_stride` defaults to 10
+  (chosen to keep dimensions disjoint with up to 10 runners).
+- The variant determines `runner_index` by looking up `--runner` in `--peers`.
+- The variant determines `qos` from `--qos`.
+
+This convention is variant-implementation-defined — the runner does not
+manipulate ports inside `[variant.specific]`. It only injects `--peers` and
+`--qos` and lets each variant compute what it needs.
 
 ## Validation Rules
 
@@ -93,8 +118,31 @@ args. Examples:
 3. Each `[[variant]]` must have a unique `name`.
 4. `binary` paths should be validated at launch time (runner checks existence
    before discovery).
-5. `qos` must be in range 1-4.
+5. If `qos` is an integer, it must be in range 1-4. If an array, every
+   element must be in range 1-4 and the array must be non-empty. If
+   omitted, the runner treats it as `[1, 2, 3, 4]`.
 6. `timeout_secs` (or `default_timeout_secs`) must be positive.
+
+## QoS Expansion
+
+When a `[[variant]]` entry resolves to more than one QoS level, the runner
+executes one full lifecycle per level — back-to-back, in ascending QoS
+order — under a synthesized name:
+
+- Effective spawn name: `<variant.name>-qos<N>` (e.g. `custom-udp-1000x100hz-qos2`).
+  This is what the runner passes as `--variant` to the spawn AND uses for
+  ready/done barrier identifiers.
+- Each spawn runs the full `stabilize_secs / operate_secs / silent_secs`
+  cycle, gets its own `--launch-ts`, and produces its own JSONL log file.
+- Ready/done barriers happen per spawn, so all runners stay in lockstep
+  per QoS level.
+- The base name (`<variant.name>` without the `-qosN` suffix) and the QoS
+  level are recoverable from log records via `(variant, qos)`. The
+  analysis tool groups by `(variant_base, qos)` for per-variant per-QoS
+  statistics.
+
+Single-QoS entries (integer form) skip the expansion and use the original
+`<variant.name>` as before — backward compatible.
 
 ## Known Deviations
 

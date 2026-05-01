@@ -1,8 +1,10 @@
+use crate::local_addrs::canonical_peer_host;
 use crate::message::Message;
 use anyhow::{bail, Result};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Mutex;
 use std::time::Duration;
 
 const BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
@@ -32,6 +34,12 @@ pub struct Coordinator {
     /// self for unicast fallback). Each runner gets its own port to avoid
     /// Windows same-port delivery issues.
     peer_addrs: Vec<SocketAddr>,
+    /// Peer host strings captured during discovery, keyed by runner name.
+    /// Same-host peers (local interface IP or `127.0.0.1` source) are stored
+    /// as the literal `"127.0.0.1"`. Always contains an entry for this
+    /// runner itself (`127.0.0.1`). Wrapped in a Mutex so `discover()` can
+    /// populate it through a shared reference.
+    peer_hosts: Mutex<HashMap<String, String>>,
     /// Whether this is single-runner mode.
     single_runner: bool,
 }
@@ -88,6 +96,12 @@ impl Coordinator {
             Some(create_coordination_socket(my_port)?)
         };
 
+        // Self-populate the peer_hosts map. Single-runner mode never receives
+        // discovery messages from peers, so this is also the final state.
+        // Multi-runner mode adds peer entries as Discover messages arrive.
+        let mut peer_hosts: HashMap<String, String> = HashMap::new();
+        peer_hosts.insert(name.clone(), "127.0.0.1".to_string());
+
         Ok(Coordinator {
             name,
             expected,
@@ -97,8 +111,18 @@ impl Coordinator {
             proposed_log_subdir: log_subdir,
             socket,
             peer_addrs,
+            peer_hosts: Mutex::new(peer_hosts),
             single_runner,
         })
+    }
+
+    /// Snapshot of the peer host map captured during discovery.
+    ///
+    /// Keys are runner names; values are the canonical host strings used in
+    /// the runner-injected `--peers` CLI argument. Same-host peers appear as
+    /// `"127.0.0.1"`. The local runner is always present.
+    pub fn peer_hosts(&self) -> HashMap<String, String> {
+        self.peer_hosts.lock().unwrap().clone()
     }
 
     /// Run the discovery phase.
@@ -141,7 +165,7 @@ impl Coordinator {
 
             let deadline = std::time::Instant::now() + BROADCAST_INTERVAL;
             while std::time::Instant::now() < deadline {
-                if let Some(received) = self.recv(socket) {
+                if let Some((received, src_ip)) = self.recv_from(socket) {
                     // Accept any message type as proof that a peer exists.
                     // This handles the race where a fast peer has already
                     // moved past discovery and is sending Ready/Done messages.
@@ -170,13 +194,29 @@ impl Coordinator {
                     };
                     if let Some(name) = peer_name {
                         if self.expected.contains(&name) {
-                            seen.insert(name);
+                            seen.insert(name.clone());
+                            // Capture the peer's host. Same-host peers (local
+                            // interface or 127.0.0.1 source) collapse to
+                            // "127.0.0.1". Skip self-loopback echoes -- self
+                            // was pre-populated with "127.0.0.1" at construction.
+                            if name != self.name {
+                                let host = canonical_peer_host(src_ip);
+                                let mut guard = self.peer_hosts.lock().unwrap();
+                                guard.entry(name).or_insert(host);
+                            }
                         }
                     }
                 }
             }
 
-            if seen == self.expected {
+            // Discovery completes only when every expected runner has been
+            // seen AND has an entry in peer_hosts (which is populated above
+            // for peers and at construction for self).
+            let hosts_known = {
+                let guard = self.peer_hosts.lock().unwrap();
+                self.expected.iter().all(|n| guard.contains_key(n))
+            };
+            if seen == self.expected && hosts_known {
                 // Linger: keep broadcasting Discover for 2 more seconds so
                 // slower peers can complete their discovery phase.
                 let linger_end = std::time::Instant::now() + Duration::from_secs(2);
@@ -318,19 +358,33 @@ impl Coordinator {
     /// Try to receive a message from the socket. Returns None on timeout or
     /// parse failure.
     fn recv(&self, socket: &Socket) -> Option<Message> {
+        self.recv_from(socket).map(|(msg, _src)| msg)
+    }
+
+    /// Try to receive a message and the source address from the socket.
+    /// Returns None on timeout, parse failure, or if the source address is
+    /// not an IPv4/IPv6 address.
+    fn recv_from(&self, socket: &Socket) -> Option<(Message, IpAddr)> {
         let mut buf = [std::mem::MaybeUninit::uninit(); MAX_MSG_SIZE];
-        match socket.recv(&mut buf) {
-            Ok(n) => {
-                // SAFETY: socket.recv guarantees the first `n` bytes are initialized.
+        match socket.recv_from(&mut buf) {
+            Ok((n, sock_addr)) => {
+                // SAFETY: socket.recv_from guarantees the first `n` bytes are initialized.
                 let data: Vec<u8> = buf[..n]
                     .iter()
                     .map(|b| unsafe { b.assume_init() })
                     .collect();
-                Message::from_bytes(&data)
+                let msg = Message::from_bytes(&data)?;
+                let src_ip = sockaddr_to_ip(&sock_addr)?;
+                Some((msg, src_ip))
             }
             Err(_) => None,
         }
     }
+}
+
+/// Extract an `IpAddr` from a socket2 `SockAddr`.
+fn sockaddr_to_ip(sa: &SockAddr) -> Option<IpAddr> {
+    sa.as_socket().map(|sock| sock.ip())
 }
 
 /// Create a UDP socket for runner coordination.
@@ -381,6 +435,10 @@ mod tests {
         assert!(coord.single_runner);
         let log_subdir = coord.discover().unwrap();
         assert_eq!(log_subdir, "run01-20260415_120000");
+        // Self-population: peer_hosts contains this runner mapped to 127.0.0.1.
+        let hosts = coord.peer_hosts();
+        assert_eq!(hosts.get("local"), Some(&"127.0.0.1".to_string()));
+        assert_eq!(hosts.len(), 1);
     }
 
     #[test]
@@ -434,9 +492,10 @@ mod tests {
             .unwrap();
 
             let log_subdir = coord.discover().unwrap();
+            let hosts = coord.peer_hosts();
             coord.ready_barrier("v1").unwrap();
             let results = coord.done_barrier("v1", "success", 0).unwrap();
-            (log_subdir, results)
+            (log_subdir, results, hosts)
         });
 
         let hash_b = hash;
@@ -453,13 +512,14 @@ mod tests {
             .unwrap();
 
             let log_subdir = coord.discover().unwrap();
+            let hosts = coord.peer_hosts();
             coord.ready_barrier("v1").unwrap();
             let results = coord.done_barrier("v1", "success", 0).unwrap();
-            (log_subdir, results)
+            (log_subdir, results, hosts)
         });
 
-        let (log_subdir_a, results_a) = thread_a.join().unwrap();
-        let (log_subdir_b, results_b) = thread_b.join().unwrap();
+        let (log_subdir_a, results_a, hosts_a) = thread_a.join().unwrap();
+        let (log_subdir_b, results_b, hosts_b) = thread_b.join().unwrap();
 
         // Both runners must agree on the leader's (runner_a) log subfolder.
         assert_eq!(log_subdir_a, "run-a-20260415_120000");
@@ -469,6 +529,15 @@ mod tests {
         assert_eq!(results_b.len(), 2);
         assert_eq!(results_a.get("runner_a"), Some(&("success".to_string(), 0)));
         assert_eq!(results_a.get("runner_b"), Some(&("success".to_string(), 0)));
+
+        // Peer host capture: both runners must have entries for both names,
+        // and since both ran on the same machine, every host must be 127.0.0.1.
+        assert_eq!(hosts_a.len(), 2, "runner_a should have both peer entries");
+        assert_eq!(hosts_b.len(), 2, "runner_b should have both peer entries");
+        assert_eq!(hosts_a.get("runner_a"), Some(&"127.0.0.1".to_string()));
+        assert_eq!(hosts_a.get("runner_b"), Some(&"127.0.0.1".to_string()));
+        assert_eq!(hosts_b.get("runner_a"), Some(&"127.0.0.1".to_string()));
+        assert_eq!(hosts_b.get("runner_b"), Some(&"127.0.0.1".to_string()));
     }
 
     #[test]

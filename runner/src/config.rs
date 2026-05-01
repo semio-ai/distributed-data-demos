@@ -1,8 +1,64 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
+
+/// Default grace period (ms) inserted between consecutive per-QoS spawn jobs
+/// derived from the same `[[variant]]` entry. Gives sockets time to release
+/// before the next QoS spawn re-binds the same port.
+pub const DEFAULT_INTER_QOS_GRACE_MS: u64 = 250;
+
+/// QoS specification for a `[[variant]]` entry. Accepts an integer, an array
+/// of integers, or omission. Drives spawn-job expansion: each concrete level
+/// produces one spawn invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QosSpec {
+    /// `qos = N` -- a single concrete level.
+    Single(u8),
+    /// `qos = [..]` -- an explicit list of levels.
+    Multi(Vec<u8>),
+    /// `qos` key omitted -- expand to all four levels.
+    All,
+}
+
+impl QosSpec {
+    /// Return the concrete QoS levels to run, in ascending order, deduplicated.
+    pub fn levels(&self) -> Vec<u8> {
+        match self {
+            QosSpec::Single(n) => vec![*n],
+            QosSpec::Multi(v) => {
+                let set: BTreeSet<u8> = v.iter().copied().collect();
+                set.into_iter().collect()
+            }
+            QosSpec::All => vec![1, 2, 3, 4],
+        }
+    }
+
+    /// Validate that all elements are in the 1..=4 range and arrays are non-empty.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            QosSpec::Single(n) => {
+                if !(1..=4).contains(n) {
+                    bail!("qos {n} is out of range (must be 1..=4)");
+                }
+                Ok(())
+            }
+            QosSpec::Multi(v) => {
+                if v.is_empty() {
+                    bail!("qos array must be non-empty");
+                }
+                for n in v {
+                    if !(1..=4).contains(n) {
+                        bail!("qos {n} is out of range (must be 1..=4)");
+                    }
+                }
+                Ok(())
+            }
+            QosSpec::All => Ok(()),
+        }
+    }
+}
 
 /// Top-level benchmark configuration parsed from a TOML file.
 #[derive(Debug, Deserialize)]
@@ -13,6 +69,11 @@ pub struct BenchConfig {
     pub runners: Vec<String>,
     /// Default timeout for variant processes (seconds).
     pub default_timeout_secs: u64,
+    /// Optional inter-QoS grace period (milliseconds) inserted between
+    /// consecutive per-QoS spawn jobs derived from the same variant entry.
+    /// Defaults to `DEFAULT_INTER_QOS_GRACE_MS`.
+    #[serde(default)]
+    pub inter_qos_grace_ms: Option<u64>,
     /// Variant definitions, executed in order.
     #[serde(default)]
     pub variant: Vec<VariantConfig>,
@@ -37,6 +98,43 @@ impl VariantConfig {
     /// Returns the effective timeout for this variant.
     pub fn effective_timeout(&self, default: u64) -> u64 {
         self.timeout_secs.unwrap_or(default)
+    }
+
+    /// Parse the `qos` field from the `[variant.common]` table into a
+    /// `QosSpec`. Returns `QosSpec::All` if the key is absent.
+    ///
+    /// Accepts:
+    /// - `qos = N` (integer, 1..=4) -> `Single(N)`
+    /// - `qos = [..]` (non-empty array of 1..=4 integers) -> `Multi(..)`
+    /// - key omitted -> `All`
+    pub fn qos_spec(&self) -> Result<QosSpec> {
+        let Some(val) = self.common.get("qos") else {
+            return Ok(QosSpec::All);
+        };
+
+        if let Some(n) = val.as_integer() {
+            let n = u8::try_from(n).with_context(|| format!("qos value {n} does not fit in u8"))?;
+            let spec = QosSpec::Single(n);
+            spec.validate()?;
+            return Ok(spec);
+        }
+
+        if let Some(arr) = val.as_array() {
+            let mut levels: Vec<u8> = Vec::with_capacity(arr.len());
+            for item in arr {
+                let n = item
+                    .as_integer()
+                    .with_context(|| format!("qos array element is not an integer: {item:?}"))?;
+                let n =
+                    u8::try_from(n).with_context(|| format!("qos value {n} does not fit in u8"))?;
+                levels.push(n);
+            }
+            let spec = QosSpec::Multi(levels);
+            spec.validate()?;
+            return Ok(spec);
+        }
+
+        bail!("qos must be an integer, an array of integers, or omitted (got {val:?})");
     }
 }
 
@@ -83,18 +181,21 @@ impl BenchConfig {
             }
         }
 
-        // Validate qos in common sections if present.
+        // Validate qos in common sections via QosSpec parsing. This handles
+        // integer, array, and omitted forms uniformly and rejects out-of-range
+        // values.
         for v in &self.variant {
-            if let Some(qos_val) = v.common.get("qos") {
-                if let Some(qos) = qos_val.as_integer() {
-                    if !(1..=4).contains(&qos) {
-                        bail!("config: variant '{}' has qos {} (must be 1-4)", v.name, qos);
-                    }
-                }
-            }
+            v.qos_spec()
+                .with_context(|| format!("config: variant '{}' has invalid qos", v.name))?;
         }
 
         Ok(())
+    }
+
+    /// Effective inter-QoS grace period (milliseconds).
+    pub fn inter_qos_grace_ms(&self) -> u64 {
+        self.inter_qos_grace_ms
+            .unwrap_or(DEFAULT_INTER_QOS_GRACE_MS)
     }
 }
 
@@ -291,10 +392,135 @@ binary = "./x"
 "#;
         let config: BenchConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().unwrap_err();
+        let msg = format!("{err:#}");
         assert!(
-            err.to_string().contains("qos 5 (must be 1-4)"),
-            "unexpected error: {err}"
+            msg.contains("qos 5 is out of range"),
+            "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn validation_rejects_qos_array_with_out_of_range_element() {
+        let toml_str = r#"
+run = "test"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v1"
+binary = "./x"
+  [variant.common]
+  qos = [1, 5]
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("qos 5 is out of range"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_empty_qos_array() {
+        let toml_str = r#"
+run = "test"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v1"
+binary = "./x"
+  [variant.common]
+  qos = []
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("qos array must be non-empty"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn qos_spec_single_integer() {
+        let toml_str = r#"
+run = "test"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  qos = 2
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let spec = config.variant[0].qos_spec().unwrap();
+        assert_eq!(spec, QosSpec::Single(2));
+        assert_eq!(spec.levels(), vec![2]);
+    }
+
+    #[test]
+    fn qos_spec_array_form() {
+        let toml_str = r#"
+run = "test"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  qos = [3, 1, 1, 4]
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let spec = config.variant[0].qos_spec().unwrap();
+        assert_eq!(spec, QosSpec::Multi(vec![3, 1, 1, 4]));
+        // levels() returns sorted, deduplicated.
+        assert_eq!(spec.levels(), vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn qos_spec_omitted_means_all() {
+        let toml_str = r#"
+run = "test"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let spec = config.variant[0].qos_spec().unwrap();
+        assert_eq!(spec, QosSpec::All);
+        assert_eq!(spec.levels(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn inter_qos_grace_default_when_omitted() {
+        let toml_str = r#"
+run = "test"
+runners = ["a"]
+default_timeout_secs = 10
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.inter_qos_grace_ms(), DEFAULT_INTER_QOS_GRACE_MS);
+    }
+
+    #[test]
+    fn inter_qos_grace_overridden_in_config() {
+        let toml_str = r#"
+run = "test"
+runners = ["a"]
+default_timeout_secs = 10
+inter_qos_grace_ms = 500
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.inter_qos_grace_ms(), 500);
     }
 
     #[test]

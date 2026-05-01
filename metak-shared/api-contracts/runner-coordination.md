@@ -23,8 +23,29 @@ network.
    runner's hash, ALL runners abort with a clear error. This catches
    mismatched configs before anything is launched.
 
-4. Discovery completes when all runner names listed in the config's `runners`
-   array have been seen and their config hashes match.
+4. **Peer address capture**: when a discovery message arrives, the runner
+   records the source address of the UDP packet (via `recv_from`) as that
+   peer's address. This populates a `peer_hosts: HashMap<String, String>`
+   keyed by runner name.
+
+5. **Same-host detection**: for each captured peer source IP, compare against
+   the local interfaces of this runner (enumerate via `local-ip-address` or
+   `if-addrs`). If the peer source IP appears in the local interface set,
+   OR the source IP is `127.0.0.1`, the peer is treated as same-host and
+   stored as `127.0.0.1`. Otherwise, store the source IP as observed.
+   Rationale: on Windows, multicast/broadcast loopback can deliver packets
+   with either the LAN interface IP or `127.0.0.1` as source — both must
+   resolve to loopback for same-host inter-variant communication. The runner
+   already has localhost-fallback behaviour for its own multicast; this
+   keeps variant peer addresses consistent with that.
+
+6. Discovery completes when all runner names listed in the config's `runners`
+   array have been seen, their config hashes match, AND a host address has
+   been captured for each.
+
+7. The captured `peer_hosts` map is retained for the rest of the run and
+   passed into spawned variants via the `--peers` runner-injected CLI arg
+   (see `variant-cli.md`).
 
 ## Phase 1.5: Initial Clock Sync
 

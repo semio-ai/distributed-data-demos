@@ -1,0 +1,42 @@
+# Hybrid-only two-runner-on-localhost validation fixture for T9.3.
+#
+# Single Hybrid entry, qos omitted -> runner expands to all 4 QoS levels:
+#   - qos 1 (UDP multicast, best-effort)
+#   - qos 2 (UDP multicast, latest-value with stale discard)
+#   - qos 3 (TCP, reliable-ordered)
+#   - qos 4 (TCP, reliable-TCP)
+#
+# Per-runner / per-qos TCP ports are derived by the variant from
+# --tcp-base-port + --runner index in --peers + --qos. With base 19940 and
+# two runners (alice=0, bob=1), TCP listen ports are:
+#   alice qos1 19940, qos2 19950, qos3 19960, qos4 19970
+#   bob   qos1 19941, qos2 19951, qos3 19961, qos4 19971
+#
+# UDP multicast group is shared across all runners and all QoS levels (1/2);
+# sequential per-spawn execution + silent_secs drain + inter_qos_grace_ms
+# provide cross-spawn isolation.
+#
+# Run from the repo root in two terminals:
+#   runner/target/release/runner --name alice --config variants/hybrid/tests/fixtures/two-runner-hybrid-only.toml
+#   runner/target/release/runner --name bob   --config variants/hybrid/tests/fixtures/two-runner-hybrid-only.toml
+
+run = "hybrid-t93-validation"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "hybrid-t93"
+binary = "variants/hybrid/target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 3
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 10
+  log_dir = "./logs-t93"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19542"
+  tcp_base_port = 19940

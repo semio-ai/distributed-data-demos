@@ -328,6 +328,51 @@ Dependencies: E2 (runner exists), E4 (analysis exists).
 
 ---
 
+## E9: Peer Discovery Injection + QoS Expansion
+
+**Repos**: `runner/`, `variants/quic/`, plus contract updates in `metak-shared/`
+**Goal**: Two coupled improvements that share the runner's port-derivation
+logic and so are best implemented together:
+
+1. **Peer discovery injection.** Today the QUIC variant is the only one that
+   needs explicit peer IPs, and they are hard-coded as `127.0.0.1:...` in
+   the TOML config. This breaks any inter-machine run. The runner already
+   sees every peer's source IP during Phase 1 discovery — it just doesn't
+   capture or forward them. Capture them, do same-host detection, and pass
+   them to spawned variants as a new injected CLI arg `--peers`.
+
+2. **QoS expansion.** Today every variant entry in a config must hard-code
+   `qos = N`, which forces 4× duplication if you want to compare a variant
+   across all QoS levels. Make `qos` optional or list-typed in the TOML
+   schema, and have the runner expand a single entry into N synthesized
+   per-QoS spawns (named `<variant>-qosN`) that go through full
+   stabilize/operate/silent cycles. Per-spawn barriers keep runners in
+   lockstep per QoS level. Logs naturally separate by spawn name.
+
+The two pieces couple at the QUIC variant: with `--peers` injected and QoS
+varying per spawn, QUIC can derive both bind and connect ports from a
+single `base_port` plus its known runner index and current QoS level.
+
+Out of scope for this epic:
+- Migrating the Hybrid variant off its `peers` config field. Hybrid currently
+  works (it does its own setup using TCP per peer pair), and switching it to
+  consume `--peers` is a follow-up if/when its same-machine `peers` field
+  becomes a problem on a real two-machine run.
+- Changing what Zenoh, custom-udp, or hybrid do with `--peers` — they may
+  ignore it.
+
+Contracts touched:
+- `metak-shared/api-contracts/runner-coordination.md` (Phase 1 capture +
+  same-host detection)
+- `metak-shared/api-contracts/variant-cli.md` (`--peers` injected arg,
+  `--qos` semantics under expansion)
+- `metak-shared/api-contracts/toml-config-schema.md` (optional/list `qos`,
+  port-stride convention, expanded spawn naming)
+
+Dependencies: E2 (runner exists), E3d (QUIC variant exists).
+
+---
+
 ## E7: End-to-End Validation
 
 **Goal**: Run the full benchmark pipeline across two machines and validate

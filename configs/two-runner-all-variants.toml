@@ -24,7 +24,6 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
@@ -44,7 +43,6 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
@@ -64,7 +62,6 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
@@ -84,7 +81,6 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
@@ -104,7 +100,6 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
@@ -124,7 +119,6 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 10
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
@@ -144,7 +138,6 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 10
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
@@ -164,7 +157,6 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   silent_secs = 3
   workload = "max-throughput"
   values_per_tick = 1000
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
@@ -174,6 +166,13 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
 ##############################################################################
 # ─── Hybrid UDP/TCP ── scalar-flood at 100 Hz ───────────────────────────────
+#
+# QoS expansion: with `qos` omitted, the runner spawns one full lifecycle per
+# QoS level (1..=4). Per-runner / per-qos TCP ports are derived by the variant
+# from --tcp-base-port + --runner index in --peers + --qos (stride 1 per
+# runner, 10 per qos level). UDP multicast uses --multicast-group directly
+# with no stride (sequential per-spawn execution + silent_secs drain +
+# inter_qos_grace_ms provide cross-spawn isolation).
 
 [[variant]]
 name = "hybrid-1000x100hz"
@@ -186,13 +185,11 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19502"
   tcp_base_port = 19900
-  peers = "127.0.0.1:19900"
 
 # ─── Hybrid UDP/TCP ── 1000 vps @ 10 hz ──────────────────────────────────────
 
@@ -207,13 +204,11 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19910
-  peers = "127.0.0.1:19910"
+  tcp_base_port = 19900
 
 # ─── Hybrid UDP/TCP ── 100 vps @ 1000 hz ───────────────────────────────────────
 
@@ -228,13 +223,11 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19910
-  peers = "127.0.0.1:19910"
+  tcp_base_port = 19900
 
 # ─── Hybrid UDP/TCP ── 100 vps @ 100 hz ───────────────────────────────────────
 
@@ -249,13 +242,11 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19910
-  peers = "127.0.0.1:19910"
+  tcp_base_port = 19900
 
 # ─── Hybrid UDP/TCP ── 100 vps @ 10 hz ───────────────────────────────────────
 
@@ -270,13 +261,11 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19910
-  peers = "127.0.0.1:19910"
+  tcp_base_port = 19900
 
 # ─── Hybrid UDP/TCP ── 10 vps @ 100 hz ───────────────────────────────────────
 
@@ -291,13 +280,11 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 10
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19910
-  peers = "127.0.0.1:19910"
+  tcp_base_port = 19900
 
 # ─── Hybrid UDP/TCP ── 10 vps @ 1000 hz ───────────────────────────────────────
 
@@ -312,13 +299,11 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 10
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19910
-  peers = "127.0.0.1:19910"
+  tcp_base_port = 19900
 
 # ─── Hybrid UDP/TCP ── max-throughput ────────────────────────────────────────
 
@@ -333,17 +318,20 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
   silent_secs = 3
   workload = "max-throughput"
   values_per_tick = 1000
-  qos = 2
   log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19910
-  peers = "127.0.0.1:19910"
+  tcp_base_port = 19900
 
 
 ##############################################################################
 # ─── QUIC ── 1000 vps @ 100 hz ────────────────────────────────────────────────
+#
+# QoS expansion: with `qos` omitted, the runner spawns one full lifecycle per
+# QoS level (1..=4). Per-runner / per-qos ports are derived by the variant
+# from --base-port + --runner index in --peers + --qos (stride 1 per runner,
+# 10 per qos level).
 
 [[variant]]
 name = "quic-1000x100hz"
@@ -356,12 +344,10 @@ binary = "variants/quic/target/release/variant-quic.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
-  qos = 3
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  base_port = 19930
 
 # ─── QUIC ── 1000 vps @ 10 hz ────────────────────────────────────────────────
 
@@ -376,12 +362,10 @@ binary = "variants/quic/target/release/variant-quic.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
-  qos = 3
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  base_port = 19930
 
 
 # ─── QUIC ── 100 vps @ 10 hz ────────────────────────────────────────────────
@@ -397,12 +381,10 @@ binary = "variants/quic/target/release/variant-quic.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 3
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  base_port = 19930
 
 # ─── QUIC ── 100 vps @ 100 hz ────────────────────────────────────────────────
 
@@ -417,12 +399,10 @@ binary = "variants/quic/target/release/variant-quic.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 3
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  base_port = 19930
 
 # ─── QUIC ── 100 vps @ 1000 hz ────────────────────────────────────────────────
 
@@ -437,12 +417,10 @@ binary = "variants/quic/target/release/variant-quic.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 3
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  base_port = 19930
 
 # ─── QUIC ── 10 vps @ 100 hz ─────────────────────────────────────────────────
 
@@ -457,12 +435,10 @@ binary = "variants/quic/target/release/variant-quic.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 10
-  qos = 3
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  base_port = 19930
 
 # ─── QUIC ── 10 vps @ 1000 hz ─────────────────────────────────────────────────
 
@@ -477,12 +453,10 @@ binary = "variants/quic/target/release/variant-quic.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 10
-  qos = 3
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  base_port = 19930
 
 # ─── QUIC ── max-throughput ──────────────────────────────────────────────────
 
@@ -497,12 +471,10 @@ binary = "variants/quic/target/release/variant-quic.exe"
   silent_secs = 3
   workload = "max-throughput"
   values_per_tick = 1000
-  qos = 3
   log_dir = "./logs"
 
   [variant.specific]
-  bind_addr = "0.0.0.0:19930,0.0.0.0:19931"
-  peers = "127.0.0.1:19930,127.0.0.1:19931"
+  base_port = 19930
 
 # ─── Zenoh ── 1000 vps @ 100 Hz ────────────────────────────────────────
 
@@ -517,7 +489,6 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
-  qos = 1
   log_dir = "./logs"
 
   [variant.specific]
@@ -537,7 +508,6 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
-  qos = 1
   log_dir = "./logs"
 
   [variant.specific]
@@ -556,7 +526,6 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 1
   log_dir = "./logs"
 
   [variant.specific]
@@ -575,7 +544,6 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 1
   log_dir = "./logs"
 
   [variant.specific]
@@ -594,7 +562,6 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 100
-  qos = 1
   log_dir = "./logs"
 
   [variant.specific]
@@ -613,7 +580,6 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 10
-  qos = 1
   log_dir = "./logs"
 
   [variant.specific]
@@ -632,7 +598,6 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
   silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 10
-  qos = 1
   log_dir = "./logs"
 
   [variant.specific]
@@ -651,7 +616,6 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
   silent_secs = 3
   workload = "max-throughput"
   values_per_tick = 1000
-  qos = 1
   log_dir = "./logs"
 
   [variant.specific]

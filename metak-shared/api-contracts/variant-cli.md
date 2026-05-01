@@ -27,7 +27,7 @@ design:
 | `--silent-secs` | integer | Duration of the silent/drain phase in seconds |
 | `--workload` | string | Workload profile name (e.g. `scalar-flood`) |
 | `--values-per-tick` | integer | Number of value updates per tick |
-| `--qos` | integer | QoS level (1-4) |
+| `--qos` | integer | QoS level (1-4). Always a single integer at the variant CLI level — when the TOML omits `qos` or specifies a list, the runner expands the entry into multiple per-QoS spawn invocations and passes one concrete level per spawn. |
 | `--log-dir` | path | Directory for JSONL output |
 
 ## Runner-Injected Arguments
@@ -37,9 +37,10 @@ These are added by the runner itself, not from the config file:
 | Argument | Type | Description |
 |----------|------|-------------|
 | `--launch-ts` | RFC 3339 timestamp | Wall-clock time recorded by the runner immediately before spawn. Used by the variant to compute connection time. |
-| `--variant` | string | The variant name from config (e.g. `zenoh-replication`). Used in log entries. |
+| `--variant` | string | The variant name from config (e.g. `zenoh-replication`). May include a `-qosN` suffix when the runner expands a `qos`-omitted entry into per-QoS runs (see TOML config schema). Used in log entries. |
 | `--runner` | string | The runner's name (e.g. `a`). Used in log entries. |
 | `--run` | string | The run identifier from config (e.g. `run01`). Used in log entries. |
+| `--peers` | string | Comma-separated `name=host` pairs for ALL runners in the config (including this one), e.g. `alice=192.168.1.10,bob=192.168.1.11`. Hosts are derived by the runner during discovery (Phase 1, see `runner-coordination.md`). For same-host peers the value is `127.0.0.1`. Variants that need explicit peer addresses (e.g. QUIC) use this; variants that do their own discovery (Zenoh, mDNS-based variants) may ignore it. |
 
 ## Specific Arguments (from `[variant.specific]`)
 
