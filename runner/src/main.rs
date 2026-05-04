@@ -1,4 +1,6 @@
 mod cli_args;
+mod clock_sync;
+mod clock_sync_log;
 mod config;
 mod local_addrs;
 mod message;
@@ -86,6 +88,78 @@ fn main() -> Result<()> {
     let peer_hosts = coordinator.peer_hosts();
     eprintln!("[runner:{}] peer_hosts: {:?}", cli.name, peer_hosts);
 
+    // Resolve the per-run log directory used for the clock-sync JSONL file.
+    // Variants may declare their own `log_dir` in `[variant.common]`; we use
+    // the first one we find as the canonical run directory. Fallback to
+    // `./logs` so single-runner mode without a configured log_dir still has
+    // a sensible default.
+    let base_log_dir = bench_config
+        .variant
+        .iter()
+        .find_map(|v| v.common.get("log_dir"))
+        .map(cli_args::toml_value_to_string)
+        .unwrap_or_else(|| "./logs".to_string());
+    let run_log_dir: PathBuf = PathBuf::from(format!("{base_log_dir}/{log_subdir}"));
+
+    // Open the clock-sync log file (skipped in single-runner mode -- no peers
+    // means no sync events would ever be written, and the contract permits
+    // an absent file in that case).
+    let mut clock_sync_log = if !coordinator.is_single_runner() {
+        std::fs::create_dir_all(&run_log_dir).ok();
+        match clock_sync_log::open_clock_sync_log(&run_log_dir, &cli.name, &bench_config.run) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "[runner:{}] WARN: failed to open clock-sync log: {e:#}",
+                    cli.name
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build the clock-sync engine. None in single-runner mode (no socket).
+    let clock_sync_engine = coordinator.clock_sync_engine();
+
+    // Phase 1.5: initial clock sync. Logged with `variant=""`.
+    let peer_names: Vec<String> = bench_config
+        .runners
+        .iter()
+        .filter(|n| *n != &cli.name)
+        .cloned()
+        .collect();
+    if let (Some(engine), Some(log)) = (clock_sync_engine.as_ref(), clock_sync_log.as_mut()) {
+        if !peer_names.is_empty() {
+            eprintln!(
+                "[runner:{}] initial clock sync against {} peer(s)...",
+                cli.name,
+                peer_names.len()
+            );
+            let measurements = engine.measure_offsets(&peer_names, clock_sync::DEFAULT_SAMPLES);
+            for peer in &peer_names {
+                if let Some(m) = measurements.get(peer) {
+                    if let Err(e) = log.write("", peer, m) {
+                        eprintln!(
+                            "[runner:{}] WARN: clock-sync log write failed: {e:#}",
+                            cli.name
+                        );
+                    }
+                    eprintln!(
+                        "[runner:{}] clock_sync (initial) peer={peer} offset_ms={:.3} rtt_ms={:.3}",
+                        cli.name, m.offset_ms, m.rtt_ms
+                    );
+                } else {
+                    eprintln!(
+                        "[runner:{}] WARN: no clock-sync samples received from peer={peer}",
+                        cli.name
+                    );
+                }
+            }
+        }
+    }
+
     let inter_qos_grace = Duration::from_millis(bench_config.inter_qos_grace_ms());
 
     // Track results for summary table.
@@ -105,6 +179,37 @@ fn main() -> Result<()> {
                 cli.name, job.effective_name, job.qos
             );
             coordinator.ready_barrier(&job.effective_name)?;
+
+            // Per-variant clock resync: catches drift across the run. Logged
+            // with the spawn's effective name so analysis joins the latest
+            // measurement preceding the variant's writes. No-op in
+            // single-runner mode (engine/log are None).
+            if let (Some(engine), Some(log)) = (clock_sync_engine.as_ref(), clock_sync_log.as_mut())
+            {
+                if !peer_names.is_empty() {
+                    let measurements =
+                        engine.measure_offsets(&peer_names, clock_sync::DEFAULT_SAMPLES);
+                    for peer in &peer_names {
+                        if let Some(m) = measurements.get(peer) {
+                            if let Err(e) = log.write(&job.effective_name, peer, m) {
+                                eprintln!(
+                                    "[runner:{}] WARN: clock-sync log write failed: {e:#}",
+                                    cli.name
+                                );
+                            }
+                            eprintln!(
+                                "[runner:{}] clock_sync ({}) peer={peer} offset_ms={:.3} rtt_ms={:.3}",
+                                cli.name, job.effective_name, m.offset_ms, m.rtt_ms
+                            );
+                        } else {
+                            eprintln!(
+                                "[runner:{}] WARN: no clock-sync samples received from peer={peer} for variant {}",
+                                cli.name, job.effective_name
+                            );
+                        }
+                    }
+                }
+            }
 
             let launch_ts = chrono::Utc::now()
                 .format("%Y-%m-%dT%H:%M:%S%.9fZ")

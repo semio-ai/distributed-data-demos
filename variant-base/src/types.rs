@@ -41,6 +41,7 @@ pub enum Phase {
     Connect,
     Stabilize,
     Operate,
+    Eot,
     Silent,
 }
 
@@ -51,6 +52,7 @@ impl Phase {
             Phase::Connect => "connect",
             Phase::Stabilize => "stabilize",
             Phase::Operate => "operate",
+            Phase::Eot => "eot",
             Phase::Silent => "silent",
         }
     }

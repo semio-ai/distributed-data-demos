@@ -373,6 +373,227 @@ Dependencies: E2 (runner exists), E3d (QUIC variant exists).
 
 ---
 
+## E12: End-of-Test Handshake
+
+**Repos**: `variant-base/`, `variants/custom-udp/`, `variants/hybrid/`,
+`variants/quic/`, `variants/zenoh/`, `analysis/`, plus contract additions
+in `metak-shared/`.
+**Goal**: Replace the wall-clock `silent_secs` drain with an explicit
+end-of-test (EOT) handshake. After the operate phase ends, each variant
+broadcasts an EOT marker to all peers and waits (bounded) until every
+peer has been observed before moving into a small `silent_secs` grace
+window. The operate window becomes self-terminating, and delivery
+percentages can be scoped to writes whose ts is in
+`[operate_start, eot_sent.ts]` rather than the silent-deadline cutoff.
+
+Driving design: `metak-shared/api-contracts/eot-protocol.md` (new
+contract — review before workers spawn).
+
+Why now: T10.6b validation showed `silent_secs = 1` is materially too
+short for TCP back-pressure to drain on localhost at 100K msg/s. With
+silent_secs alone, the regression test thresholds had to be relaxed
+to 20% TCP — which barely tells us anything beyond "did the spawn
+exit." EOT lets us re-tighten to >=99% TCP without the fixture timing
+becoming part of the contract.
+
+Scope:
+- New contract `metak-shared/api-contracts/eot-protocol.md`.
+- Updated event types in `metak-shared/api-contracts/jsonl-log-schema.md`
+  (`eot_sent`, `eot_received`, `eot_timeout`, plus `phase=eot`).
+- `variant-base`: add `signal_end_of_test`/`wait_for_peer_eots` to the
+  Variant trait with no-op defaults; insert the EOT phase between
+  operate and silent in the protocol driver; emit the new JSONL events
+  and the `phase=eot` event; new CLI flag `--eot-timeout-secs`.
+- All four working variants implement EOT per the contract:
+  Hybrid (TCP frame + UDP multicast), Custom UDP (TCP frame + UDP
+  multicast), QUIC (stream-end + datagram), Zenoh
+  (`bench/__eot__/<writer>` key).
+- `analysis/`: scope operate window to `eot_sent.ts` when present, fall
+  back to `phase=silent.ts` for legacy logs. Add a `late_receives`
+  metric for receives between EOT and silent. Update integrity /
+  performance to use the new window definition.
+- Re-tighten the T10.6 regression test thresholds to:
+  - Hybrid TCP qos 3-4: `>=99%`
+  - Hybrid UDP qos 1-2: `>=99%` (correctness) / `>=95%` (high-rate)
+  - Custom UDP TCP qos 4: `>=99%`
+  - Custom UDP UDP qos 1-3: per-fixture spec, retighten where
+    appropriate
+  - QUIC qos 1-4: `>=99%` (with possible relaxation on datagram qos
+    1-2 if measured loss exceeds 1%)
+  - Zenoh `1000paths`: `==100%` (already locked in; should still hold)
+  - Zenoh `max-throughput`: `>=80%` (documented mpsc-receive drop)
+
+Out of scope:
+- Aeron. The user has elected to exclude Aeron permanently (E3c stays
+  blocked, code removal scheduled in E13). Aeron is intentionally not
+  given an EOT implementation.
+- Cross-machine validation. Stays user-owned (T10.5 / a future re-run
+  task).
+- Changes to the runner-runner coordination protocol. EOT is
+  variant-to-variant within a spawn; the runner's barriers are
+  unchanged.
+
+Dependencies:
+- E1 (Variant trait + protocol driver): touched.
+- E3a/b/d/e (the four active variants): touched.
+- E4 / E11 (analysis tool): touched in T12.6.
+- T10.6: thresholds retightened in T12.7 once T12.2-5 + T12.6 land.
+
+Acceptance:
+- All four active variants log `eot_sent` once and the expected
+  `eot_received{writer=peer}` lines on every localhost two-runner run
+  of every existing reproducer fixture.
+- T10.6 regression suite passes deterministically across 3 runs at
+  the retightened thresholds above.
+- `metak-shared/ANALYSIS.md` updated to describe the operate-window
+  definition.
+- All existing tests still pass (E11 analysis tests, per-variant unit
+  tests, T10.6a/b/c).
+
+---
+
+## E13: Remove Aeron variant code and references
+
+**Repos**: `variants/aeron/` (deleted), plus references in
+`metak-orchestrator/`, `metak-shared/`, `configs/`, `.code-workspace`.
+**Goal**: Remove the Aeron variant entirely now that the user has
+elected to exclude it (E3c was blocked indefinitely on the Windows
+toolchain issue; on Linux it would still require a media-driver setup
+the project does not want to take on).
+
+Filed as a placeholder. **Do not start E13 until E12 is fully landed**
+— per the user's explicit instruction. Removing Aeron mid-E12 risks
+losing track of references and complicates regression review.
+
+Scope (when E13 starts):
+- Delete `variants/aeron/` directory entirely.
+- Remove the Aeron entry from `metak-orchestrator/EPICS.md` (the E3c
+  block in this very file).
+- Remove Aeron mentions from `metak-orchestrator/STATUS.md`,
+  `metak-orchestrator/TASKS.md`, `metak-shared/overview.md`,
+  `metak-shared/architecture.md`,
+  `metak-shared/variant-candidates.md` (or move R3 to a
+  "rejected candidates" section with a note that Aeron was excluded
+  for build-toolchain reasons), and any other doc that references it.
+- Remove any `[[variant]]` entries with `binary = .../variant-aeron...`
+  from configs (smoke, two-runner-all-variants).
+- Remove the Aeron entry from `.code-workspace` if present.
+- Update `metak-shared/coding-standards.md` only if it mentions Aeron.
+
+Out of scope:
+- Re-evaluating whether to bring Aeron back later. If the project
+  ever wants Aeron, it gets re-introduced as a fresh epic; this epic
+  is purely cleanup.
+
+Dependencies: E12 done.
+
+---
+
+## E11: Analysis Tool — Large-Dataset Cache Rework (Phase 1.5)
+
+**Repo**: `analysis/`
+**Goal**: Re-architect the analysis tool's caching and execution pipeline
+so it scales to multi-tens-of-GB datasets with bounded memory. The current
+Phase 1 (E4) implementation cannot complete on the user's
+`inter-machine-all-variants-01-20260501_150858` dataset (40 GB across 128
+JSONL files, ~148 M events): it builds a 14.5 GB pickle and then attempts
+to flatten every event into one Python list and globally sort it, which
+on the user's machine has been thrashing on swap for hours without
+producing any output.
+
+The output behaviour (integrity/performance tables, eventually diagrams)
+must be preserved; what changes is how data is stored and processed.
+
+Driving design: see `metak-shared/ANALYSIS.md` §§ 3-4 (revised) and § 8
+Phase 1.5.
+
+Scope:
+- Replace the single `<logs-dir>/.analysis_cache.pkl` with a per-source-
+  file Parquet shard cache under `<logs-dir>/.cache/`, plus per-shard
+  meta sidecars and a global schema-version sentinel.
+- Adopt **polars** as the analytics engine (justified addition to the
+  Python stack — see CUSTOM.md). Use `pl.scan_parquet` lazy frames
+  throughout; never materialize the full dataset.
+- Replace the in-memory `Event(... data: dict)` dataclass with the
+  flat columnar schema documented in ANALYSIS.md § 4.1. JSONL parsing
+  becomes a streaming projection, not a full Python-object materialization.
+- Rework `correlate.py`, `integrity.py`, `performance.py` to do their
+  joins / groupbys via polars expressions, executed per `(variant, run)`
+  group so peak memory is bounded by the largest single group, not by
+  the whole dataset.
+- `tables.py` / `plots.py` consumers stay output-compatible: each receives
+  a list of result dataclasses or a polars DataFrame with the same fields
+  as today, just sourced through the new pipeline.
+- Migrate cleanly from any pre-existing `.analysis_cache.pkl` (delete on
+  first run with a stderr notice; do not attempt to convert).
+- Cover clock-sync events (E8) in the schema as nullable columns so E8
+  can land without further rework.
+
+What this epic does NOT address:
+- Adding new metrics or output. The set of tables and metrics stays the
+  same. (New output is E5 / E6 / E8 work.)
+- Multi-process or GPU acceleration. Polars's threaded engine is more
+  than sufficient.
+- Replacing matplotlib for plots. Plotting is downstream of materialized
+  per-group frames and unaffected.
+
+Acceptance gate:
+- The 40 GB user dataset (`logs/inter-machine-all-variants-01-20260501_150858/`)
+  analyses end-to-end with `--summary` in under 10 minutes wall-clock on
+  first run and under 30 seconds on a re-run with no JSONL changes; peak
+  RSS under 4 GB throughout.
+- Existing analysis output on the small `logs/same-machine-20260430_140856/`
+  dataset matches the Phase 1 output byte-for-byte (where deterministic)
+  or value-for-value (where ordering of equal-key rows is implementation-
+  defined).
+
+Dependencies: E4 (Phase 1 — shipped). Independent of E5/E6/E8 — they all
+benefit from this rework but none block it.
+
+---
+
+## E10: Variant Robustness Under Load
+
+**Repos**: `variants/custom-udp/`, `variants/hybrid/`, `variants/zenoh/`
+**Goal**: Fix variant-implementation weaknesses uncovered by the first
+full-matrix two-machine run of `configs/two-runner-all-variants.toml`.
+These are not E9 contract issues — the runner contract is sound and 128/128
+spawns invoke correctly on both machines. They're pre-existing bugs in
+the variants that QoS-expansion now exercises (and that cross-machine
+network behaviour exposes more aggressively than loopback).
+
+Three independent threads:
+
+1. **Custom UDP TCP framing panic** (T10.4) — `src/udp.rs:233` slices a
+   length-prefix into a `Vec` sized by an untrusted length read off the
+   wire, with no `>= 4` check. A torn TCP read at peer-shutdown returns
+   a zero/garbage length and the variant panics. Cross-machine only.
+2. **Hybrid high-throughput failures** (T10.1) — both UDP send (returns
+   `WSAEWOULDBLOCK` on Windows under load) and TCP send (same, plus
+   `CONNABORTED`/`CONNRESET` cascade once one side bails) fail at high
+   rate. The TCP read loop also bails on transient connection errors.
+   The original `variants/hybrid/CUSTOM.md` already specified blocking
+   writes for TCP — implementation diverged.
+3. **Zenoh path-count scaling** (T10.2) — workloads with 1000 distinct
+   keys per tick time out independent of total throughput. 100-key
+   workloads at 100K msg/s succeed; 1000-key workloads at 10K msg/s
+   time out. The `max-throughput` workload also times out (different
+   code path, separate failure mode worth investigating).
+
+T10.3 (cross-machine smoke) was completed by the user as part of T9.4c
+acceptance and is closed.
+
+Out of scope for this epic:
+- Performance tuning beyond the minimum needed to make spawns finish.
+- Protocol redesign. Each variant should keep its existing semantics;
+  fixes are at the I/O / framing layer.
+- Aeron (E3c is still blocked on the Windows toolchain).
+
+Dependencies: E9 (closed). E10 fixes can run in parallel — T10.1 and
+T10.4 are small, T10.2 is investigation-heavy.
+
+---
+
 ## E7: End-to-End Validation
 
 **Goal**: Run the full benchmark pipeline across two machines and validate

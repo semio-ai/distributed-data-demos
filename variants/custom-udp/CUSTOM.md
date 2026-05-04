@@ -140,6 +140,44 @@ existing UDP socket — no peer-host knowledge required from `--peers`.
 Keep it compact — these are small messages at 100K/sec. Avoid serde for the
 wire format; manual byte packing is faster and simpler for fixed-layout headers.
 
+The minimum-valid-frame size is 17 bytes (`HEADER_FIXED_SIZE` in
+`src/protocol.rs` = 4 + 1 + 8 + 2 + 2). Any frame smaller than that cannot
+contain a complete header and is invalid by construction.
+
+### Framing safety
+
+Any length-prefixed reader (today the QoS-4 TCP path in
+`src/udp.rs::read_framed_message`, but the rule applies to any future
+length-prefixed transport) MUST validate that the declared length
+`total_len` from the wire satisfies:
+
+```
+HEADER_FIXED_SIZE <= total_len <= max_buffer_size
+```
+
+before allocating a buffer of that size. Anything else from the wire is a
+peer protocol violation (or a torn cross-machine read masquerading as one)
+and MUST be handled by:
+
+1. Logging a single `eprintln!` with a short reason.
+2. Dropping that peer's stream.
+3. Continuing — never panic, never propagate the error up to the spawn
+   driver.
+
+Why: on loopback the kernel atomically tears down both ends of a TCP
+connection, so `read_exact` either delivers a complete frame or returns
+EOF. Across the network there is a real window where `read_exact` returns
+`Ok(())` with stale or zero bytes that decode as a 0..=3 length prefix.
+Without the bounds check, `vec![0u8; total_len]` followed by
+`msg_buf[..4].copy_from_slice(&len_buf)` panics for `total_len < 4`. This
+is the regression that hit the user on the cross-machine `custom-udp-
+10x1000hz-qos4` spawn (LEARNED.md "Cross-machine validation reveals
+failures invisible on localhost"; TASKS.md T10.4).
+
+Treat reads of `total_len > max_buffer_size` the same way (drop peer): a
+peer that asks us to allocate more than `--buffer-size` bytes is buggy
+or hostile, and silent truncation is worse than dropping the stream.
+
 ### MTU handling
 
 Standard Ethernet MTU = 1500 bytes. UDP payload limit = ~1472 bytes.

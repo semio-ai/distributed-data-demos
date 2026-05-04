@@ -1,0 +1,38 @@
+# Custom-UDP-only two-runner-on-localhost regression fixture for T10.4.
+#
+# Mirrors the failing entry from the user's two-machine run
+# (`custom-udp-10x1000hz-qos4`): 10 distinct paths × 1000 ticks/sec × QoS 4
+# (TCP). Used to verify the framing-panic fix at QoS 4 stays fixed and the
+# spawn still completes status=success on localhost.
+#
+# Per-runner / per-qos TCP ports are derived by the variant from
+# --tcp-base-port + --runner index in --peers + --qos. With base 19800 and
+# two runners (alice=0, bob=1) at qos=4, TCP listen ports are:
+#   alice qos4 19830, bob qos4 19831
+#
+# Run from the repo root in two terminals:
+#   runner/target/release/runner --name alice --config variants/custom-udp/tests/fixtures/two-runner-custom-udp-qos4.toml
+#   runner/target/release/runner --name bob   --config variants/custom-udp/tests/fixtures/two-runner-custom-udp-qos4.toml
+
+run = "custom-udp-t104-validation"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "custom-udp-10x1000hz"
+binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 10
+  qos = 4
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19543"
+  buffer_size = 65536
+  tcp_base_port = 19800

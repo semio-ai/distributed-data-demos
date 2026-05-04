@@ -15,5 +15,5 @@ pub use logger::Logger;
 pub use resource::ResourceMonitor;
 pub use seq::SeqGenerator;
 pub use types::{Phase, Qos, ReceivedUpdate};
-pub use variant_trait::Variant;
+pub use variant_trait::{PeerEot, Variant};
 pub use workload::{create_workload, ScalarFlood, Workload, WriteOp};

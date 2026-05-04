@@ -4,6 +4,7 @@
 - Never import directly from another repo's source code. Use shared contracts in `metak-shared/api-contracts/`.
 - When in doubt about system boundaries, consult `metak-shared/architecture.md`.
 - **No emojis in code, commits, or documentation.** Use text alternatives like `[OK]`, `[FAIL]`, `[WARN]` when status indicators are needed.
+- **`log_dir` is always `"./logs"`** — for every config in `configs/` and every test/validation fixture under `*/tests/fixtures/`. Per-run isolation is the auto-created `logs/<run-name>-<launch-ts>/` session subfolder produced by the runner. Anything a task wants to break out (analysis output, plots, scratch artifacts) goes INSIDE the session subfolder. Never introduce sibling roots like `logs-<tag>/` at the repo level. See `metak-shared/api-contracts/toml-config-schema.md` `log_dir` row for the contract.
 
 ## Commit Messages
 

@@ -1,0 +1,40 @@
+# Zenoh path-count timeout reproducer for T10.2 investigation.
+#
+# Single Zenoh entry, values_per_tick = 1000 (=> 1000 distinct paths
+# /bench/0 .. /bench/999 written each tick), tick_rate_hz = 10
+# (=> 10K msg/s total), qos = 1, operate_secs = 5.
+#
+# Per the failure inventory in STATUS.md "T9.4c: Cross-machine smoke
+# run" and TASKS.md "T10.2", Zenoh times out on every variant entry
+# with values_per_tick = 1000. The dominant signal is distinct path
+# count per tick, not raw throughput. This fixture is the smallest
+# reproducer that triggers the failure on two runners on localhost.
+#
+# Run from the repo root in two terminals:
+#   runner/target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000paths.toml
+#   runner/target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000paths.toml
+#
+# To enable the diagnostic [zenoh-trace] output, add `--debug-trace`
+# to `[variant.specific]` (parsed by the Zenoh variant from extra args).
+
+run = "zenoh-t102-1000paths"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-1000paths"
+binary = "variants/zenoh/target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 2
+  operate_secs = 5
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+  # debug_trace = true   # uncomment to emit `[zenoh-trace] ...` lines on stderr.

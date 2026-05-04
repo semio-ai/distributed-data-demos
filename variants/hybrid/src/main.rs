@@ -10,6 +10,7 @@ use clap::Parser;
 
 use variant_base::cli::CliArgs;
 use variant_base::driver::run_protocol;
+use variant_base::types::Qos;
 
 use crate::hybrid::{HybridConfig, HybridVariant};
 
@@ -47,11 +48,15 @@ fn run() -> Result<()> {
     let derived = derive_endpoints(&peer_map, &args.runner, tcp_base_port, args.qos)
         .context("TCP port derivation failed")?;
 
+    let qos = Qos::from_int(args.qos)
+        .ok_or_else(|| anyhow!("invalid --qos {}; expected 1..=4", args.qos))?;
+
     let config = HybridConfig {
         multicast_group,
         bind_addr: Ipv4Addr::UNSPECIFIED,
         tcp_listen_addr: derived.tcp_listen_addr,
         tcp_peers: derived.tcp_peers,
+        qos,
     };
     let mut variant = HybridVariant::new(&args.runner, config);
     run_protocol(&mut variant, &args)?;

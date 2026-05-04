@@ -76,7 +76,7 @@ converts `snake_case` keys to `--kebab-case` args.
 | `workload` | yes | string | Workload profile name |
 | `values_per_tick` | yes | integer | Values written per tick |
 | `qos` | no | integer OR array of integers (1-4) | If omitted, the runner expands the entry into 4 spawn invocations (qos 1, 2, 3, 4). If an array (e.g. `qos = [1, 3]`), the runner expands into one spawn per listed level. If an integer, behaves as before — one spawn at that level. See "QoS Expansion" below. |
-| `log_dir` | yes | string | JSONL output directory |
+| `log_dir` | yes | string | JSONL output directory. **MUST be `"./logs"`** for every config and every test/validation fixture. Per-run isolation is provided by the auto-created session subfolder `<log_dir>/<run-name>-<launch-ts>/`; tests and ad-hoc validations MUST NOT introduce sibling `logs-<tag>/` roots at the repo level. Anything a task wants to "break out" goes inside the session subfolder, not next to `logs/`. |
 
 ### `[variant.specific]`
 

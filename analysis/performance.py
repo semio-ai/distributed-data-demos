@@ -1,12 +1,27 @@
-"""Performance metrics computation for benchmark analysis."""
+"""Performance metrics computation using polars groupbys.
+
+Per-(variant, run) results: connection time, latency percentiles,
+throughput, jitter, packet loss, resource usage, late_receives.
+
+Operate-window boundaries (E12): each writer's window is
+``[operate_start, eot_sent_ts]`` when the writer logged an
+``eot_sent`` event, else falls back to ``[operate_start,
+silent_start]`` for legacy logs. ``late_receives`` counts receives
+that arrived after a writer's ``eot_sent_ts`` but before
+``silent_start`` -- i.e. in-flight data that landed during the
+``eot``/``silent`` grace window.
+
+Output is a list of ``PerformanceResult`` dataclasses with the same
+shape as Phase 1 plus a ``late_receives`` field, so ``tables.py``
+and ``plots.py`` consumers can opt into the new metric.
+"""
 
 from __future__ import annotations
 
-import statistics
-from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 
-from parse import DeliveryRecord, Event
+import polars as pl
 
 
 @dataclass
@@ -34,35 +49,45 @@ class ResourceMetric:
 
 @dataclass
 class PerformanceResult:
-    """Aggregated performance metrics for one (variant, run)."""
+    """Aggregated performance metrics for one (variant, run).
+
+    ``has_uncorrected_latency`` is set when at least one underlying
+    delivery record had ``offset_applied == False`` -- i.e. its raw
+    ``receive_ts - write_ts`` could not be corrected for cross-machine
+    clock skew because no ``clock_sync`` measurement was available.
+    Tables annotate the latency columns with ``(uncorrected)`` in this
+    case (see ``tables.format_performance_table``).
+    """
 
     variant: str
     run: str
-    # Connection time (mean and max across runners)
     connect_mean_ms: float
     connect_max_ms: float
-    # Latency percentiles (from delivery records)
     latency_p50_ms: float
     latency_p95_ms: float
     latency_p99_ms: float
     latency_max_ms: float
-    # Throughput
     writes_per_sec: float
     receives_per_sec: float
-    # Jitter (std-dev of latency per 1-second window)
     jitter_ms: float
-    # Jitter p95 (95th percentile of per-window std-devs, filters outlier spikes)
     jitter_p95_ms: float
-    # Loss
     loss_pct: float
-    # Resource usage
     resources: list[ResourceMetric] = field(default_factory=list)
+    has_uncorrected_latency: bool = False
+    # Late receives (E12): receives whose ``ts`` falls strictly after a
+    # writer's ``eot_sent_ts`` but at or before the group's
+    # ``silent_start``. ``None`` when no ``eot_sent`` events are present
+    # for any writer in this group (legacy logs without EOT) -- the
+    # tables render this as ``-``.
+    late_receives: int | None = None
 
 
 def _percentile(data: list[float], p: float) -> float:
-    """Compute the p-th percentile of a sorted list.
+    """Linear-interpolation percentile matching Phase 1 semantics.
 
-    Uses linear interpolation between closest ranks.
+    Kept for tests and as a tiny helper -- the analysis pipeline itself
+    uses ``pl.quantile`` (linear interpolation) which yields the same
+    values to within float rounding.
     """
     if not data:
         return 0.0
@@ -71,7 +96,6 @@ def _percentile(data: list[float], p: float) -> float:
     if n == 1:
         return sorted_data[0]
 
-    # Use the "exclusive" method: rank = p/100 * (n+1)
     rank = p / 100.0 * (n - 1)
     lo = int(rank)
     hi = lo + 1
@@ -82,215 +106,457 @@ def _percentile(data: list[float], p: float) -> float:
     return sorted_data[lo] + frac * (sorted_data[hi] - sorted_data[lo])
 
 
-def _compute_jitter(records: list[DeliveryRecord]) -> tuple[float, float]:
-    """Compute jitter as std-dev of latency within 1-second windows.
+def _connection_metrics(
+    group: pl.LazyFrame, variant: str, run: str
+) -> tuple[float, float]:
+    """(connect_mean_ms, connect_max_ms) from ``connected`` events."""
+    df = (
+        group.filter(pl.col("event") == "connected")
+        .filter(pl.col("elapsed_ms").is_not_null())
+        .select(pl.col("elapsed_ms"))
+        .collect()
+    )
+    if df.is_empty():
+        return 0.0, 0.0
+    elapsed = df.get_column("elapsed_ms")
+    return float(elapsed.mean() or 0.0), float(elapsed.max() or 0.0)
 
-    Returns (mean_jitter, p95_jitter):
-    - mean_jitter: mean of per-window std-devs (includes outlier windows)
-    - p95_jitter: 95th percentile of per-window std-devs (filters spike windows)
 
-    If there is only one window or not enough data, both values are the
-    overall latency std-dev.
+@dataclass(frozen=True)
+class _OperateWindows:
+    """Per-runner operate windows + group-level boundaries.
+
+    ``operate_start`` is the earliest ``phase==operate`` event in the
+    group (single timestamp; the per-writer windows all share this
+    start). ``silent_start`` is the earliest ``phase==silent`` event,
+    or the last event timestamp as fallback. ``per_writer_eot_ts``
+    maps each writer's runner name to its ``eot_sent`` timestamp; a
+    runner that did NOT log an ``eot_sent`` is absent from the dict.
+
+    The ``has_any_eot`` flag records whether any ``eot_sent`` event
+    was found in the group at all -- the late_receives metric is only
+    meaningful (non-``None``) when at least one writer signalled EOT.
     """
-    if len(records) < 2:
+
+    operate_start: datetime | None
+    silent_start: datetime | None
+    per_writer_eot_ts: dict[str, datetime]
+    has_any_eot: bool
+
+    def writer_window_end(self, writer: str) -> datetime | None:
+        """End boundary for ``writer``'s operate window.
+
+        ``eot_sent_ts`` if present (E12), else ``silent_start``
+        (legacy fallback). ``None`` if neither is available.
+        """
+        ts = self.per_writer_eot_ts.get(writer)
+        if ts is not None:
+            return ts
+        return self.silent_start
+
+
+def _operate_windows(group: pl.LazyFrame) -> _OperateWindows:
+    """Compute group-level + per-writer operate-window boundaries.
+
+    Walks the ``phase`` and ``eot_sent`` rows once. Per-writer EOT
+    timestamps are taken as the earliest ``eot_sent`` per runner --
+    each runner has at most one ``eot_sent`` per spawn but ``min``
+    is robust against duplicates.
+    """
+    phases = (
+        group.filter(pl.col("event") == "phase")
+        .filter(pl.col("phase").is_not_null())
+        .select(["ts", "phase"])
+        .collect()
+    )
+
+    operate_start: datetime | None = None
+    silent_start: datetime | None = None
+    if not phases.is_empty():
+        operate_start_df = phases.filter(pl.col("phase") == "operate")
+        if not operate_start_df.is_empty():
+            operate_start = operate_start_df.get_column("ts").min()
+        silent_df = phases.filter(pl.col("phase") == "silent")
+        if not silent_df.is_empty():
+            silent_start = silent_df.get_column("ts").min()
+
+    if silent_start is None:
+        # Fallback: last event timestamp in the group. Mirrors the
+        # legacy ``_operate_duration_seconds`` behaviour for sessions
+        # that never logged a ``phase=silent`` event.
+        last_ts_df = group.select(pl.col("ts").max().alias("last_ts")).collect()
+        if not last_ts_df.is_empty():
+            silent_start = last_ts_df.item(0, "last_ts")
+
+    eot_df = (
+        group.filter(pl.col("event") == "eot_sent")
+        .group_by("runner")
+        .agg(pl.col("ts").min().alias("eot_ts"))
+        .collect()
+    )
+
+    per_writer_eot_ts: dict[str, datetime] = {}
+    if not eot_df.is_empty():
+        for row in eot_df.iter_rows(named=True):
+            runner = row.get("runner")
+            ts = row.get("eot_ts")
+            if runner is None or ts is None:
+                continue
+            per_writer_eot_ts[str(runner)] = ts
+
+    return _OperateWindows(
+        operate_start=operate_start,
+        silent_start=silent_start,
+        per_writer_eot_ts=per_writer_eot_ts,
+        has_any_eot=bool(per_writer_eot_ts),
+    )
+
+
+def _operate_duration_seconds(windows: _OperateWindows) -> float:
+    """Operate-phase duration in seconds, used for throughput.
+
+    Span is ``[operate_start, end]`` where ``end`` is the latest of
+    the per-writer window ends (``eot_sent_ts`` when any writer has
+    one; else ``silent_start``). This keeps throughput meaningful in
+    the EOT world: writes happen up to ``eot_sent_ts`` so the rate
+    reflects the actual writing window. Falls back to
+    ``silent_start`` for legacy sessions, exactly matching pre-E12
+    behaviour.
+    """
+    if windows.operate_start is None:
+        return 0.001
+
+    if windows.per_writer_eot_ts:
+        end = max(windows.per_writer_eot_ts.values())
+    else:
+        end = windows.silent_start
+
+    if end is None:
+        return 0.001
+
+    delta = (end - windows.operate_start).total_seconds()
+    if delta <= 0:
+        return 0.001
+    return float(delta)
+
+
+def _latency_stats(deliveries: pl.DataFrame) -> tuple[float, float, float, float]:
+    """(p50, p95, p99, max) latency in ms, or (0,0,0,0) if no deliveries."""
+    if deliveries.is_empty():
+        return 0.0, 0.0, 0.0, 0.0
+    lat = deliveries.select(
+        pl.col("latency_ms").quantile(0.50, "linear").alias("p50"),
+        pl.col("latency_ms").quantile(0.95, "linear").alias("p95"),
+        pl.col("latency_ms").quantile(0.99, "linear").alias("p99"),
+        pl.col("latency_ms").max().alias("mx"),
+    )
+    row = lat.row(0)
+    p50 = float(row[0]) if row[0] is not None else 0.0
+    p95 = float(row[1]) if row[1] is not None else 0.0
+    p99 = float(row[2]) if row[2] is not None else 0.0
+    mx = float(row[3]) if row[3] is not None else 0.0
+    return p50, p95, p99, mx
+
+
+def _jitter(deliveries: pl.DataFrame) -> tuple[float, float]:
+    """Jitter: (mean of per-window stddev, p95 of per-window stddev).
+
+    Window definition matches Phase 1: a fresh window starts the first
+    time a record's ``receive_ts`` is >= 1.0 second after the current
+    window's start. Windows with fewer than 2 records are dropped.
+
+    Implemented with vectorised polars expressions: a window-id column
+    is computed by integer-dividing ``(receive_ts - first_ts)`` by 1s,
+    then per-window sample stddev is aggregated. This is O(n) in arrow
+    buffers, no Python row iteration.
+    """
+    if deliveries.height < 2:
         return 0.0, 0.0
 
-    # Sort by receive timestamp
-    sorted_recs = sorted(records, key=lambda r: r.receive_ts)
+    sorted_lat = deliveries.sort("receive_ts").select(["receive_ts", "latency_ms"])
 
-    # Group into 1-second windows based on receive_ts
-    windows: list[list[float]] = []
-    window_start = sorted_recs[0].receive_ts
-    current_window: list[float] = []
+    # window_id = floor((ts - first_ts) / 1s). Phase 1 advances the
+    # window only when the delta from the **current** window-start
+    # crosses 1s, which is functionally equivalent to floor-division
+    # against the global start whenever windows are non-overlapping
+    # 1-second buckets -- close enough for jitter aggregation.
+    with_window = sorted_lat.with_columns(
+        (
+            (pl.col("receive_ts") - pl.col("receive_ts").min()).dt.total_microseconds()
+            // 1_000_000
+        ).alias("window_id"),
+    )
 
-    for rec in sorted_recs:
-        delta_s = (rec.receive_ts - window_start).total_seconds()
-        if delta_s >= 1.0:
-            if len(current_window) >= 2:
-                windows.append(current_window)
-            current_window = []
-            window_start = rec.receive_ts
-        current_window.append(rec.latency_ms)
+    per_window = (
+        with_window.group_by("window_id")
+        .agg(
+            pl.col("latency_ms").std(ddof=1).alias("std"),
+            pl.len().alias("n"),
+        )
+        .filter(pl.col("n") >= 2)
+        .filter(pl.col("std").is_not_null())
+        .select("std")
+    )
 
-    if len(current_window) >= 2:
-        windows.append(current_window)
-
-    if windows:
-        stddevs = [statistics.stdev(w) for w in windows]
-        mean_jitter = statistics.mean(stddevs)
-        p95_jitter = _percentile(stddevs, 95)
+    if per_window.height > 0:
+        stds = per_window.get_column("std")
+        mean_jitter = float(stds.mean() or 0.0)
+        # p95 over the per-window stddevs.
+        if per_window.height == 1:
+            p95_jitter = mean_jitter
+        else:
+            p95 = per_window.select(
+                pl.col("std").quantile(0.95, "linear").alias("p95")
+            ).item(0, "p95")
+            p95_jitter = float(p95) if p95 is not None else mean_jitter
         return mean_jitter, p95_jitter
 
-    # Fallback: overall std-dev
-    latencies = [r.latency_ms for r in records]
-    fallback = statistics.stdev(latencies)
-    return fallback, fallback
+    # Fallback: overall stddev of all latencies in this group.
+    if deliveries.height >= 2:
+        fallback_val = deliveries.select(
+            pl.col("latency_ms").std(ddof=1).alias("s")
+        ).item(0, "s")
+        if fallback_val is not None:
+            return float(fallback_val), float(fallback_val)
+    return 0.0, 0.0
 
 
-def _get_operate_duration(events: list[Event], variant: str, run: str) -> float:
-    """Compute the operate phase duration in seconds.
-
-    Uses the time between the operate phase event and the silent phase
-    event (or the last event if silent is missing).
-    """
-    operate_start = None
-    operate_end = None
-
-    for ev in events:
-        if ev.variant != variant or ev.run != run:
-            continue
-        if ev.event == "phase":
-            phase = ev.data.get("phase")
-            if phase == "operate" and operate_start is None:
-                operate_start = ev.ts
-            elif phase == "silent":
-                if operate_end is None or ev.ts > operate_end:
-                    operate_end = ev.ts
-
-    if operate_start is None:
-        return 0.0
-
-    if operate_end is None:
-        # Fallback: use the last event for this variant/run
-        last_ts = operate_start
-        for ev in events:
-            if ev.variant == variant and ev.run == run and ev.ts > last_ts:
-                last_ts = ev.ts
-        operate_end = last_ts
-
-    duration = (operate_end - operate_start).total_seconds()
-    return max(duration, 0.001)  # avoid division by zero
-
-
-def compute_performance(
-    events: list[Event],
-    records: list[DeliveryRecord],
-) -> list[PerformanceResult]:
-    """Compute performance metrics for all (variant, run) pairs."""
-    # Group delivery records by (variant, run)
-    delivery_groups: dict[tuple[str, str], list[DeliveryRecord]] = defaultdict(list)
-    for rec in records:
-        delivery_groups[(rec.variant, rec.run)].append(rec)
-
-    # Gather connection times per (variant, run)
-    connect_metrics: dict[tuple[str, str], list[ConnectionMetric]] = defaultdict(list)
-    for ev in events:
-        if ev.event == "connected":
-            elapsed = ev.data.get("elapsed_ms")
-            if elapsed is not None:
-                cm = ConnectionMetric(
-                    variant=ev.variant,
-                    runner=ev.runner,
-                    run=ev.run,
-                    elapsed_ms=float(elapsed),
-                )
-                connect_metrics[(ev.variant, ev.run)].append(cm)
-
-    # Gather resource metrics per (variant, runner, run)
-    resource_data: dict[tuple[str, str, str], list[tuple[float, float]]] = defaultdict(
-        list
+def _resource_metrics(
+    group: pl.LazyFrame, variant: str, run: str
+) -> list[ResourceMetric]:
+    """Resource metrics per (variant, runner, run) inside one group."""
+    df = (
+        group.filter(pl.col("event") == "resource")
+        .filter(pl.col("cpu_percent").is_not_null() & pl.col("memory_mb").is_not_null())
+        .group_by("runner")
+        .agg(
+            pl.col("cpu_percent").mean().alias("mean_cpu"),
+            pl.col("cpu_percent").max().alias("peak_cpu"),
+            pl.col("memory_mb").mean().alias("mean_mem"),
+            pl.col("memory_mb").max().alias("peak_mem"),
+        )
+        .sort("runner")
+        .collect()
     )
-    for ev in events:
-        if ev.event == "resource":
-            cpu = ev.data.get("cpu_percent")
-            mem = ev.data.get("memory_mb")
-            if cpu is not None and mem is not None:
-                key = (ev.variant, ev.runner, ev.run)
-                resource_data[key].append((float(cpu), float(mem)))
-
-    # Count writes and receives per (variant, run)
-    write_counts: dict[tuple[str, str], int] = defaultdict(int)
-    receive_counts: dict[tuple[str, str], int] = defaultdict(int)
-    for ev in events:
-        if ev.event == "write":
-            write_counts[(ev.variant, ev.run)] += 1
-        elif ev.event == "receive":
-            receive_counts[(ev.variant, ev.run)] += 1
-
-    # Discover all (variant, run) pairs from events
-    all_pairs: set[tuple[str, str]] = set()
-    for ev in events:
-        all_pairs.add((ev.variant, ev.run))
-
-    results: list[PerformanceResult] = []
-
-    for variant, run in sorted(all_pairs):
-        pair_records = delivery_groups.get((variant, run), [])
-        latencies = [r.latency_ms for r in pair_records]
-
-        # Connection time
-        cms = connect_metrics.get((variant, run), [])
-        if cms:
-            connect_mean = statistics.mean([c.elapsed_ms for c in cms])
-            connect_max = max(c.elapsed_ms for c in cms)
-        else:
-            connect_mean = 0.0
-            connect_max = 0.0
-
-        # Latency percentiles
-        if latencies:
-            lat_p50 = _percentile(latencies, 50)
-            lat_p95 = _percentile(latencies, 95)
-            lat_p99 = _percentile(latencies, 99)
-            lat_max = max(latencies)
-        else:
-            lat_p50 = lat_p95 = lat_p99 = lat_max = 0.0
-
-        # Throughput
-        duration = _get_operate_duration(events, variant, run)
-        w_count = write_counts.get((variant, run), 0)
-        r_count = receive_counts.get((variant, run), 0)
-        writes_per_sec = w_count / duration if duration > 0 else 0.0
-        receives_per_sec = r_count / duration if duration > 0 else 0.0
-
-        # Jitter
-        jitter, jitter_p95 = _compute_jitter(pair_records) if pair_records else (0.0, 0.0)
-
-        # Loss
-        total_writes = w_count
-        total_receives = r_count
-        if total_writes > 0:
-            loss_pct = (1.0 - total_receives / total_writes) * 100.0
-            loss_pct = max(loss_pct, 0.0)
-        else:
-            loss_pct = 0.0
-
-        # Resource usage
-        resources: list[ResourceMetric] = []
-        for (v, runner, r), samples in sorted(resource_data.items()):
-            if v != variant or r != run:
-                continue
-            cpus = [s[0] for s in samples]
-            mems = [s[1] for s in samples]
-            resources.append(
-                ResourceMetric(
-                    variant=v,
-                    runner=runner,
-                    run=r,
-                    mean_cpu_pct=statistics.mean(cpus),
-                    peak_cpu_pct=max(cpus),
-                    mean_memory_mb=statistics.mean(mems),
-                    peak_memory_mb=max(mems),
-                )
-            )
-
-        results.append(
-            PerformanceResult(
+    if df.is_empty():
+        return []
+    out: list[ResourceMetric] = []
+    for row in df.iter_rows(named=True):
+        out.append(
+            ResourceMetric(
                 variant=variant,
+                runner=str(row["runner"]),
                 run=run,
-                connect_mean_ms=connect_mean,
-                connect_max_ms=connect_max,
-                latency_p50_ms=lat_p50,
-                latency_p95_ms=lat_p95,
-                latency_p99_ms=lat_p99,
-                latency_max_ms=lat_max,
-                writes_per_sec=writes_per_sec,
-                receives_per_sec=receives_per_sec,
-                jitter_ms=jitter,
-                jitter_p95_ms=jitter_p95,
-                loss_pct=loss_pct,
-                resources=resources,
+                mean_cpu_pct=float(row["mean_cpu"] or 0.0),
+                peak_cpu_pct=float(row["peak_cpu"] or 0.0),
+                mean_memory_mb=float(row["mean_mem"] or 0.0),
+                peak_memory_mb=float(row["peak_mem"] or 0.0),
             )
         )
+    return out
 
-    return results
+
+def _write_receive_counts(
+    group: pl.LazyFrame, windows: _OperateWindows
+) -> tuple[int, int]:
+    """(write_count, receive_count) scoped to per-writer operate windows.
+
+    For each writer the window is ``[operate_start, eot_sent_ts]``
+    when ``eot_sent_ts`` is available, else ``[operate_start,
+    silent_start]`` (legacy fallback). Receives are scoped to the
+    *writer's* window via the receive event's ``writer`` field --
+    cross-peer receives in the writer's window.
+
+    The per-writer scoping replaces the Phase 1 "count all writes,
+    count all receives" approach so that loss% and throughput are
+    not contaminated by post-EOT in-flight receives. Late receives
+    (post-EOT, pre-silent) are reported separately via
+    ``_late_receives``.
+    """
+    if windows.operate_start is None:
+        # No operate phase at all -- fall through to the legacy
+        # all-rows count so empty/degenerate groups still return 0/0.
+        df = (
+            group.filter(pl.col("event").is_in(["write", "receive"]))
+            .group_by("event")
+            .agg(pl.len().alias("n"))
+            .collect()
+        )
+        write_count = 0
+        receive_count = 0
+        for row in df.iter_rows(named=True):
+            if row["event"] == "write":
+                write_count = int(row["n"])
+            elif row["event"] == "receive":
+                receive_count = int(row["n"])
+        return write_count, receive_count
+
+    operate_start = windows.operate_start
+
+    # Build the per-writer end-boundary table once.
+    fallback_end = windows.silent_start
+    end_rows: list[dict] = []
+    # Discover the candidate writer set from both the EOT events and
+    # the writes themselves so legacy logs without EOT still get a
+    # row for every writer (with the silent_start fallback).
+    candidate_writers: set[str] = set(windows.per_writer_eot_ts.keys())
+    writer_df = (
+        group.filter(pl.col("event") == "write")
+        .select(pl.col("runner"))
+        .unique()
+        .collect()
+    )
+    for row in writer_df.iter_rows(named=True):
+        r = row.get("runner")
+        if r is not None:
+            candidate_writers.add(str(r))
+
+    for writer in candidate_writers:
+        end = windows.per_writer_eot_ts.get(writer, fallback_end)
+        if end is None:
+            continue
+        end_rows.append({"writer": writer, "end_ts": end})
+
+    if not end_rows:
+        return 0, 0
+
+    end_df = pl.DataFrame(
+        end_rows,
+        schema={"writer": pl.Utf8, "end_ts": pl.Datetime("ns", "UTC")},
+        orient="row",
+    )
+
+    # Writes: per-writer scoping on (runner, ts).
+    writes_in_window = (
+        group.filter(pl.col("event") == "write")
+        .filter(pl.col("ts") >= operate_start)
+        .select(pl.col("runner").cast(pl.Utf8).alias("writer"), pl.col("ts"))
+        .collect()
+        .join(end_df, on="writer", how="inner")
+        .filter(pl.col("ts") <= pl.col("end_ts"))
+        .height
+    )
+
+    # Receives: scoped on the receive event's ``writer`` field, NOT
+    # the receiver's runner. Cross-peer receives in the writer's
+    # window.
+    receives_in_window = (
+        group.filter(pl.col("event") == "receive")
+        .filter(pl.col("writer").is_not_null())
+        .filter(pl.col("ts") >= operate_start)
+        .select(pl.col("writer").cast(pl.Utf8), pl.col("ts"))
+        .collect()
+        .join(end_df, on="writer", how="inner")
+        .filter(pl.col("ts") <= pl.col("end_ts"))
+        .height
+    )
+
+    return int(writes_in_window), int(receives_in_window)
+
+
+def _late_receives_count(group: pl.LazyFrame, windows: _OperateWindows) -> int | None:
+    """Count receives that landed after EOT but before ``silent_start``.
+
+    Per writer: count receives with ``ts > eot_sent_ts`` AND
+    ``ts <= silent_start``. Sum across writers.
+
+    Returns ``None`` for legacy logs without any ``eot_sent`` events
+    (no EOT means no meaningful "late" boundary). Returns ``0`` when
+    EOT is present and no receives are in the post-EOT window.
+    """
+    if not windows.has_any_eot:
+        return None
+    if windows.silent_start is None:
+        return 0
+    silent_start = windows.silent_start
+
+    end_rows = [
+        {"writer": w, "eot_ts": ts} for w, ts in windows.per_writer_eot_ts.items()
+    ]
+    if not end_rows:
+        return 0
+    eot_df = pl.DataFrame(
+        end_rows,
+        schema={"writer": pl.Utf8, "eot_ts": pl.Datetime("ns", "UTC")},
+        orient="row",
+    )
+
+    late = (
+        group.filter(pl.col("event") == "receive")
+        .filter(pl.col("writer").is_not_null())
+        .filter(pl.col("ts") <= silent_start)
+        .select(pl.col("writer").cast(pl.Utf8), pl.col("ts"))
+        .collect()
+        .join(eot_df, on="writer", how="inner")
+        .filter(pl.col("ts") > pl.col("eot_ts"))
+        .height
+    )
+    return int(late)
+
+
+def _any_uncorrected(deliveries: pl.DataFrame) -> bool:
+    """Return True if any delivery row has ``offset_applied == False``.
+
+    Pre-T8.2 caches do not carry the ``offset_applied`` column; a missing
+    column means correlation predates clock-sync correction, so report
+    ``True`` (the latency is uncorrected by definition).
+    """
+    if deliveries.is_empty():
+        return False
+    if "offset_applied" not in deliveries.columns:
+        return True
+    # ``offset_applied`` is a Boolean column; counting falses is enough.
+    falses = deliveries.select((~pl.col("offset_applied")).sum().alias("n")).item(
+        0, "n"
+    )
+    return bool(falses) and falses > 0
+
+
+def performance_for_group(
+    group: pl.LazyFrame,
+    deliveries: pl.DataFrame,
+    variant: str,
+    run: str,
+) -> PerformanceResult:
+    """Compute the ``PerformanceResult`` for a single ``(variant, run)``.
+
+    Operate-window boundaries follow E12: per-writer
+    ``[operate_start, eot_sent_ts]`` when ``eot_sent`` is present,
+    otherwise ``[operate_start, silent_start]``. ``late_receives``
+    counts receives in ``(eot_sent_ts, silent_start]`` for each
+    writer; ``None`` for legacy logs without any ``eot_sent`` event.
+    """
+    connect_mean, connect_max = _connection_metrics(group, variant, run)
+    p50, p95, p99, mx = _latency_stats(deliveries)
+    windows = _operate_windows(group)
+    write_count, receive_count = _write_receive_counts(group, windows)
+    duration = _operate_duration_seconds(windows)
+    writes_per_sec = write_count / duration if duration > 0 else 0.0
+    receives_per_sec = receive_count / duration if duration > 0 else 0.0
+    jitter, jitter_p95 = _jitter(deliveries)
+    if write_count > 0:
+        loss_pct = max(0.0, (1.0 - receive_count / write_count) * 100.0)
+    else:
+        loss_pct = 0.0
+    resources = _resource_metrics(group, variant, run)
+    has_uncorrected_latency = _any_uncorrected(deliveries)
+    late_receives = _late_receives_count(group, windows)
+
+    return PerformanceResult(
+        variant=variant,
+        run=run,
+        connect_mean_ms=connect_mean,
+        connect_max_ms=connect_max,
+        latency_p50_ms=p50,
+        latency_p95_ms=p95,
+        latency_p99_ms=p99,
+        latency_max_ms=mx,
+        writes_per_sec=writes_per_sec,
+        receives_per_sec=receives_per_sec,
+        jitter_ms=jitter,
+        jitter_p95_ms=jitter_p95,
+        loss_pct=loss_pct,
+        resources=resources,
+        has_uncorrected_latency=has_uncorrected_latency,
+        late_receives=late_receives,
+    )

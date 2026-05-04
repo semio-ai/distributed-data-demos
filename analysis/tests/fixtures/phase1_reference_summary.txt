@@ -1,0 +1,98 @@
+Integrity Report
+------------------------------------------------------------------------------------------------------------------------------
+Variant               Run             Path                  QoS    Sent    Rcvd Delivery%  Out-of-order  Dupes Unresolved gaps
+------------------------------------------------------------------------------------------------------------------------------
+custom-udp-1000x100hz udp-all         alice->bob              2 132,000 115,496    87.50%             0      0               -
+custom-udp-1000x100hz udp-all         bob->alice              2 131,000 117,739    89.88%             0      0               -
+custom-udp-100x100hz  udp-all         alice->bob              2 100,100  99,585    99.49%             0      0               -
+custom-udp-100x100hz  udp-all         bob->alice              2 100,100 100,100   100.00%             0      0               -
+custom-udp-10x100hz   udp-all         alice->bob              2  10,010  10,010   100.00%             0      0               -
+custom-udp-10x100hz   udp-all         bob->alice              2  10,010  10,010   100.00%             0      0               -
+custom-udp-max        udp-all         alice->bob              2 129,000 114,152    88.49%             0      0               -
+custom-udp-max        udp-all         bob->alice              2 130,000 116,007    89.24%             0      0               -
+hybrid-1000x100hz     hybrid-all      alice->alice            2 123,000 120,929    98.32%             0      0               -
+hybrid-1000x100hz     hybrid-all      alice->bob              2 123,000 121,408    98.71%             0      0               -
+hybrid-1000x100hz     hybrid-all      bob->alice              2 122,000 120,673    98.91%             0      0               -
+hybrid-1000x100hz     hybrid-all      bob->bob                2 122,000 118,826    97.40%             0      0               -
+hybrid-100x100hz      hybrid-all      alice->alice            2 100,100 100,100   100.00%             0      0               -
+hybrid-100x100hz      hybrid-all      alice->bob              2 100,100 100,100   100.00%             0      0               -
+hybrid-100x100hz      hybrid-all      bob->alice              2 100,000 100,000   100.00%             0      0               -
+hybrid-100x100hz      hybrid-all      bob->bob                2 100,000 100,000   100.00%             0      0               -
+hybrid-10x100hz       hybrid-all      alice->alice            2  10,010  10,010   100.00%             0      0               -
+hybrid-10x100hz       hybrid-all      alice->bob              2  10,010  10,010   100.00%             0      0               -
+hybrid-10x100hz       hybrid-all      bob->alice              2  10,010  10,010   100.00%             0      0               -
+hybrid-10x100hz       hybrid-all      bob->bob                2  10,010  10,010   100.00%             0      0               -
+hybrid-max            hybrid-all      alice->alice            2 125,000 124,612    99.69%             0      0               -
+hybrid-max            hybrid-all      alice->bob              2 125,000 122,870    98.30%             0      0               -
+hybrid-max            hybrid-all      bob->alice              2 118,000 117,835    99.86%             0      0               -
+hybrid-max            hybrid-all      bob->bob                2 118,000 114,938    97.41%             0      0               -
+quic-1000x100hz       quic-all        alice->bob              2 922,000 922,000   100.00%             0      0               -
+quic-1000x100hz       quic-all        bob->alice              2 845,000 845,000   100.00%             0      0               -
+quic-100x100hz        quic-all        alice->bob              2 100,100 100,100   100.00%             0      0               -
+quic-100x100hz        quic-all        bob->alice              2 100,100 100,100   100.00%             0      0               -
+quic-10x100hz         quic-all        alice->bob              2  10,010  10,010   100.00%             0      0               -
+quic-10x100hz         quic-all        bob->alice              2  10,010  10,010   100.00%             0      0               -
+quic-max              quic-all        alice->bob              21,881,0001,881,000   100.00%             0      0               -
+quic-max              quic-all        bob->alice              2 158,000 158,000   100.00%             0      0               -
+zenoh-100x100hz       zenoh-all       alice->alice            2     333     300    90.09%             0      0               -
+zenoh-100x100hz       zenoh-all       alice->bob              2     333     333   100.00%             0      0               -
+zenoh-100x100hz       zenoh-all       bob->alice              2 100,100     109     0.11%             0      0               -
+zenoh-100x100hz       zenoh-all       bob->bob                2 100,100 100,100   100.00%             0      0               -
+zenoh-10x100hz        zenoh-all       alice->alice            2  10,010  10,010   100.00%             0      0               -
+zenoh-10x100hz        zenoh-all       alice->bob              2  10,010  10,010   100.00%             0      0               -
+zenoh-10x100hz        zenoh-all       bob->alice              2  10,010  10,010   100.00%             0      0               -
+zenoh-10x100hz        zenoh-all       bob->bob                2  10,010  10,010   100.00%             0      0               -
+
+Performance Report
+----------------------------------------------------------------------------------------------------------------------------------------------------
+Variant               Run               Connect(ms)      Lat p50          p95          p99          Max    Writes/s  Jitter avg  Jitter p95    Loss%
+----------------------------------------------------------------------------------------------------------------------------------------------------
+custom-udp-1000x100hz udp-all                  28.8      39.35ms      74.28ms      85.99ms      382.7ms      25,485     26.91ms     52.51ms   11.32%
+custom-udp-100x100hz  udp-all                  21.9       6.03ms      11.63ms      18.12ms      224.4ms      19,567      7.15ms     23.50ms    0.26%
+custom-udp-10x100hz   udp-all                  22.1       5.37ms       6.40ms      16.76ms      216.4ms       1,960      4.36ms     21.07ms    0.00%
+custom-udp-max        udp-all                  23.9      41.35ms      76.03ms      89.86ms      280.2ms      25,324     25.79ms     39.40ms   11.14%
+hybrid-1000x100hz     hybrid-all              728.0      36.68ms      66.58ms      74.86ms      91.07ms      24,344     17.80ms     20.01ms    0.00%
+hybrid-100x100hz      hybrid-all               29.5       4.02ms       8.36ms      12.43ms      18.00ms      19,996      2.38ms      2.61ms    0.00%
+hybrid-10x100hz       hybrid-all              284.5       1.36ms       6.33ms      107.4ms      505.8ms       1,904     12.65ms     58.22ms    0.00%
+hybrid-max            hybrid-all              279.6      36.53ms      68.57ms      79.02ms      96.37ms      24,237     18.98ms     20.28ms    0.00%
+quic-1000x100hz       quic-all                539.6      19.14ms      91.36ms      421.5ms      520.1ms     168,038     25.83ms     105.3ms    0.00%
+quic-100x100hz        quic-all                530.4       5.97ms       8.33ms      490.9ms      684.2ms      18,725     19.78ms     101.0ms    0.00%
+quic-10x100hz         quic-all                538.6       9.91ms      10.89ms      690.5ms      890.2ms       1,838     28.05ms     139.0ms    0.00%
+quic-max              quic-all                538.3      401.6ms     1188.7ms     1236.8ms     1249.8ms     186,941     47.18ms     94.07ms    0.00%
+zenoh-1000x100hz      zenoh-all               211.9     0.0000ms     0.0000ms     0.0000ms     0.0000ms      78,937    0.0000ms    0.0000ms  100.00%
+zenoh-100x100hz       zenoh-all               224.2      0.407ms      0.674ms       1.11ms      14.75ms      10,031     0.256ms     0.829ms    0.00%
+zenoh-10x100hz        zenoh-all               271.9       1.67ms       6.35ms      15.19ms      17.03ms       2,000      2.91ms      3.14ms    0.00%
+zenoh-max             zenoh-all               112.7     0.0000ms     0.0000ms     0.0000ms     0.0000ms      84,540    0.0000ms    0.0000ms  100.00%
+
+Resource Usage
+----------------------------------------------------------------------------------------------------
+Variant               Run             Runner         Mean CPU%   Peak CPU% Mean Mem(MB) Peak Mem(MB)
+----------------------------------------------------------------------------------------------------
+custom-udp-1000x100hz udp-all         alice               98.0       108.1         10.5         10.9
+custom-udp-1000x100hz udp-all         bob                 97.7       105.9         10.8         11.0
+custom-udp-100x100hz  udp-all         alice               80.7       106.7         10.5         10.5
+custom-udp-100x100hz  udp-all         bob                 77.9       113.3         10.6         10.6
+custom-udp-10x100hz   udp-all         alice               14.2        42.9         10.3         10.3
+custom-udp-10x100hz   udp-all         bob                 15.4        45.7         10.3         10.4
+custom-udp-max        udp-all         alice               98.1       112.7         10.8         11.0
+custom-udp-max        udp-all         bob                 98.0       107.5         10.6         11.0
+hybrid-1000x100hz     hybrid-all      alice               97.4       106.7         10.7         10.7
+hybrid-1000x100hz     hybrid-all      bob                 98.5       110.3         10.7         10.7
+hybrid-100x100hz      hybrid-all      alice               89.2       109.4         10.4         10.4
+hybrid-100x100hz      hybrid-all      bob                 89.5       111.3         10.4         10.4
+hybrid-10x100hz       hybrid-all      alice               15.4        41.7         10.3         10.3
+hybrid-10x100hz       hybrid-all      bob                 14.4        28.8         10.3         10.3
+hybrid-max            hybrid-all      alice               97.6       110.8         10.8         10.8
+hybrid-max            hybrid-all      bob                 97.7       108.6         10.8         10.8
+quic-1000x100hz       quic-all        alice              248.8       314.3         14.1         14.6
+quic-1000x100hz       quic-all        bob                228.9       342.9         13.7         14.7
+quic-100x100hz        quic-all        alice               33.4        98.2         13.5         13.9
+quic-100x100hz        quic-all        bob                 29.3       100.0         13.3         13.6
+quic-10x100hz         quic-all        alice               11.6        71.4         13.2         13.2
+quic-10x100hz         quic-all        bob                 11.9        69.6         13.3         13.4
+quic-max              quic-all        alice              243.6       328.6         13.5         13.6
+quic-max              quic-all        bob                218.8       266.7         14.4         14.7
+zenoh-100x100hz       zenoh-all       bob                 15.1        45.7         15.7         15.7
+zenoh-10x100hz        zenoh-all       alice               12.8        57.1         16.1         16.5
+zenoh-10x100hz        zenoh-all       bob                 13.2        51.2         16.0         16.5
+

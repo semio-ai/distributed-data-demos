@@ -12,6 +12,12 @@ anyhow = "1"
 variant-base = { path = "../../variant-base" }
 zenoh = "1"
 clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+# Tokio runtime owned by ZenohVariant for the publish/receive bridge
+# (Option B in DECISIONS.md D7 / T10.2b). The runtime drives Zenoh's async
+# API end-to-end so the variant's main thread never blocks the routing path.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
+serde_json = "1"

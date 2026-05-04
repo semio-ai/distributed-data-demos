@@ -24,6 +24,28 @@ pub enum Message {
         status: String,
         exit_code: i32,
     },
+    /// Clock-sync probe request from `from` to `to`. The initiator records
+    /// `t1` (send time) and the responder echoes it back so the initiator
+    /// does not need state for in-flight probes. Timestamps are RFC 3339
+    /// nanosecond strings.
+    ProbeRequest {
+        from: String,
+        to: String,
+        id: u64,
+        t1: String,
+    },
+    /// Clock-sync probe response. `t1` is echoed from the request; `t2` is
+    /// the receiver's wall-clock at receive; `t3` is the receiver's
+    /// wall-clock at send-back. All timestamps are RFC 3339 nanosecond
+    /// strings.
+    ProbeResponse {
+        from: String,
+        to: String,
+        id: u64,
+        t1: String,
+        t2: String,
+        t3: String,
+    },
 }
 
 impl Message {
@@ -114,5 +136,65 @@ mod tests {
     fn invalid_bytes_returns_none() {
         assert!(Message::from_bytes(b"not json").is_none());
         assert!(Message::from_bytes(b"{}").is_none());
+    }
+
+    #[test]
+    fn probe_request_roundtrip() {
+        let msg = Message::ProbeRequest {
+            from: "a".into(),
+            to: "b".into(),
+            id: 7,
+            t1: "2026-05-03T12:00:00.123456789Z".into(),
+        };
+        let bytes = msg.to_bytes();
+        let parsed = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, parsed);
+    }
+
+    #[test]
+    fn probe_response_roundtrip() {
+        let msg = Message::ProbeResponse {
+            from: "b".into(),
+            to: "a".into(),
+            id: 7,
+            t1: "2026-05-03T12:00:00.123456789Z".into(),
+            t2: "2026-05-03T12:00:00.123567890Z".into(),
+            t3: "2026-05-03T12:00:00.123678901Z".into(),
+        };
+        let bytes = msg.to_bytes();
+        let parsed = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, parsed);
+    }
+
+    #[test]
+    fn probe_request_json_format() {
+        let msg = Message::ProbeRequest {
+            from: "a".into(),
+            to: "b".into(),
+            id: 42,
+            t1: "2026-05-03T12:00:00.000000000Z".into(),
+        };
+        let json: serde_json::Value = serde_json::from_slice(&msg.to_bytes()).unwrap();
+        assert_eq!(json["type"], "probe_request");
+        assert_eq!(json["from"], "a");
+        assert_eq!(json["to"], "b");
+        assert_eq!(json["id"], 42);
+    }
+
+    #[test]
+    fn probe_response_json_format() {
+        let msg = Message::ProbeResponse {
+            from: "b".into(),
+            to: "a".into(),
+            id: 42,
+            t1: "2026-05-03T12:00:00.000000000Z".into(),
+            t2: "2026-05-03T12:00:00.000100000Z".into(),
+            t3: "2026-05-03T12:00:00.000200000Z".into(),
+        };
+        let json: serde_json::Value = serde_json::from_slice(&msg.to_bytes()).unwrap();
+        assert_eq!(json["type"], "probe_response");
+        assert_eq!(json["from"], "b");
+        assert_eq!(json["to"], "a");
+        assert_eq!(json["id"], 42);
     }
 }

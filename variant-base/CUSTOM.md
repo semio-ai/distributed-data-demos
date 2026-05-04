@@ -93,6 +93,12 @@ The trait is the core of this crate. It must be:
   "receives" its own writes. This is intentional — it exercises the full
   write/receive logging path.
 - `disconnect` is a no-op.
+- Does NOT override `signal_end_of_test` / `poll_peer_eots`; the trait
+  defaults are sufficient because the dummy is only ever spawned in
+  single-runner self-loopback configurations. In that mode the driver's
+  expected-peer set (peers from `--peers` minus self) is empty, so the
+  EOT phase exits immediately after a single `eot_sent` event with
+  `eot_id=0` — no `eot_timeout` is logged.
 - Ships as `variant-dummy` binary that the runner can spawn like any other
   variant.
 
@@ -103,7 +109,19 @@ generic `impl Variant`) and the parsed CLI config, then runs:
 1. Connect phase
 2. Stabilize phase (sleep)
 3. Operate phase (tick loop with workload)
-4. Silent phase (drain + flush)
+4. EOT phase (signal end-of-test, wait for peer EOTs, bounded by
+   `--eot-timeout-secs` which defaults to `max(operate_secs, 5)`)
+5. Silent phase (drain + flush)
 
 The driver owns the logger and calls it directly. Variants never touch
 the logger — they only do transport work through the trait methods.
+
+The EOT phase uses `Variant::signal_end_of_test` (called once at phase
+start; logs `eot_sent`) and `Variant::poll_peer_eots` (polled every
+~10 ms; logs `eot_received` per new (writer, eot_id), with a defensive
+dedup-by-writer backstop on the driver side). The expected-peer set is
+derived from the runner-injected `--peers` argument (which the driver
+finds in `CliArgs::extra` via `cli::parse_peer_names_from_extra`) minus
+the runner's own name. If the wait expires with peers still missing,
+the driver logs a single `eot_timeout` event with the missing names —
+the spawn does NOT abort.

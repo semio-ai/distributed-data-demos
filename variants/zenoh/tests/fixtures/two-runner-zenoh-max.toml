@@ -1,0 +1,37 @@
+# Zenoh max-throughput timeout reproducer for T10.2 investigation.
+#
+# Single Zenoh entry, workload = "max-throughput" with
+# values_per_tick = 1000 (=> 1000 paths but no tick sleep, the
+# protocol driver iterates as fast as possible), operate_secs = 5,
+# qos = 1.
+#
+# Per the failure inventory, the max-throughput workload also times
+# out — investigation needs to confirm whether this is the same root
+# cause as the path-count timeout (this fixture has 1000 paths) or a
+# separate failure mode introduced by the max-throughput tight loop.
+#
+# Run from the repo root in two terminals:
+#   runner/target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-max.toml
+#   runner/target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-max.toml
+
+run = "zenoh-t102-max"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-max"
+binary = "variants/zenoh/target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 5
+  silent_secs = 2
+  workload = "max-throughput"
+  values_per_tick = 1000
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+  # debug_trace = true   # uncomment to emit `[zenoh-trace] ...` lines on stderr.

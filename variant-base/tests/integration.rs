@@ -14,6 +14,7 @@ fn test_args(log_dir: &str) -> CliArgs {
         stabilize_secs: 0,
         operate_secs: 1,
         silent_secs: 0,
+        eot_timeout_secs: Some(1),
         workload: "scalar-flood".to_string(),
         values_per_tick: 5,
         qos: 1,
@@ -24,7 +25,9 @@ fn test_args(log_dir: &str) -> CliArgs {
         variant: "dummy".to_string(),
         runner: "test-runner".to_string(),
         run: "run01".to_string(),
-        extra: vec![],
+        // Single-runner self-loopback peers list -> empty expected set
+        // -> EOT phase terminates immediately with no `eot_timeout`.
+        extra: vec!["--peers".to_string(), "test-runner=127.0.0.1".to_string()],
     }
 }
 
@@ -78,7 +81,7 @@ fn test_full_protocol_with_dummy() {
         })
         .collect();
 
-    assert_eq!(phase_events.len(), 4, "should have 4 phase events");
+    assert_eq!(phase_events.len(), 5, "should have 5 phase events");
     assert_eq!(phase_events[0].0, "connect");
     assert_eq!(phase_events[1].0, "stabilize");
     assert_eq!(phase_events[2].0, "operate");
@@ -87,7 +90,19 @@ fn test_full_protocol_with_dummy() {
         Some("scalar-flood"),
         "operate phase should include workload profile"
     );
-    assert_eq!(phase_events[3].0, "silent");
+    assert_eq!(phase_events[3].0, "eot");
+    assert_eq!(phase_events[4].0, "silent");
+
+    // EOT phase: an `eot_sent` event must appear exactly once. With an
+    // empty expected-peer set (single-runner self-loopback) no
+    // `eot_timeout` should fire.
+    let eot_sent_count = events.iter().filter(|&&e| e == "eot_sent").count();
+    assert_eq!(eot_sent_count, 1, "should have exactly one eot_sent event");
+    let eot_timeout_count = events.iter().filter(|&&e| e == "eot_timeout").count();
+    assert_eq!(
+        eot_timeout_count, 0,
+        "single-runner self-loopback should not emit eot_timeout"
+    );
 
     // Connected event must exist with launch_ts and elapsed_ms.
     let connected: Vec<&serde_json::Value> =
@@ -176,6 +191,8 @@ fn test_variant_dummy_binary_exit_code() {
             "1",
             "--silent-secs",
             "0",
+            "--eot-timeout-secs",
+            "1",
             "--workload",
             "scalar-flood",
             "--values-per-tick",
@@ -192,6 +209,8 @@ fn test_variant_dummy_binary_exit_code() {
             "bin-test",
             "--run",
             "run-bin",
+            "--peers",
+            "bin-test=127.0.0.1",
         ])
         .output()
         .expect("failed to execute variant-dummy binary");

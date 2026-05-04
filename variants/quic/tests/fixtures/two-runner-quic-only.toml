@@ -20,7 +20,7 @@ binary = "variants/quic/target/release/variant-quic.exe"
   silent_secs = 1
   workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs-t92"
+  log_dir = "./logs"
 
   [variant.specific]
   base_port = 19930

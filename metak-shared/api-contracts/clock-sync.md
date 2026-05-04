@@ -47,11 +47,47 @@ Equivalently, `self` SUBTRACTS `offset` from a timestamp logged by `peer` to
 express it in `self`'s clock frame.
 
 Of the `N` samples, **select the one with the smallest `rtt`** as the
-estimate. (Min-RTT selection is the standard NTP heuristic — the sample with
-the least asymmetric queueing delay produces the least biased offset.)
+initial candidate. (Min-RTT selection is the standard NTP heuristic — the
+sample with the least asymmetric queueing delay produces the least biased
+offset.)
 
 Default `N = 32`. Inter-sample delay: 5 ms (so 32 samples take ~160 ms +
 RTTs).
+
+### Outlier rejection (added in T8.4)
+
+The min-RTT heuristic alone is not sufficient on Windows: occasionally the
+sample with the smallest RTT lands on a clock-quantization tick boundary
+or coincides with a transient OS time correction, producing an offset that
+disagrees with all other samples by hundreds of milliseconds despite a low
+RTT. Observed once during T8.1 validation — see DECISIONS.md D8.
+
+Mitigation:
+
+1. Compute the median offset across all `N` samples and the standard
+   deviation of offsets.
+2. If the min-RTT sample's offset deviates from the median by more than
+   `5 × stddev`, reject it.
+3. Fall back to the **median offset of the three samples with the lowest
+   RTTs**. This trades a tiny amount of best-case precision for robustness
+   against the single-sample artefact.
+4. Set `outlier_rejected = true` on the resulting `OffsetMeasurement` so
+   the JSONL line records that the fallback fired.
+
+Defense in depth: every `ProbeResponse` is verified to echo the same
+`t1` string the request was sent with. Mismatches are dropped (a
+defense against future protocol changes that might let a stale response
+slip through despite the `(from, to, id)` matching).
+
+### Per-sample diagnostic log (added in T8.4)
+
+Each runner additionally writes a sibling
+`<runner>-clock-sync-debug-<run>.jsonl` containing one line per raw
+sample (NOT just the chosen one). This is for offline diagnosis and is
+not consumed by analysis. Per-line fields: `runner`, `run`, `variant`,
+`peer`, `id`, `t1`, `t2`, `t3`, `t4`, `rtt_ms`, `offset_ms`, plus a
+`chosen: bool` flag marking the sample that fed the canonical
+measurement.
 
 ## When to Run
 
@@ -102,6 +138,8 @@ Every line includes the standard common fields plus the clock-sync-specific
 fields. `variant` is set to the variant currently being prepared (`""` for
 the initial sync that runs before any variant).
 
+**Required columnar fields** (promoted to `analysis/schema.py::SHARD_SCHEMA`):
+
 | Field | Type | Description |
 |-------|------|-------------|
 | `ts` | string (RFC 3339) | When the measurement was recorded by `self` |
@@ -112,12 +150,25 @@ the initial sync that runs before any variant).
 | `peer` | string | Peer runner name (the `other` side) |
 | `offset_ms` | float | `peer.clock − self.clock` in milliseconds (best sample) |
 | `rtt_ms` | float | RTT of the selected best sample, in milliseconds |
+
+**Optional diagnostic fields** (kept in the JSONL line for debugging /
+network quality inspection but NOT in `SHARD_SCHEMA` — analysis ignores
+them):
+
+| Field | Type | Description |
+|-------|------|-------------|
 | `samples` | integer | Number of samples taken (typically `N`) |
 | `min_rtt_ms` | float | Minimum RTT across all samples (= `rtt_ms` for the chosen one) |
 | `max_rtt_ms` | float | Maximum RTT across all samples (sanity / network-quality indicator) |
+| `outlier_rejected` | bool | `true` if the min-RTT sample was rejected and the median-of-three-lowest-RTT fallback fired (T8.4) |
 
 Single-runner runs (loopback only) emit no clock-sync events — the file may
 be absent. Analysis must handle this case gracefully (treat offset as 0).
+
+**Sibling debug file** (T8.4): each runner additionally writes
+`<runner>-clock-sync-debug-<run>.jsonl` with one line per raw sample
+(t1, t2, t3, t4, id, derived `rtt_ms`/`offset_ms`, and a `chosen` flag).
+Used for offline diagnosis only; analysis ignores this file entirely.
 
 ## Analysis Application
 

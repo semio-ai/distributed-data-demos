@@ -1,0 +1,39 @@
+# Custom-UDP UDP-path EOT validation fixture (T12.3).
+#
+# A single qos=1 spawn so a manual two-runner-on-localhost run exercises
+# the UDP EOT path (5 retries with 5 ms spacing, receiver dedup by
+# `(writer, eot_id)`). The companion qos=4 (TCP) path lives in
+# `two-runner-custom-udp-qos4.toml`.
+#
+# Run from the repo root in two terminals:
+#   runner/target/release/runner --name alice --config variants/custom-udp/tests/fixtures/two-runner-custom-udp-qos1-eot.toml
+#   runner/target/release/runner --name bob   --config variants/custom-udp/tests/fixtures/two-runner-custom-udp-qos1-eot.toml
+#
+# Verify in each runner's JSONL inside the per-run session subfolder:
+#   - `phase=eot` event
+#   - `eot_sent` event with a non-zero `eot_id`
+#   - `eot_received` event with `writer=<peer>` and the matching id
+#   - no `eot_timeout` event under normal conditions
+
+run = "custom-udp-t123-eot-udp"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "custom-udp-eot-qos1"
+binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 3
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19544"
+  buffer_size = 65536
+  tcp_base_port = 19800

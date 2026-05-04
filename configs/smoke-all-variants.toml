@@ -18,7 +18,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   workload = "scalar-flood"
   values_per_tick = 5
   qos = 1
-  log_dir = "./logs-smoke"
+  log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19590"
@@ -37,7 +37,7 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
   workload = "scalar-flood"
   values_per_tick = 5
   qos = 1
-  log_dir = "./logs-smoke"
+  log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19591"
@@ -55,7 +55,7 @@ binary = "variants/quic/target/release/variant-quic.exe"
   workload = "scalar-flood"
   values_per_tick = 5
   qos = 1
-  log_dir = "./logs-smoke"
+  log_dir = "./logs"
 
   [variant.specific]
   base_port = 19992
@@ -72,7 +72,7 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
   workload = "scalar-flood"
   values_per_tick = 5
   qos = 1
-  log_dir = "./logs-smoke"
+  log_dir = "./logs"
 
   [variant.specific]
   zenoh_mode = "peer"

@@ -1,0 +1,45 @@
+# Hybrid-only two-runner-on-localhost HIGH-THROUGHPUT validation fixture for
+# T10.1.
+#
+# Same shape as `two-runner-hybrid-only.toml`, but with the throughput knobs
+# bumped per the T10.1 spec:
+#   - tick_rate_hz   = 100
+#   - values_per_tick = 1000   (= 100K msg/s sustained)
+#   - operate_secs   = 5
+#
+# Single Hybrid entry, qos omitted -> runner expands to all 4 QoS levels.
+# All 4 spawns must complete `status=success` to satisfy T10.1's
+# high-throughput acceptance criterion.
+#
+# UDP path (qos 1-2): exercises the bounded WouldBlock retry on
+# `UdpTransport::send`.
+# TCP path (qos 3-4): exercises blocking writes on the per-peer TCP socket
+# plus the per-peer fault-tolerance branch in the read loop.
+#
+# Distinct port range / log dir from the regression fixture so the two can
+# coexist without TIME_WAIT collisions or log mixups.
+#
+# Run from the repo root in two terminals:
+#   runner/target/release/runner --name alice --config variants/hybrid/tests/fixtures/two-runner-hybrid-highrate.toml
+#   runner/target/release/runner --name bob   --config variants/hybrid/tests/fixtures/two-runner-hybrid-highrate.toml
+
+run = "hybrid-t101-highrate-validation"
+runners = ["alice", "bob"]
+default_timeout_secs = 90
+
+[[variant]]
+name = "hybrid-t101-highrate"
+binary = "variants/hybrid/target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19642"
+  tcp_base_port = 19840

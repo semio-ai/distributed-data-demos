@@ -1,17 +1,17 @@
-"""Tests for the performance metrics module."""
+"""Tests for the polars-based performance metrics module."""
 
 from __future__ import annotations
 
-import json
+from helpers import events_to_lazy, make_event
 
-from helpers import make_event
-from correlate import correlate
-from parse import parse_line
-from performance import _percentile, compute_performance
+from correlate import correlate_lazy
+from performance import _percentile, performance_for_group
 
 
-def _ev(d: dict) -> object:
-    return parse_line(json.dumps(d))
+def _perf(events: list[dict], variant: str = "test-variant", run: str = "run01"):
+    lazy = events_to_lazy(events)
+    deliveries = correlate_lazy(lazy).collect()
+    return performance_for_group(lazy, deliveries, variant, run)
 
 
 class TestPercentile:
@@ -32,93 +32,73 @@ class TestPercentile:
         assert p99 >= 97.0
 
 
-class TestComputePerformance:
+class TestPerformanceForGroup:
     def test_basic_metrics(self) -> None:
-        """Compute performance for a simple two-runner scenario."""
         events = [
-            _ev(make_event("phase", runner="alice", phase="connect", offset_ms=0)),
-            _ev(
-                make_event(
-                    "connected",
-                    runner="alice",
-                    launch_ts="2025-04-15T09:35:49Z",
-                    elapsed_ms=50.0,
-                    offset_ms=50,
-                )
+            make_event("phase", runner="alice", phase="connect", offset_ms=0),
+            make_event(
+                "connected",
+                runner="alice",
+                launch_ts="2025-04-15T09:35:49Z",
+                elapsed_ms=50.0,
+                offset_ms=50,
             ),
-            _ev(make_event("phase", runner="alice", phase="stabilize", offset_ms=51)),
-            _ev(
-                make_event(
-                    "phase",
-                    runner="alice",
-                    phase="operate",
-                    profile="scalar-flood",
-                    offset_ms=1000,
-                )
+            make_event("phase", runner="alice", phase="stabilize", offset_ms=51),
+            make_event(
+                "phase",
+                runner="alice",
+                phase="operate",
+                profile="scalar-flood",
+                offset_ms=1000,
             ),
-            _ev(
-                make_event(
-                    "write",
-                    runner="alice",
-                    seq=1,
-                    path="/k",
-                    qos=1,
-                    bytes=8,
-                    offset_ms=1001,
-                )
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=1001,
             ),
-            _ev(
-                make_event(
-                    "write",
-                    runner="alice",
-                    seq=2,
-                    path="/k",
-                    qos=1,
-                    bytes=8,
-                    offset_ms=1002,
-                )
+            make_event(
+                "write",
+                runner="alice",
+                seq=2,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=1002,
             ),
-            _ev(
-                make_event(
-                    "receive",
-                    runner="bob",
-                    writer="alice",
-                    seq=1,
-                    path="/k",
-                    qos=1,
-                    bytes=8,
-                    offset_ms=1010,
-                )
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=1010,
             ),
-            _ev(
-                make_event(
-                    "receive",
-                    runner="bob",
-                    writer="alice",
-                    seq=2,
-                    path="/k",
-                    qos=1,
-                    bytes=8,
-                    offset_ms=1011,
-                )
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=2,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=1011,
             ),
-            _ev(
-                make_event(
-                    "resource",
-                    runner="alice",
-                    cpu_percent=5.0,
-                    memory_mb=10.0,
-                    offset_ms=1100,
-                )
+            make_event(
+                "resource",
+                runner="alice",
+                cpu_percent=5.0,
+                memory_mb=10.0,
+                offset_ms=1100,
             ),
-            _ev(make_event("phase", runner="alice", phase="silent", offset_ms=2000)),
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000),
         ]
-
-        records = correlate(events)
-        results = compute_performance(events, records)
-        assert len(results) == 1
-
-        r = results[0]
+        r = _perf(events)
         assert r.variant == "test-variant"
         assert r.connect_mean_ms == 50.0
         assert r.latency_p50_ms > 0
@@ -128,33 +108,29 @@ class TestComputePerformance:
         assert r.resources[0].mean_cpu_pct == 5.0
 
     def test_no_events(self) -> None:
-        results = compute_performance([], [])
-        assert results == []
+        # Empty group still returns a result, with zero metrics.
+        r = _perf([])
+        assert r.connect_mean_ms == 0.0
+        assert r.latency_p50_ms == 0.0
+        assert r.writes_per_sec == 0.0
 
     def test_connection_time_from_connected_event(self) -> None:
-        """Connection time should use elapsed_ms from connected events."""
         events = [
-            _ev(
-                make_event(
-                    "connected",
-                    runner="alice",
-                    launch_ts="2025-04-15T09:35:49Z",
-                    elapsed_ms=42.5,
-                    offset_ms=42,
-                )
+            make_event(
+                "connected",
+                runner="alice",
+                launch_ts="2025-04-15T09:35:49Z",
+                elapsed_ms=42.5,
+                offset_ms=42,
             ),
-            _ev(
-                make_event(
-                    "connected",
-                    runner="bob",
-                    launch_ts="2025-04-15T09:35:49Z",
-                    elapsed_ms=60.0,
-                    offset_ms=60,
-                )
+            make_event(
+                "connected",
+                runner="bob",
+                launch_ts="2025-04-15T09:35:49Z",
+                elapsed_ms=60.0,
+                offset_ms=60,
             ),
         ]
-        results = compute_performance(events, [])
-        assert len(results) == 1
-        r = results[0]
+        r = _perf(events)
         assert abs(r.connect_mean_ms - 51.25) < 0.01
         assert r.connect_max_ms == 60.0

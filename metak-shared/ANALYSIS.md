@@ -34,56 +34,144 @@ When neither `--summary` nor `--diagrams` is given, both are produced.
 
 ## 3. Caching Pipeline
 
-Repeated analysis runs should be fast. The tool uses a pickle cache to avoid
-re-parsing unchanged log files.
+Repeated analysis runs should be fast. The tool maintains a per-file
+columnar cache so that large datasets (tens of GB, 100M+ events) can be
+analysed with bounded memory and incremental updates.
+
+> **Implementation note.** The original Phase 1 design (E4) used a single
+> monolithic pickle file holding every parsed event in RAM. That approach
+> works for small datasets but does not scale: it is O(total dataset size)
+> in both load time and peak memory, with no way to process subsets.
+> Phase 1.5 (E11) replaces it with the design below. See § 8.
+
+### 3.1 Storage layout
 
 ```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ Check for    │──►│ Detect new / │──►│ Parse &      │──►│ Pickle the   │
-│ pickle cache │    │ changed files │    │ merge into   │    │ updated      │
-│              │    │              │    │ cache        │    │ cache        │
-└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
-         │                                                         │
-         │  (cache exists, no changes)                             ▼
-         └───────────────────────────────────────────────► Run analysis
+<logs-dir>/
+  <name>-<runner>-<run>.jsonl              # source logs (untouched)
+  ...
+  .cache/
+    <name>-<runner>-<run>.parquet          # columnar shard, one per JSONL
+    <name>-<runner>-<run>.meta.json        # sidecar: mtime + schema version + row count
+    ...
+    _cache_schema_version.json             # global schema sentinel
 ```
 
-### 3.1 Steps
+Each source JSONL file gets exactly one Parquet shard plus one tiny meta
+sidecar. There is **no global index file**. The set of shards present on
+disk *is* the cache.
 
-1. **Check for pickle cache** — look for `<logs-dir>/.analysis_cache.pkl`.
-   If absent (or `--clear` was passed), start with an empty cache.
-2. **Detect new or changed files** — the cache stores the path and
-   `mtime` of every JSONL file it has ingested. Scan `<logs-dir>/*.jsonl`
-   and compare. Files with a newer `mtime` or not in the cache are
-   marked for (re)loading.
-3. **Parse and merge** — for each changed or new file, parse all JSONL
-   lines and insert/replace them in the cache keyed by
-   `(variant, runner, run)`. A changed file fully replaces its previous
-   entries.
-4. **Pickle the cache** — write the updated cache back to
-   `<logs-dir>/.analysis_cache.pkl`.
-5. **Run analysis** — integrity verification and performance analysis
-   operate on the cached data.
+### 3.2 Why Parquet (not pickle)
 
-### 3.2 The `--clear` Flag
+| Property | Pickle (Phase 1) | Parquet (Phase 1.5) |
+|---|---|---|
+| Random access | No — must load whole file | Yes — read columns, row-groups, predicate-pushdown |
+| Compression | None | ~5-10x (snappy/zstd) on event data |
+| Memory footprint when read | ~3x dataset size in Python objects | Native Arrow buffers, ~10-30x denser than Python objects |
+| Streaming reads | No | Yes (mmap or row-group iterator) |
+| Schema evolution safety | Brittle (class identity tied to Python source) | Schema metadata in file; easy to detect mismatch |
+| Crash safety during build | Whole-file rewrite each update | Per-shard write; partial updates are recoverable |
 
-Deletes `.analysis_cache.pkl` before step 1, forcing a full rebuild from
-every JSONL file. Use this after manually editing or deleting log files.
+### 3.3 Steps
+
+```
+┌────────────────┐  ┌─────────────────┐  ┌──────────────┐  ┌────────────────┐
+│ Discover JSONL │─►│ Diff against    │─►│ Stream-parse │─►│ Run analysis   │
+│ + shards       │  │ shard meta      │  │ stale files  │  │ via lazy reads │
+│                │  │ (mtime, schema) │  │ → parquet    │  │ over shards    │
+└────────────────┘  └─────────────────┘  └──────────────┘  └────────────────┘
+```
+
+1. **Discover** — list `<logs-dir>/*.jsonl` and `<logs-dir>/.cache/*.parquet`.
+2. **Diff** — for each JSONL, look up its sidecar. A shard is **stale**
+   when: the sidecar is missing, sidecar `mtime` is older than the JSONL
+   `mtime`, or the global schema version has changed. Stale shards are
+   marked for rebuild. Orphan shards (no matching JSONL) are removed.
+3. **Stream-parse** — for each stale or missing shard, read the JSONL line
+   by line, project into the columnar schema (§ 4.1), and write a Parquet
+   shard incrementally via row-group batches (e.g. 100k rows per batch).
+   Memory is bounded by the batch size, not the file size.
+   Write the sidecar after the shard is fully flushed.
+4. **Run analysis** — integrity and performance both operate on
+   `pl.scan_parquet(<logs-dir>/.cache/*.parquet)`, a lazy frame that
+   pushes filters and projections down into the Parquet readers. No
+   step in the analysis pipeline materializes the full dataset in memory.
+
+### 3.4 The `--clear` flag
+
+Deletes the entire `.cache/` directory before step 1, forcing a full
+rebuild from every JSONL file. Use this after manually editing or deleting
+log files, or after a schema change forces it.
+
+### 3.5 Migrating from the Phase 1 pickle cache
+
+On startup, if a legacy `<logs-dir>/.analysis_cache.pkl` exists, the tool
+deletes it (after a one-line stderr notice). Do **not** attempt to
+convert — re-parsing from the source JSONL is the source of truth.
 
 ## 4. Data Model
 
-After ingestion, the cache holds a flat table of events. Each event retains
-all fields from its JSONL line. The composite key
-`(variant, run, writer, seq, path)` uniquely identifies a logical write and
-is used to correlate writes with their corresponding receives across runners.
+### 4.1 Columnar event schema
 
-### 4.1 Correlation
+After ingestion, events live in a single flat columnar schema, one row per
+JSONL line. Event-specific fields share the same row; columns that don't
+apply to a given event type are null. This is the schema written to every
+Parquet shard and read by every analysis step.
+
+| Column | Polars dtype | Source |
+|---|---|---|
+| `ts` | `Datetime("ns", "UTC")` | every event |
+| `variant` | `Categorical` | every event |
+| `runner` | `Categorical` | every event |
+| `run` | `Categorical` | every event |
+| `event` | `Categorical` | every event (enum: `connected`, `phase`, `write`, `receive`, `gap_detected`, `gap_filled`, `resource`, `clock_sync`) |
+| `seq` | `Int64` (nullable) | `write`, `receive` |
+| `path` | `Utf8` (nullable) | `write`, `receive` |
+| `writer` | `Utf8` (nullable) | `receive`, `gap_detected`, `gap_filled` |
+| `qos` | `Int8` (nullable) | `write`, `receive`, `gap_*` |
+| `elapsed_ms` | `Float64` (nullable) | `connected` |
+| `phase` | `Utf8` (nullable) | `phase` |
+| `missing_seq` | `Int64` (nullable) | `gap_detected` |
+| `recovered_seq` | `Int64` (nullable) | `gap_filled` |
+| `cpu_percent` | `Float32` (nullable) | `resource` |
+| `memory_mb` | `Float32` (nullable) | `resource` |
+| `peer` | `Utf8` (nullable) | `clock_sync` (E8) |
+| `offset_ms` | `Float64` (nullable) | `clock_sync` |
+| `rtt_ms` | `Float64` (nullable) | `clock_sync` |
+
+Categorical encoding is essential: `variant`, `runner`, `run`, `event` are
+low-cardinality (under ~50 distinct values across an entire dataset).
+Dictionary encoding shrinks them from ~30 bytes/row to ~1 byte/row.
+
+Schema is centrally defined in code; bumping the version sentinel forces
+all shards to rebuild. New event types add nullable columns — they do not
+require a schema bump for older logs.
+
+### 4.2 Correlation
 
 For every `write` event, the analysis tool finds the matching `receive`
 events on other runners by joining on `(variant, run, seq, path)` where the
 `receive` event's `writer` field matches the `write` event's `runner` field.
 
-This produces a **delivery record** per (write, receiver) pair:
+This is expressed as a polars join:
+
+```python
+writes = lazy.filter(pl.col("event") == "write").select(
+    "variant", "run", pl.col("runner").alias("writer"), "seq", "path",
+    pl.col("ts").alias("write_ts"), "qos",
+)
+receives = lazy.filter(pl.col("event") == "receive").select(
+    "variant", "run", pl.col("runner").alias("receiver"),
+    "writer", "seq", "path", pl.col("ts").alias("receive_ts"),
+)
+deliveries = receives.join(writes, on=["variant", "run", "writer", "seq", "path"], how="inner") \
+                     .with_columns(
+                         ((pl.col("receive_ts") - pl.col("write_ts")).dt.total_microseconds() / 1000.0)
+                         .alias("latency_ms")
+                     )
+```
+
+The resulting **delivery record** carries the same fields as before:
 
 | Field | Source |
 |---|---|
@@ -96,7 +184,26 @@ This produces a **delivery record** per (write, receiver) pair:
 | `receiver` | receive event's `runner` |
 | `write_ts` | write event's `ts` |
 | `receive_ts` | receive event's `ts` |
-| `latency` | `receive_ts − write_ts` |
+| `latency_ms` | `(receive_ts − write_ts).total_milliseconds()` |
+
+### 4.3 Per-group execution
+
+The analysis is naturally partitioned by `(variant, run)`. The driver
+iterates groups and applies all downstream steps (correlation, integrity,
+performance) in a per-group lazy pipeline. At any moment only one group
+is materialized, bounding peak memory regardless of total dataset size.
+
+```
+groups = lazy.select(["variant", "run"]).unique().collect()
+for variant, run in groups.iter_rows():
+    g = lazy.filter((pl.col("variant") == variant) & (pl.col("run") == run))
+    deliveries = correlate_group(g)
+    integrity_results.extend(integrity_group(g, deliveries))
+    performance_results.append(performance_group(g, deliveries))
+```
+
+The only cross-group step is the final summary table, which operates on
+already-aggregated metrics — never raw events.
 
 ## 5. Integrity Verification
 
@@ -256,20 +363,35 @@ the output directory as PNG files.
 
 ## 8. Phased Delivery
 
-The analysis tool will be built incrementally:
+The analysis tool is built incrementally:
 
-### Phase 1 — Foundation
+### Phase 1 — Foundation (E4, done)
 
 - Caching pipeline (pickle load/save, change detection, `--clear`).
-- JSONL parsing and data model.
+- JSONL parsing and data model (in-memory dataclasses).
 - Write-receive correlation.
 - CLI summary tables (integrity + performance).
+
+> Phase 1 is superseded by Phase 1.5 below. The analysis-output behaviour
+> (CLI tables, integrity/performance semantics) is preserved; the
+> storage and execution model is replaced.
+
+### Phase 1.5 — Large-Dataset Cache and Pipeline Rework (E11)
+
+Replace the monolithic-pickle cache with the per-shard Parquet cache and
+the lazy / per-group execution model described in §§ 3-4. Required for
+any dataset larger than a few hundred MB. Acceptance: a 40 GB dataset
+analyses to completion with bounded memory (target <4 GB peak) within
+minutes, and re-runs against an unchanged dataset complete in seconds.
 
 ### Phase 2 — Diagrams
 
 - Latency histogram, CDF, box plot.
 - Throughput bar chart.
 - Connection time bar chart.
+
+Built on top of the Phase 1.5 lazy pipeline — plot generators consume
+materialized per-group polars frames, not raw event lists.
 
 ### Phase 3 — Time-Series and Advanced
 

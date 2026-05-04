@@ -44,8 +44,11 @@ Logged at the start of each test protocol phase.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `phase` | string | One of: `connect`, `stabilize`, `operate`, `silent` |
+| `phase` | string | One of: `connect`, `stabilize`, `operate`, `eot`, `silent` |
 | `profile` | string (optional) | Workload profile name (only for `operate`) |
+
+The `eot` phase is the bounded end-of-test handshake between `operate`
+and `silent`. See `eot-protocol.md` for the full contract.
 
 ### `write`
 
@@ -88,6 +91,36 @@ Logged by a reader when a previously detected gap is recovered (QoS 3).
 | `writer` | string | Runner name of the writer |
 | `recovered_seq` | integer | The recovered sequence number |
 
+### `eot_sent`
+
+Logged once by the writer immediately after the variant's
+`signal_end_of_test` returns, at the start of the EOT phase. See
+`eot-protocol.md` for the full contract.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `eot_id` | integer | The 64-bit id used for this writer's EOT. Lets a receiver's `eot_received.eot_id` join with the writer's `eot_sent.eot_id`. |
+
+### `eot_received`
+
+Logged once per (writer, eot_id) by the receiver, after dedup.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `writer` | string | Runner name of the writer whose EOT was just observed |
+| `eot_id` | integer | The id from the writer's `eot_sent` |
+
+### `eot_timeout`
+
+Logged once at the end of the EOT phase IF the variant's
+`wait_for_peer_eots` returned `EotOutcome::TimedOut`. Diagnostic only —
+presence does NOT abort the spawn.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `missing` | array of strings | Peer runner names that never signalled EOT |
+| `wait_ms` | integer | Wall-clock duration of the wait |
+
 ### `resource`
 
 Logged periodically (e.g. every 100 ms) during operation phases.
@@ -104,14 +137,27 @@ Logged by the **runner** (not variants) into a sibling log file
 Used by analysis to correct cross-machine `receive_ts − write_ts` for
 inter-machine clock skew. See `clock-sync.md` for the measurement protocol.
 
+Required (columnar) fields:
+
 | Field | Type | Description |
 |-------|------|-------------|
 | `peer` | string | Peer runner name (the other side of the pair) |
 | `offset_ms` | float | `peer.clock − self.clock` in milliseconds (best sample) |
 | `rtt_ms` | float | RTT of the selected best sample, in milliseconds |
+
+Optional diagnostic fields (kept in JSONL only, not in `SHARD_SCHEMA`):
+
+| Field | Type | Description |
+|-------|------|-------------|
 | `samples` | integer | Number of samples taken |
 | `min_rtt_ms` | float | Minimum RTT across all samples |
 | `max_rtt_ms` | float | Maximum RTT across all samples |
+| `outlier_rejected` | bool | `true` if the min-RTT sample was rejected and the median-of-three-lowest-RTT fallback fired (T8.4) |
+
+A sibling `<runner>-clock-sync-debug-<run>.jsonl` file is also written
+with one line per raw sample (per-sample t1/t2/t3/t4, derived rtt/offset,
+and a `chosen` flag). Used for offline diagnosis only; analysis ignores
+this file entirely.
 
 Note: in clock-sync events, the `variant` common field carries the variant
 about to start (or `""` for the initial sync that runs before any variant).

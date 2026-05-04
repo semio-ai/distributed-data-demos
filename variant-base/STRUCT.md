@@ -6,11 +6,11 @@ variant-base/
     CLAUDE.md              -- Worker agent instructions (read-only scope)
   src/
     lib.rs                 -- Public API re-exports for the library crate
-    variant_trait.rs       -- Variant trait definition (connect, publish, poll_receive, disconnect)
-    types.rs               -- Shared types: Qos enum, Phase enum, ReceivedUpdate struct
-    cli.rs                 -- Common CLI argument parsing with clap derive (CliArgs struct)
-    logger.rs              -- JSONL structured logger with methods for all 7 event types
-    driver.rs              -- Test protocol driver: runs connect, stabilize, operate, silent phases
+    variant_trait.rs       -- Variant trait definition (connect, publish, poll_receive, disconnect, signal_end_of_test, poll_peer_eots) + PeerEot struct
+    types.rs               -- Shared types: Qos enum, Phase enum (connect|stabilize|operate|eot|silent), ReceivedUpdate struct
+    cli.rs                 -- Common CLI argument parsing with clap derive (CliArgs struct, including --eot-timeout-secs); helpers for parsing extra args (--peers names)
+    logger.rs              -- JSONL structured logger with methods for connected, phase, write, receive, gap_detected, gap_filled, resource, eot_sent, eot_received, eot_timeout
+    driver.rs              -- Test protocol driver: runs connect, stabilize, operate, eot, silent phases
     workload.rs            -- Workload trait + ScalarFlood implementation + factory function
     seq.rs                 -- Monotonic sequence number generator (SeqGenerator)
     resource.rs            -- CPU/memory resource monitor using sysinfo (ResourceMonitor)

@@ -1,10 +1,11 @@
+use crate::clock_sync::{respond_to_probe, ClockSyncEngine};
 use crate::local_addrs::canonical_peer_host;
 use crate::message::Message;
 use anyhow::{bail, Result};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
@@ -29,7 +30,9 @@ pub struct Coordinator {
     /// This runner's proposed log subfolder.
     proposed_log_subdir: String,
     /// UDP socket (None in single-runner mode since no network I/O is needed).
-    socket: Option<Socket>,
+    /// Wrapped in `Arc` so the `ClockSyncEngine` can share ownership without
+    /// reopening the port.
+    socket: Option<Arc<Socket>>,
     /// Addresses of all peer runners (including self for multicast, excluding
     /// self for unicast fallback). Each runner gets its own port to avoid
     /// Windows same-port delivery issues.
@@ -93,7 +96,7 @@ impl Coordinator {
         let socket = if single_runner {
             None
         } else {
-            Some(create_coordination_socket(my_port)?)
+            Some(Arc::new(create_coordination_socket(my_port)?))
         };
 
         // Self-populate the peer_hosts map. Single-runner mode never receives
@@ -125,6 +128,26 @@ impl Coordinator {
         self.peer_hosts.lock().unwrap().clone()
     }
 
+    /// Whether this coordinator is in single-runner mode (no peers, no socket).
+    pub fn is_single_runner(&self) -> bool {
+        self.single_runner
+    }
+
+    /// Build a `ClockSyncEngine` that shares the coordination socket with this
+    /// coordinator. Returns `None` in single-runner mode (no socket exists).
+    ///
+    /// The engine and the coordinator must NOT be used concurrently from
+    /// different threads — the runner's main loop only invokes one or the
+    /// other at a time, so single-threaded sequential use is safe.
+    pub fn clock_sync_engine(&self) -> Option<ClockSyncEngine> {
+        let socket = self.socket.as_ref()?.clone();
+        Some(ClockSyncEngine::new(
+            self.name.clone(),
+            socket,
+            self.peer_addrs.clone(),
+        ))
+    }
+
     /// Run the discovery phase.
     ///
     /// Broadcasts Discover messages until all expected runners have been seen
@@ -142,7 +165,7 @@ impl Coordinator {
             return Ok(self.proposed_log_subdir.clone());
         }
 
-        let socket = self.socket.as_ref().unwrap();
+        let socket = self.socket.as_deref().unwrap();
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(self.name.clone());
 
@@ -191,6 +214,24 @@ impl Coordinator {
                         }
                         Message::Ready { ref name, .. } => Some(name.clone()),
                         Message::Done { ref name, .. } => Some(name.clone()),
+                        Message::ProbeRequest { from, to, id, t1 } => {
+                            // Always-respond rule: even mid-discovery, a peer
+                            // probing us must get a prompt reply. Discovery
+                            // is rare here (peers usually probe after Phase
+                            // 1.5) but is included for completeness.
+                            if to == &self.name {
+                                let _ = respond_to_probe(
+                                    socket,
+                                    &self.peer_addrs,
+                                    &self.name,
+                                    from,
+                                    *id,
+                                    t1,
+                                );
+                            }
+                            None
+                        }
+                        Message::ProbeResponse { .. } => None,
                     };
                     if let Some(name) = peer_name {
                         if self.expected.contains(&name) {
@@ -224,7 +265,7 @@ impl Coordinator {
                     self.send(socket, &msg)?;
                     // Also drain incoming messages during linger to keep
                     // the socket buffer clean.
-                    let _ = self.recv(socket);
+                    self.drain_and_answer_probe(socket);
                     std::thread::sleep(BROADCAST_INTERVAL);
                 }
 
@@ -247,7 +288,7 @@ impl Coordinator {
             return Ok(());
         }
 
-        let socket = self.socket.as_ref().unwrap();
+        let socket = self.socket.as_deref().unwrap();
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(self.name.clone());
 
@@ -262,10 +303,28 @@ impl Coordinator {
 
             let deadline = std::time::Instant::now() + BROADCAST_INTERVAL;
             while std::time::Instant::now() < deadline {
-                if let Some(Message::Ready { name, variant, run }) = self.recv(socket) {
-                    if variant == variant_name && run == self.run && self.expected.contains(&name) {
-                        seen.insert(name);
+                match self.recv(socket) {
+                    Some(Message::Ready { name, variant, run }) => {
+                        if variant == variant_name
+                            && run == self.run
+                            && self.expected.contains(&name)
+                        {
+                            seen.insert(name);
+                        }
                     }
+                    Some(Message::ProbeRequest { from, to, id, t1 }) => {
+                        if to == self.name {
+                            let _ = respond_to_probe(
+                                socket,
+                                &self.peer_addrs,
+                                &self.name,
+                                &from,
+                                id,
+                                &t1,
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -276,7 +335,7 @@ impl Coordinator {
                 while std::time::Instant::now() < linger_end {
                     self.send(socket, &msg)?;
                     // Drain incoming messages to keep the socket buffer clean.
-                    let _ = self.recv(socket);
+                    self.drain_and_answer_probe(socket);
                     std::thread::sleep(BROADCAST_INTERVAL);
                 }
                 return Ok(());
@@ -302,7 +361,7 @@ impl Coordinator {
             return Ok(results);
         }
 
-        let socket = self.socket.as_ref().unwrap();
+        let socket = self.socket.as_deref().unwrap();
         let msg = Message::Done {
             name: self.name.clone(),
             variant: variant_name.to_string(),
@@ -316,17 +375,34 @@ impl Coordinator {
 
             let deadline = std::time::Instant::now() + BROADCAST_INTERVAL;
             while std::time::Instant::now() < deadline {
-                if let Some(Message::Done {
-                    name,
-                    variant,
-                    run,
-                    status: s,
-                    exit_code: c,
-                }) = self.recv(socket)
-                {
-                    if variant == variant_name && run == self.run && self.expected.contains(&name) {
-                        results.insert(name, (s, c));
+                match self.recv(socket) {
+                    Some(Message::Done {
+                        name,
+                        variant,
+                        run,
+                        status: s,
+                        exit_code: c,
+                    }) => {
+                        if variant == variant_name
+                            && run == self.run
+                            && self.expected.contains(&name)
+                        {
+                            results.insert(name, (s, c));
+                        }
                     }
+                    Some(Message::ProbeRequest { from, to, id, t1 }) => {
+                        if to == self.name {
+                            let _ = respond_to_probe(
+                                socket,
+                                &self.peer_addrs,
+                                &self.name,
+                                &from,
+                                id,
+                                &t1,
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -337,7 +413,7 @@ impl Coordinator {
                 while std::time::Instant::now() < linger_end {
                     self.send(socket, &msg)?;
                     // Drain incoming messages to keep the socket buffer clean.
-                    let _ = self.recv(socket);
+                    self.drain_and_answer_probe(socket);
                     std::thread::sleep(BROADCAST_INTERVAL);
                 }
                 return Ok(results);
@@ -353,6 +429,17 @@ impl Coordinator {
             let _ = socket.send_to(&data, &(*addr).into());
         }
         Ok(())
+    }
+
+    /// Drain a single inbound message while still answering probe requests.
+    /// Used during linger phases where we just want to keep the socket buffer
+    /// clean but must not drop probes silently.
+    fn drain_and_answer_probe(&self, socket: &Socket) {
+        if let Some(Message::ProbeRequest { from, to, id, t1 }) = self.recv(socket) {
+            if to == self.name {
+                let _ = respond_to_probe(socket, &self.peer_addrs, &self.name, &from, id, &t1);
+            }
+        }
     }
 
     /// Try to receive a message from the socket. Returns None on timeout or

@@ -140,6 +140,39 @@ The map is then injected into every variant spawn as
 `--peers <name1>=<host1>,<name2>=<host2>,...` (sorted by name for
 determinism). See `metak-shared/api-contracts/variant-cli.md`.
 
+### Clock synchronization (E8)
+
+Cross-machine latency measurement requires correcting `receive_ts -
+write_ts` for inter-machine clock skew. The runner — not variants — is
+responsible for measuring pairwise offsets and writing them to a sibling
+JSONL file.
+
+Full protocol: `metak-shared/api-contracts/clock-sync.md`. Summary:
+
+- NTP-style 4-timestamp exchange (t1 send, t2 peer-receive, t3 peer-reply,
+  t4 receive). N=32 samples per peer. Pick the sample with smallest RTT.
+  Compute `offset = ((t2 - t1) + (t3 - t4)) / 2` (peer.clock − self.clock).
+- Inter-sample delay: 5 ms. Per-sample timeout: 100 ms.
+- Reuses the existing UDP coordination socket. Two new `Message` variants:
+  `ProbeRequest { from, to, id, t1 }` and
+  `ProbeResponse { from, to, id, t1, t2, t3 }`. Probe traffic is filtered
+  by `to` so each probe targets exactly one peer.
+- Probe responses must be sent promptly even while the runner is in a
+  barrier loop. Add probe handling alongside the barrier loops in
+  `protocol.rs`.
+
+Run the protocol twice per variant cycle:
+1. **Initial sync** — once after discovery completes, before the first
+   ready barrier. Logged with `variant=""`.
+2. **Per-variant resync** — after each variant's ready barrier, before
+   spawning. Logged with `variant=<name>`.
+
+Output: `<runner>-clock-sync-<run>.jsonl` in the same directory as variant
+log files. One JSONL line per (peer, measurement_event). Schema in
+`metak-shared/api-contracts/jsonl-log-schema.md` (`clock_sync` event).
+
+Single-runner runs skip clock sync entirely (no peers).
+
 ### QoS expansion (E9 Part B)
 
 `[variant.common].qos` is now optional and may also be an array. Parse it

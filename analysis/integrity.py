@@ -1,11 +1,16 @@
-"""Integrity verification for benchmark delivery records."""
+"""Integrity verification using polars groupbys.
+
+Output is a list of ``IntegrityResult`` dataclasses, one per
+``(variant, run, writer -> receiver)`` pair. The dataclass shape and
+field set match Phase 1 so ``tables.py`` consumers do not need to
+change.
+"""
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 
-from parse import DeliveryRecord, Event
+import polars as pl
 
 
 @dataclass
@@ -23,185 +28,304 @@ class IntegrityResult:
     out_of_order: int
     duplicates: int
     unresolved_gaps: int | None  # None when gap checking does not apply
-    # Error flags (True means the integrity check failed)
     completeness_error: bool
     ordering_error: bool
     duplicate_error: bool
     gap_error: bool
 
 
-# Type alias for the grouping key
-_PairKey = tuple[str, str, str, str]  # (variant, run, writer, receiver)
+def _count_writes_per_writer(group: pl.LazyFrame) -> pl.DataFrame:
+    """Count write events per (variant, run, writer) inside one group."""
+    return (
+        group.filter(pl.col("event") == "write")
+        .filter(pl.col("seq").is_not_null() & pl.col("path").is_not_null())
+        .group_by(["variant", "run", "runner"])
+        .agg(pl.len().alias("write_count"))
+        .rename({"runner": "writer"})
+        .with_columns(
+            pl.col("variant").cast(pl.Utf8),
+            pl.col("run").cast(pl.Utf8),
+            pl.col("writer").cast(pl.Utf8),
+        )
+        .collect()
+    )
 
 
-def _group_deliveries(
-    records: list[DeliveryRecord],
-) -> dict[_PairKey, list[DeliveryRecord]]:
-    """Group delivery records by (variant, run, writer, receiver)."""
-    groups: dict[_PairKey, list[DeliveryRecord]] = defaultdict(list)
-    for rec in records:
-        key = (rec.variant, rec.run, rec.writer, rec.receiver)
-        groups[key].append(rec)
-    return groups
+def _check_per_pair(deliveries: pl.DataFrame) -> pl.DataFrame:
+    """Per ``(variant, run, writer, receiver)`` integrity stats.
 
+    Computes:
+      - ``receive_count``
+      - ``out_of_order`` (count of receives whose seq is < the previous
+        seq in receive-time order, matching Phase 1's prev-seq scan)
+      - ``duplicates`` (count of duplicate ``(writer, seq, path)`` on a
+        receiver, summed across all duplicate groups)
+      - ``qos`` (the qos of the first delivery in receive-time order)
 
-def _count_writes(
-    events: list[Event],
-) -> dict[tuple[str, str, str], int]:
-    """Count write events per (variant, run, writer).
-
-    Returns a dict mapping (variant, run, writer) to write count.
+    Implementation note: every aggregation here is built on the same
+    columns of ``deliveries``. We do the heavy sort once, project to
+    the minimum needed columns up front, and run the aggregations as a
+    single lazy plan so polars can fuse the scan-pass and minimise
+    intermediate copies. On a 3M-row group this drops working-set RSS
+    from a few hundred MB down to under 100 MB.
     """
-    counts: dict[tuple[str, str, str], int] = defaultdict(int)
-    for ev in events:
-        if ev.event == "write":
-            counts[(ev.variant, ev.run, ev.runner)] += 1
-    return counts
+    if deliveries.is_empty():
+        return pl.DataFrame(
+            schema={
+                "variant": pl.Utf8,
+                "run": pl.Utf8,
+                "writer": pl.Utf8,
+                "receiver": pl.Utf8,
+                "receive_count": pl.UInt32,
+                "out_of_order": pl.UInt32,
+                "duplicates": pl.UInt32,
+                "qos": pl.Int64,
+            }
+        )
+
+    # Project the bare minimum columns the integrity checks need.
+    minimal = deliveries.lazy().select(
+        "variant",
+        "run",
+        "writer",
+        "receiver",
+        "seq",
+        "path",
+        "qos",
+        "receive_ts",
+    )
+
+    # Sort once and reuse the sorted lazy frame for all reductions.
+    sorted_lazy = minimal.sort(["variant", "run", "writer", "receiver", "receive_ts"])
+
+    out_of_order = (
+        sorted_lazy.with_columns(
+            pl.col("seq")
+            .shift(1)
+            .over(["variant", "run", "writer", "receiver"])
+            .alias("prev_seq")
+        )
+        .with_columns(
+            (
+                pl.col("prev_seq").is_not_null() & (pl.col("seq") < pl.col("prev_seq"))
+            ).alias("ooo_flag")
+        )
+        .group_by(["variant", "run", "writer", "receiver"])
+        .agg(pl.col("ooo_flag").sum().cast(pl.UInt32).alias("out_of_order"))
+    )
+
+    # Duplicates: every same-key group of size N contributes N-1 dupes.
+    duplicates = (
+        minimal.group_by(["variant", "run", "writer", "receiver", "seq", "path"])
+        .agg(pl.len().alias("n"))
+        .with_columns((pl.col("n") - 1).alias("dupes"))
+        .group_by(["variant", "run", "writer", "receiver"])
+        .agg(pl.col("dupes").sum().cast(pl.UInt32).alias("duplicates"))
+    )
+
+    base = sorted_lazy.group_by(["variant", "run", "writer", "receiver"]).agg(
+        pl.len().cast(pl.UInt32).alias("receive_count"),
+        pl.col("qos").first().cast(pl.Int64).alias("qos"),
+    )
+
+    return (
+        base.join(
+            out_of_order,
+            on=["variant", "run", "writer", "receiver"],
+            how="left",
+        )
+        .join(
+            duplicates,
+            on=["variant", "run", "writer", "receiver"],
+            how="left",
+        )
+        .collect()
+    )
 
 
-def _get_receivers(
-    records: list[DeliveryRecord],
-) -> dict[tuple[str, str, str], set[str]]:
-    """Find all receivers for each (variant, run, writer)."""
-    result: dict[tuple[str, str, str], set[str]] = defaultdict(set)
-    for rec in records:
-        result[(rec.variant, rec.run, rec.writer)].add(rec.receiver)
-    return result
+def _gap_counts(group: pl.LazyFrame) -> pl.DataFrame:
+    """Per (variant, run, writer, receiver) unresolved-gap counts.
 
+    ``unresolved = |detected - filled|`` (set difference, not arithmetic
+    difference, matching Phase 1).
 
-def _check_ordering(records: list[DeliveryRecord]) -> int:
-    """Count out-of-order receives (non-decreasing seq expected).
-
-    Records must already be sorted by receive timestamp.
+    Returns rows only for pairs that have at least one gap_detected or
+    gap_filled event; absence of a row means "no gap data".
     """
-    sorted_recs = sorted(records, key=lambda r: r.receive_ts)
-    count = 0
-    prev_seq = -1
-    for rec in sorted_recs:
-        if rec.seq < prev_seq:
-            count += 1
-        prev_seq = rec.seq
-    return count
+    gaps = group.filter(
+        pl.col("event").is_in(["gap_detected", "gap_filled"])
+        & pl.col("writer").is_not_null()
+    )
+
+    # Use lazy collect once -- gap events are small.
+    gaps_df = gaps.collect()
+    if gaps_df.is_empty():
+        return pl.DataFrame(
+            schema={
+                "variant": pl.Utf8,
+                "run": pl.Utf8,
+                "writer": pl.Utf8,
+                "receiver": pl.Utf8,
+                "unresolved_gaps": pl.UInt32,
+            }
+        )
+
+    # Coerce categoricals to Utf8 for hashing on join.
+    gaps_df = gaps_df.with_columns(
+        pl.col("variant").cast(pl.Utf8),
+        pl.col("run").cast(pl.Utf8),
+        pl.col("runner").cast(pl.Utf8).alias("receiver"),
+        pl.col("writer").cast(pl.Utf8),
+    )
+
+    detected = (
+        gaps_df.filter(pl.col("event") == "gap_detected")
+        .filter(pl.col("missing_seq").is_not_null())
+        .select(
+            "variant",
+            "run",
+            "writer",
+            "receiver",
+            pl.col("missing_seq").alias("seq"),
+        )
+        .unique()
+    )
+    filled = (
+        gaps_df.filter(pl.col("event") == "gap_filled")
+        .filter(pl.col("recovered_seq").is_not_null())
+        .select(
+            "variant",
+            "run",
+            "writer",
+            "receiver",
+            pl.col("recovered_seq").alias("seq"),
+        )
+        .unique()
+    )
+
+    detected_with_status = detected.join(
+        filled.with_columns(pl.lit(True).alias("filled")),
+        on=["variant", "run", "writer", "receiver", "seq"],
+        how="left",
+    ).with_columns(pl.col("filled").is_null().alias("unresolved"))
+
+    unresolved = detected_with_status.group_by(
+        ["variant", "run", "writer", "receiver"]
+    ).agg(pl.col("unresolved").sum().cast(pl.UInt32).alias("unresolved_gaps"))
+
+    # Also include pairs that have only filled events with no detected:
+    # they have 0 unresolved gaps but still count as "gap data exists"
+    # so the report shows "0" rather than "-".
+    only_filled = (
+        filled.join(
+            detected.select("variant", "run", "writer", "receiver").unique(),
+            on=["variant", "run", "writer", "receiver"],
+            how="anti",
+        )
+        .select("variant", "run", "writer", "receiver")
+        .unique()
+        .with_columns(pl.lit(0).cast(pl.UInt32).alias("unresolved_gaps"))
+    )
+
+    return pl.concat([unresolved, only_filled], how="vertical_relaxed")
 
 
-def _check_duplicates(records: list[DeliveryRecord]) -> int:
-    """Count duplicate receives (same writer, seq, path on same receiver)."""
-    seen: set[tuple[str, int, str]] = set()
-    dupes = 0
-    for rec in records:
-        key = (rec.writer, rec.seq, rec.path)
-        if key in seen:
-            dupes += 1
-        else:
-            seen.add(key)
-    return dupes
-
-
-def _check_gaps(
-    events: list[Event], variant: str, run: str, writer: str, receiver: str
-) -> int | None:
-    """Check gap_detected vs gap_filled events for QoS 3.
-
-    Returns the number of unresolved gaps, or None if no gap events exist.
-    """
-    detected: set[int] = set()
-    filled: set[int] = set()
-
-    for ev in events:
-        if ev.variant != variant or ev.run != run or ev.runner != receiver:
-            continue
-        writer_field = ev.data.get("writer")
-        if writer_field != writer:
-            continue
-
-        if ev.event == "gap_detected":
-            missing_seq = ev.data.get("missing_seq")
-            if missing_seq is not None:
-                detected.add(int(missing_seq))
-        elif ev.event == "gap_filled":
-            recovered_seq = ev.data.get("recovered_seq")
-            if recovered_seq is not None:
-                filled.add(int(recovered_seq))
-
-    if not detected and not filled:
-        return None
-
-    return len(detected - filled)
-
-
-def verify_integrity(
-    events: list[Event],
-    records: list[DeliveryRecord],
+def integrity_for_group(
+    group: pl.LazyFrame,
+    deliveries: pl.DataFrame,
 ) -> list[IntegrityResult]:
-    """Run integrity checks on all (variant, run, writer -> receiver) pairs.
+    """Compute integrity results for a single ``(variant, run)`` group.
 
-    Returns a list of IntegrityResult objects, one per pair.
+    ``group`` is the per-group lazy frame over the cache. ``deliveries``
+    is the materialized delivery-records DataFrame for that group.
     """
-    write_counts = _count_writes(events)
-    receivers_map = _get_receivers(records)
-    grouped = _group_deliveries(records)
+    write_counts = _count_writes_per_writer(group)
+    pair_stats = _check_per_pair(deliveries)
+    gaps = _gap_counts(group)
 
-    # Build the set of all pairs we need to check. This includes pairs
-    # where a writer has writes but a known receiver got zero receives
-    # (would show as missing from grouped).
-    all_pairs: set[_PairKey] = set(grouped.keys())
-    for (variant, run, writer), recv_set in receivers_map.items():
-        for receiver in recv_set:
-            all_pairs.add((variant, run, writer, receiver))
+    # Pull writers' receivers from deliveries; also add pairs from
+    # write_counts that have no deliveries (writer wrote but nothing
+    # was received) but only when we know about a candidate receiver.
+    # The Phase 1 implementation only listed pairs that appeared in
+    # deliveries OR pairs reachable via the receivers_map from
+    # deliveries -- which is identical to the deliveries set itself.
+    # So we use the deliveries pair set directly, joining writes for
+    # the count.
+
+    if pair_stats.is_empty():
+        return []
+
+    pair_stats = pair_stats.with_columns(
+        pl.col("variant").cast(pl.Utf8),
+        pl.col("run").cast(pl.Utf8),
+        pl.col("writer").cast(pl.Utf8),
+        pl.col("receiver").cast(pl.Utf8),
+    )
+
+    joined = pair_stats.join(
+        write_counts,
+        on=["variant", "run", "writer"],
+        how="left",
+    )
+    if not gaps.is_empty():
+        joined = joined.join(
+            gaps,
+            on=["variant", "run", "writer", "receiver"],
+            how="left",
+        )
+    else:
+        joined = joined.with_columns(
+            pl.lit(None).cast(pl.UInt32).alias("unresolved_gaps")
+        )
+
+    joined = joined.with_columns(
+        pl.col("write_count").fill_null(0),
+        pl.col("out_of_order").fill_null(0),
+        pl.col("duplicates").fill_null(0),
+    ).sort(["variant", "run", "writer", "receiver"])
 
     results: list[IntegrityResult] = []
+    for row in joined.iter_rows(named=True):
+        qos = int(row["qos"]) if row["qos"] is not None else 1
+        write_count = int(row["write_count"])
+        receive_count = int(row["receive_count"])
+        out_of_order = int(row["out_of_order"])
+        duplicates = int(row["duplicates"])
 
-    for variant, run, writer, receiver in sorted(all_pairs):
-        pair_records = grouped.get((variant, run, writer, receiver), [])
-        w_count = write_counts.get((variant, run, writer), 0)
-        r_count = len(pair_records)
+        delivery_pct = (receive_count / write_count * 100.0) if write_count > 0 else 0.0
 
-        # Determine QoS from records (use the first record's qos)
-        qos = pair_records[0].qos if pair_records else 1
-
-        delivery_pct = (r_count / w_count * 100.0) if w_count > 0 else 0.0
-        out_of_order = _check_ordering(pair_records) if pair_records else 0
-        duplicates = _check_duplicates(pair_records) if pair_records else 0
-
-        # Gap checking only applies to QoS 3
+        unresolved_gaps_raw = row.get("unresolved_gaps")
         if qos == 3:
-            unresolved_gaps = _check_gaps(events, variant, run, writer, receiver)
-            if unresolved_gaps is None:
-                unresolved_gaps = 0
+            unresolved_gaps: int | None = (
+                int(unresolved_gaps_raw) if unresolved_gaps_raw is not None else 0
+            )
         else:
             unresolved_gaps = None
 
-        # Error flags based on QoS level
         completeness_error = False
         ordering_error = False
         duplicate_error = False
         gap_error = False
 
         if qos >= 3:
-            # QoS 3-4: 100% delivery required
-            completeness_error = r_count < w_count
-            # QoS 3-4: strict ordering required
+            completeness_error = receive_count < write_count
             ordering_error = out_of_order > 0
-            # QoS 3-4: duplicates are errors
             duplicate_error = duplicates > 0
         elif qos == 2:
-            # QoS 2: ordering required, delivery is loss-tolerant
             ordering_error = out_of_order > 0
-
-        # QoS 1: no error flags (fully loss-tolerant, unordered)
 
         if qos == 3 and unresolved_gaps is not None:
             gap_error = unresolved_gaps > 0
 
         results.append(
             IntegrityResult(
-                variant=variant,
-                run=run,
-                writer=writer,
-                receiver=receiver,
+                variant=row["variant"],
+                run=row["run"],
+                writer=row["writer"],
+                receiver=row["receiver"],
                 qos=qos,
-                write_count=w_count,
-                receive_count=r_count,
+                write_count=write_count,
+                receive_count=receive_count,
                 delivery_pct=delivery_pct,
                 out_of_order=out_of_order,
                 duplicates=duplicates,

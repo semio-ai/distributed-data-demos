@@ -145,10 +145,66 @@ Same compact binary header as custom-udp:
 ### TCP connection management
 
 - One TCP connection per peer (bidirectional).
-- Use non-blocking mode with `set_nonblocking(true)` for `poll_receive`.
-- For `publish`, use blocking writes (small messages at ~1KB will fit in
-  the kernel buffer and return immediately).
-- Set `TCP_NODELAY` to disable Nagle algorithm — critical for latency.
+- For each peer's `TcpStream`:
+  - The socket stays in **blocking mode** (we never call
+    `set_nonblocking(true)` on it). `publish` writes are truly blocking:
+    when the kernel send buffer fills, the writer thread pauses until
+    the receiver drains it. This is the back-pressure signal we want to
+    measure for the benchmark; bypassing it (e.g. with non-blocking
+    writes plus app-side retry-and-drop) would distort the comparison
+    against `custom-udp`'s NACK approach.
+  - To make reads pollable without flipping the socket-wide `FIONBIO`
+    flag, the read handle (obtained via `try_clone`) gets a short
+    `SO_RCVTIMEO` via `TcpStream::set_read_timeout` (~1 ms). Reads then
+    return `WouldBlock` (Unix) or `TimedOut` (Windows) when no data is
+    in flight, allowing `poll_receive` to interleave UDP and other
+    peers' reads without stalling the protocol loop. Writes are
+    unaffected by `SO_RCVTIMEO` and remain blocking.
+- **Why not just `set_nonblocking(true)` on the read clone?** Because
+  `set_nonblocking` calls `ioctlsocket(FIONBIO,...)` which is
+  socket-wide; the cloned read handle's `FIONBIO` flag is shared with
+  the write handle and would silently un-block the write side too,
+  defeating the back-pressure goal.
+- The variant also keeps a defence-in-depth `write_with_retry` wrapper
+  with a generous wall-clock budget (10 s) that catches any
+  `WouldBlock` it might somehow see — under normal operation the socket
+  is blocking and `write` never returns `WouldBlock`, but the wrapper
+  protects against accidental future regressions of the blocking flag.
+- Set `TCP_NODELAY` on every connection to disable Nagle — critical for
+  latency.
+
+### TCP read loop — per-peer fault tolerance
+
+At cross-machine high throughput, individual peer streams may return
+`ConnectionAborted` / `ConnectionReset` or unexpected EOF — typically as
+a downstream effect of one side bailing on a `WouldBlock`. The TCP
+read loop in `try_recv` MUST NOT propagate such errors up: it logs a
+single `eprintln!` warning, drops that peer's stream from the active
+set, and continues polling the surviving peers. The whole spawn does
+NOT fail on a single peer drop; the protocol-driver layer must still
+complete its phases. The same fault-tolerance rule is applied to write
+errors during `broadcast`: a per-peer write failure drops the offending
+peer and the broadcast continues with the rest.
+
+### UDP send — bounded WouldBlock retry
+
+The UDP socket is non-blocking because `poll_receive` needs `recv_from`
+to be non-blocking so the variant's poll loop can interleave UDP and
+TCP reads without one starving the other. `set_nonblocking(true)` sets
+the flag for the entire socket — there is no per-direction toggle on a
+UDP socket — so `send_to` is also non-blocking and can return
+`WouldBlock` when the kernel send buffer fills. Making the UDP socket
+fully blocking is therefore awkward: it would force `recv_from` to
+block too, breaking the polled receive path.
+
+To keep the receive path non-blocking while still tolerating transient
+send pressure, `publish` retries on `WouldBlock` with a bounded
+wall-clock budget (~1 ms via `std::thread::yield_now()` between
+attempts). If the budget is exhausted while still hitting `WouldBlock`,
+the send returns an error so the caller surfaces back-pressure rather
+than silently dropping data. We also bump `SO_SNDBUF` (~4 MB) at socket
+creation to reduce how often the retry actually triggers under high
+multicast rates on Windows.
 
 ### Testing
 

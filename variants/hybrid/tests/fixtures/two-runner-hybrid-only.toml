@@ -35,7 +35,7 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
   silent_secs = 1
   workload = "scalar-flood"
   values_per_tick = 10
-  log_dir = "./logs-t93"
+  log_dir = "./logs"
 
   [variant.specific]
   multicast_group = "239.0.0.1:19542"

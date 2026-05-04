@@ -114,24 +114,41 @@ def format_integrity_table(results: list[IntegrityResult]) -> str:
     return "\n".join(lines)
 
 
+_UNCORRECTED_SUFFIX: str = " (uncorrected)"
+
+
 def format_performance_table(results: list[PerformanceResult]) -> str:
-    """Format the performance report as a CLI table."""
+    """Format the performance report as a CLI table.
+
+    When a ``PerformanceResult`` carries
+    ``has_uncorrected_latency = True`` (at least one underlying delivery
+    record had ``offset_applied == False`` because no ``clock_sync``
+    measurement was available for the cross-runner pair), the row's
+    latency cells are appended with ``(uncorrected)`` so the operator
+    can tell at a glance that the cross-machine latency may be
+    contaminated by clock skew. See E8 / clock-sync.md for the protocol.
+    """
     if not results:
         return "Performance Report\n(no data)\n"
 
     lines: list[str] = []
     lines.append("Performance Report")
-    sep = "-" * 148
+    # Widen the table to accommodate the (uncorrected) annotation on
+    # any of the four latency cells, plus the new ``Late`` column.
+    sep = "-" * 210
     lines.append(sep)
 
-    # Column widths
+    # Column widths. The latency columns are widened so that
+    # "12.34ms (uncorrected)" still fits without ragging the rest of
+    # the table.
     w_variant = 22
     w_run = 16
     w_conn = 13
-    w_lat = 13
+    w_lat = 25
     w_rate = 12
     w_jitter = 12
     w_loss = 9
+    w_late = 9
 
     header = (
         _pad("Variant", w_variant)
@@ -145,23 +162,27 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
         + _rpad("Jitter avg", w_jitter)
         + _rpad("Jitter p95", w_jitter)
         + _rpad("Loss%", w_loss)
+        + _rpad("Late", w_late)
     )
     lines.append(header)
     lines.append(sep)
 
     for r in results:
+        suffix = _UNCORRECTED_SUFFIX if r.has_uncorrected_latency else ""
+        late_str = "-" if r.late_receives is None else f"{r.late_receives:,}"
         row = (
             _pad(r.variant, w_variant)
             + _pad(r.run, w_run)
             + _rpad(f"{r.connect_mean_ms:.1f}", w_conn)
-            + _rpad(_fmt_ms(r.latency_p50_ms), w_lat)
-            + _rpad(_fmt_ms(r.latency_p95_ms), w_lat)
-            + _rpad(_fmt_ms(r.latency_p99_ms), w_lat)
-            + _rpad(_fmt_ms(r.latency_max_ms), w_lat)
+            + _rpad(_fmt_ms(r.latency_p50_ms) + suffix, w_lat)
+            + _rpad(_fmt_ms(r.latency_p95_ms) + suffix, w_lat)
+            + _rpad(_fmt_ms(r.latency_p99_ms) + suffix, w_lat)
+            + _rpad(_fmt_ms(r.latency_max_ms) + suffix, w_lat)
             + _rpad(_fmt_rate(r.writes_per_sec), w_rate)
             + _rpad(_fmt_ms(r.jitter_ms), w_jitter)
             + _rpad(_fmt_ms(r.jitter_p95_ms), w_jitter)
             + _rpad(_fmt_pct(r.loss_pct), w_loss)
+            + _rpad(late_str, w_late)
         )
         lines.append(row)
 

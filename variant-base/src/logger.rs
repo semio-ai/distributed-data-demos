@@ -160,6 +160,47 @@ impl Logger {
         self.write_line(&entry)
     }
 
+    /// Log an `eot_sent` event.
+    pub fn log_eot_sent(&mut self, eot_id: u64) -> Result<()> {
+        let entry = json!({
+            "ts": Self::now_ts(),
+            "variant": self.variant,
+            "runner": self.runner,
+            "run": self.run,
+            "event": "eot_sent",
+            "eot_id": eot_id,
+        });
+        self.write_line(&entry)
+    }
+
+    /// Log an `eot_received` event.
+    pub fn log_eot_received(&mut self, writer: &str, eot_id: u64) -> Result<()> {
+        let entry = json!({
+            "ts": Self::now_ts(),
+            "variant": self.variant,
+            "runner": self.runner,
+            "run": self.run,
+            "event": "eot_received",
+            "writer": writer,
+            "eot_id": eot_id,
+        });
+        self.write_line(&entry)
+    }
+
+    /// Log an `eot_timeout` event.
+    pub fn log_eot_timeout(&mut self, missing: &[String], wait_ms: u64) -> Result<()> {
+        let entry = json!({
+            "ts": Self::now_ts(),
+            "variant": self.variant,
+            "runner": self.runner,
+            "run": self.run,
+            "event": "eot_timeout",
+            "missing": missing,
+            "wait_ms": wait_ms,
+        });
+        self.write_line(&entry)
+    }
+
     /// Log a `resource` event.
     pub fn log_resource(&mut self, cpu_percent: f64, memory_mb: f64) -> Result<()> {
         let entry = json!({
@@ -333,6 +374,59 @@ mod tests {
         assert_eq!(line["event"], "gap_filled");
         assert_eq!(line["writer"], "runner-c");
         assert_eq!(line["recovered_seq"], 99);
+    }
+
+    #[test]
+    fn test_eot_sent_event() {
+        let (mut logger, _dir) = create_test_logger();
+        logger.log_eot_sent(0xDEADBEEF).unwrap();
+        logger.flush().unwrap();
+
+        let lines = read_lines(&logger);
+        let line = &lines[0];
+        assert_eq!(line["event"], "eot_sent");
+        assert_eq!(line["eot_id"], 0xDEADBEEF_u64);
+    }
+
+    #[test]
+    fn test_eot_received_event() {
+        let (mut logger, _dir) = create_test_logger();
+        logger.log_eot_received("runner-b", 42).unwrap();
+        logger.flush().unwrap();
+
+        let lines = read_lines(&logger);
+        let line = &lines[0];
+        assert_eq!(line["event"], "eot_received");
+        assert_eq!(line["writer"], "runner-b");
+        assert_eq!(line["eot_id"], 42);
+    }
+
+    #[test]
+    fn test_eot_timeout_event() {
+        let (mut logger, _dir) = create_test_logger();
+        let missing = vec!["alice".to_string(), "bob".to_string()];
+        logger.log_eot_timeout(&missing, 5000).unwrap();
+        logger.flush().unwrap();
+
+        let lines = read_lines(&logger);
+        let line = &lines[0];
+        assert_eq!(line["event"], "eot_timeout");
+        assert_eq!(line["wait_ms"], 5000);
+        let arr = line["missing"].as_array().expect("missing should be array");
+        let names: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(names, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn test_eot_phase_event() {
+        let (mut logger, _dir) = create_test_logger();
+        logger.log_phase(Phase::Eot, None).unwrap();
+        logger.flush().unwrap();
+
+        let lines = read_lines(&logger);
+        let line = &lines[0];
+        assert_eq!(line["event"], "phase");
+        assert_eq!(line["phase"], "eot");
     }
 
     #[test]
