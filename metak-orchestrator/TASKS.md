@@ -2241,6 +2241,154 @@ Acceptance criteria:
 
 ---
 
+### T8.5: Clock-sync silently fails across machines — root-cause + harden
+
+**Repo**: `runner/` (with possible `metak-shared/` doc updates)
+**Status**: in progress
+**Depends on**: T8.1, T8.2, T8.4 (all done)
+
+**Field report (2026-05-05).** User ran `configs/two-runner-all-variants.toml`
+between alice and bob = `192.168.1.77` (real LAN, not localhost). Run id
+`all-variants-01-20260505_171445`. Symptoms:
+
+- **alice's stdout**: prints `[runner:alice] WARN: no clock-sync samples
+  received from peer=bob for variant <name>` for *every* per-variant
+  resync; the initial-sync line shows the same WARN. So `pick_best`
+  returned `None` for every measurement (zero `ProbeResponse` ever
+  matched).
+- **alice's `logs/all-variants-01-20260505_171445/alice-clock-sync-all-variants-01.jsonl`**:
+  exists but **0 lines**. The sibling `*-clock-sync-debug-*.jsonl` is
+  also **0 lines**. So alice's `is_single_runner()` returned false
+  (file was created), but no sample ever produced a row.
+- **bob's machine**: no `bob-clock-sync-*.jsonl` file exists at all in
+  the equivalent log directory, and bob's stdout has **no `clock_sync`
+  log lines** (initial or per-variant). That implies bob's
+  `coordinator.is_single_runner()` returned `true` on bob's side OR
+  the file open failed silently OR bob's `peer_names` filter excluded
+  alice — none of which should be possible if discovery saw alice.
+- **Yet variants completed successfully** with `status=success,
+  exit_code=0` on alice — meaning the ready/done barriers DID round-trip
+  with bob over the same UDP coordination socket. So bidirectional
+  coordination works at the message-exchange level, but `ProbeRequest`/
+  `ProbeResponse` traffic is silently failing.
+
+This means **every cross-machine latency number in this run is
+uncorrected** (per-machine clocks differ by Windows-w32time-scale
+amounts, swamping the 10 ms target). It also means the runner today
+silently produces statistically invalid data when clock-sync fails —
+unacceptable for benchmark trust.
+
+**Scope** — three pieces, in this order:
+
+1. **Diagnose the asymmetry between coordination messages (work) and
+   probe messages (don't).**
+   - Read `runner/src/protocol.rs` and `runner/src/clock_sync.rs`. The
+     send path for probes is `socket.send_to` over `peer_addrs`
+     (multicast + per-peer-localhost fan-out); the discover/ready/done
+     messages use the *same* fan-out. Why would probes drop while
+     barriers succeed?
+   - Hypotheses to check by code inspection / instrumentation:
+     - **Bob's `is_single_runner()` flips after discovery** (e.g. peer
+       map cleared between Phase 1 and Phase 1.5; or
+       `clock_sync_engine()` consults a different runners list than
+       barriers do; or `peer_names` filter on bob is excluding alice
+       because alice's name compares mismatch).
+     - **Probe filter mismatch**: `ProbeRequest`'s `to` field is
+       checked against `self_name`; if either side has a name with
+       mismatched casing/whitespace from what's stored in the peer
+       map, every probe gets dropped silently. Discover/ready/done
+       barrier messages may key on different fields and not hit the
+       same mismatch.
+     - **`wait_for_response` blocks on `socket.recv_from` with a read
+       timeout that interacts badly with the in-flight datagrams from
+       barrier / discovery rebroadcast traffic** — ProbeResponse can
+       arrive *after* the per-sample 100 ms deadline if the socket's
+       receive queue has unrelated barrier traffic in front of it.
+       Note `loop { match recv_from }` consumes one datagram per
+       iteration; if non-Probe traffic is queued first the deadline
+       can expire while still draining barrier messages.
+     - **Bob's clock-sync engine is never instantiated**: trace
+       `Coordinator::clock_sync_engine()` — does it return `None` on
+       bob due to e.g. an empty peer_addrs list? If so, why does
+       barrier coordination still work?
+   - Add lightweight tracing (behind a `--verbose-clock-sync` flag or
+     `RUST_LOG`-style toggle, NOT permanent stderr noise) that on bob
+     prints: did `is_single_runner()` evaluate to true/false? did
+     `clock_sync_engine()` return Some/None? on alice prints: per
+     `wait_for_response` call, what datagrams were received during
+     the wait window and why each was rejected (wrong `to`, wrong
+     `from`, wrong `id`, wrong `t1`, parse failure, non-Probe variant).
+
+2. **Harden against silent failure** — apply regardless of root cause:
+   - **Initial-sync zero-sample = fatal.** If the initial sync produces
+     zero samples for any listed peer, `eprintln!` a clear error and
+     **exit non-zero** before the first ready barrier. Cross-machine
+     latency without correction is meaningless; we must not let a
+     run produce contaminated data silently. Per-variant resyncs may
+     remain warnings (analysis falls back to the most recent valid
+     measurement).
+   - **Debug file logs every probe attempt, not just successful ones.**
+     Today `clock_sync_log` only writes to the debug JSONL when a
+     `ProbeResponse` is matched. That gives **zero signal** in the
+     failure mode just observed (both files are empty when nothing
+     matches). Extend the `RawSample` / debug-row schema with a
+     `result: "ok" | "timeout" | "rejected_filter" | "rejected_t1" |
+     "parse_error"` field, and write one row per `ProbeRequest`
+     attempted, regardless of outcome. Update
+     `metak-shared/api-contracts/clock-sync.md` to reflect the new
+     debug-file schema.
+   - **Bob-side log open should not depend on `is_single_runner()`
+     alone.** If bob's `is_single_runner()` is wrongly returning true
+     (one of the diagnosis hypotheses), the silent skip is the bug.
+     Even if not the root cause, log a one-line "skipping clock-sync:
+     single-runner mode" message to bob's stdout when this branch is
+     taken so the user can see it.
+
+3. **Reproduction / diagnostic instructions for the user to run on
+   bob.** The user has explicitly offered to launch anything on bob's
+   machine. Provide:
+   - The exact runner command to run on bob with the new verbose
+     flag enabled.
+   - What stderr lines to capture and send back.
+   - What files to look for (or confirm absent) in bob's log directory
+     after the run.
+   - Document this in `metak-shared/LEARNED.md` under a "Diagnosing
+     clock-sync failure on a real LAN" section so it's reusable.
+
+**Validate by:**
+- Existing `cargo test` for runner stays green.
+- Add at least one unit test for the new debug-row "result" variants
+  (probe sent but no response → row with `result="timeout"`).
+- Add at least one unit test that initial-sync zero-sample produces a
+  non-zero exit (can be at the `main`-level helper or a function
+  extracted from the new fail-fast logic).
+- `cargo clippy -- -D warnings`, `cargo fmt -- --check` clean.
+
+**Cannot fully validate without user action**: the cross-machine
+reproduction requires alice + bob. Once code lands, ask the user to
+re-run with the verbose flag enabled and report the captured output.
+The worker writes a STATUS.md update including the exact commands and
+what to look for.
+
+**Acceptance criteria:**
+- [ ] Root-cause hypothesis identified, with evidence pointing to which
+      of the listed hypotheses (or a new one).
+- [ ] Initial-sync zero-sample now causes a non-zero exit.
+- [ ] Debug JSONL writes one row per probe attempt with `result` field.
+- [ ] Bob-side `is_single_runner()` skip emits a visible log line.
+- [ ] Verbose-tracing toggle implemented for both alice (probe-receive
+      filter) and bob (engine-init / single-runner branch).
+- [ ] Contract `clock-sync.md` updated for new debug-file schema and
+      new fail-fast behavior.
+- [ ] LEARNED.md updated with "Diagnosing clock-sync failure" section.
+- [ ] Unit tests added covering the new behaviors.
+- [ ] `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`
+      clean in `runner/`.
+- [ ] Completion report includes precise instructions for the user to
+      reproduce on the alice/bob LAN with verbose tracing.
+
+---
+
 ## Completed — E1: Variant Base Crate
 
 All tasks done. See STATUS.md for completion report.

@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "variant-base",
+    "runner",
+    "variants/zenoh",
+    "variants/custom-udp",
+    "variants/quic",
+    "variants/hybrid",
+]
+resolver = "2"

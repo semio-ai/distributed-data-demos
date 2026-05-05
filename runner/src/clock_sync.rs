@@ -20,9 +20,30 @@ use chrono::{DateTime, Utc};
 use socket2::Socket;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Process-wide verbose-tracing toggle. Turned on by the `--verbose-clock-sync`
+/// CLI flag in `main.rs`. When `true`, the engine and the coordinator emit
+/// detailed per-datagram traces to stderr while measuring offsets so an
+/// operator can diagnose silent-failure modes (e.g. probe responses being
+/// dropped by the wrong-`to` filter, or `is_single_runner()` taking the wrong
+/// branch on a peer machine).
+///
+/// Reads are `Relaxed` because tracing is best-effort observability — we never
+/// gate behavior on this flag.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// Enable verbose clock-sync tracing process-wide. Idempotent.
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, Ordering::Relaxed);
+}
+
+/// Whether verbose clock-sync tracing is currently enabled.
+pub fn is_verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
 
 /// Number of samples per peer. The contract says 32; this is the default the
 /// runner uses unless an override is passed to `measure_offsets`.
@@ -67,6 +88,48 @@ pub struct OffsetMeasurement {
     pub outlier_rejected: bool,
 }
 
+/// Outcome of one probe-attempt as recorded in the per-sample debug log.
+///
+/// Every `ProbeRequest` the engine sends produces exactly one `ProbeAttempt`
+/// row regardless of whether a response arrived. The `result` field records
+/// what happened so that an empty cohort still leaves a diagnostic trail —
+/// previously, only successful samples were logged, which gave zero signal
+/// in the cross-machine failure mode observed in T8.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeResult {
+    /// A matching `ProbeResponse` arrived in time and the sample's
+    /// `(t1, t2, t3, t4)` are all populated.
+    Ok,
+    /// No matching `ProbeResponse` arrived within `PER_SAMPLE_TIMEOUT`.
+    /// `t1_ns`/`t4_ns` may still be present; `t2_ns`/`t3_ns` are 0.
+    Timeout,
+    /// One or more datagrams arrived but were filtered out because their
+    /// `(from, to, id)` did not match the in-flight probe. Recorded only
+    /// when the probe also ultimately timed out (otherwise we would have
+    /// fallen through to `Ok`).
+    RejectedFilter,
+    /// A `ProbeResponse` matched on `(from, to, id)` but its echoed `t1`
+    /// string did not match the request's `t1` (defense-in-depth check).
+    RejectedT1,
+    /// One or more datagrams arrived during the wait window but failed to
+    /// parse as a `Message`. Recorded only if no successful response was
+    /// also received.
+    ParseError,
+}
+
+impl ProbeResult {
+    /// Stable string representation written to the debug JSONL `result` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeResult::Ok => "ok",
+            ProbeResult::Timeout => "timeout",
+            ProbeResult::RejectedFilter => "rejected_filter",
+            ProbeResult::RejectedT1 => "rejected_t1",
+            ProbeResult::ParseError => "parse_error",
+        }
+    }
+}
+
 /// One probe exchange's raw timestamps + derived offset/rtt. Public so
 /// `clock_sync_log` can serialize it to the diagnostic JSONL.
 ///
@@ -74,7 +137,13 @@ pub struct OffsetMeasurement {
 /// clock, `t2`/`t3` are on `peer`'s clock. `offset_ms`/`rtt_ms` are derived
 /// per the NTP formulas. `accepted` is `true` if this is the sample whose
 /// numbers landed in the parent `OffsetMeasurement`'s `offset_ms`/`rtt_ms`
-/// fields.
+/// fields. `result` records why the sample landed where it did — see
+/// `ProbeResult` — so an empty/skipped cohort still leaves a diagnostic
+/// trail in the debug JSONL.
+///
+/// For `result != Ok`, `t2_ns`/`t3_ns` are 0 and `offset_ms`/`rtt_ms` are
+/// `f64::NAN` to signal "no measurement". Consumers reading the debug
+/// JSONL must check `result` before trusting the numeric fields.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RawSample {
     pub t1_ns: i64,
@@ -84,6 +153,60 @@ pub struct RawSample {
     pub offset_ms: f64,
     pub rtt_ms: f64,
     pub accepted: bool,
+    pub result: ProbeResult,
+}
+
+/// Per-peer outcome of `ClockSyncEngine::measure_one` /
+/// `measure_offsets`.
+///
+/// `measurement` is the canonical `OffsetMeasurement` analysis consumes.
+/// `attempts` is one `RawSample` per probe SENT — including timeouts and
+/// filter rejections — so `clock_sync_log` can always write at least one
+/// debug row per attempt, even when zero responses arrived. This is the
+/// hardening required by T8.5: previously, an empty cohort produced a
+/// 0-byte debug file, which gave operators no signal to diagnose.
+#[derive(Debug, Clone)]
+pub struct PeerMeasurement {
+    pub measurement: Option<OffsetMeasurement>,
+    pub attempts: Vec<RawSample>,
+}
+
+/// Build a `RawSample` placeholder for a probe that did not produce a
+/// usable `(t1, t2, t3, t4)` quad. `t1_ns` is preserved (we know when the
+/// request was sent); the other timestamps are zeroed and the derived
+/// numbers are NaN. Consumers must check `result` before reading the
+/// numeric fields.
+fn timeout_row(t1_ns: i64, result: ProbeResult) -> RawSample {
+    RawSample {
+        t1_ns,
+        t2_ns: 0,
+        t3_ns: 0,
+        t4_ns: 0,
+        offset_ms: f64::NAN,
+        rtt_ms: f64::NAN,
+        accepted: false,
+        result,
+    }
+}
+
+/// After `pick_best` selects a sample, flip the matching attempt row's
+/// `accepted` flag so the per-sample debug JSONL agrees with the canonical
+/// summary.
+fn mark_accepted(attempts: &mut [RawSample], chosen: &OffsetMeasurement) {
+    if chosen.outlier_rejected {
+        // The outlier path synthesises an offset from the median of three
+        // samples; no single attempt is "the" accepted one.
+        return;
+    }
+    for a in attempts.iter_mut() {
+        if a.result == ProbeResult::Ok
+            && (a.rtt_ms - chosen.rtt_ms).abs() < 1e-9
+            && (a.offset_ms - chosen.offset_ms).abs() < 1e-9
+        {
+            a.accepted = true;
+            return;
+        }
+    }
 }
 
 /// Threshold (in standard deviations) above which `pick_best` treats the
@@ -232,6 +355,9 @@ fn pick_best(samples: &[Sample]) -> Option<OffsetMeasurement> {
                 offset_ms: s_off_ns as f64 / 1_000_000.0,
                 rtt_ms: s_rtt_ns as f64 / 1_000_000.0,
                 accepted,
+                // Every `Sample` reaching `pick_best` came back from
+                // `wait_for_response` with all four timestamps populated.
+                result: ProbeResult::Ok,
             }
         })
         .collect();
@@ -324,32 +450,39 @@ impl ClockSyncEngine {
     }
 
     /// Measure offsets against every peer in `peers`. The local runner must
-    /// be excluded by the caller. Returns one entry per peer that produced
-    /// at least one valid sample. Peers that produced zero samples (e.g.
-    /// unreachable, or 100% packet loss within the measurement window) are
-    /// omitted from the returned map.
+    /// be excluded by the caller.
+    ///
+    /// Returns one entry per peer in `peers`, regardless of whether any
+    /// sample succeeded. The value is a `PeerMeasurement` carrying:
+    /// - `measurement`: `Some(OffsetMeasurement)` if at least one sample
+    ///   round-tripped, else `None` (peer unreachable or 100% probe loss).
+    /// - `attempts`: one `RawSample` per probe sent — including timeouts /
+    ///   filter rejections — so the per-sample debug JSONL always has rows
+    ///   to inspect after a silent failure.
     pub fn measure_offsets(
         &self,
         peers: &[String],
         n_samples: usize,
-    ) -> HashMap<String, OffsetMeasurement> {
+    ) -> HashMap<String, PeerMeasurement> {
         let mut out = HashMap::new();
         for peer in peers {
             if peer == &self.self_name {
                 continue;
             }
-            if let Some(m) = self.measure_one(peer, n_samples) {
-                out.insert(peer.clone(), m);
-            }
+            out.insert(peer.clone(), self.measure_one(peer, n_samples));
         }
         out
     }
 
     /// Measure a single peer. Sends `n_samples` probes one at a time and
-    /// waits for each response before moving on. Returns `None` if zero
-    /// valid samples were collected.
-    pub fn measure_one(&self, peer: &str, n_samples: usize) -> Option<OffsetMeasurement> {
+    /// waits for each response before moving on.
+    ///
+    /// The returned `PeerMeasurement` always has `attempts.len() == n_samples`
+    /// (modulo timestamp-overflow skips, which are extremely unlikely). The
+    /// `measurement` field is `None` if zero valid samples were collected.
+    pub fn measure_one(&self, peer: &str, n_samples: usize) -> PeerMeasurement {
         let mut samples: Vec<Sample> = Vec::with_capacity(n_samples);
+        let mut attempts: Vec<RawSample> = Vec::with_capacity(n_samples);
         for i in 0..n_samples {
             if i > 0 {
                 std::thread::sleep(INTER_SAMPLE_DELAY);
@@ -362,13 +495,46 @@ impl ClockSyncEngine {
                 None => continue,
             };
             if self.send_probe_request(peer, id, &t1_str).is_err() {
+                attempts.push(timeout_row(t1_ns, ProbeResult::Timeout));
                 continue;
             }
-            if let Some(s) = self.wait_for_response(peer, id, &t1_str, t1_ns) {
-                samples.push(s);
+            let (sample, result) = self.wait_for_response(peer, id, &t1_str, t1_ns);
+            match (sample, result) {
+                (Some(s), ProbeResult::Ok) => {
+                    let off_ns = s.offset_ns();
+                    let rtt_ns = s.rtt_ns();
+                    attempts.push(RawSample {
+                        t1_ns: s.t1_ns,
+                        t2_ns: s.t2_ns,
+                        t3_ns: s.t3_ns,
+                        t4_ns: s.t4_ns,
+                        offset_ms: off_ns as f64 / 1_000_000.0,
+                        rtt_ms: rtt_ns as f64 / 1_000_000.0,
+                        // `accepted` is decided after pick_best runs across
+                        // the cohort, so we leave it false here and let the
+                        // caller refresh the flag for the chosen sample.
+                        accepted: false,
+                        result: ProbeResult::Ok,
+                    });
+                    samples.push(s);
+                }
+                (_, other) => {
+                    // No usable sample — record why so the debug log has a
+                    // row regardless.
+                    attempts.push(timeout_row(t1_ns, other));
+                }
             }
         }
-        pick_best(&samples)
+        let measurement = pick_best(&samples);
+        // If pick_best chose a sample, mark the matching attempt as accepted
+        // so the debug JSONL agrees with the canonical measurement file.
+        if let Some(m) = measurement.as_ref() {
+            mark_accepted(&mut attempts, m);
+        }
+        PeerMeasurement {
+            measurement,
+            attempts,
+        }
     }
 
     /// Broadcast a `ProbeRequest` to all peer addresses. Peers filter by the
@@ -390,22 +556,50 @@ impl ClockSyncEngine {
     /// Wait up to `PER_SAMPLE_TIMEOUT` for a `ProbeResponse` matching this
     /// `(peer, id)`. While waiting, also answer any inbound `ProbeRequest`
     /// addressed to us (the always-respond rule from the contract).
-    fn wait_for_response(&self, peer: &str, id: u64, t1_str: &str, t1_ns: i64) -> Option<Sample> {
+    ///
+    /// Returns `(Some(sample), Ok)` on success, or `(None, reason)` on
+    /// timeout where `reason` summarises the most informative failure mode
+    /// observed during the wait window. `RejectedFilter` is preferred over
+    /// `ParseError` is preferred over `Timeout` so that an operator looking
+    /// at a debug-row `result="rejected_filter"` immediately knows datagrams
+    /// arrived but were addressed to someone else (a strong hint that
+    /// per-runner port routing is misconfigured).
+    fn wait_for_response(
+        &self,
+        peer: &str,
+        id: u64,
+        t1_str: &str,
+        t1_ns: i64,
+    ) -> (Option<Sample>, ProbeResult) {
         let deadline = Instant::now() + PER_SAMPLE_TIMEOUT;
+        let mut worst_reason = ProbeResult::Timeout;
         loop {
             if Instant::now() >= deadline {
-                return None;
+                return (None, worst_reason);
             }
             let mut buf = [std::mem::MaybeUninit::uninit(); 4096];
             match self.socket.recv_from(&mut buf) {
-                Ok((n, _src)) => {
+                Ok((n, src)) => {
                     let data: Vec<u8> = buf[..n]
                         .iter()
                         .map(|b| unsafe { b.assume_init() })
                         .collect();
                     let msg = match Message::from_bytes(&data) {
                         Some(m) => m,
-                        None => continue,
+                        None => {
+                            if is_verbose() {
+                                eprintln!(
+                                    "[clock-sync verbose] {}: received {n}-byte datagram from {:?} that did not parse as Message",
+                                    self.self_name,
+                                    src.as_socket()
+                                );
+                            }
+                            // Promote only if no stronger reason already.
+                            if worst_reason == ProbeResult::Timeout {
+                                worst_reason = ProbeResult::ParseError;
+                            }
+                            continue;
+                        }
                     };
                     match msg {
                         Message::ProbeResponse {
@@ -417,37 +611,67 @@ impl ClockSyncEngine {
                             t3,
                         } => {
                             if to != self.self_name || from != peer || rid != id {
-                                // Stale or for someone else; ignore.
+                                if is_verbose() {
+                                    eprintln!(
+                                        "[clock-sync verbose] {}: rejected ProbeResponse from={from} to={to} id={rid} (expected from={peer} to={} id={id})",
+                                        self.self_name, self.self_name
+                                    );
+                                }
+                                worst_reason = ProbeResult::RejectedFilter;
                                 continue;
                             }
                             // Defense-in-depth: even though (from, to, id)
                             // uniquely identifies this exchange, also require
-                            // the echoed t1 string to match what we sent. This
-                            // shields the offset math from any conceivable
-                            // form of stale response that survives the triple
-                            // filter (e.g. a 64-bit id wrap, or a future
-                            // protocol change). Mismatch -> drop and keep
-                            // waiting.
+                            // the echoed t1 string to match what we sent.
                             if rt1 != t1_str {
+                                if is_verbose() {
+                                    eprintln!(
+                                        "[clock-sync verbose] {}: rejected ProbeResponse t1 mismatch (got {rt1}, sent {t1_str})",
+                                        self.self_name
+                                    );
+                                }
+                                worst_reason = ProbeResult::RejectedT1;
                                 continue;
                             }
                             // Use the local t4 we record now, not anything
                             // from the wire.
-                            let t4_ns = Utc::now().timestamp_nanos_opt()?;
+                            let t4_ns = match Utc::now().timestamp_nanos_opt() {
+                                Some(v) => v,
+                                None => return (None, worst_reason),
+                            };
                             let t2_ns = match parse_ns(&t2) {
                                 Some(v) => v,
-                                None => continue,
+                                None => {
+                                    if worst_reason == ProbeResult::Timeout {
+                                        worst_reason = ProbeResult::ParseError;
+                                    }
+                                    continue;
+                                }
                             };
                             let t3_ns = match parse_ns(&t3) {
                                 Some(v) => v,
-                                None => continue,
+                                None => {
+                                    if worst_reason == ProbeResult::Timeout {
+                                        worst_reason = ProbeResult::ParseError;
+                                    }
+                                    continue;
+                                }
                             };
-                            return Some(Sample {
-                                t1_ns,
-                                t2_ns,
-                                t3_ns,
-                                t4_ns,
-                            });
+                            if is_verbose() {
+                                eprintln!(
+                                    "[clock-sync verbose] {}: matched ProbeResponse from={from} id={id}",
+                                    self.self_name
+                                );
+                            }
+                            return (
+                                Some(Sample {
+                                    t1_ns,
+                                    t2_ns,
+                                    t3_ns,
+                                    t4_ns,
+                                }),
+                                ProbeResult::Ok,
+                            );
                         }
                         Message::ProbeRequest {
                             from,
@@ -456,6 +680,12 @@ impl ClockSyncEngine {
                             t1: rt1,
                         } => {
                             if to == self.self_name {
+                                if is_verbose() {
+                                    eprintln!(
+                                        "[clock-sync verbose] {}: answering inbound ProbeRequest from={from} id={rid}",
+                                        self.self_name
+                                    );
+                                }
                                 let _ = respond_to_probe(
                                     &self.socket,
                                     &self.peer_addrs,
@@ -773,14 +1003,10 @@ mod tests {
         let t_a = std::thread::spawn(move || engine_a.measure_one("b", 8));
         let t_b = std::thread::spawn(move || engine_b.measure_one("a", 8));
 
-        let m_a = t_a
-            .join()
-            .unwrap()
-            .expect("engine a got at least one sample");
-        let m_b = t_b
-            .join()
-            .unwrap()
-            .expect("engine b got at least one sample");
+        let pm_a = t_a.join().unwrap();
+        let pm_b = t_b.join().unwrap();
+        let m_a = pm_a.measurement.expect("engine a got at least one sample");
+        let m_b = pm_b.measurement.expect("engine b got at least one sample");
 
         assert!(
             m_a.offset_ms.abs() < 1.0,
@@ -796,5 +1022,94 @@ mod tests {
         assert!(m_b.rtt_ms > 0.0, "engine b rtt_ms should be > 0.0");
         assert!(m_a.samples > 0);
         assert!(m_b.samples > 0);
+        // Every probe sent must produce exactly one attempt row, regardless
+        // of outcome. With 8 samples each side records 8 attempts.
+        assert_eq!(pm_a.attempts.len(), 8, "engine a attempts");
+        assert_eq!(pm_b.attempts.len(), 8, "engine b attempts");
+    }
+
+    #[test]
+    fn measure_one_records_timeout_attempts_when_peer_is_silent() {
+        // No peer is bound on `port_b`, so every probe will time out.
+        // Even so, `measure_one` must produce one attempt row per sample with
+        // `result == Timeout`, so the debug JSONL has rows even on total
+        // failure (the silent-failure regression from T8.5).
+        let port_a = next_port();
+        let port_b = port_a + 1;
+        let sock_a = bind_loopback(port_a);
+
+        let addrs_a_to_b = vec![SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            port_b,
+        ))];
+        let engine_a = ClockSyncEngine::new("a".into(), Arc::clone(&sock_a), addrs_a_to_b);
+
+        // Use a small N; per-sample timeout is 100 ms so 4 samples ≈ 0.4s.
+        let pm = engine_a.measure_one("b", 4);
+        assert!(pm.measurement.is_none(), "no peer => no measurement");
+        assert_eq!(pm.attempts.len(), 4, "one attempt per probe");
+        for a in &pm.attempts {
+            assert_eq!(
+                a.result,
+                ProbeResult::Timeout,
+                "no datagram should ever arrive; got {:?}",
+                a.result
+            );
+            assert!(!a.accepted, "timeout rows are never accepted");
+            assert!(a.offset_ms.is_nan(), "timeout rows have NaN offset");
+            assert!(a.rtt_ms.is_nan(), "timeout rows have NaN rtt");
+            assert_eq!(a.t2_ns, 0);
+            assert_eq!(a.t3_ns, 0);
+            assert!(a.t1_ns > 0, "t1 should still be recorded for timeouts");
+        }
+    }
+
+    #[test]
+    fn measure_one_marks_chosen_attempt_accepted_on_success() {
+        // Sanity: when a peer answers, exactly one of the attempt rows in
+        // the returned PeerMeasurement carries `accepted = true`, and that
+        // row's offset/rtt match the canonical OffsetMeasurement.
+        let port_a = next_port();
+        let port_b = port_a + 1;
+        let sock_a = bind_loopback(port_a);
+        let sock_b = bind_loopback(port_b);
+
+        let addrs_a_to_b = vec![SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            port_b,
+        ))];
+        let addrs_b_to_a = vec![SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            port_a,
+        ))];
+
+        let engine_a = ClockSyncEngine::new("a".into(), Arc::clone(&sock_a), addrs_a_to_b);
+        let engine_b = ClockSyncEngine::new("b".into(), Arc::clone(&sock_b), addrs_b_to_a);
+
+        let t_a = std::thread::spawn(move || engine_a.measure_one("b", 4));
+        let _t_b = std::thread::spawn(move || engine_b.measure_one("a", 4));
+
+        let pm_a = t_a.join().unwrap();
+        let m_a = pm_a.measurement.expect("a got at least one sample");
+        if !m_a.outlier_rejected {
+            // Exactly one accepted row.
+            let accepted: Vec<_> = pm_a.attempts.iter().filter(|a| a.accepted).collect();
+            assert_eq!(accepted.len(), 1, "exactly one accepted attempt");
+            let row = accepted[0];
+            assert!((row.offset_ms - m_a.offset_ms).abs() < 1e-9);
+            assert!((row.rtt_ms - m_a.rtt_ms).abs() < 1e-9);
+            assert_eq!(row.result, ProbeResult::Ok);
+        }
+    }
+
+    #[test]
+    fn probe_result_as_str_is_stable() {
+        // Locked: the JSONL `result` field must stay stable since downstream
+        // tooling (post-mortem scripts in LEARNED.md) keys off these values.
+        assert_eq!(ProbeResult::Ok.as_str(), "ok");
+        assert_eq!(ProbeResult::Timeout.as_str(), "timeout");
+        assert_eq!(ProbeResult::RejectedFilter.as_str(), "rejected_filter");
+        assert_eq!(ProbeResult::RejectedT1.as_str(), "rejected_t1");
+        assert_eq!(ProbeResult::ParseError.as_str(), "parse_error");
     }
 }

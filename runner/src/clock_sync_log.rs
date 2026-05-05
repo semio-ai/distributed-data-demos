@@ -15,7 +15,7 @@
 //! consumed by analysis; analysis globs only the canonical
 //! `*-clock-sync-<run>.jsonl` files.
 
-use crate::clock_sync::{format_ts, OffsetMeasurement};
+use crate::clock_sync::{format_ts, OffsetMeasurement, RawSample};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::fs::{File, OpenOptions};
@@ -104,33 +104,56 @@ impl ClockSyncLogger {
     /// `Utc::now()` at write time. `variant` is `""` for the initial sync
     /// and the variant name for per-variant resyncs.
     ///
-    /// Writes the canonical summary line to the primary log AND one debug
-    /// line per raw sample to the sibling debug log.
-    pub fn write(&mut self, variant: &str, peer: &str, m: &OffsetMeasurement) -> Result<()> {
+    /// Writes the canonical summary line to the primary log if `m` is
+    /// `Some`. Always writes one debug line per attempt to the sibling
+    /// debug log (T8.5: previously the debug file only got rows on
+    /// success, leaving nothing to inspect when a probe storm timed out).
+    /// `attempts` may include rows whose `result != ProbeResult::Ok`,
+    /// signalling timeouts, filter rejections, or parse errors.
+    pub fn write(
+        &mut self,
+        variant: &str,
+        peer: &str,
+        m: Option<&OffsetMeasurement>,
+        attempts: &[RawSample],
+    ) -> Result<()> {
         let ts = format_ts(Utc::now());
-        let line = serde_json::json!({
-            "ts": ts,
-            "variant": variant,
-            "runner": self.runner,
-            "run": self.run,
-            "event": "clock_sync",
-            // Required columnar fields.
-            "peer": peer,
-            "offset_ms": m.offset_ms,
-            "rtt_ms": m.rtt_ms,
-            // Diagnostic-only fields. Analysis ignores these.
-            "samples": m.samples,
-            "min_rtt_ms": m.min_rtt_ms,
-            "max_rtt_ms": m.max_rtt_ms,
-            "outlier_rejected": m.outlier_rejected,
-        });
-        let s = serde_json::to_string(&line)?;
-        writeln!(self.file, "{s}")?;
-        self.file.flush()?;
 
-        // Per-sample debug trace. One line per raw sample.
-        for (i, raw) in m.raw_samples.iter().enumerate() {
-            let dline = serde_json::json!({
+        // Canonical summary line: only emitted when we actually have a
+        // measurement. Analysis tolerates missing entries (per the contract,
+        // it falls back to "no correction" and flags the cross-runner pair
+        // as uncorrected).
+        if let Some(m) = m {
+            let line = serde_json::json!({
+                "ts": ts,
+                "variant": variant,
+                "runner": self.runner,
+                "run": self.run,
+                "event": "clock_sync",
+                // Required columnar fields.
+                "peer": peer,
+                "offset_ms": m.offset_ms,
+                "rtt_ms": m.rtt_ms,
+                // Diagnostic-only fields. Analysis ignores these.
+                "samples": m.samples,
+                "min_rtt_ms": m.min_rtt_ms,
+                "max_rtt_ms": m.max_rtt_ms,
+                "outlier_rejected": m.outlier_rejected,
+            });
+            let s = serde_json::to_string(&line)?;
+            writeln!(self.file, "{s}")?;
+            self.file.flush()?;
+        }
+
+        // Per-sample debug trace. One line per probe ATTEMPT (T8.5),
+        // including timeouts and filter rejections so an empty cohort still
+        // leaves diagnostic rows.
+        let outlier_rejected = m.is_some_and(|m| m.outlier_rejected);
+        for (i, raw) in attempts.iter().enumerate() {
+            // serde_json refuses to serialize NaN. For non-Ok rows we leave
+            // the numeric fields out; the `result` field tells the reader
+            // why no measurement was produced.
+            let mut dline = serde_json::json!({
                 "ts": ts,
                 "variant": variant,
                 "runner": self.runner,
@@ -142,11 +165,16 @@ impl ClockSyncLogger {
                 "t2_ns": raw.t2_ns,
                 "t3_ns": raw.t3_ns,
                 "t4_ns": raw.t4_ns,
-                "offset_ms": raw.offset_ms,
-                "rtt_ms": raw.rtt_ms,
                 "accepted": raw.accepted,
-                "outlier_rejected": m.outlier_rejected,
+                "outlier_rejected": outlier_rejected,
+                "result": raw.result.as_str(),
             });
+            if raw.offset_ms.is_finite() {
+                dline["offset_ms"] = serde_json::json!(raw.offset_ms);
+            }
+            if raw.rtt_ms.is_finite() {
+                dline["rtt_ms"] = serde_json::json!(raw.rtt_ms);
+            }
             let ds = serde_json::to_string(&dline)?;
             writeln!(self.debug_file, "{ds}")?;
         }
@@ -158,6 +186,35 @@ impl ClockSyncLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock_sync::ProbeResult;
+
+    fn ok_sample(t1_ns: i64, t2_ns: i64, t3_ns: i64, t4_ns: i64, accepted: bool) -> RawSample {
+        let off = ((t2_ns - t1_ns) + (t3_ns - t4_ns)) as f64 / 2.0 / 1_000_000.0;
+        let rtt = ((t4_ns - t1_ns) - (t3_ns - t2_ns)) as f64 / 1_000_000.0;
+        RawSample {
+            t1_ns,
+            t2_ns,
+            t3_ns,
+            t4_ns,
+            offset_ms: off,
+            rtt_ms: rtt,
+            accepted,
+            result: ProbeResult::Ok,
+        }
+    }
+
+    fn timeout_sample(t1_ns: i64) -> RawSample {
+        RawSample {
+            t1_ns,
+            t2_ns: 0,
+            t3_ns: 0,
+            t4_ns: 0,
+            offset_ms: f64::NAN,
+            rtt_ms: f64::NAN,
+            accepted: false,
+            result: ProbeResult::Timeout,
+        }
+    }
 
     #[test]
     fn writes_valid_jsonl_with_required_and_diagnostic_fields() {
@@ -176,8 +233,9 @@ mod tests {
             raw_samples: vec![],
             outlier_rejected: false,
         };
-        log.write("", "bob", &m).unwrap();
-        log.write("zenoh-replication", "bob", &m).unwrap();
+        log.write("", "bob", Some(&m), &[]).unwrap();
+        log.write("zenoh-replication", "bob", Some(&m), &[])
+            .unwrap();
 
         let path = dir.join("alice-clock-sync-run01.jsonl");
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -202,12 +260,10 @@ mod tests {
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(second["variant"], "zenoh-replication");
 
-        // Debug log was created (empty raw_samples means no per-sample lines,
-        // but the file itself must exist and be empty/zero-length-ish).
+        // Debug log was created (no attempts -> zero per-sample lines).
         let dpath = dir.join("alice-clock-sync-debug-run01.jsonl");
         assert!(dpath.exists(), "debug log must exist alongside canonical");
         let dcontents = std::fs::read_to_string(&dpath).unwrap();
-        // No raw samples were attached to `m`, so debug log has zero lines.
         assert!(dcontents.lines().count() == 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -215,8 +271,6 @@ mod tests {
 
     #[test]
     fn debug_log_contains_one_line_per_raw_sample() {
-        use crate::clock_sync::RawSample;
-
         let dir = std::env::temp_dir().join(format!(
             "runner-clock-sync-debug-test-{}",
             std::process::id()
@@ -231,38 +285,15 @@ mod tests {
             samples: 3,
             min_rtt_ms: 0.3,
             max_rtt_ms: 0.5,
-            raw_samples: vec![
-                RawSample {
-                    t1_ns: 100,
-                    t2_ns: 200,
-                    t3_ns: 250,
-                    t4_ns: 400,
-                    offset_ms: -0.025,
-                    rtt_ms: 0.0001,
-                    accepted: false,
-                },
-                RawSample {
-                    t1_ns: 1000,
-                    t2_ns: 1150,
-                    t3_ns: 1200,
-                    t4_ns: 1300,
-                    offset_ms: 0.025,
-                    rtt_ms: 0.0002,
-                    accepted: true,
-                },
-                RawSample {
-                    t1_ns: 2000,
-                    t2_ns: 2200,
-                    t3_ns: 2250,
-                    t4_ns: 2500,
-                    offset_ms: -0.025,
-                    rtt_ms: 0.0003,
-                    accepted: false,
-                },
-            ],
+            raw_samples: vec![],
             outlier_rejected: false,
         };
-        log.write("v1", "bob", &m).unwrap();
+        let attempts = vec![
+            ok_sample(100, 200, 250, 400, false),
+            ok_sample(1000, 1150, 1200, 1300, true),
+            ok_sample(2000, 2200, 2250, 2500, false),
+        ];
+        log.write("v1", "bob", Some(&m), &attempts).unwrap();
 
         let dpath = dir.join("alice-clock-sync-debug-run01.jsonl");
         let dcontents = std::fs::read_to_string(&dpath).unwrap();
@@ -274,9 +305,63 @@ mod tests {
         assert_eq!(first["sample_index"], 0);
         assert_eq!(first["t1_ns"], 100);
         assert_eq!(first["accepted"], false);
+        assert_eq!(first["result"], "ok");
         let second: serde_json::Value = serde_json::from_str(dlines[1]).unwrap();
         assert_eq!(second["sample_index"], 1);
         assert_eq!(second["accepted"], true);
+        assert_eq!(second["result"], "ok");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debug_log_records_timeout_attempts_when_no_measurement() {
+        // T8.5 hardening: a totally-failed cohort must still write one debug
+        // row per attempt with `result="timeout"`. Previously the file was
+        // 0-byte in this case, leaving operators with no signal.
+        let dir = std::env::temp_dir().join(format!(
+            "runner-clock-sync-timeout-rows-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut log = open_clock_sync_log(&dir, "alice", "run01").unwrap();
+        let attempts = vec![
+            timeout_sample(1000),
+            timeout_sample(2000),
+            timeout_sample(3000),
+        ];
+        // Note: measurement is None.
+        log.write("", "bob", None, &attempts).unwrap();
+
+        // Canonical file must be empty -- we have no measurement to record.
+        let path = dir.join("alice-clock-sync-run01.jsonl");
+        let canonical = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(canonical.lines().count(), 0);
+
+        // Debug file must contain one row per attempt with result=timeout.
+        let dpath = dir.join("alice-clock-sync-debug-run01.jsonl");
+        let dcontents = std::fs::read_to_string(&dpath).unwrap();
+        let dlines: Vec<_> = dcontents.lines().collect();
+        assert_eq!(dlines.len(), 3, "one debug row per attempt");
+        for (i, line) in dlines.iter().enumerate() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["event"], "clock_sync_sample");
+            assert_eq!(row["sample_index"], i as i64);
+            assert_eq!(row["result"], "timeout");
+            assert_eq!(row["accepted"], false);
+            assert_eq!(row["t2_ns"], 0);
+            // NaN-derived fields are omitted, not serialized.
+            assert!(
+                row.get("offset_ms").is_none(),
+                "offset_ms must be absent for timeout rows"
+            );
+            assert!(
+                row.get("rtt_ms").is_none(),
+                "rtt_ms must be absent for timeout rows"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -302,11 +387,11 @@ mod tests {
 
         {
             let mut log = open_clock_sync_log(&dir, "r1", "run1").unwrap();
-            log.write("", "r2", &m).unwrap();
+            log.write("", "r2", Some(&m), &[]).unwrap();
         }
         {
             let mut log = open_clock_sync_log(&dir, "r1", "run1").unwrap();
-            log.write("v1", "r2", &m).unwrap();
+            log.write("v1", "r2", Some(&m), &[]).unwrap();
         }
 
         let path = dir.join("r1-clock-sync-run1.jsonl");

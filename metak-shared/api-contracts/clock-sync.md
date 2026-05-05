@@ -79,15 +79,40 @@ Defense in depth: every `ProbeResponse` is verified to echo the same
 defense against future protocol changes that might let a stale response
 slip through despite the `(from, to, id)` matching).
 
-### Per-sample diagnostic log (added in T8.4)
+### Per-sample diagnostic log (added in T8.4, extended in T8.5)
 
 Each runner additionally writes a sibling
-`<runner>-clock-sync-debug-<run>.jsonl` containing one line per raw
-sample (NOT just the chosen one). This is for offline diagnosis and is
-not consumed by analysis. Per-line fields: `runner`, `run`, `variant`,
-`peer`, `id`, `t1`, `t2`, `t3`, `t4`, `rtt_ms`, `offset_ms`, plus a
-`chosen: bool` flag marking the sample that fed the canonical
-measurement.
+`<runner>-clock-sync-debug-<run>.jsonl` containing one line per probe
+**attempted**, regardless of whether a response was received. This is
+for offline diagnosis and is not consumed by analysis.
+
+Per-line fields: `ts`, `runner`, `run`, `variant`, `peer`,
+`sample_index`, `t1_ns`, `t2_ns`, `t3_ns`, `t4_ns`, `accepted: bool`
+(marks the sample that fed the canonical measurement, or `false` if
+no sample was chosen / outlier path fired), `outlier_rejected: bool`,
+and `result: string` — see below.
+
+The numeric `offset_ms` and `rtt_ms` fields are present **only** for
+`result == "ok"` rows. For non-`ok` rows they are absent (the sample
+quad was never completed) and consumers must check `result` first.
+
+#### `result` values (T8.5)
+
+| Value | Meaning |
+|-------|---------|
+| `"ok"` | A matching `ProbeResponse` arrived in time; `(t1, t2, t3, t4)` are all populated and the derived `offset_ms`/`rtt_ms` fields are present. |
+| `"timeout"` | No matching `ProbeResponse` arrived within the per-sample 100 ms window. `t1_ns` is preserved (we know when we sent); `t2_ns`/`t3_ns`/`t4_ns` are 0; numeric fields absent. |
+| `"rejected_filter"` | One or more datagrams arrived during the wait window but their `(from, to, id)` did not match the in-flight probe. Strong signal that per-runner port routing is misconfigured (e.g. a peer is binding the wrong port, or a stale process is still listening). |
+| `"rejected_t1"` | A `ProbeResponse` matched on `(from, to, id)` but its echoed `t1` string did not match the request's `t1`. Should be impossible in production; only fires under protocol-version skew or extreme stale-response scenarios. |
+| `"parse_error"` | One or more datagrams arrived during the wait window but failed to parse as a `Message`. Indicates either an unrelated process bound on the coordination port or a serializer-version skew. |
+
+The motivating regression: pre-T8.5, this file only got a row when a
+sample completed successfully. In a cross-machine run where 100% of
+probes silently failed (T8.5 field report), the file was 0 bytes —
+giving the operator no signal to distinguish "engine never ran" from
+"every probe was filter-rejected." With the new schema, even a
+total-failure cohort produces N debug rows whose `result` field
+identifies which failure mode dominated.
 
 ## When to Run
 
@@ -96,6 +121,18 @@ Twice in the runner lifecycle:
 1. **Initial sync**: after discovery completes and config hashes match,
    before the first `ready` barrier. This gives a baseline offset for each
    peer.
+
+   **Fail-fast (T8.5).** If the initial sync produces zero samples for any
+   listed peer, the runner aborts with a non-zero exit *before* the first
+   ready barrier. Cross-machine latency without an offset measurement is
+   statistically meaningless; we must never silently produce a benchmark
+   run whose cross-machine numbers are uncorrected. The peer side is also
+   forced to abort because it never sees its peer reach the ready barrier.
+
+   The fail-fast applies only to the initial sync. Per-variant resyncs
+   that produce zero samples remain soft warnings: analysis falls back to
+   the most recent valid measurement (the initial sync, in the worst
+   case).
 
 2. **Per-variant resync**: immediately after each variant's `ready` barrier
    completes, before spawning the variant child. This catches clock drift
@@ -165,10 +202,11 @@ them):
 Single-runner runs (loopback only) emit no clock-sync events — the file may
 be absent. Analysis must handle this case gracefully (treat offset as 0).
 
-**Sibling debug file** (T8.4): each runner additionally writes
-`<runner>-clock-sync-debug-<run>.jsonl` with one line per raw sample
-(t1, t2, t3, t4, id, derived `rtt_ms`/`offset_ms`, and a `chosen` flag).
-Used for offline diagnosis only; analysis ignores this file entirely.
+**Sibling debug file** (T8.4, extended in T8.5): each runner additionally
+writes `<runner>-clock-sync-debug-<run>.jsonl` with one line per probe
+**attempted** (T8.5: not just successful samples — see "Per-sample
+diagnostic log" above for the full schema and the `result` enum). Used
+for offline diagnosis only; analysis ignores this file entirely.
 
 ## Analysis Application
 

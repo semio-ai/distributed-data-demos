@@ -28,10 +28,27 @@ struct Cli {
     /// UDP coordination port (default: 19876).
     #[arg(long, default_value_t = 19876)]
     port: u16,
+
+    /// Emit verbose clock-sync tracing to stderr.
+    ///
+    /// When enabled, the runner prints (a) which branch
+    /// `is_single_runner()` and `clock_sync_engine()` returned, and (b)
+    /// for every datagram received during a probe-wait window, why it was
+    /// accepted or rejected (wrong `to`, wrong `from`, wrong `id`, wrong
+    /// `t1`, parse failure, or non-Probe variant). Off by default — use
+    /// only when diagnosing why a real-LAN run produced empty clock-sync
+    /// JSONL files. See `metak-shared/LEARNED.md`, "Diagnosing clock-sync
+    /// failure on a real LAN".
+    #[arg(long, default_value_t = false)]
+    verbose_clock_sync: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Wire the process-wide clock-sync verbose toggle so the engine and
+    // coordinator emit per-datagram traces while diagnosing field issues.
+    clock_sync::set_verbose(cli.verbose_clock_sync);
 
     // Load and validate config.
     let (bench_config, config_hash) = config::BenchConfig::from_file(&cli.config)?;
@@ -103,11 +120,32 @@ fn main() -> Result<()> {
 
     // Open the clock-sync log file (skipped in single-runner mode -- no peers
     // means no sync events would ever be written, and the contract permits
-    // an absent file in that case).
-    let mut clock_sync_log = if !coordinator.is_single_runner() {
+    // an absent file in that case). Emit a visible log line either way so an
+    // operator can confirm from stdout/stderr which branch was taken (T8.5).
+    let single_runner = coordinator.is_single_runner();
+    if single_runner {
+        eprintln!(
+            "[runner:{}] skipping clock-sync: single-runner mode (no peers in config; \
+             single_runner=true). No clock-sync log file will be created.",
+            cli.name
+        );
+    } else if cli.verbose_clock_sync {
+        eprintln!(
+            "[runner:{}] clock-sync: multi-runner mode, runners={:?}",
+            cli.name, bench_config.runners
+        );
+    }
+    let mut clock_sync_log = if !single_runner {
         std::fs::create_dir_all(&run_log_dir).ok();
         match clock_sync_log::open_clock_sync_log(&run_log_dir, &cli.name, &bench_config.run) {
-            Ok(l) => Some(l),
+            Ok(l) => {
+                eprintln!(
+                    "[runner:{}] clock-sync log opened at {}",
+                    cli.name,
+                    run_log_dir.display()
+                );
+                Some(l)
+            }
             Err(e) => {
                 eprintln!(
                     "[runner:{}] WARN: failed to open clock-sync log: {e:#}",
@@ -122,6 +160,17 @@ fn main() -> Result<()> {
 
     // Build the clock-sync engine. None in single-runner mode (no socket).
     let clock_sync_engine = coordinator.clock_sync_engine();
+    if cli.verbose_clock_sync {
+        eprintln!(
+            "[runner:{}] clock_sync_engine() returned {} (None means no socket -> single-runner)",
+            cli.name,
+            if clock_sync_engine.is_some() {
+                "Some(engine)"
+            } else {
+                "None"
+            }
+        );
+    }
 
     // Phase 1.5: initial clock sync. Logged with `variant=""`.
     let peer_names: Vec<String> = bench_config
@@ -130,6 +179,14 @@ fn main() -> Result<()> {
         .filter(|n| *n != &cli.name)
         .cloned()
         .collect();
+
+    // Track which peers the initial sync produced no samples for. T8.5:
+    // initial-sync zero-sample is FATAL because cross-machine latency
+    // numbers without an offset correction are statistically meaningless.
+    // Per-variant resyncs may still be soft warnings (analysis falls back
+    // to the most recent valid measurement).
+    let mut initial_failed_peers: Vec<String> = Vec::new();
+
     if let (Some(engine), Some(log)) = (clock_sync_engine.as_ref(), clock_sync_log.as_mut()) {
         if !peer_names.is_empty() {
             eprintln!(
@@ -139,13 +196,18 @@ fn main() -> Result<()> {
             );
             let measurements = engine.measure_offsets(&peer_names, clock_sync::DEFAULT_SAMPLES);
             for peer in &peer_names {
-                if let Some(m) = measurements.get(peer) {
-                    if let Err(e) = log.write("", peer, m) {
-                        eprintln!(
-                            "[runner:{}] WARN: clock-sync log write failed: {e:#}",
-                            cli.name
-                        );
-                    }
+                let pm = measurements.get(peer);
+                let (m_opt, attempts) = match pm {
+                    Some(pm) => (pm.measurement.as_ref(), pm.attempts.as_slice()),
+                    None => (None, &[][..]),
+                };
+                if let Err(e) = log.write("", peer, m_opt, attempts) {
+                    eprintln!(
+                        "[runner:{}] WARN: clock-sync log write failed: {e:#}",
+                        cli.name
+                    );
+                }
+                if let Some(m) = m_opt {
                     eprintln!(
                         "[runner:{}] clock_sync (initial) peer={peer} offset_ms={:.3} rtt_ms={:.3}",
                         cli.name, m.offset_ms, m.rtt_ms
@@ -155,9 +217,45 @@ fn main() -> Result<()> {
                         "[runner:{}] WARN: no clock-sync samples received from peer={peer}",
                         cli.name
                     );
+                    initial_failed_peers.push(peer.clone());
                 }
             }
         }
+    } else if !single_runner && !peer_names.is_empty() {
+        // The engine or the log slot is None despite multi-runner mode and a
+        // non-empty peer list -- that means open_clock_sync_log failed. Treat
+        // this as fatal: the run would silently produce uncorrected data.
+        bail!(
+            "clock-sync was enabled (multi-runner, {} peer(s)) but the engine or log slot is \
+             unavailable; refusing to start to avoid producing uncorrected cross-machine data. \
+             Re-run with --verbose-clock-sync for diagnostics.",
+            peer_names.len()
+        );
+    }
+
+    // T8.5 fail-fast: if the initial sync produced zero samples for any
+    // expected peer, abort with non-zero exit BEFORE the first ready
+    // barrier. This guarantees we never produce a benchmark run whose
+    // cross-machine latency numbers are uncorrected by an undetected silent
+    // failure. (Per-variant resyncs remain soft warnings -- analysis can
+    // fall back to the most recent valid measurement; only the initial
+    // sync is load-bearing for correctness.)
+    if let Err(e) = require_initial_sync_complete(&initial_failed_peers) {
+        eprintln!(
+            "[runner:{}] FATAL: initial clock-sync produced zero samples for peer(s): {:?}.",
+            cli.name, initial_failed_peers
+        );
+        eprintln!(
+            "[runner:{}]        Cross-machine latencies cannot be corrected without an offset \
+             measurement.",
+            cli.name
+        );
+        eprintln!(
+            "[runner:{}]        Re-run with --verbose-clock-sync for per-datagram tracing, and \
+             see metak-shared/LEARNED.md (\"Diagnosing clock-sync failure on a real LAN\").",
+            cli.name
+        );
+        return Err(e);
     }
 
     let inter_qos_grace = Duration::from_millis(bench_config.inter_qos_grace_ms());
@@ -183,20 +281,28 @@ fn main() -> Result<()> {
             // Per-variant clock resync: catches drift across the run. Logged
             // with the spawn's effective name so analysis joins the latest
             // measurement preceding the variant's writes. No-op in
-            // single-runner mode (engine/log are None).
+            // single-runner mode (engine/log are None). Per-variant zero-
+            // sample is a soft warning, NOT fatal -- the most recent valid
+            // measurement (the initial sync, or a successful prior resync)
+            // remains available to analysis.
             if let (Some(engine), Some(log)) = (clock_sync_engine.as_ref(), clock_sync_log.as_mut())
             {
                 if !peer_names.is_empty() {
                     let measurements =
                         engine.measure_offsets(&peer_names, clock_sync::DEFAULT_SAMPLES);
                     for peer in &peer_names {
-                        if let Some(m) = measurements.get(peer) {
-                            if let Err(e) = log.write(&job.effective_name, peer, m) {
-                                eprintln!(
-                                    "[runner:{}] WARN: clock-sync log write failed: {e:#}",
-                                    cli.name
-                                );
-                            }
+                        let pm = measurements.get(peer);
+                        let (m_opt, attempts) = match pm {
+                            Some(pm) => (pm.measurement.as_ref(), pm.attempts.as_slice()),
+                            None => (None, &[][..]),
+                        };
+                        if let Err(e) = log.write(&job.effective_name, peer, m_opt, attempts) {
+                            eprintln!(
+                                "[runner:{}] WARN: clock-sync log write failed: {e:#}",
+                                cli.name
+                            );
+                        }
+                        if let Some(m) = m_opt {
                             eprintln!(
                                 "[runner:{}] clock_sync ({}) peer={peer} offset_ms={:.3} rtt_ms={:.3}",
                                 cli.name, job.effective_name, m.offset_ms, m.rtt_ms
@@ -286,6 +392,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Decide whether the initial clock-sync produced enough data to safely
+/// proceed with the run.
+///
+/// Extracted so it is unit-testable independently of the network plumbing.
+/// Returns `Err` iff at least one peer produced zero samples and the run
+/// must be aborted before the first ready barrier (T8.5 acceptance
+/// criterion).
+fn require_initial_sync_complete(failed_peers: &[String]) -> Result<()> {
+    if failed_peers.is_empty() {
+        Ok(())
+    } else {
+        bail!("initial clock-sync failed for peers: {failed_peers:?}")
+    }
+}
+
 struct SummaryRow {
     variant: String,
     runner: String,
@@ -305,5 +426,47 @@ fn print_summary(run_id: &str, rows: &[SummaryRow]) {
             "{:<24} {:<8} {:<9} {}",
             row.variant, row.runner, row.status, row.exit_code
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_initial_sync_complete_passes_when_no_peers_failed() {
+        // No peers were listed as failed -- the run must be allowed to
+        // proceed (single-runner runs and successful multi-runner runs both
+        // hit this path).
+        require_initial_sync_complete(&[]).expect("empty failed list must succeed");
+    }
+
+    #[test]
+    fn require_initial_sync_complete_fails_when_any_peer_has_zero_samples() {
+        // One peer with zero samples -> Err. This is the load-bearing T8.5
+        // hardening: cross-machine latency without an offset measurement
+        // is statistically meaningless and must NOT be silently produced.
+        let err = require_initial_sync_complete(&["bob".to_string()])
+            .expect_err("zero-sample peer must abort the run");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("initial clock-sync failed"),
+            "error message should mention initial sync failure: {msg}"
+        );
+        assert!(
+            msg.contains("bob"),
+            "error message should name the failed peer: {msg}"
+        );
+    }
+
+    #[test]
+    fn require_initial_sync_complete_fails_when_any_peer_in_a_set_failed() {
+        // Even one failed peer in a larger set is fatal. Mixed success/
+        // failure does not "average" -- analysis cannot correct one cross-
+        // runner pair while leaving another uncorrected.
+        let err = require_initial_sync_complete(&["bob".to_string(), "carol".to_string()])
+            .expect_err("any failed peer must abort the run");
+        let msg = err.to_string();
+        assert!(msg.contains("bob") && msg.contains("carol"), "msg={msg}");
     }
 }
