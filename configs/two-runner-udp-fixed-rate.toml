@@ -17,5 +17,6 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
   log_dir = "./logs"
 
   [variant.specific]
-  multicast_group = "239.0.0.1:19500"
+  multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
+  tcp_base_port = 19800
