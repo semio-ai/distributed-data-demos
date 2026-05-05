@@ -72,27 +72,6 @@ valuable data point.
 when there's no framework overhead. Directly comparable to every other
 variant since it implements the design with zero abstraction.
 
-### R3: Aeron (finance-grade messaging)
-
-- **Project**: Adaptive Aeron | https://aeron.io/
-- **Crate**: `rusteron` / `rusteron-client` (community C bindings, unsafe)
-- **Transport**: UDP multicast (LAN) or TCP. SPSC/MPSC ring buffers.
-  Kernel bypass optional with Aeron Premium.
-- **Discovery**: Built-in media driver handles peer coordination.
-- **QoS**: Reliable and unreliable modes. Ordering guaranteed per stream.
-- **Latency**: 21-39 us P50 at 100K-1M msg/sec (AWS 2025 benchmarks).
-  57 us open-source at 100K msg/sec (Google Cloud).
-- **Throughput**: Designed for > 1M msg/sec.
-- **Fit**: Strong. Cross-machine LAN, push-based, small messages ideal.
-  Microsecond latency far exceeds our 10 ms target.
-- **Concerns**: C bindings (unsafe Rust). Media driver process required.
-  Premium features need licensing. Less idiomatic Rust.
-- **Windows**: Supported but less optimized than Linux.
-
-**Why include**: The performance ceiling reference. Finance-grade latency
-and throughput. Interesting to see how much a purpose-built messaging
-system outperforms general frameworks and raw UDP.
-
 ### R4: QUIC via quinn (modern protocol)
 
 - **Project**: quinn-rs | https://github.com/quinn-rs/quinn

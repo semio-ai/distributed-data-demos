@@ -168,27 +168,6 @@ Dependencies: E1 (base crate), E2 (runner to spawn it).
 
 ---
 
-## E3c: Aeron Variant
-
-**Repo**: `variants/aeron/`
-**Goal**: Implement a replication variant using Adaptive Aeron. Represents
-the "finance-grade" performance ceiling.
-
-Scope:
-- Implements `Variant` trait from `variant-base`.
-- Uses `rusteron-client` crate (C bindings to Aeron).
-- Aeron media driver handles peer coordination.
-- UDP multicast for data distribution.
-- Aeron-specific CLI args: `aeron_dir`, `channel`, `stream_id`.
-- Buffer callbacks into internal queue, drain via `poll_receive`.
-
-Dependencies: E1 (base crate), E2 (runner to spawn it). Aeron media
-driver must be running on each machine.
-
-Note: C bindings introduce unsafe Rust. Extra review needed.
-
----
-
 ## E3d: QUIC Variant
 
 **Repo**: `variants/quic/`
@@ -449,43 +428,6 @@ Acceptance:
   definition.
 - All existing tests still pass (E11 analysis tests, per-variant unit
   tests, T10.6a/b/c).
-
----
-
-## E13: Remove Aeron variant code and references
-
-**Repos**: `variants/aeron/` (deleted), plus references in
-`metak-orchestrator/`, `metak-shared/`, `configs/`, `.code-workspace`.
-**Goal**: Remove the Aeron variant entirely now that the user has
-elected to exclude it (E3c was blocked indefinitely on the Windows
-toolchain issue; on Linux it would still require a media-driver setup
-the project does not want to take on).
-
-Filed as a placeholder. **Do not start E13 until E12 is fully landed**
-— per the user's explicit instruction. Removing Aeron mid-E12 risks
-losing track of references and complicates regression review.
-
-Scope (when E13 starts):
-- Delete `variants/aeron/` directory entirely.
-- Remove the Aeron entry from `metak-orchestrator/EPICS.md` (the E3c
-  block in this very file).
-- Remove Aeron mentions from `metak-orchestrator/STATUS.md`,
-  `metak-orchestrator/TASKS.md`, `metak-shared/overview.md`,
-  `metak-shared/architecture.md`,
-  `metak-shared/variant-candidates.md` (or move R3 to a
-  "rejected candidates" section with a note that Aeron was excluded
-  for build-toolchain reasons), and any other doc that references it.
-- Remove any `[[variant]]` entries with `binary = .../variant-aeron...`
-  from configs (smoke, two-runner-all-variants).
-- Remove the Aeron entry from `.code-workspace` if present.
-- Update `metak-shared/coding-standards.md` only if it mentions Aeron.
-
-Out of scope:
-- Re-evaluating whether to bring Aeron back later. If the project
-  ever wants Aeron, it gets re-introduced as a fresh epic; this epic
-  is purely cleanup.
-
-Dependencies: E12 done.
 
 ---
 
