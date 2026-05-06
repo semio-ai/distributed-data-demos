@@ -31,6 +31,12 @@
       "path": "variants/hybrid"
     },
     {
+      "path": "variants/websocket"
+    },
+    {
+      "path": "variants/webrtc"
+    },
+    {
       "path": "analysis"
     }
   ],

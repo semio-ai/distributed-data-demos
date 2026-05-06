@@ -1,0 +1,36 @@
+# WebSocket-only two-runner-on-localhost fixture for T3f.1 validation.
+#
+# Single websocket entry. The variant only supports reliable QoS levels
+# (3 and 4) -- QoS 1 and 2 belong to the Hybrid variant. The runner
+# spawns the variant once per QoS level (3 and 4 here).
+#
+# Per-runner / per-qos WebSocket TCP ports are derived from
+# --ws-base-port + runner_index + (qos - 1) * 10. With base 19960 and
+# two runners (alice=0, bob=1), listen ports are:
+#   alice qos3 19980, qos4 19990
+#   bob   qos3 19981, qos4 19991
+#
+# Run from the repo root in two terminals:
+#   runner/target/release/runner --name alice --config variants/websocket/tests/fixtures/two-runner-websocket-only.toml
+#   runner/target/release/runner --name bob   --config variants/websocket/tests/fixtures/two-runner-websocket-only.toml
+
+run = "websocket-t3f1-validation"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "websocket-qos34"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 3
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 10
+  qos = [3, 4]
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960

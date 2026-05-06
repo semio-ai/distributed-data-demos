@@ -1,0 +1,20 @@
+[package]
+name = "variant-websocket"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "variant-websocket"
+path = "src/main.rs"
+
+[dependencies]
+variant-base = { path = "../../variant-base" }
+tungstenite = "0.24"
+socket2 = "0.5"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"

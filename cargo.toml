@@ -6,5 +6,7 @@ members = [
     "variants/custom-udp",
     "variants/quic",
     "variants/hybrid",
+    "variants/webrtc",
+    "variants/websocket",
 ]
 resolver = "2"

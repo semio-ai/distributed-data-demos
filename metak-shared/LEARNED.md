@@ -5,6 +5,41 @@ Things discovered during development that are useful for future work.
 <!-- When any agent discovers useful methods, procedures, or tricks, document them here. -->
 <!-- Each entry should have a Discovery (what was learned) and an Implication (how to apply it). -->
 
+## Windows: SO_RCVTIMEO can surface as `os error 997` (`ERROR_IO_PENDING`)
+
+**Discovery (T3f.1, 2026-05-06)**: when polling a TCP socket with a short
+`SO_RCVTIMEO` (the trick used by hybrid + websocket variants to keep
+reads pollable while writes stay blocking for back-pressure
+measurement), Windows can return `os error 997 (ERROR_IO_PENDING)` from
+`read` on timeout instead of the more familiar `WSAEWOULDBLOCK`
+(10035) or `WSAETIMEDOUT` (10060). The standard library maps the
+former two to `io::ErrorKind::WouldBlock` / `TimedOut`, but
+`ERROR_IO_PENDING` lands as a raw OS error with no `ErrorKind` match.
+Code that classifies "transient, retry" purely on `ErrorKind` will
+mis-treat 997 as a hard failure and abort the read loop. Surfaces only
+on lower-traffic spawns; high-traffic spawns rarely hit a `read` after
+the deadline because data is usually already buffered.
+
+**Implication**: any variant doing the SO_RCVTIMEO + cloned read
+handle pattern on Windows MUST classify error 997 alongside 10035 and
+10060 as transient. Concretely, an `is_transient_io_error(e)` helper
+should match all of:
+- `e.kind() == ErrorKind::WouldBlock`
+- `e.kind() == ErrorKind::TimedOut`
+- `e.raw_os_error() == Some(997)`  (`ERROR_IO_PENDING`)
+- `e.raw_os_error() == Some(10035)` (`WSAEWOULDBLOCK`)
+- `e.raw_os_error() == Some(10060)` (`WSAETIMEDOUT`)
+
+The websocket variant ships this classifier (see
+`variants/websocket/src/websocket.rs` `is_transient_io_error`). The
+hybrid variant currently does NOT — it has the same SO_RCVTIMEO
+pattern and the same latent bug, but its workloads run hot enough that
+the read-after-deadline path rarely fires. Treat this as a latent
+hybrid bug that should be back-ported when convenient (see the
+follow-up entry in TASKS.md). Any future variant using the same
+pattern (and any port of these patterns to async I/O on Windows)
+should copy the classifier verbatim from websocket.
+
 ## Cross-machine validation reveals failures invisible on localhost (E9 → E10)
 
 **Discovery**: Same-machine two-runner runs and cross-machine two-runner runs

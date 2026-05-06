@@ -549,3 +549,131 @@ Scope:
 - Document results and any issues discovered.
 
 Dependencies: E2, at least one E3 variant, E4.
+
+---
+
+## E3f: WebSocket Variant
+
+**Repo**: `variants/websocket/` (Rust binary)
+**Goal**: Implement a replication variant using WebSocket as the reliable
+transport. Represents the "browser-compatible reliable transport"
+comparison and isolates the cost of WebSocket framing on top of TCP.
+
+The interesting question this variant answers: **what does the WebSocket
+framing layer (handshake, masking, length-prefixed frames) cost on top of
+raw TCP under our workload?** Comparing E3f to E3e (Hybrid) at QoS 4
+isolates that cost directly — both run TCP underneath, both use the same
+runner-injected peer setup, differing only in what sits between the
+application and the kernel socket.
+
+Scope:
+- Implements `Variant` trait from `variant-base`.
+- **Reliable QoS only (3-4).** WebSocket is TCP-based; there is no
+  unreliable mode. For QoS 1-2 the variant's `publish` returns a clear
+  error and the spawn exits non-zero with a recognisable message — the
+  benchmark configs simply do not spawn it at unreliable QoS levels.
+  This is intentional: this variant exists to characterise reliable
+  framing overhead, not to duplicate Hybrid's UDP path.
+- Symmetric peer pairing: lower-sorted-index runner connects (WS client),
+  higher-sorted-index runner accepts (WS server). One WS connection per
+  peer pair, full-duplex.
+- Peer hosts come from the runner-injected `--peers` (E9). Port derivation
+  follows the same `runner_stride = 1 / qos_stride = 10` convention used
+  by Hybrid TCP and QUIC. Variant-specific `--ws-base-port`.
+- Same compact binary header on top of the WebSocket binary frame as the
+  other variants use; WebSocket adds its own framing on top.
+- Sync API: use the synchronous `tungstenite` crate over
+  `std::net::TcpStream`. No tokio. Same blocking-write + short
+  `SO_RCVTIMEO` polling trick as Hybrid, so kernel back-pressure remains
+  the measured signal (matching Hybrid's design rationale, see its
+  CUSTOM.md).
+- EOT (E12): implement the TCP-frame variant of the protocol per
+  `eot-protocol.md` — broadcast `eot_sent` frame to every peer over the
+  same WS connection at end-of-operate, collect peers' `eot_sent` via
+  the same channel.
+
+Out of scope:
+- TLS / `wss://`. Self-signed certificate juggling adds noise without
+  measuring anything new (QUIC already pays for TLS in its numbers).
+- Subprotocols, extensions (compression, etc.).
+- HTTP/2 WebSockets (RFC 8441). Plain HTTP/1.1 upgrade only.
+- QoS 1-2 over UDP. Use Hybrid for that comparison.
+
+Dependencies: E1 (base crate), E2 (runner), E9 (`--peers` injection),
+E12 (EOT trait + driver).
+
+---
+
+## E3g: WebRTC DataChannel Variant
+
+**Repo**: `variants/webrtc/` (Rust binary)
+**Goal**: Implement a replication variant using WebRTC DataChannels as the
+transport. Represents the "browser stack on a LAN" comparison — the
+heaviest stack in the lineup (DTLS + SCTP over UDP), but the only one
+that natively offers both reliable and unreliable modes from a single
+session.
+
+The interesting question this variant answers: **what does the WebRTC
+stack cost on a LAN compared to raw QUIC, raw UDP, and raw TCP?** It is
+the only candidate that natively maps to all four QoS levels through
+DataChannel options (ordered/unordered × reliable/maxRetransmits=0)
+without any application-layer reliability code on our side.
+
+Scope:
+- Implements `Variant` trait from `variant-base`.
+- All four QoS levels mapped to DataChannel configurations:
+  - L1 (best-effort): unordered, `maxRetransmits=0`
+  - L2 (latest-value): same as L1; receiver does seq filtering
+  - L3 (reliable-ordered): ordered, default reliable
+  - L4 (reliable): ordered, default reliable (same channel config as L3)
+- Peer hosts come from the runner-injected `--peers`. ICE uses **host
+  candidates only** — no STUN, no TURN, no mDNS candidates. Hard-coded
+  host candidates derived from `--peers` and the variant-specific
+  `--media-base-port` are sufficient on a LAN.
+- **Signaling**: a small TCP signaling channel between every peer pair on
+  a derived port (`--signaling-base-port`). The lower-sorted runner
+  initiates the TCP connection and sends an SDP offer; the higher
+  responds with an SDP answer; ICE candidates are exchanged over the
+  same socket; the socket closes once the DataChannel reports `open`.
+  Pairing and port derivation use the same `runner_stride = 1 /
+  qos_stride = 10` convention as Hybrid/QUIC. The runner does NOT
+  participate — signaling is entirely variant-to-variant.
+- Sync-to-async bridge: the `webrtc` crate is async (tokio). Same pattern
+  as the QUIC variant — internal tokio runtime, mpsc channels between
+  the sync trait surface and async tasks. See `variants/quic/CUSTOM.md`
+  for the established pattern; the worker should mirror it.
+- EOT (E12): implement the DataChannel variant of the protocol per
+  `eot-protocol.md` — send `eot_sent` over the L3/L4 (reliable) channel
+  to every peer, parallel to QUIC's stream-end approach.
+- Same compact binary header as other variants on top of the
+  DataChannel message body.
+
+Crate choice: `webrtc` (webrtc-rs). Pulls in many transitive deps but is
+the most complete and best-documented Rust WebRTC implementation. Not
+`str0m` for this benchmark — a sans-IO library would force the worker
+to write the same kind of glue we already have in custom-udp; that
+defeats the purpose of "what does the off-the-shelf WebRTC stack
+cost?" If the build proves problematic on Windows the worker should
+flag and we will reconsider.
+
+Out of scope:
+- STUN/TURN. LAN-only.
+- mDNS ICE candidates.
+- Browser interop (no SDP-munging or compatibility shims).
+- DTLS certificate pinning beyond the bare minimum.
+- Multiple DataChannels per peer pair beyond the four logical QoS
+  channels.
+
+Dependencies: E1 (base crate), E2 (runner), E9 (`--peers` injection),
+E12 (EOT trait + driver). E3d (QUIC) provides the async-bridge pattern
+to copy.
+
+**Known limitation (T3g.2 outcome, 2026-05-06)**: the implemented
+variant supports exactly **one peer per spawn**. webrtc-rs ties one
+`RTCPeerConnection` to one UDP socket via `SettingEngine`, and our
+`EphemeralUDP::new(p, p)` pin to a single derived `--media-base-port`
+makes that socket unique per spawn. The two-runner case fits exactly;
+N>2 runners would need a per-peer media-port stride or a Muxed UDP
+setup. Variant errors clearly when violated. A future N-peer
+extension is a separate epic if/when N-peer benchmarks become a
+priority — not on the current backlog.

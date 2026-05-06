@@ -1,0 +1,75 @@
+run = "websocket-all"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+# WebSocket variant only supports reliable QoS (3 and 4). QoS 1-2 belong
+# to the Hybrid variant. Each entry below uses `qos = [3, 4]` so the
+# runner expands the spawn into one run per reliable QoS level.
+
+[[variant]]
+name = "websocket-1000x100hz"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = [3, 4]
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960
+
+[[variant]]
+name = "websocket-100x100hz"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = [3, 4]
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960
+
+[[variant]]
+name = "websocket-10x100hz"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 10
+  qos = [3, 4]
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960
+
+[[variant]]
+name = "websocket-max"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "max-throughput"
+  values_per_tick = 1000
+  qos = [3, 4]
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960

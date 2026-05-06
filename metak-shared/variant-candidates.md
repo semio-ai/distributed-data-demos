@@ -129,6 +129,87 @@ for reliable) at QoS 3 gives us the definitive answer.
 
 ---
 
+### R6: WebSocket (browser-compatible reliable transport)
+
+- **Approach**: TCP transport with the WebSocket framing/upgrade layer on
+  top. One connection per peer pair, full-duplex, binary frames carrying
+  the same compact header as the other variants.
+- **Crates**: `tungstenite` (sync) over `std::net::TcpStream`, plus
+  `socket2` for buffer tuning. No tokio.
+- **Transport**: TCP with the WebSocket frame format. Reliable QoS only
+  (3-4); the variant returns a clear error and exits non-zero if asked
+  to publish at QoS 1-2. UDP for unreliable QoS is intentionally not
+  duplicated here — Hybrid already covers that. Added 2026-05-06.
+- **Discovery**: Runner-injected `--peers` (E9). No mDNS, no signaling
+  side-channel.
+- **QoS**: Reliable-ordered (L3/L4) only.
+- **Latency**: Expected to track Hybrid TCP closely (1-5 ms warm on LAN
+  with `TCP_NODELAY`) plus the cost of the WebSocket masking and frame
+  header — typically tens of nanoseconds per message at our payload
+  sizes, but worth measuring rather than assuming.
+- **Throughput**: Bounded by TCP back-pressure, same as Hybrid TCP.
+  The masking step on the client side is the only material per-message
+  cost difference vs raw TCP at our payload sizes.
+- **Fit**: Excellent for the question it answers (framing overhead vs
+  raw TCP). Poor as a general-purpose variant because half of the QoS
+  matrix is unsupported. That is an acceptable trade-off — the design
+  brief is "compare implementations", not "every variant must cover
+  every QoS".
+- **Concerns**: WebSocket is a client/server protocol. Symmetric peer
+  pairing requires choosing a client and a server per pair — we use
+  sorted-name index, lower initiates. Same pairing rule as Hybrid TCP.
+- **Windows**: Fully supported.
+- **Complexity**: Low. Smaller surface area than Hybrid (no UDP path).
+
+**Why include**: Isolates the WebSocket framing tax. Comparing E3f vs
+E3e (Hybrid) at QoS 4 directly measures the cost of a framing layer
+that is widely used in production systems (real-time dashboards,
+collaborative editors, game-server channels). Cheap to build because
+it reuses Hybrid's TCP design verbatim and just swaps the framing.
+
+### R7: WebRTC DataChannels (browser stack on a LAN)
+
+- **Project**: webrtc-rs | https://github.com/webrtc-rs/webrtc
+- **Crate**: `webrtc` (Rust-native, port of pion/webrtc).
+- **Transport**: SCTP-over-DTLS-over-UDP with DataChannels. Each
+  DataChannel is configurable as ordered/unordered and reliable /
+  `maxRetransmits=N`. We use one channel per QoS level per peer pair.
+- **Discovery**: Runner-injected `--peers`, host ICE candidates only.
+  No STUN/TURN/mDNS — LAN-only.
+- **Signaling**: Direct variant-to-variant TCP signaling channel for
+  SDP offer/answer + ICE candidate exchange. Closes once DataChannels
+  open. The runner does NOT participate.
+- **QoS**: All four levels mapped natively:
+  - L1 / L2: unordered + `maxRetransmits=0` (lossy datagram-like)
+  - L3 / L4: ordered + default reliable
+- **Latency**: Higher than QUIC at cold start (DTLS handshake + SCTP
+  init); warm latency expected to be in the same ballpark as QUIC
+  (1-5 ms on LAN). The SCTP layer adds a small per-message cost vs
+  raw QUIC streams.
+- **Throughput**: SCTP is the practical bottleneck. Should reach our
+  100K msg/s target on a LAN but with more variance than QUIC or
+  Hybrid because of DTLS framing and SCTP windowing.
+- **Fit**: The only candidate that natively maps to all four QoS
+  levels with zero application-layer reliability code on our side.
+  Heaviest stack of any candidate. Added 2026-05-06.
+- **Concerns**: Build size and dependency footprint are significant.
+  Setup latency dominates connect-time measurements (acceptable — we
+  log it). Windows builds of `webrtc-rs` are known to work but the
+  worker should validate early.
+- **Windows**: Supported. Validate early.
+- **Complexity**: High. Sync-to-async bridge same as QUIC.
+
+**Why include**: WebRTC is the only widely-deployed off-the-shelf
+mechanism that gives applications a reliable+unreliable mux from a
+single session. Measuring its cost on a LAN — versus QUIC (which
+multiplexes streams over a single QUIC connection but has no
+unreliable-with-ordering equivalent) and versus a hand-rolled
+hybrid — fills a real gap in the comparison matrix. It is also the
+only variant whose protocol is implementable in a browser, which
+matters for any future "browser-as-peer" experiments.
+
+---
+
 ## Considered but Not Recommended
 
 ### Dust DDS (pure Rust DDS)
@@ -203,6 +284,8 @@ for reliable) at QoS 3 gives us the definitive answer.
 | Aeron | Framework | 21-57 us | C bindings | Built-in | Reliable/unreliable | Medium |
 | QUIC (quinn) | Protocol | 2-12 ms | Native | mDNS | Streams + datagrams | High |
 | Hybrid UDP/TCP | Mixed | 2-5 ms (UDP) / 1-5 ms (TCP) | Native | mDNS | UDP L1-2, TCP L3-4 | Low-Medium |
+| WebSocket | Framed TCP | 1-5 ms (TCP) + framing cost | Native (`tungstenite`) | Runner --peers | L3-4 only | Low |
+| WebRTC | DTLS+SCTP/UDP | 1-5 ms warm; high cold | Native (`webrtc-rs`) | Runner --peers + variant-to-variant SDP | All 4 native | High |
 
 ## Impact on E1 (Variant Base Crate)
 

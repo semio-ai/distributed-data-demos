@@ -4000,6 +4000,289 @@ benchmark sweeps against the current state.
 
 ---
 
+### T3g.1: variants/webrtc -- crate scaffold + dependency build smoke test -- done
+
+**Result**: PASS. `webrtc-rs` 0.8.0 builds and runs cleanly on Windows
+with a default tokio multi-threaded runtime. T3g.2 is unblocked; no
+version pinning workarounds were required.
+
+#### What was attempted
+
+1. Scaffolded `variants/webrtc/Cargo.toml` per the T3g.1 spec:
+   - `variant-base` via path `../../variant-base`.
+   - `webrtc = "0.8"` (latest stable on crates.io; `0.20.0-alpha.1`
+     is alpha and was rejected per "latest stable").
+   - `tokio = "1"` with `rt-multi-thread`, `macros`, `sync`, `net`
+     features.
+   - `anyhow = "1"`.
+2. Added `variants/webrtc` to the workspace members in the root
+   `Cargo.toml` (necessary for `cargo build -p variant-webrtc`
+   from the workspace root, which the acceptance criteria
+   require). This is the only file touched outside
+   `variants/webrtc/`. Note: `variants/websocket` was already in
+   the workspace list at the time of edit -- preserved that entry.
+3. Wrote a minimal `src/main.rs` smoke binary that:
+   - Builds a multi-threaded tokio runtime.
+   - Calls `webrtc::api::APIBuilder::new().build()`.
+   - Constructs an `RTCPeerConnection` from
+     `RTCConfiguration::default()`.
+   - Closes it.
+   - Shuts the runtime down with a 2 s timeout, then exits 0.
+
+#### Build result
+
+```
+cargo build --release -p variant-webrtc
+... 250+ transitive crates compiled ...
+   Compiling webrtc v0.8.0
+   Compiling variant-base v0.1.0
+   Compiling variant-webrtc v0.1.0
+    Finished `release` profile [optimized] target(s) in 1m 26s
+```
+
+No errors, no warnings from `variant-webrtc` itself. `webrtc` 0.8.0
+pulls a sizeable transitive tree (`webrtc-dtls`, `webrtc-sctp`,
+`webrtc-ice`, `webrtc-srtp`, `webrtc-mdns`, `webrtc-media`,
+`interceptor`, `turn`, `stun`, `rtp`, `rtcp`, `sdp`, `rcgen`,
+`rustls 0.19`, `webpki 0.21`, plus several AES / curve25519 /
+elliptic-curve crates) but every member built first try. No
+OpenSSL or `ring`-version issues materialised on this Windows
+host -- the crate's pure-Rust `rustls 0.19.1` path ships with
+its own bundled `webpki 0.21` and avoids the `openssl-sys`
+trap that historically bit `webrtc-rs` on Windows.
+
+#### Runtime smoke result
+
+```
+$ time variant-webrtc.exe
+variant-webrtc smoke test: starting
+variant-webrtc smoke test: RTCPeerConnection constructed
+variant-webrtc smoke test: RTCPeerConnection closed
+variant-webrtc smoke test: exit 0
+
+real    0m1.099s
+exit code: 0
+```
+
+Well under the 10 s acceptance bound. No DTLS, ICE agent, or SCTP
+errors emitted during construction / close of an empty PeerConnection.
+
+#### Workarounds applied
+
+None. The build worked at HEAD with `webrtc = "0.8"` and the
+default tokio feature set requested by T3g.1. No `[patch]`
+entries, no version pins beyond what `Cargo.toml` already declares.
+
+#### Recommendation
+
+**T3g.2 can proceed unchanged.** The dependency stack is healthy on
+this Windows host. A few notes for the T3g.2 worker:
+
+- Keep `webrtc = "0.8"` -- it pulled `0.8.0`. Do not jump to
+  `0.20.0-alpha.1`; the API surface is still in flux on alpha.
+- The transitive `rustls 0.19.1` is independent of the QUIC
+  variant's `rustls 0.23` -- expect both major versions in the
+  workspace `Cargo.lock`. That is fine; cargo handles the dual
+  versions per-crate.
+- The smoke uses `enable_all()` on the tokio builder; T3g.2 will
+  want explicit feature selection to match `CUSTOM.md`'s
+  `rt-multi-thread, macros, sync, net` set.
+- `RTCPeerConnection::close().await` returns a `webrtc::Error`,
+  which `anyhow` accepts via `?` -- bridging is straightforward,
+  no special `From` impls needed.
+
+#### Acceptance criteria status
+
+- [x] `Cargo.toml` declares `variant-base`, `webrtc`, `tokio`
+      (rt-multi-thread + macros + sync + net), and `anyhow`.
+- [x] `cargo build --release -p variant-webrtc` succeeds on Windows
+      (1m 26s, no warnings on our crate).
+- [x] Smoke main runs to exit 0 in ~1.1 s, well under 10 s.
+- [x] Completion report appended (this section).
+
+#### Files added / modified
+
+- `variants/webrtc/Cargo.toml` (new).
+- `variants/webrtc/src/main.rs` (new).
+- `variants/webrtc/STRUCT.md` (updated to record current vs
+  target layout).
+- `Cargo.toml` (workspace root) -- added `variants/webrtc` to
+  the `members` array. This is the single intentional
+  cross-directory edit, justified by the acceptance criterion
+  `cargo build --release -p variant-webrtc` which requires
+  workspace membership.
+
+---
+
+### T3f.1: variants/websocket -- implement WebSocket variant end-to-end -- done
+
+**Repo**: `variants/websocket/`
+**Status**: done
+
+#### What was implemented
+
+1. `variants/websocket/Cargo.toml` -- binary crate depending on
+   `variant-base` (path), `tungstenite = "0.24"` (sync, no
+   `tokio-tungstenite`), `socket2`, `anyhow`, `clap`, `rand`. No
+   `tokio` anywhere in the dependency tree.
+2. `src/main.rs` -- CLI parsing, QoS guard (rejects 1 and 2 with a
+   clear stderr message and exit 1 BEFORE any I/O), then constructs
+   `WebSocketVariant` and hands off to `variant-base`'s
+   `run_protocol`.
+3. `src/protocol.rs` -- compact binary header matching
+   `variants/hybrid` and `variants/custom-udp`. Two frame variants:
+   data (1..=4 tag) and EOT (`0xE0` tag). The bytes live INSIDE the
+   WebSocket binary frame body; WS framing replaces the 4-byte
+   length prefix used on the raw TCP path.
+4. `src/pairing.rs` -- sorted-name pairing + port derivation
+   (`runner_stride=1`, `qos_stride=10`), same convention as Hybrid
+   TCP and QUIC. Lower-sorted-name runner is the WS client; higher
+   is the WS server.
+5. `src/websocket.rs` -- `WebSocketVariant` implements the `Variant`
+   trait. One `tungstenite::WebSocket<TcpStream>` per peer pair.
+   - Underlying TCP socket stays in **blocking mode** so writes
+     under back-pressure truly block (the back-pressure measurement
+     signal we want).
+   - `set_read_timeout(1ms)` on the same socket so reads return
+     `WouldBlock`/`TimedOut` quickly without flipping the
+     socket-wide non-blocking flag.
+   - `TCP_NODELAY` on every connection.
+   - Per-peer fault tolerance: read or write errors drop only the
+     offending peer; the spawn continues with the survivors.
+   - EOT: `signal_end_of_test` broadcasts an EOT-tagged binary
+     frame; `poll_peer_eots` drains observations queued in
+     `poll_receive`.
+6. `tests/integration.rs` -- single-process loopback covering
+   bind/listen on the derived port, role-decision logic, and full
+   round-trip of both data and EOT frames through tungstenite's
+   handshake + binary-frame path.
+7. `tests/fixtures/two-runner-websocket-only.toml` -- minimal
+   two-runner-on-localhost fixture (qos=[3, 4], scalar-flood,
+   short phases).
+8. `configs/two-runner-websocket-all.toml` -- project-level config
+   modelled on `configs/two-runner-hybrid-all.toml`. Variants:
+   `websocket-1000x100hz`, `websocket-100x100hz`,
+   `websocket-10x100hz`, `websocket-max`. Each spawns at qos
+   `[3, 4]` only (qos 1-2 belong to Hybrid).
+
+#### Validation against reality
+
+```
+cargo build --release -p variant-websocket
+# Finished `release` profile [optimized] target(s)
+
+cargo test --release -p variant-websocket
+# 33 unit tests + 27 integration tests = 60 passed; 0 failed
+
+cargo clippy --release -p variant-websocket --all-targets -- -D warnings
+# clean
+
+cargo fmt -p variant-websocket -- --check
+# clean
+```
+
+End-to-end localhost two-runner run via
+`configs/two-runner-websocket-all.toml`:
+
+```
+target/release/runner.exe --name alice --config configs/two-runner-websocket-all.toml --port 19880
+target/release/runner.exe --name bob   --config configs/two-runner-websocket-all.toml --port 19880
+```
+
+All 16 spawns (4 throughput levels x 2 qos levels x 2 runners) exited
+with `status=success, exit_code=0`. Analysis (`python analyze.py
+--summary <run-dir>`) reports **100.00% delivery** for every
+(writer, receiver) pair at every qos and every throughput level:
+
+| Variant | Path | QoS | Sent | Rcvd | Delivery |
+|---|---|---|---|---|---|
+| websocket-1000x100hz-qos3 | alice->bob / bob->alice | 3 | 218k / 226k | 218k / 226k | 100.00% |
+| websocket-1000x100hz-qos4 | alice->bob / bob->alice | 4 | 265k / 264k | 265k / 264k | 100.00% |
+| websocket-100x100hz-qos3 | alice->bob / bob->alice | 3 | 60.5k / 60.7k | 60.5k / 60.7k | 100.00% |
+| websocket-100x100hz-qos4 | alice->bob / bob->alice | 4 | 58.9k / 58.8k | 58.9k / 58.8k | 100.00% |
+| websocket-10x100hz-qos3 | alice->bob / bob->alice | 3 | 6.06k / 6.29k | 6.06k / 6.29k | 100.00% |
+| websocket-10x100hz-qos4 | alice->bob / bob->alice | 4 | 6.57k / 6.62k | 6.57k / 6.62k | 100.00% |
+| websocket-max-qos3 | alice->bob / bob->alice | 3 | 259k / 259k | 259k / 259k | 100.00% |
+| websocket-max-qos4 | alice->bob / bob->alice | 4 | 256k / 256k | 256k / 256k | 100.00% |
+
+EOT events: every JSONL log has exactly two EOT events (`eot_sent` x1
++ `eot_received` x1 from the peer). Zero `eot_timeout` events across
+all 16 logs.
+
+QoS rejection check (direct binary invocation):
+
+```
+variant-websocket.exe ... --qos 1 ... -- --peers self=127.0.0.1 --ws-base-port 19960
+# Error: websocket variant only supports reliable QoS (3 or 4); got --qos 1
+# exit=1
+
+variant-websocket.exe ... --qos 2 ...
+# Error: websocket variant only supports reliable QoS (3 or 4); got --qos 2
+# exit=1
+```
+
+#### Deviations from the task spec
+
+- One bug surfaced during the first end-to-end run: under low-rate
+  workloads on Windows (`websocket-10x100hz`), the underlying TCP
+  socket occasionally returned `os error 997` (`ERROR_IO_PENDING`)
+  on a `read` after the `SO_RCVTIMEO` deadline, instead of the
+  expected `WouldBlock`/`TimedOut`. The first version of the variant
+  treated 997 as fatal and dropped the peer, which surfaced as 18-50%
+  delivery on the 10x runs. Fix: a `is_transient_io_error` helper
+  that classifies `WouldBlock`, `TimedOut`, OS error 997
+  (`ERROR_IO_PENDING`), 10035 (`WSAEWOULDBLOCK`), and 10060
+  (`WSAETIMEDOUT`) as transient. After the fix every spawn delivers
+  100%.
+- The variant binary is built into the workspace `target/` rather
+  than the per-variant `variants/websocket/target/`. The TOML
+  configs reference `target/release/variant-websocket.exe`
+  directly. (The other variants currently still reference the
+  per-variant subtargets; that is a workspace-conversion artifact,
+  not specific to this variant.)
+
+#### Open concerns
+
+- None blocking. The benign `Close frame; dropping` warning
+  occasionally observed at end-of-spawn is the peer cleanly
+  closing during its own `disconnect` -- the EOT exchange has
+  already completed by then so delivery is unaffected.
+
+#### Files added / modified
+
+- `Cargo.toml` (workspace root) -- added `variants/websocket` to
+  the `members` array. Single cross-directory edit, justified by
+  `cargo build -p variant-websocket` requiring workspace membership.
+- `variants/websocket/Cargo.toml` (new).
+- `variants/websocket/src/main.rs` (new).
+- `variants/websocket/src/websocket.rs` (new).
+- `variants/websocket/src/protocol.rs` (new).
+- `variants/websocket/src/pairing.rs` (new).
+- `variants/websocket/tests/integration.rs` (new).
+- `variants/websocket/tests/fixtures/two-runner-websocket-only.toml`
+  (new).
+- `variants/websocket/STRUCT.md` (updated to reflect actual layout).
+- `configs/two-runner-websocket-all.toml` (new).
+
+#### Acceptance criteria status
+
+- [x] `Cargo.toml` lists only the dependencies in CUSTOM.md (no
+      `tokio`, no `tokio-tungstenite`).
+- [x] `cargo build --release -p variant-websocket` succeeds on Windows.
+- [x] `cargo test --release -p variant-websocket` all-green (60/60).
+- [x] `cargo clippy --release -p variant-websocket --all-targets -- -D warnings` clean.
+- [x] `cargo fmt -p variant-websocket -- --check` clean.
+- [x] Variant exits non-zero with a clear stderr message if launched
+      with `--qos 1` or `--qos 2`.
+- [x] EOT events (`eot_sent`, `eot_received`) appear in JSONL logs
+      from both runners on the localhost two-runner run.
+- [x] Localhost two-runner run produces JSONL logs with delivery >= 99%
+      at both QoS 3 and QoS 4 (actual: 100.00% across all 8 spawns).
+- [x] STRUCT.md remains accurate (updated to record actual layout).
+- [x] Completion report appended (this section).
+
+---
+
 ## What's next
 
 | Epic | Status | Can start now? |
@@ -4012,3 +4295,182 @@ benchmark sweeps against the current state.
 | E8: Application-Level Clock Sync | T8.1 done; T8.2 done; T8.3 (two-machine validation) pending | T8.3 needs a fresh two-machine run with clock-sync logs |
 | E9: Peer Discovery Injection + QoS Expansion | **closed** | -- |
 | E10: Variant Robustness | open | Yes -- variant-specific fixes |
+
+---
+
+### T3g.2: variants/webrtc -- implement WebRTC variant end-to-end -- done
+
+**Repo**: `variants/webrtc/`
+**Status**: PASS. End-to-end two-runner localhost run shows 100.00%
+delivery on every QoS level (including QoS 1 and QoS 2 unreliable
+channels at high rates), no `eot_timeout` events, and host-only ICE
+candidates throughout signaling.
+
+#### What was implemented
+
+1. `variants/webrtc/Cargo.toml` -- binary crate depending on
+   `variant-base` (path), `webrtc = "0.8"`, `tokio` with the narrow
+   feature set `rt-multi-thread, macros, sync, net, time, io-util`
+   (no `enable_all()`), `anyhow`, `clap` (derive), `rand`,
+   `serde`/`serde_json` (signaling envelopes), and `bytes`. Dev-deps
+   `tempfile`. Workspace membership preserved from T3g.1.
+2. `src/main.rs` -- parses `--peers`, `--runner`, `--qos`,
+   `--signaling-base-port`, `--media-base-port`, derives ports,
+   constructs `WebRtcVariant`, runs the protocol driver. Logs the
+   computed listen addresses + per-peer descriptors at startup for
+   debugging.
+3. `src/pairing.rs` -- sorted-name pairing, port derivation
+   (`runner_stride=1`, `qos_stride=10`, identical to QUIC / Hybrid /
+   WebSocket), initiator/responder roles by sorted-name comparison.
+4. `src/protocol.rs` -- compact binary header matching
+   `variants/hybrid` / `custom-udp` / `websocket`. Same wire layout
+   for data and EOT frames; reused tag byte `0xE0` for EOT.
+5. `src/signaling.rs` -- per-pair TCP signaling. Length-prefixed JSON
+   envelopes with serde-tagged `kind`: `offer`, `answer`, `candidate`,
+   `done`. `RTCIceCandidateInit` is converted to / from JSON via the
+   webrtc-rs `to_json` helper plus the standard SDP fields.
+6. `src/webrtc.rs` -- `WebRtcVariant` implementing `Variant`. Internal
+   tokio runtime; `connect` blocks on building the per-peer
+   `RTCPeerConnection`, running the signaling exchange, and waiting
+   for all four DataChannels to reach `open`. `publish` enqueues onto
+   an unbounded mpsc; the per-runtime `send_loop` task dispatches via
+   `RTCDataChannel::send` (no `block_on` per call). `poll_receive`
+   and `poll_peer_eots` are non-blocking `try_recv` drains. EOT is
+   always sent on the QoS 4 reliable channel regardless of the
+   spawn's `--qos`.
+7. `tests/integration.rs` -- subprocess tests covering successful
+   single-process loopback, missing-arg errors, and runner-not-in-peers.
+8. `tests/fixtures/loopback.toml` -- single-process fixture (qos=1,
+   ports 29980 / 30000) used by the runner-driven loopback.
+9. `configs/two-runner-webrtc-all.toml` -- four `[[variant]]` entries
+   (`1000x100hz`, `100x100hz`, `10x100hz`, `max-throughput`) without
+   a `qos` field, so the runner expands each into per-QoS spawns.
+   Signaling base 19980 / media base 20000.
+
+#### ICE configuration (host-only)
+
+- `RTCConfiguration::ice_servers` left empty (no STUN, no TURN).
+- `SettingEngine::set_ice_multicast_dns_mode(MulticastDnsMode::Disabled)`.
+- `set_network_types(vec![NetworkType::Udp4])` (no TCP-ICE, no IPv6).
+- `set_udp_network(UDPNetwork::Ephemeral(EphemeralUDP::new(port,
+  port)))` pins the host candidate to the derived `media_listen` port.
+
+Verified from the per-pair signaling trace: every locally-emitted and
+remotely-received candidate logs `typ host`. Grepping the runner's
+stderr for `srflx`, `relay`, or `mdns` returns zero matches across
+the two-runner-all run.
+
+#### Tests run
+
+```
+$ cargo build --release -p variant-webrtc
+   Compiling variant-webrtc v0.1.0
+    Finished `release` profile [optimized] target(s) in 35.93s
+
+$ cargo test --release -p variant-webrtc
+running 36 tests   (unit, all in src/)
+test result: ok. 36 passed; 0 failed
+running 4 tests    (subprocess integration, tests/integration.rs)
+test result: ok. 4 passed; 0 failed
+
+$ cargo clippy --release -p variant-webrtc --all-targets -- -D warnings
+    Finished `release` profile [optimized] target(s) in 1.68s   (clean)
+
+$ cargo fmt -p variant-webrtc -- --check
+   (silent -- clean)
+```
+
+#### Validation run (two-runner localhost, all four QoS)
+
+Ran `configs/two-runner-webrtc-all.toml` with both `runner --name
+alice` and `runner --name bob` on the same machine. All 32 spawns
+(4 throughputs x 4 QoS levels x 2 runners) exited successfully.
+`logs/webrtc-all-20260506_094103/` contains the JSONL output.
+
+`python analysis/analyze.py --summary` integrity report excerpt:
+
+| Spawn                      | Path        | QoS | Sent      | Rcvd      | Delivery |
+|----------------------------|-------------|-----|-----------|-----------|----------|
+| webrtc-1000x100hz-qos1     | alice->bob  | 1   | 814,000   | 814,000   | 100.00%  |
+| webrtc-1000x100hz-qos1     | bob->alice  | 1   | 869,000   | 869,000   | 100.00%  |
+| webrtc-1000x100hz-qos2     | alice->bob  | 2   | 704,000   | 704,000   | 100.00%  |
+| webrtc-1000x100hz-qos3     | alice->bob  | 3   | 440,000   | 440,000   | 100.00%  |
+| webrtc-1000x100hz-qos4     | alice->bob  | 4   | 588,000   | 588,000   | 100.00%  |
+| webrtc-100x100hz-qos{1..4} | both        | 1-4 | 100,100   | 100,100   | 100.00%  |
+| webrtc-10x100hz-qos{1..4}  | both        | 1-4 | 10,010    | 10,010    | 100.00%  |
+| webrtc-max-qos1            | alice->bob  | 1   | 1,112,000 | 1,112,000 | 100.00%  |
+| webrtc-max-qos3            | bob->alice  | 3   | 1,089,000 | 1,089,000 | 100.00%  |
+| webrtc-max-qos4            | bob->alice  | 4   | 1,050,000 | 1,050,000 | 100.00%  |
+
+Delivery is 100.00% on every (writer, reader, QoS) pair, including
+QoS 1 / QoS 2 max-throughput (over a million writes per direction).
+Acceptance bar (>=95% on QoS 3-4) cleared by a wide margin; QoS 1-2
+baseline measurement: zero loss observed at all tested rates on this
+machine. Out-of-order counts on QoS 2 are non-zero (3,354 to 3,456
+on the 1000x100hz spawn) -- this is by design; the L2 unordered
+channel reorders aggressively under load and the receiver's
+latest-value filter handles it without dropping anything that the
+analysis tool considers "delivered". The analysis tool's
+`[FAIL: ordering]` flag on QoS 2 is its strict-order check, not a
+delivery failure -- delivery is 100.00% on those rows.
+
+EOT events sanity check (`grep -c eot_sent / eot_received / eot_timeout`):
+- `eot_sent`: 1 per JSONL log (each writer emits exactly once).
+- `eot_received`: 1 per JSONL log (each reader observes the peer's EOT
+  exactly once, after dedup).
+- `eot_timeout`: 0 across all 32 logs.
+
+#### Deviations / known limitations
+
+- **One peer per spawn.** webrtc-rs ties one `RTCPeerConnection` to
+  one UDP socket via the `SettingEngine`. With our derived `media_port`
+  pinned to a single value via `EphemeralUDP::new(p, p)`, two peers on
+  the same runner cannot share a socket. The variant explicitly
+  rejects multi-peer spawns with a clear error. The two-runner case
+  exactly fits this constraint, so it is not a problem for the
+  benchmark suite. A future N-peer-per-runner extension would need
+  per-peer media ports (extra port stride dimension) or a Muxed UDP
+  setup; out of scope for T3g.2.
+- **Per-spawn stride sufficient for sequential spawns.** The runner's
+  sequential spawn-per-QoS execution combined with the existing
+  `silent_secs` drain plus `inter_qos_grace_ms` keeps the four
+  per-QoS port ranges from colliding across spawns; matches
+  Hybrid / QUIC behaviour.
+- **Workspace target dir.** `cargo build --release -p variant-webrtc`
+  from the repo root puts the binary in `target/release/`, not
+  `variants/webrtc/target/release/`. The TOML config expects the
+  per-variant path, so I copied the binary into
+  `variants/webrtc/target/release/variant-webrtc.exe` for the
+  validation run. This matches what the existing variants ship.
+
+#### Acceptance criteria status
+
+- [x] `cargo test --release -p variant-webrtc` -- 36 unit + 4
+      integration tests, all green.
+- [x] `cargo clippy --release -p variant-webrtc --all-targets -- -D warnings` -- clean.
+- [x] `cargo fmt -p variant-webrtc -- --check` -- clean.
+- [x] ICE host-only verified -- only `typ host` candidates in the
+      signaling logs; no `srflx`, `relay`, or `mdns` matches.
+- [x] Localhost two-runner JSONL produces all four QoS levels
+      separated by spawn name; delivery 100.00% on QoS 3-4 (well
+      above the 95% bar) and 100.00% on QoS 1-2 (baseline measured).
+- [x] `eot_sent` and `eot_received` events appear in every JSONL
+      log; no `eot_timeout` events.
+- [x] STRUCT.md updated to the final layout.
+- [x] Completion report (this section).
+
+#### Files added / modified (only inside the worker's allowed scope)
+
+- `variants/webrtc/Cargo.toml` -- updated dependencies.
+- `variants/webrtc/src/main.rs` -- replaced T3g.1 smoke with the
+  full variant entry point.
+- `variants/webrtc/src/webrtc.rs` -- new.
+- `variants/webrtc/src/signaling.rs` -- new.
+- `variants/webrtc/src/pairing.rs` -- new.
+- `variants/webrtc/src/protocol.rs` -- new.
+- `variants/webrtc/tests/integration.rs` -- new.
+- `variants/webrtc/tests/fixtures/loopback.toml` -- new.
+- `variants/webrtc/STRUCT.md` -- updated to the final layout.
+- `configs/two-runner-webrtc-all.toml` -- new (project-level config
+  per the task's step 11).
+- `metak-orchestrator/STATUS.md` -- this section appended.

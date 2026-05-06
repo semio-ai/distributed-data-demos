@@ -1,0 +1,21 @@
+run = "webrtc-loopback"
+runners = ["self"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "webrtc-loopback"
+binary = "variants/webrtc/target/release/variant-webrtc.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 1
+  operate_secs = 2
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+  signaling_base_port = 29980
+  media_base_port = 30000

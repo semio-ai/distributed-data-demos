@@ -2635,3 +2635,282 @@ Acceptance criteria:
 - [ ] Summary table printed to stdout
 - [ ] `cargo test` passes, `cargo clippy -- -D warnings` clean, `cargo fmt -- --check` clean
 - [ ] STRUCT.md exists and describes the file layout
+
+---
+
+## E3f: WebSocket Variant
+
+See `EPICS.md` E3f and `metak-shared/variant-candidates.md` R6 for the
+driving design. Single task — the variant is small enough that splitting
+it adds more coordination overhead than it removes.
+
+### T3f.1: variants/websocket — implement WebSocket variant end-to-end
+
+**Repo**: `variants/websocket/`
+**Status**: done (2026-05-06; see STATUS.md). All acceptance criteria
+met: 60/60 tests pass, clippy/fmt clean, QoS 1/2 rejection works,
+two-runner localhost run at QoS 3+4 produced 100.00% delivery across
+all 16 spawns with clean EOT events. One Windows-specific transient
+io error (`os error 997` / `ERROR_IO_PENDING`) discovered and fixed
+during validation by extending the `is_transient_io_error` classifier
+alongside `WSAEWOULDBLOCK` / `WSAETIMEDOUT`.
+**Depends on**: E1, E2, E9, E12. Folder is already scaffolded
+(AGENTS.md, CUSTOM.md, STRUCT.md, .claude/CLAUDE.md present); all that
+exists in `src/` is empty directories.
+
+Implement the WebSocket variant per `variants/websocket/CUSTOM.md` and
+`metak-shared/variant-candidates.md` R6.
+
+#### Scope
+
+1. Initialise the binary crate (`Cargo.toml`, `src/main.rs`).
+   Dependencies: `variant-base` (path), `tungstenite` (sync, no
+   `tokio-tungstenite`), `socket2`, `anyhow`, plus whatever
+   `variant-base` re-exports (`clap`, etc.). No `tokio` dependency.
+2. Implement `WebSocketVariant` (`src/websocket.rs`) per the trait,
+   the symmetric pairing rules, and the port-derivation strides
+   documented in CUSTOM.md.
+3. Implement the binary header in `src/protocol.rs` matching the
+   format used by `variants/hybrid` and `variants/custom-udp` (do
+   not invent a new header).
+4. Implement pairing / port derivation in `src/pairing.rs`.
+5. CLI: parse `--ws-base-port`, `--peers`, `--runner`, `--qos`. If
+   `--qos` is 1 or 2, log a clear error and exit non-zero before any
+   I/O. All other CLI args are handled by `variant-base`.
+6. Implement EOT (`signal_end_of_test`, `poll_peer_eots`) per
+   `metak-shared/api-contracts/eot-protocol.md`. Use the same TCP-frame
+   marker scheme as Hybrid; encode the EOT into a WebSocket binary
+   frame body using the reserved header value defined by the contract.
+7. Tests:
+   - Unit: header serialization round-trip.
+   - Unit: pairing / port derivation across a few `--peers` shapes.
+   - Unit: `publish` at QoS 1 or 2 returns an error.
+   - Integration (single-process, `--peers self=127.0.0.1`): bind +
+     listen + framing exercised; full peer flow validated by T3f.4.
+8. Add a sample TOML config under `variants/websocket/tests/fixtures/`
+   for single-process loopback (analogous to the other variants'
+   fixtures).
+9. Add a project-level config `configs/two-runner-websocket-all.toml`
+   that exercises QoS 3 and 4 across two runners on localhost,
+   modelled on `configs/two-runner-hybrid-all.toml`.
+10. Run the two-runner localhost test and validate delivery is
+    ≥ 99% over the operate window for both QoS 3 and QoS 4.
+
+#### Acceptance criteria
+
+- [ ] `Cargo.toml` lists only the dependencies in CUSTOM.md (no
+      `tokio`, no `tokio-tungstenite`).
+- [ ] `cargo build --release -p variant-websocket` succeeds on Windows.
+- [ ] `cargo test --release -p variant-websocket` all-green.
+- [ ] `cargo clippy --release -p variant-websocket --all-targets -- -D warnings` clean.
+- [ ] `cargo fmt -p variant-websocket -- --check` clean.
+- [ ] Variant exits non-zero with a clear stderr message if launched
+      with `--qos 1` or `--qos 2`.
+- [ ] EOT events (`eot_sent`, `eot_received`) appear in JSONL logs
+      from both runners on the localhost two-runner run.
+- [ ] Localhost two-runner run produces JSONL logs with delivery ≥ 99%
+      at both QoS 3 and QoS 4.
+- [ ] STRUCT.md remains accurate (update if file layout differs from
+      the scaffold).
+- [ ] Completion report appended to `metak-orchestrator/STATUS.md`.
+
+---
+
+## E3g: WebRTC DataChannel Variant
+
+See `EPICS.md` E3g and `metak-shared/variant-candidates.md` R7 for the
+driving design. Split into two tasks because the build risk on the
+`webrtc` crate is real and worth de-risking before sinking
+implementation effort.
+
+### T3g.1: variants/webrtc — crate scaffold + dependency build smoke test
+
+**Repo**: `variants/webrtc/`
+**Status**: done (2026-05-06; see STATUS.md). `webrtc = "0.8"` builds
+clean on Windows in ~90 s, runtime smoke (construct + close
+RTCPeerConnection) exits 0 in ~1 s. No version pinning or workarounds
+needed — the pure-Rust `rustls 0.19` path that webrtc 0.8 uses dodges
+the historical `openssl-sys` Windows trap.
+**Depends on**: nothing (folder is already scaffolded with AGENTS.md,
+CUSTOM.md, STRUCT.md, .claude/CLAUDE.md).
+
+De-risk the `webrtc-rs` build before committing implementation effort.
+
+#### Scope
+
+1. Initialise the binary crate (`Cargo.toml`, minimal `src/main.rs`
+   that prints a banner and exits 0).
+2. Add the dependency on `webrtc` (latest stable), `tokio` with
+   `rt-multi-thread`, `anyhow`, and `variant-base` (path).
+3. `cargo build --release` on Windows. If it fails, do NOT spend
+   hours debugging — capture the exact error, list the candidate
+   workarounds you researched (pinning OpenSSL / ring versions,
+   alternative crate version), and stop. Report findings via
+   STATUS.md so the orchestrator can decide between fixing it,
+   pinning, or reconsidering the variant.
+4. If the build succeeds, also run a tiny tokio + webrtc smoke
+   inside `src/main.rs` (e.g. construct an `RTCPeerConnection` with
+   no peer, immediately close it) just to confirm the crate
+   initialises at runtime, not only at link time.
+
+#### Acceptance criteria
+
+- [ ] `Cargo.toml` declares the listed dependencies.
+- [ ] `cargo build --release -p variant-webrtc` succeeds on Windows
+      (or, on failure, a STATUS.md entry documents the failure mode and
+      the proposed remediation paths).
+- [ ] If the smoke main is added, the binary runs to exit 0 in under
+      10 s.
+- [ ] Completion report appended to `metak-orchestrator/STATUS.md`.
+
+### T3g.2: variants/webrtc — implement WebRTC variant end-to-end
+
+**Repo**: `variants/webrtc/`
+**Status**: done (2026-05-06; see STATUS.md). All acceptance criteria
+met: 40/40 tests pass (36 unit + 4 integration), clippy/fmt clean,
+ICE host-only verified, two-runner localhost run at all four QoS
+levels produced **100.00% delivery on every (writer, reader, QoS)
+pair across 32 spawns**, including QoS 1 max-throughput at 1.1 M
+messages. `eot_sent` / `eot_received` present on every log; zero
+`eot_timeout`. Known limitation captured: one peer per spawn
+(documented in CUSTOM.md and enforced with a clear error). See
+follow-up T-config.1 below for a small config-path inconsistency
+discovered during validation.
+**Depends on**: T3g.1 (build proven on Windows), E1, E2, E9, E12.
+
+Implement the WebRTC variant per `variants/webrtc/CUSTOM.md` and
+`metak-shared/variant-candidates.md` R7.
+
+#### Scope
+
+1. Implement `WebRtcVariant` (`src/webrtc.rs`) per the trait, with the
+   sync-to-async bridge documented in CUSTOM.md (mirror the QUIC
+   variant's pattern).
+2. Implement the per-pair TCP signaling exchange (`src/signaling.rs`)
+   per the envelope format documented in CUSTOM.md.
+3. Implement pairing / port derivation (`src/pairing.rs`).
+4. Implement the binary header in `src/protocol.rs` matching the
+   format used by `variants/hybrid` and `variants/custom-udp`.
+5. Configure ICE for **host candidates only** — disable STUN, TURN,
+   and mDNS providers in webrtc-rs.
+6. Per peer: open four DataChannels (one per QoS) with the QoS-
+   appropriate ordered/reliable settings as documented in CUSTOM.md.
+7. CLI: parse `--signaling-base-port`, `--media-base-port`, `--peers`,
+   `--runner`, `--qos`. All other CLI args are handled by
+   `variant-base`.
+8. Implement EOT (`signal_end_of_test`, `poll_peer_eots`) per
+   `metak-shared/api-contracts/eot-protocol.md`. Always send the EOT
+   marker on the **reliable** DataChannel (L3/L4) regardless of the
+   spawn's `--qos`, otherwise unreliable EOTs could deadlock the wait.
+9. Tests:
+   - Unit: header serialization round-trip.
+   - Unit: pairing / port derivation across a few `--peers` shapes.
+   - Unit: signaling envelope encode / decode.
+   - Integration (single-process, `--peers self=127.0.0.1`): exercises
+     CLI parsing, port derivation, and the runtime startup path. Full
+     peer flow is validated by step 11 below.
+10. Add a sample TOML config under `variants/webrtc/tests/fixtures/`
+    for single-process loopback.
+11. Add a project-level config `configs/two-runner-webrtc-all.toml`
+    that exercises all four QoS levels across two runners on
+    localhost, modelled on `configs/two-runner-quic-all.toml`. Run it
+    and validate:
+    - Delivery ≥ 95% on QoS 3 and QoS 4 over the operate window.
+    - QoS 1 and QoS 2 at moderate rates show low loss; record what you
+      measure (no hard threshold — this is a baseline measurement).
+    - EOT events appear and the spawn terminates without an
+      `eot_timeout`.
+
+#### Acceptance criteria
+
+- [ ] `cargo test --release -p variant-webrtc` all-green.
+- [ ] `cargo clippy --release -p variant-webrtc --all-targets -- -D warnings` clean.
+- [ ] `cargo fmt -p variant-webrtc -- --check` clean.
+- [ ] ICE produces only host candidates (verified via signaling logs
+      at debug level — no `srflx`, no `relay`, no `mdns`).
+- [ ] Localhost two-runner run produces JSONL logs with the four QoS
+      levels separated by spawn name and delivery ≥ 95% on QoS 3-4.
+- [ ] EOT events (`eot_sent`, `eot_received`) appear in JSONL logs
+      from both runners with no `eot_timeout` events.
+- [ ] STRUCT.md remains accurate (update if file layout differs from
+      the scaffold).
+- [ ] Completion report appended to `metak-orchestrator/STATUS.md`.
+
+---
+
+## Cross-cutting follow-ups (discovered during T3f.1 / T3g.2)
+
+### T-config.1: Standardise variant binary paths in configs
+
+**Repo**: `configs/` (project-level), no source-code changes.
+**Status**: pending
+**Depends on**: nothing.
+**Priority**: low (current configs work via manual binary copying;
+this is an ergonomics fix for clean workspace builds).
+
+Discovered during T3g.2 validation. The repo is a Cargo workspace, so
+`cargo build --release -p variant-X` from the repo root puts every
+binary in `target/release/variant-X.exe`. But the per-variant config
+files inconsistently reference one of two paths:
+
+- `target/release/variant-<name>.exe` — used by `two-runner-websocket-all.toml`. Correct for a workspace build.
+- `variants/<name>/target/release/variant-<name>.exe` — used by `two-runner-{hybrid,quic,custom-udp,zenoh,webrtc}-all.toml`. NOT created by a workspace build; requires `cd variants/<name> && cargo build --release` to populate. The webrtc T3g.2 worker had to manually copy the binary from `target/release/` into the per-variant subdir for validation to run.
+
+#### Scope
+
+1. Pick one convention. Recommend `target/release/variant-<name>.exe`
+   (matches Cargo workspace behaviour, no manual steps).
+2. Update every TOML in `configs/` to use the chosen path.
+3. Update `usage-guide.md` (repo root) if it documents the build /
+   run flow.
+4. Run one of the two-runner configs end-to-end after the change to
+   confirm the runner finds the binary cleanly.
+
+#### Acceptance criteria
+
+- [ ] All `configs/two-runner-*-all.toml` files use a single path
+      convention.
+- [ ] Clean `cargo build --release` from repo root + `runner --config
+      configs/two-runner-<any>-all.toml` succeeds without manual
+      binary copies for at least one verified variant.
+- [ ] `usage-guide.md` updated if affected.
+
+### T-windows.1: Back-port `os error 997` classifier to hybrid
+
+**Repo**: `variants/hybrid/`
+**Status**: pending
+**Depends on**: nothing.
+**Priority**: low (latent — hybrid's workloads run hot enough that
+the read-after-deadline path rarely fires; no observed failure yet).
+
+Discovered during T3f.1 validation. The websocket variant added an
+`is_transient_io_error` helper that classifies Windows `os error 997`
+(`ERROR_IO_PENDING`) alongside `WSAEWOULDBLOCK` (10035) and
+`WSAETIMEDOUT` (10060) as transient retries. See
+`metak-shared/LEARNED.md` for full context.
+
+The hybrid variant uses the same SO_RCVTIMEO + cloned read handle
+pattern but lacks the 997 case. It has the same latent bug; on a
+slow-enough hybrid workload (e.g. `--values-per-tick 1` at 10 Hz),
+the read loop could mis-classify a timed-out read as a hard failure
+and bail.
+
+#### Scope
+
+1. Copy the `is_transient_io_error` helper from
+   `variants/websocket/src/websocket.rs` to the matching site in
+   `variants/hybrid/src/tcp.rs` (or wherever the read poll lives).
+2. Replace any direct `ErrorKind::WouldBlock | ErrorKind::TimedOut`
+   match in the hybrid TCP read loop with the helper.
+3. Add a unit test that constructs an `io::Error` from
+   `Error::from_raw_os_error(997)` and verifies the classifier
+   returns `true`.
+4. Run the existing hybrid integration tests to confirm no regression.
+
+#### Acceptance criteria
+
+- [ ] Hybrid TCP read loop uses the same transient-error classifier
+      as websocket.
+- [ ] Unit test covers the 997 case explicitly.
+- [ ] `cargo test --release -p variant-hybrid` clean.
+- [ ] `cargo clippy --release -p variant-hybrid --all-targets -- -D warnings` clean.
