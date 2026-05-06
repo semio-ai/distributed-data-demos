@@ -28,12 +28,19 @@ everything else.
 
 ## Build and Test
 
+All commands run from the repo root (Cargo workspace). Do **not** `cd` into
+`variant-base/` to build — that produces a stray per-subfolder `target/`
+directory which the configs and the runner integration tests do not point
+at.
+
 ```
-cargo build                   # build library + variant-dummy binary
-cargo test                    # unit + integration tests
-cargo clippy -- -D warnings   # lint
-cargo fmt -- --check          # format check
+cargo build --release -p variant-base       # build library + variant-dummy binary
+cargo test --release -p variant-base        # unit + integration tests
+cargo clippy --release -p variant-base -- -D warnings
+cargo fmt -p variant-base -- --check
 ```
+
+Compiled `variant-dummy` lives at `target/release/variant-dummy(.exe)`.
 
 ## Integration Contracts
 

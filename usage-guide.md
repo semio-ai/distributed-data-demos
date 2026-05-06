@@ -11,24 +11,28 @@ How to build, configure, and run the benchmark system.
 
 ## Building
 
-From the repository root:
+The repo is a Cargo workspace. **All builds run from the repository root**;
+do not `cd` into individual sub-crates (that produces stray per-subfolder
+`target/` directories which the configs do not point at and which cause
+silent stale-binary problems on multi-machine runs).
 
 ```bash
-# Build the benchmark runner
-cd runner
-cargo build --release
-cd ..
+# Build everything (runner + every variant) in one go.
+cargo build --release --workspace
 
-# Build one or more variants
-cd variants/custom-udp && cargo build --release && cd ../..
-cd variants/zenoh      && cargo build --release && cd ../..
-cd variants/quic       && cargo build --release && cd ../..
-cd variants/hybrid     && cargo build --release && cd ../..
+# Or build a single binary by package name:
+cargo build --release -p runner
+cargo build --release -p variant-custom-udp
+cargo build --release -p variant-zenoh
+cargo build --release -p variant-quic
+cargo build --release -p variant-hybrid
+cargo build --release -p variant-webrtc
+cargo build --release -p variant-websocket
 ```
 
 Binaries are produced at:
-- `runner/target/release/runner` (`.exe` on Windows)
-- `variants/<name>/target/release/variant-<name>` (`.exe` on Windows)
+- `target/release/runner` (`.exe` on Windows)
+- `target/release/variant-<name>` (`.exe` on Windows)
 
 ## Configuration
 
@@ -44,7 +48,7 @@ default_timeout_secs = 60
 
 [[variant]]
 name = "custom-udp"
-binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+binary = "target/release/variant-custom-udp.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -70,7 +74,7 @@ default_timeout_secs = 120
 
 [[variant]]
 name = "custom-udp"
-binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+binary = "target/release/variant-custom-udp.exe"
 timeout_secs = 60
 
   [variant.common]
@@ -100,7 +104,7 @@ default_timeout_secs = 120
 
 [[variant]]
 name = "custom-udp"
-binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+binary = "target/release/variant-custom-udp.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -118,7 +122,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
 [[variant]]
 name = "zenoh"
-binary = "variants/zenoh/target/release/variant-zenoh.exe"
+binary = "target/release/variant-zenoh.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -193,10 +197,10 @@ Open two terminals at the repo root and start both runners:
 
 ```bash
 # Terminal 1
-runner/target/release/runner --name alice --config configs/two-runner-test.toml
+target/release/runner --name alice --config configs/two-runner-test.toml
 
 # Terminal 2
-runner/target/release/runner --name bob --config configs/two-runner-test.toml
+target/release/runner --name bob --config configs/two-runner-test.toml
 ```
 
 Both runners must be started — they discover each other before proceeding.
@@ -223,10 +227,10 @@ On each machine, run the runner with the same config file but a different
 
 ```bash
 # Machine A
-runner/target/release/runner --name machine-a --config configs/bench.toml
+target/release/runner --name machine-a --config configs/bench.toml
 
 # Machine B
-runner/target/release/runner --name machine-b --config configs/bench.toml
+target/release/runner --name machine-b --config configs/bench.toml
 ```
 
 Runners discover each other via UDP multicast on port 19876 (configurable

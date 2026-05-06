@@ -9,13 +9,13 @@ conditions.
 ## Quick Start
 
 ```bash
-# 1. Build the runner and a variant
-cd runner && cargo build --release && cd ..
-cd variants/custom-udp && cargo build --release && cd ../..
+# 1. Build everything from the repo root (Cargo workspace).
+#    Use -p <crate> to build a single binary, or --workspace for all.
+cargo build --release --workspace
 
 # 2. Run (two terminals on the same machine)
-runner/target/release/runner --name alice --config configs/two-runner-test.toml
-runner/target/release/runner --name bob   --config configs/two-runner-test.toml
+target/release/runner --name alice --config configs/two-runner-test.toml
+target/release/runner --name bob   --config configs/two-runner-test.toml
 
 # 3. Analyse (auto-selects the latest run)
 cd analysis && python analyze.py ../logs --summary

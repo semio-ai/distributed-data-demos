@@ -21,12 +21,18 @@ full manual control over transport, implementing all four QoS levels.
 
 ## Build and Test
 
+All commands run from the repo root (Cargo workspace). Do **not** `cd` into
+`variants/custom-udp/` to build — that produces a stray per-subfolder
+`target/` directory which the configs do not point at.
+
 ```
-cargo build
-cargo test
-cargo clippy -- -D warnings
-cargo fmt -- --check
+cargo build --release -p variant-custom-udp
+cargo test --release -p variant-custom-udp
+cargo clippy --release -p variant-custom-udp -- -D warnings
+cargo fmt -p variant-custom-udp -- --check
 ```
+
+Compiled binary lives at `target/release/variant-custom-udp(.exe)`.
 
 ## Architecture
 

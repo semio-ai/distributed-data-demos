@@ -11,8 +11,8 @@
 #   bob   qos3 19981, qos4 19991
 #
 # Run from the repo root in two terminals:
-#   runner/target/release/runner --name alice --config variants/websocket/tests/fixtures/two-runner-websocket-only.toml
-#   runner/target/release/runner --name bob   --config variants/websocket/tests/fixtures/two-runner-websocket-only.toml
+#   target/release/runner --name alice --config variants/websocket/tests/fixtures/two-runner-websocket-only.toml
+#   target/release/runner --name bob   --config variants/websocket/tests/fixtures/two-runner-websocket-only.toml
 
 run = "websocket-t3f1-validation"
 runners = ["alice", "bob"]

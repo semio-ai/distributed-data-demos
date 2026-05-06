@@ -1834,14 +1834,14 @@ runs them via `cargo test --release -- --ignored two_runner_regression`.
 
 Test fn structure (pseudocode applies to all three):
 
-1. Skip-with-clear-message if `<repo-root>/runner/target/release/runner.exe`
+1. Skip-with-clear-message if `<repo-root>/target/release/runner.exe`
    does not exist (point user at `cargo build --release -p runner`).
-2. Skip-with-clear-message if `<repo-root>/variants/<name>/target/release/variant-<name>.exe`
+2. Skip-with-clear-message if `<repo-root>/target/release/variant-<name>.exe`
    does not exist.
 3. Allocate a `tempfile::tempdir()` for `log_dir`. Read the fixture
    file, substitute the line `log_dir = "./logs"` with
    `log_dir = "<tmpdir>"`, write to `<tmpdir>/config.toml`. (The
-   fixture's `binary` path is `variants/<name>/target/release/...`
+   fixture's `binary` path is `target/release/variant-<name>...`
    relative to the runner's CWD — leave it as-is.)
 4. Spawn two `runner` child processes from CWD = repo root with
    `--name alice` / `--name bob` and `--config <tmpdir>/config.toml`.
@@ -2588,7 +2588,7 @@ Scope:
 
    [[variant]]
    name = "dummy"
-   binary = "../variant-base/target/release/variant-dummy"
+   binary = "target/release/variant-dummy"
 
      [variant.common]
      tick_rate_hz = 10
@@ -2742,7 +2742,8 @@ De-risk the `webrtc-rs` build before committing implementation effort.
    that prints a banner and exits 0).
 2. Add the dependency on `webrtc` (latest stable), `tokio` with
    `rt-multi-thread`, `anyhow`, and `variant-base` (path).
-3. `cargo build --release` on Windows. If it fails, do NOT spend
+3. `cargo build --release -p variant-webrtc` from the repo root on
+   Windows. If it fails, do NOT spend
    hours debugging — capture the exact error, list the candidate
    workarounds you researched (pinning OpenSSL / ring versions,
    alternative crate version), and stop. Report findings via
@@ -2843,37 +2844,35 @@ Implement the WebRTC variant per `variants/webrtc/CUSTOM.md` and
 ### T-config.1: Standardise variant binary paths in configs
 
 **Repo**: `configs/` (project-level), no source-code changes.
-**Status**: pending
+**Status**: done (see "Workspace target convention" sweep). Every
+`configs/*.toml` now points at `target/release/variant-<name>.exe`,
+matching the Cargo workspace layout. Per-subfolder builds are
+abandoned; see CUSTOM.md files in `runner/`, `variant-base/`, and
+`variants/<name>/` for the workspace-rooted build commands.
 **Depends on**: nothing.
-**Priority**: low (current configs work via manual binary copying;
-this is an ergonomics fix for clean workspace builds).
 
-Discovered during T3g.2 validation. The repo is a Cargo workspace, so
-`cargo build --release -p variant-X` from the repo root puts every
-binary in `target/release/variant-X.exe`. But the per-variant config
-files inconsistently reference one of two paths:
+The repo is a Cargo workspace, so `cargo build --release --workspace`
+(or `-p variant-X`) from the repo root puts every binary in
+`target/release/variant-X.exe`. All `configs/*.toml` files reference
+that single path; there is no `variants/<name>/target/` directory
+in the convention any more.
 
-- `target/release/variant-<name>.exe` — used by `two-runner-websocket-all.toml`. Correct for a workspace build.
-- `variants/<name>/target/release/variant-<name>.exe` — used by `two-runner-{hybrid,quic,custom-udp,zenoh,webrtc}-all.toml`. NOT created by a workspace build; requires `cd variants/<name> && cargo build --release` to populate. The webrtc T3g.2 worker had to manually copy the binary from `target/release/` into the per-variant subdir for validation to run.
-
-#### Scope
-
-1. Pick one convention. Recommend `target/release/variant-<name>.exe`
-   (matches Cargo workspace behaviour, no manual steps).
-2. Update every TOML in `configs/` to use the chosen path.
-3. Update `usage-guide.md` (repo root) if it documents the build /
-   run flow.
-4. Run one of the two-runner configs end-to-end after the change to
-   confirm the runner finds the binary cleanly.
+The historical incident behind this task: per-subfolder builds
+created stray `variants/<name>/target/` and `runner/target/` trees,
+which the configs then pointed into. This regularly caused stale-
+binary skew on a secondary machine where some sub-crates had been
+rebuilt and others had not — manifesting as silent loss of features
+that had been added in the most recent commit (e.g. clock sync, EOT
+markers).
 
 #### Acceptance criteria
 
-- [ ] All `configs/two-runner-*-all.toml` files use a single path
-      convention.
-- [ ] Clean `cargo build --release` from repo root + `runner --config
-      configs/two-runner-<any>-all.toml` succeeds without manual
-      binary copies for at least one verified variant.
-- [ ] `usage-guide.md` updated if affected.
+- [x] All `configs/*.toml` files use `target/release/variant-<name>.exe`.
+- [x] Clean `cargo build --release --workspace` from repo root +
+      `runner --config configs/two-runner-<any>-all.toml` succeeds
+      without manual binary copies.
+- [x] `usage-guide.md`, `README.md`, and every `CUSTOM.md` updated to
+      teach workspace-rooted builds only.
 
 ### T-windows.1: Back-port `os error 997` classifier to hybrid
 

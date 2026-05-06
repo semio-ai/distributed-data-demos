@@ -13,6 +13,7 @@ use crate::pairing::{derive_endpoints, parse_peers};
 use crate::websocket::{WebSocketConfig, WebSocketVariant};
 
 fn main() {
+    variant_base::print_build_banner!("websocket");
     if let Err(e) = run() {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);

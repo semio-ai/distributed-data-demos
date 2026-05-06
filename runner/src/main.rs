@@ -43,8 +43,28 @@ struct Cli {
     verbose_clock_sync: bool,
 }
 
+/// Build identifier baked in at compile time by `../build_info.rs`.
+///
+/// Printed once on startup so version skew between machines is visible at
+/// a glance. See `metak-orchestrator/STATUS.md` for the post-mortem of the
+/// stale-runner-binary incident on machine B that motivated this banner.
+const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
+const BUILD_GIT_DIRTY: &str = env!("BUILD_GIT_DIRTY");
+const BUILD_RUSTC: &str = env!("BUILD_RUSTC");
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Print the build banner immediately after CLI parse, before any
+    // discovery/protocol work. The label is `runner:<name>` so the line
+    // is attributable when stdout/stderr from multiple runners are
+    // collected in one place.
+    let dirty = BUILD_GIT_DIRTY == "true";
+    let dirty_suffix = if dirty { "+dirty" } else { "" };
+    eprintln!(
+        "[runner:{}] build: {}{} (rustc {})",
+        cli.name, BUILD_GIT_SHA, dirty_suffix, BUILD_RUSTC
+    );
 
     // Wire the process-wide clock-sync verbose toggle so the engine and
     // coordinator emit per-datagram traces while diagnosing field issues.

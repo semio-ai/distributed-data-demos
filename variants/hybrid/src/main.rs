@@ -20,6 +20,7 @@ pub const RUNNER_STRIDE: u16 = 1;
 pub const QOS_STRIDE: u16 = 10;
 
 fn main() {
+    variant_base::print_build_banner!("hybrid");
     if let Err(e) = run() {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);

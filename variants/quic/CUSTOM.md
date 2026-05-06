@@ -22,12 +22,18 @@ encryption, multiplexed streams, congestion control.
 
 ## Build and Test
 
+All commands run from the repo root (Cargo workspace). Do **not** `cd` into
+`variants/quic/` to build — that produces a stray per-subfolder `target/`
+directory which the configs do not point at.
+
 ```
-cargo build
-cargo test
-cargo clippy -- -D warnings
-cargo fmt -- --check
+cargo build --release -p variant-quic
+cargo test --release -p variant-quic
+cargo clippy --release -p variant-quic -- -D warnings
+cargo fmt -p variant-quic -- --check
 ```
+
+Compiled binary lives at `target/release/variant-quic(.exe)`.
 
 ## Architecture
 

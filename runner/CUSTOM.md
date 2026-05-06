@@ -30,21 +30,28 @@ CLI arguments, monitors for exit (or timeout), and records the result.
 
 ## Build and Test
 
+All commands run from the repo root; this is a Cargo workspace. Do **not**
+`cd` into the `runner/` subfolder to build — that produces a stray
+`runner/target/` directory which nothing else points at and which causes
+stale-binary skew on multi-machine runs.
+
 ```
-cargo build                   # build runner binary
-cargo test                    # unit + integration tests
-cargo clippy -- -D warnings   # lint
-cargo fmt -- --check          # format check
+cargo build --release -p runner            # build runner binary
+cargo test --release -p runner             # unit + integration tests
+cargo clippy --release -p runner -- -D warnings   # lint
+cargo fmt -p runner -- --check             # format check
 ```
 
 Integration tests use `variant-dummy` from the `variant-base` crate. The
-binary must be built first:
+binary must be built first (also workspace-rooted):
 
 ```
-cd ../variant-base && cargo build --release
+cargo build --release -p variant-base
 ```
 
-The path to `variant-dummy` in test configs is relative to the runner's CWD.
+The compiled binary lives at `target/release/variant-dummy(.exe)`. The path
+to `variant-dummy` in test configs is relative to the runner's CWD (the
+repo root when invoking via `cargo test`).
 
 ## Integration Contracts
 

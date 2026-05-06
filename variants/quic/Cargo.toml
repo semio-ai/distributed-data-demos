@@ -2,6 +2,7 @@
 name = "variant-quic"
 version = "0.1.0"
 edition = "2021"
+build = "../../build_info.rs"
 
 [[bin]]
 name = "variant-quic"

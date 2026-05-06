@@ -31,12 +31,18 @@ is Hybrid's role.
 
 ## Build and Test
 
+All commands run from the repo root (Cargo workspace). Do **not** `cd` into
+`variants/websocket/` to build — that produces a stray per-subfolder
+`target/` directory which the configs do not point at.
+
 ```
-cargo build
-cargo test
-cargo clippy -- -D warnings
-cargo fmt -- --check
+cargo build --release -p variant-websocket
+cargo test --release -p variant-websocket
+cargo clippy --release -p variant-websocket -- -D warnings
+cargo fmt -p variant-websocket -- --check
 ```
+
+Compiled binary lives at `target/release/variant-websocket(.exe)`.
 
 ## Architecture
 

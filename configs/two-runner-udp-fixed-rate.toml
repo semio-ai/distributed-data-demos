@@ -4,7 +4,7 @@ default_timeout_secs = 120
 
 [[variant]]
 name = "custom-udp"
-binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+binary = "target/release/variant-custom-udp.exe"
 
   [variant.common]
   tick_rate_hz = 100

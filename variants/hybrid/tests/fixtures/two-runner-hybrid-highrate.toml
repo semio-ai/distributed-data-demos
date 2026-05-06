@@ -20,8 +20,8 @@
 # coexist without TIME_WAIT collisions or log mixups.
 #
 # Run from the repo root in two terminals:
-#   runner/target/release/runner --name alice --config variants/hybrid/tests/fixtures/two-runner-hybrid-highrate.toml
-#   runner/target/release/runner --name bob   --config variants/hybrid/tests/fixtures/two-runner-hybrid-highrate.toml
+#   target/release/runner --name alice --config variants/hybrid/tests/fixtures/two-runner-hybrid-highrate.toml
+#   target/release/runner --name bob   --config variants/hybrid/tests/fixtures/two-runner-hybrid-highrate.toml
 
 run = "hybrid-t101-highrate-validation"
 runners = ["alice", "bob"]
@@ -29,7 +29,7 @@ default_timeout_secs = 90
 
 [[variant]]
 name = "hybrid-t101-highrate"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
+binary = "target/release/variant-hybrid.exe"
 
   [variant.common]
   tick_rate_hz = 100

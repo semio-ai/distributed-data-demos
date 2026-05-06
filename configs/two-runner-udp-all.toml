@@ -4,7 +4,7 @@ default_timeout_secs = 60
 
 [[variant]]
 name = "custom-udp-1000x100hz"
-binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+binary = "target/release/variant-custom-udp.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -22,7 +22,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
 [[variant]]
 name = "custom-udp-100x100hz"
-binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+binary = "target/release/variant-custom-udp.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -40,7 +40,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
 [[variant]]
 name = "custom-udp-10x100hz"
-binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+binary = "target/release/variant-custom-udp.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -58,7 +58,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
 [[variant]]
 name = "custom-udp-max"
-binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+binary = "target/release/variant-custom-udp.exe"
 
   [variant.common]
   tick_rate_hz = 100

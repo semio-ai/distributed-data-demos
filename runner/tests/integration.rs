@@ -32,7 +32,7 @@ fn arg_echo_binary() -> String {
 }
 
 fn variant_dummy_exists() -> bool {
-    Path::new("../variant-base/target/release/variant-dummy.exe").exists()
+    Path::new("../target/release/variant-dummy.exe").exists()
 }
 
 #[test]

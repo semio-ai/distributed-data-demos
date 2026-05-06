@@ -11,8 +11,8 @@
 # reproducer that triggers the failure on two runners on localhost.
 #
 # Run from the repo root in two terminals:
-#   runner/target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000paths.toml
-#   runner/target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000paths.toml
+#   target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000paths.toml
+#   target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000paths.toml
 #
 # To enable the diagnostic [zenoh-trace] output, add `--debug-trace`
 # to `[variant.specific]` (parsed by the Zenoh variant from extra args).
@@ -23,7 +23,7 @@ default_timeout_secs = 60
 
 [[variant]]
 name = "zenoh-1000paths"
-binary = "variants/zenoh/target/release/variant-zenoh.exe"
+binary = "target/release/variant-zenoh.exe"
 
   [variant.common]
   tick_rate_hz = 10

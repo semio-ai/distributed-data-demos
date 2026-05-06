@@ -24,12 +24,18 @@ routing, and delivery.
 
 ## Build and Test
 
+All commands run from the repo root (Cargo workspace). Do **not** `cd` into
+`variants/zenoh/` to build — that produces a stray per-subfolder `target/`
+directory which the configs do not point at.
+
 ```
-cargo build                   # build variant-zenoh binary
-cargo test                    # unit + integration tests
-cargo clippy -- -D warnings
-cargo fmt -- --check
+cargo build --release -p variant-zenoh            # build variant-zenoh binary
+cargo test --release -p variant-zenoh             # unit + integration tests
+cargo clippy --release -p variant-zenoh -- -D warnings
+cargo fmt -p variant-zenoh -- --check
 ```
+
+Compiled binary lives at `target/release/variant-zenoh(.exe)`.
 
 ## Integration Contracts
 

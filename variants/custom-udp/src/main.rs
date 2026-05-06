@@ -19,6 +19,10 @@ pub const RUNNER_STRIDE: u16 = 1;
 pub const QOS_STRIDE: u16 = 10;
 
 fn main() {
+    // Print the build banner first thing so version skew between machines
+    // is immediately visible (see metak-orchestrator/STATUS.md for the
+    // stale-binary post-mortem).
+    variant_base::print_build_banner!("custom-udp");
     if let Err(e) = run() {
         eprintln!("[custom-udp] error: {:#}", e);
         std::process::exit(1);

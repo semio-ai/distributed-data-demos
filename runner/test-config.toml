@@ -4,7 +4,7 @@ default_timeout_secs = 60
 
 [[variant]]
 name = "dummy"
-binary = "../variant-base/target/release/variant-dummy.exe"  # adjust path
+binary = "../target/release/variant-dummy.exe"  # adjust path
 
   [variant.common]
   tick_rate_hz = 100

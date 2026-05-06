@@ -11,8 +11,8 @@
 # separate failure mode introduced by the max-throughput tight loop.
 #
 # Run from the repo root in two terminals:
-#   runner/target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-max.toml
-#   runner/target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-max.toml
+#   target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-max.toml
+#   target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-max.toml
 
 run = "zenoh-t102-max"
 runners = ["alice", "bob"]
@@ -20,7 +20,7 @@ default_timeout_secs = 60
 
 [[variant]]
 name = "zenoh-max"
-binary = "variants/zenoh/target/release/variant-zenoh.exe"
+binary = "target/release/variant-zenoh.exe"
 
   [variant.common]
   tick_rate_hz = 100

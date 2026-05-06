@@ -1765,7 +1765,7 @@ deterministically.
 
 ### Two-fixture localhost validation
 
-Both runs use `runner/target/release/runner.exe --name <alice|bob>
+Both runs use `target/release/runner.exe --name <alice|bob>
 --config variants/zenoh/tests/fixtures/<fixture>` in two terminals
 on the same Windows host. Logs under
 `logs-t102/<run>-<timestamp>/` (kept on disk for orchestrator
@@ -2201,8 +2201,8 @@ two `runner` child processes on localhost.
 - New test file `variants/custom-udp/tests/two_runner_regression.rs`
   (~370 lines, strict types throughout) with:
   - Skip-with-clear-message guard if either binary is missing
-    (`runner/target/release/runner.exe` or
-    `variants/custom-udp/target/release/variant-custom-udp.exe`).
+    (`target/release/runner.exe` or
+    `target/release/variant-custom-udp.exe`).
   - `tempfile::TempDir` allocation; in-memory substitution of the
     fixture's `log_dir = "./logs"` line with the tempdir path,
     written to `<tmpdir>/config.toml`. The source fixture is not
@@ -2317,8 +2317,8 @@ now machine-checkable.
 - New test file `variants/hybrid/tests/two_runner_regression.rs`
   (~520 lines, strict types throughout) implementing:
   - Skip-with-clear-message guard if either binary is missing
-    (`runner/target/release/runner.exe` or
-    `variants/hybrid/target/release/variant-hybrid.exe`).
+    (`target/release/runner.exe` or
+    `target/release/variant-hybrid.exe`).
   - `tempfile::TempDir` allocation; in-memory substitution of the
     fixture's `log_dir = "./logs"` line with the tempdir path,
     written to `<tmpdir>/config.toml`. Source fixtures are not
@@ -2492,8 +2492,8 @@ max-throughput tight-loop variant) are now machine-checkable.
 - New test file `variants/zenoh/tests/two_runner_regression.rs`
   (~415 lines, strict types throughout, type-hint-clean) with:
   - Skip-with-clear-message guard if either binary is missing
-    (`<repo-root>/runner/target/release/runner.exe` or
-    `<repo-root>/variants/zenoh/target/release/variant-zenoh.exe`).
+    (`<repo-root>/target/release/runner.exe` or
+    `<repo-root>/target/release/variant-zenoh.exe`).
   - `tempfile::TempDir` allocation; in-memory substitution of the
     fixture's `log_dir = "./logs"` line with the tempdir path
     (forward-slash-normalised so the embedded TOML string parses
@@ -4437,11 +4437,12 @@ EOT events sanity check (`grep -c eot_sent / eot_received / eot_timeout`):
   per-QoS port ranges from colliding across spawns; matches
   Hybrid / QUIC behaviour.
 - **Workspace target dir.** `cargo build --release -p variant-webrtc`
-  from the repo root puts the binary in `target/release/`, not
-  `variants/webrtc/target/release/`. The TOML config expects the
-  per-variant path, so I copied the binary into
-  `variants/webrtc/target/release/variant-webrtc.exe` for the
-  validation run. This matches what the existing variants ship.
+  from the repo root puts the binary in `target/release/`. At the
+  time of this report the TOML configs still pointed into the
+  per-variant `target/release/` subdirs and the binary had to be
+  copied into place for validation. This was the trigger for
+  T-config.1 (now done): every `configs/*.toml` has been migrated to
+  the workspace path so manual copying is no longer needed.
 
 #### Acceptance criteria status
 
@@ -4474,3 +4475,191 @@ EOT events sanity check (`grep -c eot_sent / eot_received / eot_timeout`):
 - `configs/two-runner-webrtc-all.toml` -- new (project-level config
   per the task's step 11).
 - `metak-orchestrator/STATUS.md` -- this section appended.
+
+---
+
+## T-config.1: Workspace target convention + build banner -- done (2026-05-05)
+
+Three-part sweep to abandon the per-subfolder build pattern and add
+build-hash startup logging across every binary.
+
+### Sub-task 1: TOML configs -- done
+
+Every `[[variant]].binary` path now points at the workspace target
+directory. Replacements applied (showing the substitution shape with
+the per-subfolder segment elided so future grep sweeps stay clean):
+
+  variants/<name>/target/...      ->  target/release/variant-<name>.exe
+  runner/target/...               ->  target/release/runner.exe
+
+Files touched (TOML, 25 files total):
+
+  configs/*.toml ........................ 11 files (every config in the
+                                          repo's project-level configs)
+  runner/test-config.toml ............... 1 file (uses `../target/...`
+                                          because runner-relative tests
+                                          run from `runner/` cwd)
+  runner/tests/fixtures/*.toml .......... 5 files (same `../target/...`
+                                          rationale)
+  variants/<name>/tests/fixtures/*.toml . 8 files (run from repo-root
+                                          cwd via `current_dir(repo_root())`,
+                                          so they use `target/...` directly)
+
+`runner/tests/integration.rs::variant_dummy_exists()` was also updated
+to look for the binary at `../target/release/variant-dummy.exe`.
+
+Verification: a recursive grep for the abandoned per-subfolder target
+patterns (`variants/<name>/target/...`, `runner/target/...`,
+`variant-base/target/...`) across `configs/`, `*.md`, and
+`metak-orchestrator/` returns zero hits other than the
+historical-context paragraph in TASKS.md that explicitly describes
+what was abandoned.
+
+### Sub-task 2: Docs and CUSTOM.md files -- done
+
+Every doc that taught the old `cd <subfolder> && cargo build --release`
+pattern was updated to teach `cargo build --release --workspace` (or
+`-p <crate>`) from the repo root. Files touched:
+
+  README.md ............................. Quick-start block rewritten
+  usage-guide.md ........................ Building section rewritten,
+                                          all `cd <subfolder>` removed,
+                                          binary-path mentions updated,
+                                          run examples updated
+  runner/CUSTOM.md ...................... Build/test commands updated
+  variant-base/CUSTOM.md ................ Build/test commands updated
+  variants/custom-udp/CUSTOM.md ......... Build/test commands updated
+  variants/zenoh/CUSTOM.md .............. Build/test commands updated
+  variants/quic/CUSTOM.md ............... Build/test commands updated
+  variants/hybrid/CUSTOM.md ............. Build/test commands updated
+  variants/webrtc/CUSTOM.md ............. Build/test commands updated +
+                                          the "Validate the build early"
+                                          paragraph
+  variants/websocket/CUSTOM.md .......... Build/test commands updated
+  metak-orchestrator/TASKS.md ........... Lines 1837-1845 (T10.6 binary
+                                          path checks), line 2591
+                                          (sample fixture config), line
+                                          2745 (T3g.1 build smoke test
+                                          phrasing), and the entire
+                                          T-config.1 section (now done)
+                                          rewritten
+  metak-orchestrator/STATUS.md .......... 5 historical entries updated
+                                          to use the workspace path
+
+Each CUSTOM.md now opens its build section with a short paragraph
+explaining why workspace-rooted builds are mandatory: per-subfolder
+`target/` directories are the proximate cause of the two stale-binary
+incidents this sweep was triggered by.
+
+### Sub-task 3: Build-hash startup banner -- done
+
+Every binary in the workspace prints a one-line build banner on stderr
+at startup:
+
+  [runner:alice] build: 7b92712+dirty (rustc 1.94.1)
+  [custom-udp]   build: 7b92712+dirty (rustc 1.94.1)
+  [hybrid]       build: 7b92712+dirty (rustc 1.94.1)
+  [quic]         build: 7b92712+dirty (rustc 1.94.1)
+  [webrtc]       build: 7b92712+dirty (rustc 1.94.1)
+  [websocket]    build: 7b92712+dirty (rustc 1.94.1)
+  [zenoh]        build: 7b92712+dirty (rustc 1.94.1)
+  [dummy]        build: 7b92712+dirty (rustc 1.94.1)
+
+Implementation:
+
+  build_info.rs ......................... NEW. Workspace-shared build
+                                          script. Runs `git rev-parse
+                                          --short=7 HEAD` and `git
+                                          status --porcelain
+                                          --untracked-files=no` to set
+                                          `BUILD_GIT_SHA`,
+                                          `BUILD_GIT_DIRTY`, and
+                                          `BUILD_RUSTC` rustc-env vars
+                                          for the consuming binary.
+                                          Falls back to "unknown" if
+                                          git is unavailable. Pure
+                                          stdlib + git -- no new deps.
+  variant-base/src/build_info.rs ........ NEW. `format_banner`,
+                                          `print_banner`, and the
+                                          `print_build_banner!` macro
+                                          (env! must expand at the
+                                          binary's compile site for
+                                          correctness, hence a macro
+                                          rather than a function).
+                                          4 unit tests cover the
+                                          dirty/clean and runner-prefix
+                                          shapes.
+  runner/Cargo.toml ..................... Added `build = "../build_info.rs"`
+  variant-base/Cargo.toml ............... Added `build = "../build_info.rs"`
+  variants/<each>/Cargo.toml ............ Added `build = "../../build_info.rs"`
+  runner/src/main.rs .................... Reads BUILD_* env vars via
+                                          `env!` and prints the banner
+                                          immediately after `Cli::parse()`,
+                                          before discovery. Inlined
+                                          rather than depending on
+                                          variant-base (the runner
+                                          intentionally has no
+                                          variant-base dep -- see
+                                          `runner/CUSTOM.md`).
+  variants/<each>/src/main.rs ........... Calls
+                                          `variant_base::print_build_banner!("<short-name>")`
+                                          as the first statement in
+                                          `fn main()`.
+  variant-base/src/bin/variant_dummy.rs . Same call with label
+                                          `"dummy"`.
+
+### Stretch goal: discovery-time build_hash exchange -- skipped
+
+The task allowed skipping if the protocol change got hairy. It does:
+adding `build_hash` to `Discover` requires a `#[serde(default)]`
+backstop for backward-compat, comparison logic in `Coordinator::discover`,
+fail-fast wiring, and at least one new protocol test. The startup
+banner alone already turns "stale binary on machine B" into a
+visible diff in the first three lines of stderr, which directly
+addresses the two production incidents that motivated the task.
+Leaving the protocol untouched also keeps this sweep a pure
+build-and-docs change with no on-the-wire risk.
+
+If a future incident shows the banner is being missed in practice
+(e.g. operators aggregate logs and skip startup lines), reopen this
+as a follow-up task.
+
+### Validation results
+
+  * `cargo build --release --workspace` from repo root -- success
+    (33s, zero warnings new to these changes).
+  * `target/release/runner.exe`, `target/release/variant-{custom-udp,
+    hybrid,quic,webrtc,websocket,zenoh,dummy}.exe` all present.
+  * `cargo test --release -p variant-base --lib` -- 47 passed,
+    0 failed (includes 4 new build_info unit tests).
+  * `cargo test --release -p runner --tests` -- 87 passed
+    (79 unit + 1 stress + 7 integration), 0 failed. The
+    integration suite exercises every fixture whose binary path
+    was changed.
+  * Smoke run: `target/release/runner --name alice --config configs/two-runner-udp-fixed-rate.toml`
+    prints `[runner:alice] build: 7b92712+dirty (rustc 1.94.1)`,
+    `[runner:alice] config loaded: run=udp-1000x100hz, 1 variant(s),
+    2 runner(s), hash=4fc3c81817c8`, then enters discovery (killed
+    after 5s). The variant binary path resolved cleanly -- no
+    "variant binary not found" error.
+  * `--help` on every variant binary prints the build banner before
+    the clap usage text (verified for custom-udp, hybrid, quic,
+    webrtc, websocket, zenoh, dummy).
+
+### Open concerns
+
+  * The `dirty` flag is computed at *compile* time, not runtime. A
+    binary built from a clean tree and then run on a machine where
+    the source tree has since been edited will still print the
+    clean SHA. This is by design (the binary's identity is fixed
+    at link time) but worth flagging for anyone reading log output.
+  * `BUILD_RUSTC` reports the rustc version of whoever compiled the
+    binary, not necessarily the version installed on the running
+    machine. Same comment -- this is the right behaviour for a
+    skew-detection banner.
+  * `git status --porcelain` is invoked from the build script's
+    cwd (the workspace root via cargo's normal behaviour). On a
+    network-mounted source tree where `.git/` is unreadable, the
+    flag silently falls back to `false` rather than failing the
+    build. Acceptable for the current LAN-bench use case; if this
+    becomes a CI concern we can switch to `--unwrap-or` semantics.

@@ -17,6 +17,7 @@ const RUNNER_STRIDE: u16 = 1;
 const QOS_STRIDE: u16 = 10;
 
 fn main() {
+    variant_base::print_build_banner!("quic");
     if let Err(e) = run() {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);

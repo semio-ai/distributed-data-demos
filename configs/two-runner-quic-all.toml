@@ -4,7 +4,7 @@ default_timeout_secs = 60
 
 [[variant]]
 name = "quic-1000x100hz"
-binary = "variants/quic/target/release/variant-quic.exe"
+binary = "target/release/variant-quic.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -22,7 +22,7 @@ binary = "variants/quic/target/release/variant-quic.exe"
 
 [[variant]]
 name = "quic-10x100hz"
-binary = "variants/quic/target/release/variant-quic.exe"
+binary = "target/release/variant-quic.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -40,7 +40,7 @@ binary = "variants/quic/target/release/variant-quic.exe"
 
 [[variant]]
 name = "quic-100x100hz"
-binary = "variants/quic/target/release/variant-quic.exe"
+binary = "target/release/variant-quic.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -58,7 +58,7 @@ binary = "variants/quic/target/release/variant-quic.exe"
 
 [[variant]]
 name = "quic-max"
-binary = "variants/quic/target/release/variant-quic.exe"
+binary = "target/release/variant-quic.exe"
 
   [variant.common]
   tick_rate_hz = 100

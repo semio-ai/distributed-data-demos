@@ -4,7 +4,7 @@ default_timeout_secs = 60
 
 [[variant]]
 name = "zenoh-1000x100hz"
-binary = "variants/zenoh/target/release/variant-zenoh.exe"
+binary = "target/release/variant-zenoh.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -21,7 +21,7 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
 
 [[variant]]
 name = "zenoh-100x100hz"
-binary = "variants/zenoh/target/release/variant-zenoh.exe"
+binary = "target/release/variant-zenoh.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -38,7 +38,7 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
 
 [[variant]]
 name = "zenoh-10x100hz"
-binary = "variants/zenoh/target/release/variant-zenoh.exe"
+binary = "target/release/variant-zenoh.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -55,7 +55,7 @@ binary = "variants/zenoh/target/release/variant-zenoh.exe"
 
 [[variant]]
 name = "zenoh-max"
-binary = "variants/zenoh/target/release/variant-zenoh.exe"
+binary = "target/release/variant-zenoh.exe"
 
   [variant.common]
   tick_rate_hz = 100

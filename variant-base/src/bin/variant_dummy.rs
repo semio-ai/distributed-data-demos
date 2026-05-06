@@ -6,6 +6,7 @@ use variant_base::driver::run_protocol;
 use variant_base::dummy::VariantDummy;
 
 fn main() {
+    variant_base::print_build_banner!("dummy");
     if let Err(e) = run() {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);

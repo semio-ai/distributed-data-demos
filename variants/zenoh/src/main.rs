@@ -9,6 +9,7 @@ use variant_base::driver::run_protocol;
 use crate::zenoh::ZenohVariant;
 
 fn main() {
+    variant_base::print_build_banner!("zenoh");
     if let Err(e) = run() {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);

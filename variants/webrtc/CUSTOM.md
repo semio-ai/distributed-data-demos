@@ -35,18 +35,25 @@ only one that natively offers reliable + unreliable from one session.
 
 ## Build and Test
 
+All commands run from the repo root (Cargo workspace). Do **not** `cd` into
+`variants/webrtc/` to build — that produces a stray per-subfolder `target/`
+directory which the configs do not point at.
+
 ```
-cargo build
-cargo test
-cargo clippy -- -D warnings
-cargo fmt -- --check
+cargo build --release -p variant-webrtc
+cargo test --release -p variant-webrtc
+cargo clippy --release -p variant-webrtc -- -D warnings
+cargo fmt -p variant-webrtc -- --check
 ```
 
+Compiled binary lives at `target/release/variant-webrtc(.exe)`.
+
 **Validate the build early.** webrtc-rs has a heavy dependency tree;
-on Windows, OpenSSL or ring versions may need pinning. If `cargo build`
-takes more than a few minutes or fails on Windows, stop and report
-back via STATUS.md before going further. We can either pin a working
-combination or, in the worst case, reconsider the variant.
+on Windows, OpenSSL or ring versions may need pinning. If
+`cargo build --release -p variant-webrtc` takes more than a few minutes
+or fails on Windows, stop and report back via STATUS.md before going
+further. We can either pin a working combination or, in the worst case,
+reconsider the variant.
 
 ## Architecture
 
@@ -237,7 +244,8 @@ variant of EOT closely resembles QUIC's stream-end approach:
   by design); the test exercises CLI parsing, port derivation, and
   the runtime startup path. Full end-to-end DataChannel exchange is
   validated by the cross-machine regression task (T3g.4).
-- Build smoke test: `cargo build --release` completes on Windows.
+- Build smoke test: `cargo build --release -p variant-webrtc` from the
+  repo root completes on Windows.
 
 ### Validation against reality
 

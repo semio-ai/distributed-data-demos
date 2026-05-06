@@ -2,8 +2,8 @@
 # Short timings; QoS omitted so the runner expands to all 4 levels.
 #
 # Run from the repo root with two terminals:
-#   runner/target/release/runner --name alice --config variants/quic/tests/fixtures/two-runner-quic-only.toml
-#   runner/target/release/runner --name bob   --config variants/quic/tests/fixtures/two-runner-quic-only.toml
+#   target/release/runner --name alice --config variants/quic/tests/fixtures/two-runner-quic-only.toml
+#   target/release/runner --name bob   --config variants/quic/tests/fixtures/two-runner-quic-only.toml
 
 run = "quic-t92-validation"
 runners = ["alice", "bob"]
@@ -11,7 +11,7 @@ default_timeout_secs = 60
 
 [[variant]]
 name = "quic-1000x100hz"
-binary = "variants/quic/target/release/variant-quic.exe"
+binary = "target/release/variant-quic.exe"
 
   [variant.common]
   tick_rate_hz = 100

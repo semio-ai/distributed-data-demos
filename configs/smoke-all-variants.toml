@@ -8,7 +8,7 @@ default_timeout_secs = 30
 
 [[variant]]
 name = "smoke-custom-udp"
-binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
+binary = "target/release/variant-custom-udp.exe"
 
   [variant.common]
   tick_rate_hz = 50
@@ -27,7 +27,7 @@ binary = "variants/custom-udp/target/release/variant-custom-udp.exe"
 
 [[variant]]
 name = "smoke-hybrid"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
+binary = "target/release/variant-hybrid.exe"
 
   [variant.common]
   tick_rate_hz = 50
@@ -45,7 +45,7 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
 
 [[variant]]
 name = "smoke-quic"
-binary = "variants/quic/target/release/variant-quic.exe"
+binary = "target/release/variant-quic.exe"
 
   [variant.common]
   tick_rate_hz = 50
@@ -62,7 +62,7 @@ binary = "variants/quic/target/release/variant-quic.exe"
 
 [[variant]]
 name = "smoke-zenoh"
-binary = "variants/zenoh/target/release/variant-zenoh.exe"
+binary = "target/release/variant-zenoh.exe"
 
   [variant.common]
   tick_rate_hz = 50

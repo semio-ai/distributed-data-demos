@@ -4,7 +4,7 @@ default_timeout_secs = 60
 
 [[variant]]
 name = "hybrid-1000x100hz"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
+binary = "target/release/variant-hybrid.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -23,7 +23,7 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
 
 [[variant]]
 name = "hybrid-100x100hz"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
+binary = "target/release/variant-hybrid.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -42,7 +42,7 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
 
 [[variant]]
 name = "hybrid-10x100hz"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
+binary = "target/release/variant-hybrid.exe"
 
   [variant.common]
   tick_rate_hz = 100
@@ -61,7 +61,7 @@ binary = "variants/hybrid/target/release/variant-hybrid.exe"
 
 [[variant]]
 name = "hybrid-max"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
+binary = "target/release/variant-hybrid.exe"
 
   [variant.common]
   tick_rate_hz = 100

@@ -17,8 +17,8 @@
 # provide cross-spawn isolation.
 #
 # Run from the repo root in two terminals:
-#   runner/target/release/runner --name alice --config variants/hybrid/tests/fixtures/two-runner-hybrid-only.toml
-#   runner/target/release/runner --name bob   --config variants/hybrid/tests/fixtures/two-runner-hybrid-only.toml
+#   target/release/runner --name alice --config variants/hybrid/tests/fixtures/two-runner-hybrid-only.toml
+#   target/release/runner --name bob   --config variants/hybrid/tests/fixtures/two-runner-hybrid-only.toml
 
 run = "hybrid-t93-validation"
 runners = ["alice", "bob"]
@@ -26,7 +26,7 @@ default_timeout_secs = 60
 
 [[variant]]
 name = "hybrid-t93"
-binary = "variants/hybrid/target/release/variant-hybrid.exe"
+binary = "target/release/variant-hybrid.exe"
 
   [variant.common]
   tick_rate_hz = 100
