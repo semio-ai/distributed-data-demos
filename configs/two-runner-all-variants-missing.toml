@@ -1,0 +1,121 @@
+# Comprehensive benchmark: all variants, all workload modes.
+#
+# 16 variants executed sequentially. Each runs for 30s operate
+# with 3s stabilize and 3s silent drain. Total runtime: ~10 minutes.
+#
+# Run from the repo root with two terminals:
+#   target/release/runner --name alice --config configs/two-runner-all-variants.toml
+#   target/release/runner --name bob   --config configs/two-runner-all-variants.toml
+
+run = "all-variants-01"
+runners = ["alice", "bob"]
+default_timeout_secs = 120
+
+
+# ─── Zenoh ── 100 vps @ 1000 hz ────────────────────────────────────────────────
+
+[[variant]]
+name = "zenoh-100x1000hz"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  values_per_tick = 100
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+
+# ─── Zenoh ── 100 vps @ 100 hz ────────────────────────────────────────────────
+
+[[variant]]
+name = "zenoh-100x100hz"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  values_per_tick = 100
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+
+# ─── Zenoh ── 100 vps @ 10 hz ────────────────────────────────────────────────
+
+[[variant]]
+name = "zenoh-100x10hz"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  values_per_tick = 100
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+
+# ─── Zenoh ── 10 vps @ 100 hz ────────────────────────────────────────────────
+
+[[variant]]
+name = "zenoh-10x100hz"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  values_per_tick = 10
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+
+# ─── Zenoh ── 10 vps @ 1000 hz ────────────────────────────────────────────────
+
+[[variant]]
+name = "zenoh-10x1000hz"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  values_per_tick = 10
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+
+# ─── Zenoh ── max-throughput ─────────────────────────────────────────────────
+
+[[variant]]
+name = "zenoh-max"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "max-throughput"
+  values_per_tick = 1000
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"

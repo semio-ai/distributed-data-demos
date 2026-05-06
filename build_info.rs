@@ -53,7 +53,10 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=BUILD_GIT_SHA={sha}");
-    println!("cargo:rustc-env=BUILD_GIT_DIRTY={}", if dirty { "true" } else { "false" });
+    println!(
+        "cargo:rustc-env=BUILD_GIT_DIRTY={}",
+        if dirty { "true" } else { "false" }
+    );
     println!("cargo:rustc-env=BUILD_RUSTC={rustc}");
 
     // Re-run when HEAD moves or the index changes (covers commits, switches,

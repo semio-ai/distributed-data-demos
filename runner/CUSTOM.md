@@ -211,3 +211,39 @@ The runner does NOT manipulate ports inside `[variant.specific]`. Variants
 that need QoS-disjoint ports use the `base_port + runner_index * runner_stride + (qos - 1) * qos_stride`
 convention documented in `metak-shared/api-contracts/toml-config-schema.md`,
 which they compute themselves from `--peers`, `--runner`, and `--qos`.
+
+### Variant templates + multi-dimensional expansion (T-config.2)
+
+Two further config-side mechanisms layer on top of QoS expansion:
+
+1. **`[[variant_template]]`** — a top-level array of reusable defaults.
+   `[[variant]]` entries with `template = "<name>"` inherit the template's
+   `binary`, `timeout_secs`, `[variant.common]`, and `[variant.specific]`,
+   with the variant entry's keys winning on conflict. Templates do not
+   spawn. Resolution happens in `config.rs` after parse, before validation.
+
+2. **Array expansion for `tick_rate_hz` and `values_per_tick`** — same
+   pattern as `QosSpec`. Add `tick_rate_spec()` / `values_per_tick_spec()`
+   helpers returning ascending-deduped concrete values. The expansion
+   in `spawn_job.rs` becomes a triple-nested Cartesian product in stable
+   order: `tick_rate_hz` (outer) → `values_per_tick` (middle) → `qos`
+   (inner). `SpawnJob` carries the per-spawn scalar values; `cli_args.rs`
+   emits `--tick-rate-hz`, `--values-per-tick`, `--qos` from the SpawnJob,
+   not from `[variant.common]`.
+
+Auto-naming after expansion:
+
+```
+<post-template-name>[-<vpt>x<hz>hz][-qos<N>]
+```
+
+The hz/vpt suffix appears whenever either dimension expanded (multiple
+effective values). Both numbers always show in the suffix even if only
+one dimension expanded, so spawn names are always unique within a parent
+entry. `inter_qos_grace_ms` becomes "inter-spawn grace" — applied
+between every consecutive pair of spawns derived from one source entry,
+not just QoS-pair boundaries.
+
+Full spec: `metak-shared/api-contracts/toml-config-schema.md` "Variant
+Templates" and "Array Expansion" sections. Worker brief:
+`metak-orchestrator/TASKS.md` T-config.2.

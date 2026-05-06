@@ -24,6 +24,40 @@ binary = "target/release/variant-websocket.exe"
   ws_base_port = 19960
 
 [[variant]]
+name = "websocket-1000x10hz"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = [3, 4]
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960
+
+[[variant]]
+name = "websocket-100x1000hz"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = [3, 4]
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960
+
+[[variant]]
 name = "websocket-100x100hz"
 binary = "target/release/variant-websocket.exe"
 
@@ -41,11 +75,45 @@ binary = "target/release/variant-websocket.exe"
   ws_base_port = 19960
 
 [[variant]]
+name = "websocket-100x10hz"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = [3, 4]
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960
+
+[[variant]]
 name = "websocket-10x100hz"
 binary = "target/release/variant-websocket.exe"
 
   [variant.common]
   tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 10
+  qos = [3, 4]
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960
+
+[[variant]]
+name = "websocket-10x1000hz"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
   stabilize_secs = 2
   operate_secs = 10
   silent_secs = 2

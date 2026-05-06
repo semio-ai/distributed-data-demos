@@ -20,6 +20,40 @@ binary = "target/release/variant-webrtc.exe"
   media_base_port = 20000
 
 [[variant]]
+name = "webrtc-1000x10hz"
+binary = "target/release/variant-webrtc.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  log_dir = "./logs"
+
+  [variant.specific]
+  signaling_base_port = 19980
+  media_base_port = 20000
+
+[[variant]]
+name = "webrtc-100x1000hz"
+binary = "target/release/variant-webrtc.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 100
+  log_dir = "./logs"
+
+  [variant.specific]
+  signaling_base_port = 19980
+  media_base_port = 20000
+
+[[variant]]
 name = "webrtc-100x100hz"
 binary = "target/release/variant-webrtc.exe"
 
@@ -37,11 +71,45 @@ binary = "target/release/variant-webrtc.exe"
   media_base_port = 20000
 
 [[variant]]
+name = "webrtc-100x10hz"
+binary = "target/release/variant-webrtc.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 100
+  log_dir = "./logs"
+
+  [variant.specific]
+  signaling_base_port = 19980
+  media_base_port = 20000
+
+[[variant]]
 name = "webrtc-10x100hz"
 binary = "target/release/variant-webrtc.exe"
 
   [variant.common]
   tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 10
+  log_dir = "./logs"
+
+  [variant.specific]
+  signaling_base_port = 19980
+  media_base_port = 20000
+
+[[variant]]
+name = "webrtc-10x1000hz"
+binary = "target/release/variant-webrtc.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
   stabilize_secs = 2
   operate_secs = 10
   silent_secs = 2

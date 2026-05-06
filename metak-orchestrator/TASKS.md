@@ -2913,3 +2913,212 @@ and bail.
 - [ ] Unit test covers the 997 case explicitly.
 - [ ] `cargo test --release -p variant-hybrid` clean.
 - [ ] `cargo clippy --release -p variant-hybrid --all-targets -- -D warnings` clean.
+
+### T-config.2: Variant templates + array expansion for tick_rate_hz / values_per_tick
+
+**Repo**: `runner/` (parser + spawn-job expansion) and `configs/`
+(refactor existing all-variants config + add new 10-peer config).
+**Status**: pending
+**Depends on**: contract update landed (`metak-shared/api-contracts/toml-config-schema.md`
+and `variant-cli.md` updated). Touches the same code path as E9's QoS
+expansion (`runner/src/spawn_job.rs`).
+
+Driving need: existing configs duplicate ~12 lines per variant case across
+many `[[variant]]` entries that only differ in `tick_rate_hz` and
+`values_per_tick`. The next phase of testing is a 4-machine, 10-peer setup
+(Windows PC × 3 peers, Windows PC × 4 peers, Raspberry Pi × 1 peer, old
+Mac × 2 peers) where this duplication will only get worse. Add two
+mechanisms — variant templates and Cartesian array expansion — that keep
+backwards compatibility with every existing config while allowing radical
+size reduction in new configs.
+
+#### Scope
+
+1. **Parser changes** (`runner/src/config.rs`):
+   - Add `[[variant_template]]` top-level array. Same fields as
+     `[[variant]]` but `name` is just a template identifier (not a spawn
+     name). Templates do not spawn.
+   - Add `template: Option<String>` field to `VariantConfig`.
+   - Resolution pass after parse / before validation:
+     - Validate template names are unique.
+     - For every `[[variant]]` with `template = "X"`: look up `X`,
+       deep-merge `[variant_template.common]` and
+       `[variant_template.specific]` into the variant entry's matching
+       sections (variant entry's keys win), and fall through to the
+       template's `binary` / `timeout_secs` if the variant entry omits
+       them.
+     - After resolution every `[[variant]]` must have a non-empty
+       `binary`. Validation runs on the resolved values.
+   - Internal: keep `BenchConfig` shape stable for downstream code. Either
+     mutate `variant` in place after merging, or expose a resolved view —
+     pick whichever is cleaner; the spawn-job loop should see fully
+     resolved entries.
+
+2. **Tick-rate and VPT array support** (`runner/src/config.rs`):
+   - Mirror the existing `qos_spec()` / `QosSpec` pattern. Add `tick_rate_spec()`
+     and `values_per_tick_spec()` returning ascending-deduped Vec<u32>
+     (or u64 — match existing types). Accept integer or array; require
+     positive values; non-empty arrays.
+   - Validation rejects non-positive values, empty arrays, non-integer
+     elements, and out-of-range u32 values.
+
+3. **Spawn-job expansion** (`runner/src/spawn_job.rs`):
+   - Replace the qos-only loop with a triple-nested expansion in this
+     stable order: `tick_rate_hz` (outer) → `values_per_tick` (middle) →
+     `qos` (inner). Output is the Cartesian product, in that order, so
+     spawn ordering is deterministic and grouped naturally for human reading.
+   - Add `tick_rate_hz: u32` and `values_per_tick: u32` (or matching
+     existing types) to `SpawnJob`.
+   - Auto-naming per the contract:
+     - Base = post-resolution `variant.name`.
+     - Append `-<vpt>x<hz>hz` if `tick_rate_hz` OR `values_per_tick`
+       expanded (i.e. > 1 effective value). Both numbers always shown
+       even when only one dimension expanded.
+     - Append `-qos<N>` if `qos` expanded (existing behaviour).
+   - Existing helper-naming tests must still pass; add new tests for the
+     three-dimensional expansion.
+
+4. **CLI arg construction** (`runner/src/cli_args.rs`):
+   - The runner currently passes `--tick-rate-hz` and `--values-per-tick`
+     verbatim from `[variant.common]`. Now they may be arrays. The
+     spawn-job carries the concrete scalar — at CLI-construction time
+     emit the per-spawn scalar from `SpawnJob`, NOT the array from
+     `[variant.common]`. Same pattern as `--qos`.
+
+5. **Inter-spawn grace period** (`runner/src/main.rs` or wherever the
+   loop lives): the existing `inter_qos_grace_ms` grace currently
+   inserts between consecutive QoS spawns from one source entry. Apply
+   it between every consecutive pair of spawns derived from the same
+   source entry (i.e. across all dimensions, not just QoS pairs).
+   Variants that bind ports may collide otherwise.
+
+6. **Tests** (in `runner/`):
+   - Unit: template resolution merges common / specific tables correctly,
+     variant key wins, missing keys come from template, top-level scalars
+     fall through, missing template name is a validation error,
+     duplicate template names is a validation error.
+   - Unit: `tick_rate_spec` and `values_per_tick_spec` accept scalar,
+     accept array, reject empty array, reject non-positive integers,
+     reject non-integer elements, dedup + sort.
+   - Unit: `expand_variant` produces the right Cartesian product in the
+     documented stable order, with the right auto-name suffixes for
+     scalar-scalar, array-scalar (vpt), scalar-array (hz), and array-array
+     cases, combined with single-qos vs multi-qos.
+   - Unit: single-element array on hz / vpt counts as scalar (no suffix).
+   - Integration: end-to-end spawn loop using a small synthetic config
+     that exercises both templates and array expansion, verifying every
+     expected spawn name appears in the runner's logged spawn-job list.
+     A live `variant-dummy` run is fine — the existing integration test
+     scaffolding can be reused.
+
+7. **Config refactor**: rewrite `configs/two-runner-all-variants.toml` to
+   use templates + array expansion. The expanded set of spawns must
+   exactly match what the current config produces, in the same order.
+   Recommended structure:
+   - One `[[variant_template]]` per variant binary capturing the shared
+     common + specific fields (binary, multicast/port settings, workload
+     defaults, stabilize/operate/silent durations, log_dir).
+   - One `[[variant]]` per (workload, vpt-group) cluster, e.g. for
+     custom-udp:
+     - `vpt = 1000, hz = [10, 100]` → 2 spawns.
+     - `vpt = 100, hz = [10, 100, 1000]` → 3 spawns.
+     - `vpt = 10, hz = [100, 1000]` → 2 spawns.
+     - `vpt = 1000, hz = 100, workload = "max-throughput"` → 1 spawn.
+     Total 8 — same as today. With qos omitted (current default for the
+     all-variants config) each multiplies by 4. Verify the resulting
+     spawn-job count matches the original config's count. Keep the
+     header comment block, update it to describe the new template form.
+
+8. **New 10-peer config**: `configs/multi-machine-10peer-all.toml` (name
+   subject to revision if a clearer convention exists). Targets the
+   4-machine layout described above. Use peer names that identify their
+   host machine:
+
+   ```toml
+   runners = [
+     "winA-1", "winA-2", "winA-3",       # Windows PC A
+     "winB-1", "winB-2", "winB-3", "winB-4",  # Windows PC B
+     "rpi-1",                             # Raspberry Pi
+     "mac-1", "mac-2",                    # Old Mac
+   ]
+   ```
+
+   Pick conservative durations (e.g. `stabilize_secs = 5, operate_secs = 30,
+   silent_secs = 5`) and a reasonable `default_timeout_secs` (180 — leaves
+   headroom for slow startup on the Pi and Mac). Use the templated form
+   throughout. Cover all 5 working variants (custom-udp, hybrid, quic,
+   zenoh, websocket; webrtc supports only one peer per spawn per E3g and
+   should be excluded — note this in the header comment) at a moderate
+   load profile (e.g. `tick_rate_hz = [10, 100]`, `values_per_tick = [10, 100]`,
+   qos omitted) plus per-variant `max-throughput` cases.
+
+   Header comment must describe:
+   - The 10-peer layout (names → machines).
+   - Why webrtc is excluded.
+   - Operator instructions: launch `runner --name <peer-name> --config configs/multi-machine-10peer-all.toml`
+     on the appropriate machine for each name in `runners`. Multiple
+     peers per machine = multiple `runner` processes on that machine,
+     each with a different `--name`.
+   - Reminder that ports are derived per (runner_index, qos) per the
+     port-stride convention; with 10 runners and qos_stride = 10 the
+     reserved port range per variant is `base_port .. base_port + 40`.
+
+#### Validation against reality
+
+- `cargo build --release --workspace` from repo root — all crates
+  compile clean.
+- `cargo test --release -p runner` — full runner test suite green
+  including the new tests.
+- `cargo clippy --release -p runner --all-targets -- -D warnings` clean.
+- `cargo fmt -p runner -- --check` clean.
+- Build `variant-base` (`cargo build --release -p variant-base`) so
+  `variant-dummy` is available; then run a SINGLE-RUNNER smoke against
+  the refactored `configs/two-runner-all-variants.toml` (or a small
+  subset of it) using `variant-dummy` swapped in for one variant entry,
+  just to confirm the expansion produces the expected spawn names. Show
+  the runner stdout's spawn-job list in the completion report.
+- For the new 10-peer config: structural-only validation. The user owns
+  cross-machine execution. Run `cargo run --release -p runner -- --name winA-1 --config configs/multi-machine-10peer-all.toml --validate-only`
+  IF such a flag exists; otherwise just parse the config in a unit test
+  fixture or note in the completion report that live validation is
+  pending the multi-machine setup.
+- All other existing configs must still parse cleanly without
+  modification (`for f in configs/*.toml; do cargo run -p runner -- --name x --config "$f" --validate-only; done` if the flag exists, else write a quick unit test or rely on the existing per-config test scaffolding).
+
+#### Acceptance criteria
+
+- [ ] `[[variant_template]]` and `template = "..."` parse and resolve
+      per the contract.
+- [ ] `tick_rate_hz` and `values_per_tick` accept arrays and expand
+      Cartesian-style with `qos`.
+- [ ] Spawn auto-naming follows `<name>[-<vpt>x<hz>hz][-qos<N>]`.
+- [ ] Sequential spawn execution order: hz outer, vpt middle, qos
+      inner (all ascending).
+- [ ] `inter_qos_grace_ms` applies between every consecutive pair of
+      spawns derived from one source entry, not only QoS pairs.
+- [ ] Single-element arrays count as scalar (no suffix).
+- [ ] All new unit tests land in `runner/`.
+- [ ] `configs/two-runner-all-variants.toml` rewritten to the
+      template + array form; expanded spawn count + names match the
+      pre-rewrite config exactly (worker should produce a side-by-side
+      list in the completion report).
+- [ ] `configs/multi-machine-10peer-all.toml` added with the runner
+      naming convention above and a clear header comment.
+- [ ] Every existing `configs/*.toml` still parses without modification.
+- [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` clean for
+      `runner/`.
+- [ ] Completion report appended to `metak-orchestrator/STATUS.md` with
+      spawn-list comparison + new-config layout summary.
+
+#### Out of scope
+
+- Variant code changes — variants still receive scalar `--tick-rate-hz`,
+  `--values-per-tick`, `--qos`. The new mechanisms are entirely runner-
+  side.
+- Refactoring the smaller per-variant `configs/two-runner-<v>-all.toml`
+  files. They already use single-qos arrays where it matters; extending
+  the template form to them is a follow-up if/when worth it.
+- Cross-machine validation of the new 10-peer config. User owns the
+  multi-machine execution.
+- Re-enabling webrtc for N>2 peers. Flag the limitation in the header
+  comment of the 10-peer config and leave it.

@@ -35,9 +35,10 @@ pub fn format_peers_arg(peer_hosts: &HashMap<String, String>) -> String {
 /// This matches the variant-cli.md contract.
 ///
 /// `effective_variant_name` is the value passed via `--variant`; it differs
-/// from `variant.name` when QoS expansion synthesizes a `<name>-qosN` name.
-/// `effective_qos` is the concrete QoS level for this spawn; it overrides
-/// the `qos` value in `[variant.common]` (which may be a list or omitted).
+/// from `variant.name` when array expansion synthesizes a suffixed name.
+/// `effective_qos`, `effective_tick_rate_hz`, and `effective_values_per_tick`
+/// are the concrete per-spawn scalars; they override any array (or omitted)
+/// values in `[variant.common]`.
 ///
 /// `peer_hosts` is the discovery-time map of runner names to host strings
 /// (with same-host peers collapsed to `127.0.0.1`). Always emitted, even
@@ -51,17 +52,18 @@ pub fn build_variant_args(
     log_dir_override: Option<&str>,
     effective_variant_name: &str,
     effective_qos: u8,
+    effective_tick_rate_hz: u32,
+    effective_values_per_tick: u32,
     peer_hosts: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut args = Vec::new();
 
-    // Common args from [variant.common] table. Two keys get special handling:
-    //   - log_dir: replaced with log_dir_override if provided.
-    //   - qos: skipped here -- the runner-injected --qos below carries the
-    //     concrete per-spawn level (overrides any common qos which may be a
-    //     list, omitted, or any single integer).
+    // Common args from [variant.common] table. Per-spawn dimensions
+    // (qos, tick_rate_hz, values_per_tick) are skipped here -- the
+    // runner-injected scalars below carry the concrete per-spawn values
+    // and override any array/omitted form in the common table.
     for (key, val) in &variant.common {
-        if key == "qos" {
+        if matches!(key.as_str(), "qos" | "tick_rate_hz" | "values_per_tick") {
             continue;
         }
         args.push(to_kebab_flag(key));
@@ -76,7 +78,12 @@ pub fn build_variant_args(
         }
     }
 
-    // Runner-injected --qos with the per-spawn concrete level.
+    // Runner-injected per-spawn scalars (override any array/omitted form
+    // in [variant.common]).
+    args.push("--tick-rate-hz".to_string());
+    args.push(effective_tick_rate_hz.to_string());
+    args.push("--values-per-tick".to_string());
+    args.push(effective_values_per_tick.to_string());
     args.push("--qos".to_string());
     args.push(effective_qos.to_string());
 
@@ -180,6 +187,8 @@ timeout_secs = 30
             None,
             "zenoh-replication",
             2,
+            100,
+            10,
             &peers,
         );
 
@@ -190,6 +199,8 @@ timeout_secs = 30
         assert!(args.contains(&"scalar-flood".to_string()));
         assert!(args.contains(&"--qos".to_string()));
         assert!(args.contains(&"2".to_string()));
+        assert!(args.contains(&"--values-per-tick".to_string()));
+        assert!(args.contains(&"10".to_string()));
 
         // log_dir should use the config value when no override is given.
         assert!(args.contains(&"--log-dir".to_string()));
@@ -236,6 +247,8 @@ timeout_secs = 30
             Some("./logs/run01-20260415_143022"),
             "zenoh-replication",
             2,
+            100,
+            10,
             &peers,
         );
 
@@ -259,6 +272,7 @@ binary = "./simple"
 
   [variant.common]
   tick_rate_hz = 10
+  values_per_tick = 5
   operate_secs = 5
 "#;
         let config: BenchConfig = toml::from_str(toml_str).unwrap();
@@ -272,6 +286,8 @@ binary = "./simple"
             None,
             "simple",
             1,
+            10,
+            5,
             &peers,
         );
 
@@ -288,7 +304,7 @@ binary = "./simple"
 
     #[test]
     fn build_args_uses_effective_variant_name_and_qos() {
-        // When QoS expansion synthesizes a name like "v-qos3", build_variant_args
+        // When expansion synthesizes a name like "v-qos3", build_variant_args
         // must use it for --variant and override --qos.
         let config = sample_config();
         let v = &config.variant[0];
@@ -301,6 +317,8 @@ binary = "./simple"
             None,
             "zenoh-replication-qos3",
             3,
+            100,
+            10,
             &peers,
         );
 
@@ -317,6 +335,60 @@ binary = "./simple"
             .collect();
         assert_eq!(qos_indices.len(), 1, "--qos should appear exactly once");
         assert_eq!(args[qos_indices[0] + 1], "3");
+    }
+
+    #[test]
+    fn build_args_overrides_array_dimensions_with_per_spawn_scalars() {
+        // When [variant.common] uses arrays for tick_rate_hz / values_per_tick,
+        // build_variant_args must NOT emit those arrays. The runner-injected
+        // per-spawn scalars are the only --tick-rate-hz / --values-per-tick
+        // values the variant ever sees.
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = [10, 100]
+  values_per_tick = [1, 1000]
+  workload = "scalar-flood"
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v-1000x100hz",
+            1,
+            100,
+            1000,
+            &peers,
+        );
+
+        let hz_indices: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--tick-rate-hz")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(hz_indices.len(), 1, "--tick-rate-hz must appear once");
+        assert_eq!(args[hz_indices[0] + 1], "100");
+
+        let vpt_indices: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--values-per-tick")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(vpt_indices.len(), 1, "--values-per-tick must appear once");
+        assert_eq!(args[vpt_indices[0] + 1], "1000");
     }
 
     #[test]
@@ -351,6 +423,8 @@ binary = "./simple"
             None,
             "zenoh-replication",
             1,
+            100,
+            10,
             &peers,
         );
         let peers_idx = args.iter().position(|a| a == "--peers").unwrap();

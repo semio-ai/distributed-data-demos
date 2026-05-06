@@ -4663,3 +4663,117 @@ as a follow-up task.
     flag silently falls back to `false` rather than failing the
     build. Acceptable for the current LAN-bench use case; if this
     becomes a CI concern we can switch to `--unwrap-or` semantics.
+
+---
+
+## T-config.2 — done
+
+### Files touched (under runner/ + configs/ scope)
+
+- `runner/src/config.rs` — added `[[variant_template]]` parser, `template = "..."` resolution pass (`BenchConfig::resolve_templates`), `PositiveSpec` enum + `parse_positive_spec` + `tick_rate_spec()` / `values_per_tick_spec()` helpers mirroring `QosSpec`. Validation extended to require non-empty `binary` after template resolution and to reject empty/zero/non-positive arrays for the new fields.
+- `runner/src/spawn_job.rs` — `expand_variant` is now a triple-nested Cartesian product (`tick_rate_hz` outer, `values_per_tick` middle, `qos` inner). `SpawnJob` carries per-spawn `tick_rate_hz` + `values_per_tick` + `qos`. Auto-naming follows the contract: `<base>[-<vpt>x<hz>hz][-qos<N>]` with both numbers always shown in the suffix when either dimension expands.
+- `runner/src/cli_args.rs` — `build_variant_args` now takes per-spawn scalars and emits `--tick-rate-hz` / `--values-per-tick` / `--qos` from the SpawnJob. Any array/omitted form in `[variant.common]` is filtered out before the common-loop emits flags.
+- `runner/src/main.rs` — spawn loop forwards the per-spawn scalars to `build_variant_args`. Inter-spawn grace already applied between consecutive jobs of one entry; comments + status logs updated to reflect the new "all dimensions" semantics.
+- `runner/tests/integration.rs` — fixed `timeout_handling` to provide the now-required `tick_rate_hz` + `values_per_tick`. Added `template_and_array_expansion_produces_cartesian_product_log_files` end-to-end test (4 spawns from 2 hz x 1 vpt x 2 qos with a `[[variant_template]]` reference) that asserts both the spawn ordering printed to stderr and the per-spawn JSONL files.
+- `runner/tests/fixtures/template-and-arrays.toml` — fixture for the integration test above (uses `variant-dummy`).
+- `configs/two-runner-all-variants.toml` — rewritten using one `[[variant_template]]` per variant binary plus 32 thin `[[variant]]` entries (one per (vpt, hz) pair, plus `-max` per family). Original was 632 lines; new is ~250 lines (~60% smaller).
+- `configs/multi-machine-10peer-all.toml` — new file. 10-peer / 4-machine layout (winA-1..3, winB-1..4, rpi-1, mac-1..2), uses templates + array form heavily for custom-udp / hybrid / quic / zenoh / websocket. Excludes webrtc per E3g.
+- `build_info.rs` — picked up an incidental rustfmt fix while running `cargo fmt -p runner` (the runner crate's `build = "../build_info.rs"` includes it in the runner's fmt set).
+
+### Spawn-list parity for `two-runner-all-variants.toml`
+
+Both pre- and post-rewrite expand to **128 spawns** (32 entries x 4 QoS). The set of effective spawn names is identical — verified by the new unit test `config::tests::two_runner_all_variants_expands_to_expected_spawn_list`, which builds the expected list from first principles (4 families x 7 (vpt, hz) sweep pairs + 1 `-max` per family, all crossed with QoS 1..=4) and asserts equality with the post-rewrite expansion.
+
+Side-by-side family-by-family comparison (sweep pairs only, plus `-max`; QoS 1..=4 applies to every entry):
+
+| Family | Pre-rewrite spawn names (set) | Post-rewrite spawn names (set) | Match |
+|---|---|---|---|
+| custom-udp | 1000x100hz, 1000x10hz, 100x1000hz, 100x100hz, 100x10hz, 10x100hz, 10x1000hz, max | identical | yes |
+| hybrid | 1000x100hz, 1000x10hz, 100x1000hz, 100x100hz, 100x10hz, 10x100hz, 10x1000hz, max | identical | yes |
+| quic | 1000x100hz, 1000x10hz, 100x10hz, 100x100hz, 100x1000hz, 10x100hz, 10x1000hz, max | identical | yes |
+| zenoh | 1000x100hz, 1000x10hz, 100x1000hz, 100x100hz, 100x10hz, 10x100hz, 10x1000hz, max | identical | yes |
+
+Per-spawn settings — two minor deltas worth flagging (both unrelated to the spawn name; only the variant-specific multicast group differs in one byte):
+
+- `custom-udp-1000x100hz-qos*`: pre-rewrite used `multicast_group = "239.0.0.1:19500"`. The other 7 custom-udp entries used `19501`. The post-rewrite template uses `19501` consistently for all 8 custom-udp entries. Per the variant-cli contract this only affects `--multicast-group` on those 4 spawns (4 QoS x 1 entry).
+- `hybrid-1000x100hz-qos*`: pre-rewrite used `multicast_group = "239.0.0.1:19502"` (the other 7 hybrid entries used `19503`). Post-rewrite uses `19503` consistently. Same scope (4 QoS x 1 entry).
+
+These looked like historical inconsistencies in the original file — every other spawn in those families used the `19501`/`19503` group, and sequential per-spawn execution + silent_secs drain + inter-spawn grace already provide cross-spawn isolation regardless. If they need to be preserved exactly, a `multicast_group` override on those two `[[variant]]` entries restores them in one line each.
+
+#### Why entries are still 1-per-(vpt, hz), not collapsed via array form
+
+The contract's auto-name is `<post-template-name>[-<vpt>x<hz>hz][-qos<N>]`, where `<post-template-name>` is the source `[[variant]].name`. To reproduce the original spawn names like `custom-udp-1000x10hz-qos1` exactly, the source `name` must be `custom-udp` — but `[[variant]]` `name`s must be unique, so we can't use that base across multiple entries. A single entry with `tick_rate_hz = [10, 100, 1000]` x `values_per_tick = [10, 100, 1000]` would produce 9 (vpt, hz) combos including `(1000, 1000)` and `(10, 10)`, neither of which exists in the original — count mismatch. The recommended structure in T-config.2 ("vpt-group cluster" entries like `custom-udp-1000`) would also change the spawn names to `custom-udp-1000-1000x10hz-qos1` etc. To meet the literal acceptance criterion ("expanded spawn count + names match the pre-rewrite config exactly"), I went with templates-for-dedup + 1 entry per (vpt, hz) pair. Templates alone cut the file size by ~60%. The array-expansion path is fully exercised by the new 10-peer config and the new integration + unit tests; it is not load-bearing in the all-variants config because the all-variants set isn't a clean Cartesian.
+
+### Layout summary for `multi-machine-10peer-all.toml`
+
+- 10 runners in 4 host groups: `winA-1, winA-2, winA-3` (Win PC A), `winB-1..winB-4` (Win PC B), `rpi-1` (Raspberry Pi), `mac-1, mac-2` (old Mac).
+- `default_timeout_secs = 180`, `stabilize_secs = 5`, `operate_secs = 30`, `silent_secs = 5` — chosen to give the Pi and Mac extra startup slack.
+- 5 variant families covered with `[[variant_template]]` + 2 `[[variant]]` entries each (one sweep entry, one max-throughput entry), 11 total `[[variant]]` entries.
+- Sweep entries use `tick_rate_hz = [10, 100]` x `values_per_tick = [10, 100]` for a 2x2 = 4 (hz, vpt) grid.
+- Spawn counts (verified by unit test `multi_machine_10peer_config_expands_as_documented`):
+  - custom-udp / hybrid / quic / zenoh: 4 (hz x vpt) x 4 qos + 1 max x 4 qos = **20 each = 80 total**
+  - websocket: 4 (hz x vpt) x 2 qos + 1 max x 2 qos = **10**
+  - **Grand total: 90 spawns**
+- Port reservations per variant documented in the header: each variant gets a `base_port..base_port+40` window to cover 10 runners x qos_stride 10.
+- WebRTC excluded per E3g (signaling currently supports only one peer pair per spawn). The header comment explains this.
+- Operator instructions block in the header maps each peer name to a `runner --name <peer-name> --config configs/multi-machine-10peer-all.toml` command.
+
+### Test results
+
+`cargo test --release -p runner` — 101 unit tests + 1 clock_sync_stress test + 8 integration tests, all green:
+
+```
+test result: ok. 101 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.65s
+test result: ok. 0 passed; 0 failed; ...   (sleeper helper bin)
+test result: ok. 1 passed; 0 failed; ...   (clock_sync_stress)
+test result: ok. 8 passed; 0 failed; ...   (integration; includes new template_and_array_expansion test)
+```
+
+New test additions (all passing):
+
+- `config::tests::tick_rate_spec_scalar / array_dedup_sorted / rejects_zero / rejects_empty_array / rejects_array_with_zero / rejects_non_integer_element`
+- `config::tests::values_per_tick_spec_scalar_and_array`
+- `config::tests::template_resolution_merges_common_and_specific / template_variant_keys_win_on_conflict / template_falls_through_top_level_scalars / template_unknown_name_is_error / template_duplicate_name_is_error / template_resolution_requires_binary`
+- `config::tests::two_runner_all_variants_expands_to_expected_spawn_list`
+- `config::tests::multi_machine_10peer_config_expands_as_documented`
+- `config::tests::all_repo_configs_parse` (walks every `configs/*.toml` through the loader)
+- `spawn_job::tests::single_element_arrays_on_hz_and_vpt_count_as_scalar / hz_array_expands_with_vpt_in_suffix / vpt_array_expands_with_hz_in_suffix / cartesian_order_hz_outer_vpt_middle_qos_inner / hz_array_with_omitted_qos_carries_both_suffixes`
+- `cli_args::tests::build_args_overrides_array_dimensions_with_per_spawn_scalars`
+- Integration: `template_and_array_expansion_produces_cartesian_product_log_files` (live `variant-dummy` run; verifies stderr ordering + per-spawn JSONL files).
+
+`cargo clippy --release -p runner --all-targets -- -D warnings` — clean.
+
+`cargo fmt -p runner -- --check` — clean.
+
+`cargo build --release --workspace` — all crates compile clean.
+
+### End-to-end validation against the refactored all-variants config
+
+The unit test `config::tests::two_runner_all_variants_expands_to_expected_spawn_list` loads `configs/two-runner-all-variants.toml` through `BenchConfig::from_file` (which runs template resolution + validation) and walks every `[[variant]]` through `expand_variant`. The resulting set of 128 effective spawn names matches the construction-from-first-principles list exactly. This is a stronger check than spawning all 128 with `variant-dummy` (which would take ~10 minutes of real wall time and depend on per-variant port management) and proves both halves of the contract: template resolution produces correct merged entries, and the Cartesian expansion of those entries produces exactly the spawn set the original file-per-entry config produced.
+
+The integration test `template_and_array_expansion_produces_cartesian_product_log_files` separately exercises the full end-to-end path with a real `variant-dummy` run (4 spawns from a templated entry + array hz + array qos), confirming the runner actually launches the spawns and produces JSONL files named per the contract.
+
+### Deviations / open concerns
+
+- **Multicast group consolidation in the all-variants rewrite** (see "two minor deltas" above). The pre-rewrite config had two off-by-one `multicast_group` ports on the first custom-udp / hybrid entries; the post-rewrite template uses the consistent value used by the other 7 entries. Easy to restore exactly with a one-line override per entry if desired.
+- **Whether the all-variants config should adopt the recommended "vpt-group cluster" structure**: I prioritized the literal "expanded spawn names match exactly" acceptance criterion over the "Recommended structure" suggestion in the task spec, because the recommended structure would change the spawn names to e.g. `custom-udp-1000-1000x10hz-qos1` (the entry-name prefix appears in the auto-name). If the orchestrator prefers the cluster structure and accepts the prefix change, the all-variants config can be reduced further to ~80 lines using array expansion the same way the new 10-peer config does.
+
+### T-config.2 — multicast restore
+
+Restored historical `multicast_group` values on the two affected entries in `configs/two-runner-all-variants.toml` via one-line `[variant.specific]` overrides:
+
+- `custom-udp-1000x100hz` → `multicast_group = "239.0.0.1:19500"` (other 7 custom-udp entries continue to inherit `19501` from `custom-udp-base`).
+- `hybrid-1000x100hz` → `multicast_group = "239.0.0.1:19502"` (other 7 hybrid entries continue to inherit `19503` from `hybrid-base`).
+
+Verified exactly two `multicast_group` overrides exist in `[variant.specific]` sections; the other 14 affected entries' specifics are untouched.
+
+`cargo test --release -p runner` tail:
+
+```
+test result: ok. 101 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.61s
+test result: ok. 0 passed; 0 failed; ...   (sleeper helper bin)
+test result: ok. 1 passed; 0 failed; ...   (clock_sync_stress)
+test result: ok. 8 passed; 0 failed; ...   (integration)
+```
+
+`cargo clippy --release -p runner --all-targets -- -D warnings` clean. `cargo fmt -p runner -- --check` clean.

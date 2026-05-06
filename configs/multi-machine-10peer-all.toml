@@ -1,0 +1,222 @@
+# 10-peer benchmark across 4 machines.
+#
+# Layout (peer name -> host):
+#   winA-1, winA-2, winA-3            -> Windows PC A (3 peer processes)
+#   winB-1, winB-2, winB-3, winB-4    -> Windows PC B (4 peer processes)
+#   rpi-1                             -> Raspberry Pi  (1 peer process)
+#   mac-1, mac-2                      -> Old Mac       (2 peer processes)
+#
+# Operator instructions: launch one runner process per peer name, on the
+# correct machine, all pointing at this same config file:
+#
+#   target/release/runner --name winA-1 --config configs/multi-machine-10peer-all.toml
+#   target/release/runner --name winA-2 --config configs/multi-machine-10peer-all.toml
+#   target/release/runner --name winA-3 --config configs/multi-machine-10peer-all.toml
+#   target/release/runner --name winB-1 --config configs/multi-machine-10peer-all.toml
+#   target/release/runner --name winB-2 --config configs/multi-machine-10peer-all.toml
+#   target/release/runner --name winB-3 --config configs/multi-machine-10peer-all.toml
+#   target/release/runner --name winB-4 --config configs/multi-machine-10peer-all.toml
+#   target/release/runner --name rpi-1  --config configs/multi-machine-10peer-all.toml
+#   target/release/runner --name mac-1  --config configs/multi-machine-10peer-all.toml
+#   target/release/runner --name mac-2  --config configs/multi-machine-10peer-all.toml
+#
+# Multiple peers on the same machine = multiple `runner` processes with
+# different `--name` values. They share one host's clock and network stack;
+# the runner's same-host detection collapses cross-process peers to
+# 127.0.0.1 in the --peers map automatically.
+#
+# Variants covered: custom-udp, hybrid, quic, zenoh, websocket. Each is
+# swept across `tick_rate_hz = [10, 100]` x `values_per_tick = [10, 100]`
+# (4 hz/vpt combos) plus a single `max-throughput` spawn. qos is omitted
+# for the reliable-or-unreliable variants (custom-udp, hybrid, quic, zenoh)
+# so each entry expands to 4 spawns x 4 qos = 16 + 4 = 20 spawns per
+# family. websocket only supports reliable QoS levels [3, 4] so its
+# entries pin qos = [3, 4]; that family contributes 4 hz/vpt combos x 2
+# qos + 1 max x 2 qos = 10 spawns. Grand total = 4 * 20 + 10 = 90 spawns.
+#
+# WebRTC is intentionally EXCLUDED. WebRTC's signaling design supports
+# only one peer pair per spawn (E3g), so a 10-peer fan-out is not yet
+# implementable for that variant. Re-enabling it for N>2 peers is
+# tracked separately and out of scope for this config.
+#
+# Port reservations per variant. With 10 runners and qos_stride = 10, the
+# reserved port window per variant is `base_port .. base_port + 40`
+# (10 runners x stride 1 = 10, plus 4 qos x stride 10 = 40 total).
+#
+#   custom-udp: tcp_base_port  19800 (window 19800..19840)
+#               multicast_group  239.0.0.10:19501
+#   hybrid:     tcp_base_port  19900 (window 19900..19940)
+#               multicast_group  239.0.0.10:19503
+#   quic:       base_port      19960 (window 19960..20000)
+#   zenoh:      no fixed bind ports (uses Zenoh peer discovery)
+#   websocket:  ws_base_port   20020 (window 20020..20060)
+#
+# Conservative durations: stabilize 5s, operate 30s, silent 5s. The Pi and
+# old Mac need extra slack at startup; default_timeout_secs = 180 leaves
+# headroom over the 40s lifecycle. Inter-spawn grace stays at the
+# protocol default (250 ms) and applies between every consecutive pair of
+# spawns derived from one source entry.
+
+run = "multi-10peer-01"
+runners = [
+  "winA-1", "winA-2", "winA-3",
+  "winB-1", "winB-2", "winB-3", "winB-4",
+  "rpi-1",
+  "mac-1", "mac-2",
+]
+default_timeout_secs = 180
+
+
+# ─── Custom UDP ──────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "custom-udp-base"
+binary = "target/release/variant-custom-udp.exe"
+  [variant_template.common]
+  stabilize_secs = 5
+  operate_secs = 30
+  silent_secs = 5
+  workload = "scalar-flood"
+  log_dir = "./logs"
+  [variant_template.specific]
+  multicast_group = "239.0.0.10:19501"
+  buffer_size = 65536
+  tcp_base_port = 19800
+
+[[variant]]
+template = "custom-udp-base"
+name = "custom-udp"
+  [variant.common]
+  tick_rate_hz = [10, 100]
+  values_per_tick = [10, 100]
+
+[[variant]]
+template = "custom-udp-base"
+name = "custom-udp-max"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "max-throughput"
+
+
+# ─── Hybrid UDP/TCP ──────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "hybrid-base"
+binary = "target/release/variant-hybrid.exe"
+  [variant_template.common]
+  stabilize_secs = 5
+  operate_secs = 30
+  silent_secs = 5
+  workload = "scalar-flood"
+  log_dir = "./logs"
+  [variant_template.specific]
+  multicast_group = "239.0.0.10:19503"
+  tcp_base_port = 19900
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid"
+  [variant.common]
+  tick_rate_hz = [10, 100]
+  values_per_tick = [10, 100]
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-max"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "max-throughput"
+
+
+# ─── QUIC ────────────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "quic-base"
+binary = "target/release/variant-quic.exe"
+  [variant_template.common]
+  stabilize_secs = 5
+  operate_secs = 30
+  silent_secs = 5
+  workload = "scalar-flood"
+  log_dir = "./logs"
+  [variant_template.specific]
+  base_port = 19960
+
+[[variant]]
+template = "quic-base"
+name = "quic"
+  [variant.common]
+  tick_rate_hz = [10, 100]
+  values_per_tick = [10, 100]
+
+[[variant]]
+template = "quic-base"
+name = "quic-max"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "max-throughput"
+
+
+# ─── Zenoh ───────────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "zenoh-base"
+binary = "target/release/variant-zenoh.exe"
+  [variant_template.common]
+  stabilize_secs = 5
+  operate_secs = 30
+  silent_secs = 5
+  workload = "scalar-flood"
+  log_dir = "./logs"
+  [variant_template.specific]
+  zenoh_mode = "peer"
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh"
+  [variant.common]
+  tick_rate_hz = [10, 100]
+  values_per_tick = [10, 100]
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-max"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "max-throughput"
+
+
+# ─── WebSocket (reliable QoS only) ───────────────────────────────────────────
+
+[[variant_template]]
+name = "websocket-base"
+binary = "target/release/variant-websocket.exe"
+  [variant_template.common]
+  stabilize_secs = 5
+  operate_secs = 30
+  silent_secs = 5
+  workload = "scalar-flood"
+  log_dir = "./logs"
+  [variant_template.specific]
+  ws_base_port = 20020
+
+[[variant]]
+template = "websocket-base"
+name = "websocket"
+  [variant.common]
+  tick_rate_hz = [10, 100]
+  values_per_tick = [10, 100]
+  qos = [3, 4]
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-max"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "max-throughput"
+  qos = [3, 4]

@@ -472,6 +472,8 @@ binary = "{sleeper_escaped}"
 timeout_secs = 3
 
   [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
 
   [variant.specific]
 "#
@@ -506,4 +508,101 @@ timeout_secs = 3
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn template_and_array_expansion_produces_cartesian_product_log_files() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-logs-template-and-arrays");
+    let _ = std::fs::remove_dir_all(&log_dir);
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg("tests/fixtures/template-and-arrays.toml")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}");
+    eprintln!("--- stderr ---\n{stderr}");
+
+    assert!(
+        output.status.success(),
+        "runner should exit 0, got {:?}\nstderr: {stderr}",
+        output.status.code()
+    );
+
+    // Cartesian product: 2 hz x 1 vpt x 2 qos = 4 spawns. Each spawn name
+    // includes both the vpt/hz suffix and the qos suffix.
+    let expected_names = [
+        "dummy-2x10hz-qos1",
+        "dummy-2x10hz-qos2",
+        "dummy-2x20hz-qos1",
+        "dummy-2x20hz-qos2",
+    ];
+    for name in &expected_names {
+        assert!(
+            stdout.contains(name),
+            "summary should contain {name}, got:\n{stdout}"
+        );
+    }
+
+    // Spawn ordering in stderr ("ready barrier for spawn ...") must follow
+    // the documented stable order: hz outer, vpt middle, qos inner.
+    let positions: Vec<usize> = expected_names
+        .iter()
+        .map(|n| {
+            stderr
+                .find(&format!("ready barrier for spawn '{n}'"))
+                .unwrap_or_else(|| panic!("missing ready barrier for {n}"))
+        })
+        .collect();
+    for w in positions.windows(2) {
+        assert!(
+            w[0] < w[1],
+            "expected spawn order {expected_names:?}, but got positions {positions:?} in stderr"
+        );
+    }
+
+    // Verify per-spawn JSONL files were emitted.
+    assert!(log_dir.exists(), "log dir should exist");
+    let subdirs: Vec<_> = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert_eq!(
+        subdirs.len(),
+        1,
+        "expected exactly one timestamped subfolder"
+    );
+
+    let jsonl_files: Vec<String> = std::fs::read_dir(subdirs[0].path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    assert_eq!(
+        jsonl_files.len(),
+        expected_names.len(),
+        "expected one JSONL file per spawn, got {jsonl_files:?}"
+    );
+    for name in &expected_names {
+        assert!(
+            jsonl_files.iter().any(|f| f.contains(name)),
+            "expected file containing {name}, got {jsonl_files:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&log_dir);
 }

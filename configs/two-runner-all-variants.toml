@@ -1,630 +1,464 @@
-# Comprehensive benchmark: all variants, all workload modes.
-#
-# 16 variants executed sequentially. Each runs for 30s operate
-# with 3s stabilize and 3s silent drain. Total runtime: ~10 minutes.
+﻿# Comprehensive benchmark: every variant family, every (vpt, hz) sweep, every
+# QoS level. Two runners on a LAN. Total spawn count = 48 [[variant]] entries
+# expanded across QoS levels = 176 spawns (custom-udp 32 + hybrid 32 +
+# quic 32 + zenoh 32 + websocket 16 + webrtc 32; websocket only contributes
+# 8x2 because it supports only reliable QoS [3, 4]). Each runs the full
+# stabilize/operate/silent cycle independently. Total runtime: ~10-15 minutes.
 #
 # Run from the repo root with two terminals:
 #   target/release/runner --name alice --config configs/two-runner-all-variants.toml
 #   target/release/runner --name bob   --config configs/two-runner-all-variants.toml
+#
+# Structure: each variant binary has a [[variant_template]] capturing the
+# shared common + specific defaults (binary, multicast/port settings,
+# workload, stabilize/operate/silent durations, log_dir). Each [[variant]]
+# entry then only declares its differing fields (tick_rate_hz, values_per_tick,
+# and -- for max-throughput entries -- the workload override). qos is
+# omitted from every entry, so the runner expands each entry into 4 spawn
+# jobs (qos 1..=4) per the contract.
+#
+# Per-runner / per-qos port disambiguation is handled by the variants
+# themselves (see metak-shared/api-contracts/toml-config-schema.md "Port
+# stride and QoS expansion"). With 2 runners and qos_stride = 10, each
+# variant's `base_port` reserves ports `base_port .. base_port + 30`.
 
 run = "all-variants-01"
 runners = ["alice", "bob"]
 default_timeout_secs = 120
 
-# ─── Custom UDP ── 1000 vps at 100 Hz ────────────────────────────────────
+
+# ─── Custom UDP ──────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "custom-udp-base"
+binary = "target/release/variant-custom-udp.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  log_dir = "./logs"
+  [variant_template.specific]
+  multicast_group = "239.0.0.1:19501"
+  buffer_size = 65536
+  tcp_base_port = 19800
 
 [[variant]]
+template = "custom-udp-base"
 name = "custom-udp-1000x100hz"
-binary = "target/release/variant-custom-udp.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 1000
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19500"
-  buffer_size = 65536
-  tcp_base_port = 19800
-
-# ─── Custom UDP ── 1000 vps @ 10 hz ────────────────────────────────────────────
 
 [[variant]]
+template = "custom-udp-base"
 name = "custom-udp-1000x10hz"
-binary = "target/release/variant-custom-udp.exe"
-
   [variant.common]
   tick_rate_hz = 10
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 1000
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19501"
-  buffer_size = 65536
-  tcp_base_port = 19800
-
-# ─── Custom UDP ── 100 vps @ 1000 hz ────────────────────────────────────────────
 
 [[variant]]
+template = "custom-udp-base"
 name = "custom-udp-100x1000hz"
-binary = "target/release/variant-custom-udp.exe"
-
   [variant.common]
   tick_rate_hz = 1000
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19501"
-  buffer_size = 65536
-  tcp_base_port = 19800
-
-# ─── Custom UDP ── 100 vps @ 100 hz ────────────────────────────────────────────
 
 [[variant]]
+template = "custom-udp-base"
 name = "custom-udp-100x100hz"
-binary = "target/release/variant-custom-udp.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19501"
-  buffer_size = 65536
-  tcp_base_port = 19800
-
-# ─── Custom UDP ── 100 vps @ 10 hz ────────────────────────────────────────────
 
 [[variant]]
+template = "custom-udp-base"
 name = "custom-udp-100x10hz"
-binary = "target/release/variant-custom-udp.exe"
-
   [variant.common]
   tick_rate_hz = 10
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19501"
-  buffer_size = 65536
-  tcp_base_port = 19800
-
-# ─── Custom UDP ── 10 vps @ 100 hz ────────────────────────────────────────────
 
 [[variant]]
+template = "custom-udp-base"
 name = "custom-udp-10x100hz"
-binary = "target/release/variant-custom-udp.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 10
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19501"
-  buffer_size = 65536
-  tcp_base_port = 19800
-
-# ─── Custom UDP ── 10 vps @ 1000 hz ────────────────────────────────────────────
 
 [[variant]]
+template = "custom-udp-base"
 name = "custom-udp-10x1000hz"
-binary = "target/release/variant-custom-udp.exe"
-
   [variant.common]
   tick_rate_hz = 1000
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 10
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19501"
-  buffer_size = 65536
-  tcp_base_port = 19800
-
-# ─── Custom UDP ── max-throughput ────────────────────────────────────────────
 
 [[variant]]
+template = "custom-udp-base"
 name = "custom-udp-max"
-binary = "target/release/variant-custom-udp.exe"
-
   [variant.common]
   tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "max-throughput"
+
+
+# ─── Hybrid UDP/TCP ──────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "hybrid-base"
+binary = "target/release/variant-hybrid.exe"
+  [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
   silent_secs = 3
-  workload = "max-throughput"
-  values_per_tick = 1000
+  workload = "scalar-flood"
   log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19501"
-  buffer_size = 65536
-  tcp_base_port = 19800
-
-
-##############################################################################
-# ─── Hybrid UDP/TCP ── scalar-flood at 100 Hz ───────────────────────────────
-#
-# QoS expansion: with `qos` omitted, the runner spawns one full lifecycle per
-# QoS level (1..=4). Per-runner / per-qos TCP ports are derived by the variant
-# from --tcp-base-port + --runner index in --peers + --qos (stride 1 per
-# runner, 10 per qos level). UDP multicast uses --multicast-group directly
-# with no stride (sequential per-spawn execution + silent_secs drain +
-# inter_qos_grace_ms provide cross-spawn isolation).
+  [variant_template.specific]
+  multicast_group = "239.0.0.1:19503"
+  tcp_base_port = 19900
 
 [[variant]]
+template = "hybrid-base"
 name = "hybrid-1000x100hz"
-binary = "target/release/variant-hybrid.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 1000
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19502"
-  tcp_base_port = 19900
-
-# ─── Hybrid UDP/TCP ── 1000 vps @ 10 hz ──────────────────────────────────────
 
 [[variant]]
+template = "hybrid-base"
 name = "hybrid-1000x10hz"
-binary = "target/release/variant-hybrid.exe"
-
   [variant.common]
   tick_rate_hz = 10
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 1000
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19900
-
-# ─── Hybrid UDP/TCP ── 100 vps @ 1000 hz ───────────────────────────────────────
 
 [[variant]]
+template = "hybrid-base"
 name = "hybrid-100x1000hz"
-binary = "target/release/variant-hybrid.exe"
-
   [variant.common]
   tick_rate_hz = 1000
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19900
-
-# ─── Hybrid UDP/TCP ── 100 vps @ 100 hz ───────────────────────────────────────
 
 [[variant]]
+template = "hybrid-base"
 name = "hybrid-100x100hz"
-binary = "target/release/variant-hybrid.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19900
-
-# ─── Hybrid UDP/TCP ── 100 vps @ 10 hz ───────────────────────────────────────
 
 [[variant]]
+template = "hybrid-base"
 name = "hybrid-100x10hz"
-binary = "target/release/variant-hybrid.exe"
-
   [variant.common]
   tick_rate_hz = 10
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19900
-
-# ─── Hybrid UDP/TCP ── 10 vps @ 100 hz ───────────────────────────────────────
 
 [[variant]]
+template = "hybrid-base"
 name = "hybrid-10x100hz"
-binary = "target/release/variant-hybrid.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 10
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19900
-
-# ─── Hybrid UDP/TCP ── 10 vps @ 1000 hz ───────────────────────────────────────
 
 [[variant]]
+template = "hybrid-base"
 name = "hybrid-10x1000hz"
-binary = "target/release/variant-hybrid.exe"
-
   [variant.common]
   tick_rate_hz = 1000
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 10
-  log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19900
-
-# ─── Hybrid UDP/TCP ── max-throughput ────────────────────────────────────────
 
 [[variant]]
+template = "hybrid-base"
 name = "hybrid-max"
-binary = "target/release/variant-hybrid.exe"
-
   [variant.common]
   tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "max-throughput"
+
+
+# ─── QUIC ────────────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "quic-base"
+binary = "target/release/variant-quic.exe"
+  [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
   silent_secs = 3
-  workload = "max-throughput"
-  values_per_tick = 1000
+  workload = "scalar-flood"
   log_dir = "./logs"
-
-  [variant.specific]
-  multicast_group = "239.0.0.1:19503"
-  tcp_base_port = 19900
-
-
-##############################################################################
-# ─── QUIC ── 1000 vps @ 100 hz ────────────────────────────────────────────────
-#
-# QoS expansion: with `qos` omitted, the runner spawns one full lifecycle per
-# QoS level (1..=4). Per-runner / per-qos ports are derived by the variant
-# from --base-port + --runner index in --peers + --qos (stride 1 per runner,
-# 10 per qos level).
+  [variant_template.specific]
+  base_port = 19930
 
 [[variant]]
+template = "quic-base"
 name = "quic-1000x100hz"
-binary = "target/release/variant-quic.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 1000
-  log_dir = "./logs"
-
-  [variant.specific]
-  base_port = 19930
-
-# ─── QUIC ── 1000 vps @ 10 hz ────────────────────────────────────────────────
 
 [[variant]]
+template = "quic-base"
 name = "quic-1000x10hz"
-binary = "target/release/variant-quic.exe"
-
   [variant.common]
   tick_rate_hz = 10
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 1000
-  log_dir = "./logs"
-
-  [variant.specific]
-  base_port = 19930
-
-
-# ─── QUIC ── 100 vps @ 10 hz ────────────────────────────────────────────────
 
 [[variant]]
+template = "quic-base"
 name = "quic-100x10hz"
-binary = "target/release/variant-quic.exe"
-
   [variant.common]
   tick_rate_hz = 10
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  base_port = 19930
-
-# ─── QUIC ── 100 vps @ 100 hz ────────────────────────────────────────────────
 
 [[variant]]
+template = "quic-base"
 name = "quic-100x100hz"
-binary = "target/release/variant-quic.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  base_port = 19930
-
-# ─── QUIC ── 100 vps @ 1000 hz ────────────────────────────────────────────────
 
 [[variant]]
+template = "quic-base"
 name = "quic-100x1000hz"
-binary = "target/release/variant-quic.exe"
-
   [variant.common]
   tick_rate_hz = 1000
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  base_port = 19930
-
-# ─── QUIC ── 10 vps @ 100 hz ─────────────────────────────────────────────────
 
 [[variant]]
+template = "quic-base"
 name = "quic-10x100hz"
-binary = "target/release/variant-quic.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 10
-  log_dir = "./logs"
-
-  [variant.specific]
-  base_port = 19930
-
-# ─── QUIC ── 10 vps @ 1000 hz ─────────────────────────────────────────────────
 
 [[variant]]
+template = "quic-base"
 name = "quic-10x1000hz"
-binary = "target/release/variant-quic.exe"
-
   [variant.common]
   tick_rate_hz = 1000
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 10
-  log_dir = "./logs"
-
-  [variant.specific]
-  base_port = 19930
-
-# ─── QUIC ── max-throughput ──────────────────────────────────────────────────
 
 [[variant]]
+template = "quic-base"
 name = "quic-max"
-binary = "target/release/variant-quic.exe"
-
   [variant.common]
   tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "max-throughput"
+
+
+# ─── Zenoh ───────────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "zenoh-base"
+binary = "target/release/variant-zenoh.exe"
+  [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
   silent_secs = 3
-  workload = "max-throughput"
-  values_per_tick = 1000
+  workload = "scalar-flood"
   log_dir = "./logs"
-
-  [variant.specific]
-  base_port = 19930
-
-# ─── Zenoh ── 1000 vps @ 100 Hz ────────────────────────────────────────
+  [variant_template.specific]
+  zenoh_mode = "peer"
 
 [[variant]]
+template = "zenoh-base"
 name = "zenoh-1000x100hz"
-binary = "target/release/variant-zenoh.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 1000
-  log_dir = "./logs"
-
-  [variant.specific]
-  zenoh_mode = "peer"
-
-
-# ─── Zenoh ── 1000 vps @ 10 hz ───────────────────────────────────────────────
 
 [[variant]]
+template = "zenoh-base"
 name = "zenoh-1000x10hz"
-binary = "target/release/variant-zenoh.exe"
-
   [variant.common]
   tick_rate_hz = 10
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 1000
-  log_dir = "./logs"
-
-  [variant.specific]
-  zenoh_mode = "peer"
-
-# ─── Zenoh ── 100 vps @ 1000 hz ────────────────────────────────────────────────
 
 [[variant]]
+template = "zenoh-base"
 name = "zenoh-100x1000hz"
-binary = "target/release/variant-zenoh.exe"
-
   [variant.common]
   tick_rate_hz = 1000
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  zenoh_mode = "peer"
-
-# ─── Zenoh ── 100 vps @ 100 hz ────────────────────────────────────────────────
 
 [[variant]]
+template = "zenoh-base"
 name = "zenoh-100x100hz"
-binary = "target/release/variant-zenoh.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  zenoh_mode = "peer"
-
-# ─── Zenoh ── 100 vps @ 10 hz ────────────────────────────────────────────────
 
 [[variant]]
+template = "zenoh-base"
 name = "zenoh-100x10hz"
-binary = "target/release/variant-zenoh.exe"
-
   [variant.common]
   tick_rate_hz = 10
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 100
-  log_dir = "./logs"
-
-  [variant.specific]
-  zenoh_mode = "peer"
-
-# ─── Zenoh ── 10 vps @ 100 hz ────────────────────────────────────────────────
 
 [[variant]]
+template = "zenoh-base"
 name = "zenoh-10x100hz"
-binary = "target/release/variant-zenoh.exe"
-
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 3
-  operate_secs = 30
-  silent_secs = 3
-  workload = "scalar-flood"
   values_per_tick = 10
-  log_dir = "./logs"
-
-  [variant.specific]
-  zenoh_mode = "peer"
-
-# ─── Zenoh ── 10 vps @ 1000 hz ────────────────────────────────────────────────
 
 [[variant]]
+template = "zenoh-base"
 name = "zenoh-10x1000hz"
-binary = "target/release/variant-zenoh.exe"
-
   [variant.common]
   tick_rate_hz = 1000
+  values_per_tick = 10
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-max"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "max-throughput"
+
+
+# ─── WebSocket ───────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "websocket-base"
+binary = "target/release/variant-websocket.exe"
+  [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
   silent_secs = 3
   workload = "scalar-flood"
-  values_per_tick = 10
   log_dir = "./logs"
-
-  [variant.specific]
-  zenoh_mode = "peer"
-
-# ─── Zenoh ── max-throughput ─────────────────────────────────────────────────
+  qos = [3, 4]
+  [variant_template.specific]
+  ws_base_port = 19960
 
 [[variant]]
-name = "zenoh-max"
-binary = "target/release/variant-zenoh.exe"
-
+template = "websocket-base"
+name = "websocket-1000x100hz"
   [variant.common]
   tick_rate_hz = 100
+  values_per_tick = 1000
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-1000x10hz"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-100x1000hz"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-100x100hz"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-100x10hz"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 100
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-10x100hz"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 10
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-10x1000hz"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-max"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "max-throughput"
+
+
+# ─── WebRTC ──────────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "webrtc-base"
+binary = "target/release/variant-webrtc.exe"
+  [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
   silent_secs = 3
-  workload = "max-throughput"
-  values_per_tick = 1000
+  workload = "scalar-flood"
   log_dir = "./logs"
+  [variant_template.specific]
+  signaling_base_port = 19980
+  media_base_port = 20000
 
-  [variant.specific]
-  zenoh_mode = "peer"
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x100hz"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x10hz"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-100x1000hz"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-100x100hz"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-100x10hz"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 100
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-10x100hz"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 10
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-10x1000hz"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-max"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "max-throughput"

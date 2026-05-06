@@ -284,17 +284,20 @@ fn main() -> Result<()> {
     let mut summary: Vec<SummaryRow> = Vec::new();
 
     // Execute each variant in config order. Each [[variant]] expands into
-    // one or more spawn jobs (one per concrete QoS level). Jobs from one
-    // entry run sequentially in ascending QoS order, with a small inter-job
-    // grace period to let TCP/UDP sockets release before the next spawn.
+    // one or more spawn jobs across the Cartesian product of its
+    // tick_rate_hz, values_per_tick, and qos dimensions. Jobs from one
+    // entry run sequentially in stable ascending order (hz outer, vpt
+    // middle, qos inner), with a small inter-spawn grace period between
+    // every consecutive pair to let TCP/UDP sockets release before the
+    // next spawn binds the same port.
     for (idx, variant) in bench_config.variant.iter().enumerate() {
         let timeout_secs = variant.effective_timeout(bench_config.default_timeout_secs);
         let jobs = spawn_job::expand_variant(idx, variant)?;
 
         for (job_idx, job) in jobs.iter().enumerate() {
             eprintln!(
-                "[runner:{}] ready barrier for spawn '{}' (qos={})",
-                cli.name, job.effective_name, job.qos
+                "[runner:{}] ready barrier for spawn '{}' (hz={}, vpt={}, qos={})",
+                cli.name, job.effective_name, job.tick_rate_hz, job.values_per_tick, job.qos
             );
             coordinator.ready_barrier(&job.effective_name)?;
 
@@ -356,12 +359,19 @@ fn main() -> Result<()> {
                 log_dir_resolved.as_deref(),
                 &job.effective_name,
                 job.qos,
+                job.tick_rate_hz,
+                job.values_per_tick,
                 &peer_hosts,
             );
 
             eprintln!(
-                "[runner:{}] spawning '{}' (qos={}, timeout: {}s)",
-                cli.name, job.effective_name, job.qos, timeout_secs
+                "[runner:{}] spawning '{}' (hz={}, vpt={}, qos={}, timeout: {}s)",
+                cli.name,
+                job.effective_name,
+                job.tick_rate_hz,
+                job.values_per_tick,
+                job.qos,
+                timeout_secs
             );
 
             let outcome = spawn::spawn_and_monitor(
@@ -390,9 +400,11 @@ fn main() -> Result<()> {
                 });
             }
 
-            // Inter-job grace period: skip after the last job in this entry
-            // (the next entry's ready barrier already provides a natural
-            // boundary). Only sleep if there is another job ahead.
+            // Inter-spawn grace period: applied between every consecutive
+            // pair of spawns from the same source entry (across all
+            // expanded dimensions, not just QoS). Skipped after the last
+            // job in this entry -- the next entry's ready barrier already
+            // provides a natural boundary.
             let more_jobs_in_entry = job_idx + 1 < jobs.len();
             if more_jobs_in_entry && !inter_qos_grace.is_zero() {
                 std::thread::sleep(inter_qos_grace);

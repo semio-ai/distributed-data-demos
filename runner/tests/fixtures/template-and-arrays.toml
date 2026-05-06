@@ -1,0 +1,22 @@
+run = "tplarr"
+runners = ["local"]
+default_timeout_secs = 30
+
+[[variant_template]]
+name = "dummy-base"
+binary = "../target/release/variant-dummy.exe"
+  [variant_template.common]
+  stabilize_secs = 0
+  operate_secs = 1
+  silent_secs = 0
+  workload = "scalar-flood"
+  log_dir = "./test-logs-template-and-arrays"
+  [variant_template.specific]
+
+[[variant]]
+template = "dummy-base"
+name = "dummy"
+  [variant.common]
+  tick_rate_hz = [10, 20]
+  values_per_tick = 2
+  qos = [1, 2]

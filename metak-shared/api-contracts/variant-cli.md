@@ -37,7 +37,7 @@ These are added by the runner itself, not from the config file:
 | Argument | Type | Description |
 |----------|------|-------------|
 | `--launch-ts` | RFC 3339 timestamp | Wall-clock time recorded by the runner immediately before spawn. Used by the variant to compute connection time. |
-| `--variant` | string | The variant name from config (e.g. `zenoh-replication`). May include a `-qosN` suffix when the runner expands a `qos`-omitted entry into per-QoS runs (see TOML config schema). Used in log entries. |
+| `--variant` | string | The effective spawn name from the runner. Equals the `[[variant]].name` (post-template-resolution) when the entry expands to a single spawn. May carry suffixes when the entry expands across multiple dimensions: `-<vpt>x<hz>hz` when `values_per_tick` or `tick_rate_hz` was an array, and/or `-qos<N>` when `qos` was an array or omitted. See TOML config schema "Array Expansion". Used in log entries. |
 | `--runner` | string | The runner's name (e.g. `a`). Used in log entries. |
 | `--run` | string | The run identifier from config (e.g. `run01`). Used in log entries. |
 | `--peers` | string | Comma-separated `name=host` pairs for ALL runners in the config (including this one), e.g. `alice=192.168.1.10,bob=192.168.1.11`. Hosts are derived by the runner during discovery (Phase 1, see `runner-coordination.md`). For same-host peers the value is `127.0.0.1`. Variants that need explicit peer addresses (e.g. QUIC) use this; variants that do their own discovery (Zenoh, mDNS-based variants) may ignore it. |
