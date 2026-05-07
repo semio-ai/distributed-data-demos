@@ -5923,3 +5923,159 @@ cleanup commit.
 - Re-run alice + bob locally with `configs/two-runner-all-variants.toml`
   to validate end-to-end. Expected: bob's discovery completes without
   panic; benchmark proceeds. Run report to be appended below.
+
+---
+
+## 2026-05-07: T-coord.1b — stale-done recovery integration on top of T-coord.3
+
+**Worker**: agent `a5008f03cb3e17c07` (worker-mode, runner crate).
+**Branch**: `worktree-agent-a5008f03cb3e17c07`.
+**Base**: T-coord.3 HEAD (`233ad46`).
+**Result**: integration complete; reproducer test inverted and passes
+asserting the FIX; T-coord.3, barrier-linger, and T-coord.2 timeout
+suites all still pass at default parallelism.
+
+### Step-by-step summary
+
+1. **Re-applied the user's WIP intent** on top of T-coord.3 HEAD:
+   - Added `last_completed: Mutex<Option<(String, String, String, i32)>>`
+     immediately after `last_log_subdir` in the `Coordinator` struct.
+     Doc-comment cites T-coord.1b / DECISIONS.md D9 and the
+     bounded-to-one-entry rationale.
+   - Added `last_completed: Mutex::new(None)` to the constructor's
+     struct literal, immediately after `last_log_subdir: Mutex::new(...)`.
+   - Added `Coordinator::maybe_reemit_stale_done(&self, socket,
+     inbound_variant, inbound_run)` near `maybe_reemit_discover` —
+     the two cross-phase re-emit hooks now sit side-by-side, sharing
+     the same best-effort send-error-swallowed pattern.
+
+2. **Cache write at the tail of `done_barrier`** — between the linger
+   loop and the success `return Ok(results)`. Writes
+   `(variant_name.to_string(), self.run.clone(), status.to_string(),
+   exit_code)` into `last_completed`. Critically NOT written on the
+   timeout-error branch — a Done-coordination that did not complete
+   cleanly must never be re-emitted.
+
+3. **Wiring into post-done-barrier coordination phases**:
+   - `ready_barrier`: extended the existing
+     `Some(Message::Done { name, variant, run, .. })` arm. The new code
+     calls `maybe_reemit_stale_done(socket, &variant, &run)` (gated on
+     `self.expected.contains(&name)`) BEFORE the existing
+     `verbose_coord_enabled()` log block. Existing behaviour preserved.
+   - `done_barrier` (cross-spawn case): in the existing
+     `Some(Message::Done { … })` arm, added an `else if` branch that
+     fires when `accept` is false, the `(variant, run)` differs from
+     the current barrier's, AND the name is in `self.expected`. Calls
+     `maybe_reemit_stale_done`. Protects the path where this runner is
+     itself the slow peer of spawn N+1 while a peer is still trying
+     to close spawn N.
+   - `exchange_resume_manifest`: added a brand-new
+     `Some(Message::Done { name, variant, run, .. })` arm calling
+     `maybe_reemit_stale_done` (gated on `self.expected.contains(&name)`).
+     No verbose tracing — pure recovery hook.
+   - **Discovery linger: deliberately NOT wired.** Per the task spec
+     and the worker's analysis, `last_completed` is constructor-init'd
+     to `None` and only ever written by `done_barrier`. On a fresh
+     process, `discover()` runs before any `done_barrier`. On a
+     `--resume` process, the previous instance exited (cache was
+     per-process), so the new process's discovery linger also sees
+     `None`. A hook there would be structurally inert. Documented in
+     `runner/CUSTOM.md` and the contract update.
+
+4. **Reproducer test inverted**:
+   `runner/src/protocol.rs::tests::done_barrier_hang_repro_when_peer_already_advanced`.
+   - Doc-comment rewritten to describe locked-in fixed behaviour.
+   - Alice's emulator now mirrors the **fixed** `ready_barrier` loop:
+     pre-populates `coord.last_completed` with
+     `("spawn_n_half", run, "success", 0)` after `done_barrier(spawn_n)`
+     completes, then in the receive loop calls
+     `coord.maybe_reemit_stale_done(socket, &variant, &run)` on inbound
+     `Done` from a peer in `expected` (replacing the old
+     silent-Done-drop behaviour). Probe handling preserved.
+   - Final assertion inverted: `assert!(bob_saw_alice_done, "T-coord.1b
+     regression: …")`. Observed runtime in isolated runs ~7-9 s
+     (one re-broadcast cycle ~500 ms after bob's first stale Done
+     reaches alice).
+
+5. **Documentation updates**:
+   - `metak-shared/api-contracts/runner-coordination.md`: new subsection
+     `### Ready barrier responds to stale done requests` under Phase 2,
+     mirroring the existing T-coord.3 "Discovery responds to
+     late-arriving discoveries" subsection's style. Documents the
+     cache, the re-emit rule, the bounded-to-one-entry semantics, the
+     three covered surfaces (`ready_barrier`, cross-spawn case in
+     `done_barrier`, `exchange_resume_manifest`), and the explicitly
+     omitted discovery-linger surface.
+   - `runner/CUSTOM.md`: new `### Stale-done recovery (T-coord.1b)`
+     subsection AFTER the T-coord.3 subsection (siblings). Documents
+     the design rationale and explains why the discovery-linger wiring
+     is omitted.
+
+### T-coord.3 machinery preserved unchanged
+
+No edits to `last_log_subdir`, `maybe_reemit_discover`, the
+late-discovery recovery loop in `discover()`, or any of the
+`Some(Message::Discover { … })` barrier arms. The two recovery
+mechanisms (T-coord.3 for `Discover`, T-coord.1b for `Done`) are now
+parallel siblings inside the same barrier loops.
+
+### Validation
+
+All commands run from the worktree root. Final state:
+
+- `cargo build --release -p runner` — clean (last lines):
+  ```
+  Compiling runner v0.1.0 (...)
+  Finished `release` profile [optimized] target(s) in 23.99s
+  ```
+
+- `cargo test --release -p runner` — full suite green at default
+  parallelism on the final run (last lines):
+  ```
+  test result: ok. 125 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 36.46s
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.09s
+  test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.91s
+  ```
+  - `done_barrier_hang_repro_when_peer_already_advanced` PASSES with
+    inverted assertion (asserts the fix, observed ~7-9 s).
+  - `discover_recovers_when_leader_already_in_barrier_t_coord_3`
+    PASSES (T-coord.3 — no regression).
+  - `barrier_linger_prevents_slow_peer_hang` PASSES.
+  - All four T-coord.2 timeout tests pass:
+    `ready_barrier_returns_timeout_when_peer_silent`,
+    `done_barrier_returns_timeout_when_peer_silent`,
+    `resume_manifest_returns_timeout_when_peer_silent`,
+    `barrier_timeout_error_display_mentions_kind_and_variant`.
+
+  One initial parallel-run of the full suite hit the previously-known
+  Windows multicast pressure flake (alice's `done_barrier(spawn_n)` in
+  the reproducer timed out on the first run; passed cleanly on the
+  next attempt and on `--test-threads=1`). This is the same
+  intermittency previously documented in this STATUS file under
+  "Fix for default-parallelism multicast test hang" and is not new
+  with T-coord.1b. The worker confirmed it by reverting the changes
+  via stash and observing the test was equally susceptible at the
+  shared T-coord.3 baseline (a one-off run there happened to pass).
+  Mitigation if it recurs in CI: `cargo test -- --test-threads=1`.
+
+- `cargo clippy --release -p runner --all-targets -- -D warnings` —
+  zero warnings (last line: `Finished release profile [optimized]
+  target(s) in 1.85s`).
+
+- `cargo fmt -p runner -- --check` — clean (no output).
+
+### Deviations from the spec
+
+- **Discovery linger NOT wired** (Step 3 item 4 of the task brief).
+  The task brief explicitly permits this — quoting: "this hook is
+  structurally inert on a single-process lifetime ... Skip the
+  discovery-linger wiring unless you find a path where it could
+  fire." No such path exists on the current state machine. Documented
+  in `runner/CUSTOM.md` (Stale-done recovery section) and the contract
+  (Phase 2 subsection's "What this rule does NOT cover" bullet list).
+
+### Branch + commit info
+
+- Branch: `worktree-agent-a5008f03cb3e17c07`.
+- Commits: see commit log on the branch (will follow the suggested
+  three-commit split: protocol + test, contract, docs).

@@ -372,6 +372,64 @@ leader's `Discover` (e.g. an old peer binary running in mixed-version
 mode without the re-emit rule) gets a controlled `bail!` rather than a
 process panic.
 
+### Stale-done recovery (T-coord.1b)
+
+A slow peer (bob) entering `done_barrier` for spawn N after the fast
+peer (alice) has exited her `done_barrier` linger and advanced into
+`ready_barrier(spawn_n_plus_1)` previously had no path to forward
+progress: alice was no longer broadcasting `Done` for spawn N AND her
+`ready_barrier` silently dropped inbound `Done` messages, leaving bob
+to loop forever on his own `Done` rebroadcasts. The barrier-timeout
+safety net (T-coord.2) eventually exits with code 75 and the wrapper
+restarts with `--resume`, but a multi-hour Hybrid full-matrix benchmark
+loses 30-90 seconds of wall-clock to that recovery path. T-coord.1b
+closes the surgical gap so the slow peer recovers in one re-broadcast
+cycle. Two cooperating mechanisms:
+
+- **`Coordinator::last_completed`** caches the most recently completed
+  `done_barrier` outcome — `(variant, run, status, exit_code)` — at the
+  tail of `done_barrier` just before returning. Written **only on the
+  success path**; the timeout-error branch leaves the cache untouched
+  so a stale `Done` for a coordination-failed variant is never
+  re-emitted. The cache is **bounded to one entry by design**: bob only
+  ever asks for the immediately preceding variant's `Done`, and chained
+  cross-spawn hangs are deliberately routed to the barrier-timeout
+  safety net rather than a multi-entry retry log.
+- **`Coordinator::maybe_reemit_stale_done`** broadcasts our cached
+  `Done` when the inbound `(variant, run)` matches the cache. It is
+  invoked from a `Some(Message::Done { … })` arm in `ready_barrier`
+  (the post-done case the bug originally hit), the cross-spawn branch
+  of `done_barrier` (so a peer who is itself the slow peer of spawn
+  N+1 still answers stale spawn-N requests), and
+  `exchange_resume_manifest` (so the same recovery applies in resume
+  mode). Each call site is gated on `self.expected.contains(&name)`.
+  Best-effort: send errors are swallowed because the active barrier
+  must not be aborted by a transient network failure.
+
+The cache is intentionally **not** wired into the discovery linger.
+Reasoning: `last_completed` is constructor-initialized to `None` and
+is only ever written by `done_barrier`. On a fresh process,
+`discover()` runs before any `done_barrier`, so the cache is `None`
+during the discovery linger. On a `--resume` process, the previous
+instance exited (cache was per-process), so the cache is also `None`
+on entry to the new process's `discover()`. Therefore a hook in the
+discovery linger would be structurally inert; we omit it to keep the
+recovery surface minimal and document the omission explicitly here so
+future maintainers do not "fix" the asymmetry by accident.
+
+What this rule does **not** cover:
+
+- A request for an older variant (spawn N-1 or earlier) — bounded cache
+  by design; the barrier-timeout safety net catches multi-spawn hangs.
+- A peer that crashed mid-`done_barrier` and never reached the cache
+  write — same thing: barrier-timeout + `--resume` is the recovery
+  path.
+
+This rule mirrors the late-arriving-discovery rule above (T-coord.3):
+the fast peer keeps a small piece of state about its last completed
+coordination event and is willing to replay it in response to a slow
+peer's stale request, bounded so the cost is O(1).
+
 ### Variant templates + multi-dimensional expansion (T-config.2)
 
 Two further config-side mechanisms layer on top of QoS expansion:
