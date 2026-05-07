@@ -265,6 +265,66 @@ Reference contract: `metak-shared/api-contracts/runner-coordination.md`
 (Phase 1 updates, Phase 1.25 added, Phase 2 skip rule, ResumeManifest
 message format).
 
+### Coordination barrier timeouts (T-coord.2)
+
+The post-discovery coordination barriers (ready, done, Phase 1.25
+ResumeManifest) wait on UDP messages from peers. A peer crashing mid-run
+would otherwise leave every other runner blocked forever. Each barrier
+honours a per-call timeout configured via `--barrier-timeout-secs`
+(default **120 s**); when the timeout fires the runner exits with code
+**75 (`EX_TEMPFAIL` from `<sysexits.h>`)** and a single descriptive
+stderr line so the wrapper script can detect the case and re-launch with
+`--resume`.
+
+Why these specific choices:
+
+- **120 s default.** Long enough to absorb realistic worst-case variant
+  cleanup (zenoh shutdown can take ~30 s under load; some QUIC
+  configurations stall up to 60 s in the linger-and-flush path before a
+  Done message is broadcast) without papering over a true peer death.
+  Anything shorter would falsely trip during normal high-load runs;
+  anything longer would defeat the point on small fixtures. Configurable
+  via `--barrier-timeout-secs` for stress tests, CI, and slow-LAN
+  scenarios.
+- **Exit 75.** `EX_TEMPFAIL` is the standardised "service unavailable,
+  retry later" code from BSD `sysexits.h`. Picked specifically because
+  (a) it is unambiguous about the retry intent, (b) it does not collide
+  with any code variant binaries currently produce (variants use 0/1/2),
+  and (c) it gives the wrapper script a single, clear signal to gate the
+  re-launch on. Any other non-zero exit (panic, config error, variant
+  failure, child timeout) propagates as-is and stops the wrapper loop.
+- **Discovery is excluded.** A stuck discovery means mismatched runner
+  names, blocked UDP multicast, or hardware NIC offline — none of which
+  retrying with `--resume` can fix. Discovery already has its own
+  loss-recovery loop (re-broadcast every 500 ms) that handles transient
+  packet drops; if a peer never appears the operator must intervene.
+  Keeping discovery un-timed-out also means the wrapper script will not
+  spin on a config typo.
+- **Clock-resync is implicitly bounded.** `ClockSyncEngine::measure_one`
+  sends `N=32` probes with a 100 ms per-sample timeout each — at most
+  ~3.4 s per peer. We do not wrap a separate timeout around it; if a
+  resync produces zero samples for some peer, that is a soft warning
+  (the most recent successful initial-sync measurement remains
+  available). The fail-fast on the *initial* sync is unchanged from
+  T8.5.
+- **No self-exec / auto-restart inside the runner process.** The runner
+  exits cleanly on timeout and lets the wrapper handle the loop. This
+  keeps the runner's state machine simple and allows operators to set
+  the wrapper's retry-attempt cap independently.
+
+Wrapper scripts live at `scripts/runner-resume.{sh,ps1}`. They re-launch
+the runner with `--resume` appended ONLY on exit 75; every other exit
+propagates immediately. The PowerShell wrapper is written for
+Windows PowerShell 5.1 (no `??` / ternary / `?.`). Manual smoke-test
+recipes are in `scripts/README.md`.
+
+In-flight child cleanup on timeout: the spawn-and-monitor loop is
+synchronous, so by the time a barrier is being held the variant child
+is always either not yet spawned (ready barrier) or already collected
+(done barrier). There is no orphan to kill on timeout exit. If this
+ever changes (e.g. async-spawn refactor), revisit the cleanup path in
+`main::run` where the `BarrierTimeoutError` is caught.
+
 ### Variant templates + multi-dimensional expansion (T-config.2)
 
 Two further config-side mechanisms layer on top of QoS expansion:

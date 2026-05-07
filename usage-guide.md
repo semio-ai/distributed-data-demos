@@ -241,6 +241,41 @@ variants in lockstep.
 Each machine produces its own JSONL log files. Collect all log files into
 a single directory for analysis.
 
+## Auto-resume wrappers
+
+Long multi-machine benchmarks occasionally lose a peer mid-run (process
+crash, OS hiccup, brief network partition). The runner detects this via
+a per-barrier timeout (default 120 s, see `--barrier-timeout-secs`) and
+exits with code **75** (`EX_TEMPFAIL`) so a wrapper script can re-launch
+it with `--resume` appended. The Phase 1.25 ResumeManifest exchange then
+skips every spawn whose log file is non-empty on every peer, so the
+benchmark resumes at the first incomplete spawn instead of redoing
+already-finished work.
+
+The wrappers re-launch ONLY on exit 75. Any other exit (success, panic,
+config error, variant failure) propagates as-is and stops the loop.
+
+### bash (Linux / macOS / WSL)
+
+```bash
+scripts/runner-resume.sh target/release/runner \
+    --name alice --config configs/two-runner-test.toml
+```
+
+Set `RUNNER_RESUME_MAX_ATTEMPTS=N` in the environment to cap the retry
+count (default 50).
+
+### PowerShell (Windows)
+
+```powershell
+.\scripts\runner-resume.ps1 `
+    -RunnerBinary .\target\release\runner.exe `
+    -RunnerArgs '--name','alice','--config','configs\two-runner-test.toml'
+```
+
+The PowerShell script is written for Windows PowerShell 5.1+ — no PS 7
+syntax (`??`, ternary, `?.`) is used.
+
 ## Output
 
 ### JSONL log files
