@@ -3128,7 +3128,9 @@ size reduction in new configs.
 ### T-resume.1: runner — `--resume` flag and ResumeManifest coordination
 
 **Repo**: `runner/`
-**Status**: pending
+**Status**: done (commits `16476d3 Add resume` + `6d9a53e Fix bugs leading
+to inaccurate results`, 2026-05-07). Multi-machine live validation owned
+by user.
 **Depends on**: contract update in
 `metak-shared/api-contracts/runner-coordination.md` (landed; Phase 1
 discover-message extension, Phase 1.25 ResumeManifest, Phase 2 skip rule,
@@ -3537,3 +3539,199 @@ comparison chart with the "other" transport family.
 - Changing the JSONL log schema or the variant-side debug shard
   emission.
 - Restructuring the cache.
+
+### T-coord.1: runner — diagnose mid-run coordination hang between spawn N done and spawn N+1 ready
+
+**Repo**: `runner/`
+**Status**: pending — **investigation task**, not a direct fix
+**Depends on**: nothing
+
+#### Field report (2026-05-07)
+
+User ran a full-matrix Hybrid benchmark on alice + bob over the LAN
+(commits `6d9a53e` / `16476d3+dirty`). Both runners successfully
+completed every spawn through `hybrid-1000x10hz-qos1..4`,
+`hybrid-1000x100hz-qos1..4`, and `hybrid-100x1000hz-qos1..4` (each
+side reported `status=success, exit_code=0`). Then both runners
+stopped making progress with the following terminal state:
+
+- **alice's last log line**: `[runner:alice] ready barrier for spawn 'hybrid-100x100hz-qos1' (hz=100, vpt=100, qos=1)`. Alice has finished spawn N's done barrier, completed inter-spawn grace, and is waiting at the ready barrier for spawn N+1.
+- **bob's last log line**: `[runner:bob] 'hybrid-100x1000hz-qos4' finished: status=success, exit_code=0`. Bob's variant child exited cleanly but bob never emitted any further log line — no inter-spawn grace, no clock resync, no `ready barrier` line.
+
+So the deadlock sits in the **transition between spawn N done and
+spawn N+1 ready** on bob's side, while alice has already moved past
+it. The state was static long enough that the user is confident it's
+a real hang.
+
+The user resolved the immediate situation by killing both runners
+and restarting with `--resume`. This task is about diagnosing why
+the hang happened.
+
+#### Why this is suspicious
+
+The runner protocol already had an analogous bug fixed during E2
+post-delivery (see STATUS.md "Fix 1: Discovery protocol race"): the
+fast runner stopped sending Discover messages after its own
+discovery completed, so slow peers never received them. The fix was
+a 2-second linger to keep broadcasting after completion. The same
+class of bug is plausible at the done-barrier transition: alice
+broadcasts her `Done` for spawn N, immediately moves on to
+inter-spawn-grace + ready-barrier-N+1, and stops re-broadcasting
+`Done` messages for spawn N. If bob never receives alice's `Done`
+(UDP loss, ARP cache miss, brief NIC stall), bob will wait at the
+done barrier forever, and alice's later `Ready` for spawn N+1
+won't unstick it.
+
+#### Scope
+
+This task is **investigation, not fix.** Deliverable is a written
+diagnosis plus a follow-up fix task filed in TASKS.md if a code
+change is needed. T-coord.2 (timeout safety net) lands in parallel
+regardless of this task's outcome.
+
+1. **Read the done-barrier loop** in [runner/src/protocol.rs](runner/src/protocol.rs) and trace exactly when this runner stops broadcasting its own `Done` for spawn N. Is there a "linger" pattern equivalent to the discovery fix?
+2. **Read the inter-spawn handoff** in [runner/src/main.rs](runner/src/main.rs). Confirm whether the runner continues to handle inbound `Done` messages for spawn N during the inter-spawn grace + clock-resync setup phases, or drops them silently.
+3. **Evaluate hypotheses:**
+   - **H1 — fast peer stops broadcasting:** alice sends `Done` for N once (or only briefly), then moves to grace / ready-N+1. Bob never receives it; nothing pulls bob out.
+   - **H2 — message-type or variant-name filter mismatch:** bob's coordinator filters inbound by `variant` field. If alice's `Done` for N is stamped with the wrong `effective_name` (off-by-one on the QoS expansion, stale variable), bob silently discards it. Trace the `Message::Done` construction site and confirm the variant name matches what bob expects.
+   - **H3 — receive-window race:** bob received alice's `Done` for N but bob's barrier loop had already exited (e.g. if its own `Done` broadcast crossed alice's in flight). Bob is now in some "post-N" state that doesn't drive forward to ready-N+1. Look for a state machine where exiting the done loop leaves the runner without a clear next-step trigger.
+   - **H4 — Windows socket-state side effect:** bob's variant teardown logged `os error 997` ("Overlapped I/O operation is in progress") on the variant TCP socket. Coordination is UDP, so probably unrelated, but confirm the coordination socket isn't shared / inherited / affected by variant child socket cleanup.
+4. **If reproducible from the existing logs alone**, capture and quote the exact sequence: alice's stdout from spawn N's done through to the `ready barrier` line (with timestamps), bob's stdout from spawn N's variant exit through to silence, and any wall-clock idle confirming a hang rather than a slow phase.
+5. **If not reproducible from logs**, build a minimal targeted reproducer:
+   - Smallest config that exercises QoS-expansion + per-variant clock-sync + back-to-back-spawn (likely a 2-3 spawn config is enough — the bug is at the transition, not at scale).
+   - Run on the user's two-machine setup (or single-machine two-runner if the hang reproduces on loopback) with verbose coordination tracing. Add a `--verbose-coord` flag if one doesn't already exist; instrument both sides of every barrier (broadcast sent, message received, peer-name accepted/rejected, state transition).
+6. **Write up the diagnosis** in `metak-orchestrator/DECISIONS.md` (new entry):
+   - Which hypothesis matched (or "could not reproduce — see follow-up").
+   - What's broken (file:line).
+   - What the fix should look like (estimated lines / files).
+   - Whether the fix should land as a follow-up to this task (T-coord.1b) or whether T-coord.2's timeout makes it acceptable to defer.
+
+#### Validation against reality
+
+- Reproducer (if written) actually triggers the hang on at least one configuration; document the success rate.
+- Verbose-coord tracing (if added) is gated behind a flag and produces no output in the default path. Don't ship permanent stderr noise.
+
+#### Acceptance criteria
+
+- [ ] H1-H4 each evaluated with a clear verdict (confirmed / ruled out / inconclusive-with-reason).
+- [ ] If a reproducer was written, it lives at a stable path (e.g. `runner/tests/fixtures/coord-hang-repro.toml`) with a one-liner README on how to run it.
+- [ ] Diagnosis entry added to `metak-orchestrator/DECISIONS.md`.
+- [ ] Follow-up fix task filed in TASKS.md (e.g. T-coord.1b) if a code change is warranted, OR a clear note in DECISIONS explaining why deferring to T-coord.2's safety net is acceptable.
+- [ ] `metak-orchestrator/STATUS.md` updated.
+
+#### Out of scope
+
+- Writing the fix. That's a follow-up.
+- Implementing the timeout safety net. That's T-coord.2; intentionally decoupled so the timeout lands regardless of root cause.
+- Any change to the coordination message format that would require updating `runner-coordination.md`. If the diagnosis points there, flag it; the orchestrator will file a contract task.
+
+### T-coord.2: runner — barrier timeouts + exit-on-timeout + auto-resume wrapper scripts
+
+**Repo**: `runner/` plus new `scripts/` at repo root.
+**Status**: pending
+**Depends on**: nothing (intentionally decoupled from T-coord.1).
+
+User goal: when any post-discovery coordination barrier exceeds a
+generous wall-clock budget, the runner exits cleanly with a
+recognisable non-zero code and a clear stderr line telling the
+operator to restart with `--resume`. A small wrapper script
+(PowerShell + bash) implements the auto-restart loop on top of that
+exit code, so auto-restart is **opt-in via the wrapper, not implicit
+in the runner**.
+
+The current behavior — silent unbounded wait at the ready barrier or
+done barrier — converted a transient lost-message into hours of
+stuck terminals during the 2026-05-07 Hybrid full-matrix run (see
+T-coord.1 field report). This task adds the safety net independently
+of root-cause investigation.
+
+Design rationale (orchestrator decision, 2026-05-07): the runner
+itself does NOT self-exec or auto-loop. Reasons: (a) on Windows,
+self-exec is fiddly; (b) auto-restart inside the process can mask
+real bugs by silently retrying — a wrapper is easy to disable when
+debugging; (c) "agreeing to restart" over a broken coordination
+channel is unreliable, so each runner has to time out independently
+anyway. The wrapper pattern keeps the runner's state machine simple
+and gives operators a clear opt-out.
+
+#### Scope
+
+1. **Per-barrier timeout in the runner state machine.** Apply to:
+   - Phase 1.25 ResumeManifest exchange.
+   - Per-variant clock resync wait.
+   - Phase 2 ready barrier (per variant).
+   - Phase 2 done barrier (per variant).
+   - **Not Phase 1 discovery.** Discovery has its own bounded retry pattern, and a stuck discovery indicates "wrong config / firewall / peer never started," for which auto-resume is the wrong recovery. Worker: confirm by reading the discovery loop and document the exclusion in `runner/CUSTOM.md`.
+
+2. **CLI flag** in [runner/src/main.rs](runner/src/main.rs):
+   - `--barrier-timeout-secs <integer>` (optional). Default: **120**, with the budget chosen to be comfortably larger than any expected per-barrier slowdown the user has observed; revisit only if the timeout falsely fires. Worker may pick a different default with justification in `runner/CUSTOM.md`.
+   - The flag is the wall-clock cap on each barrier wait, not cumulative across phases.
+
+3. **On timeout, exit cleanly:**
+   - `eprintln!` exactly one line: `[runner:<name>] coordination barrier '<barrier>' timed out after <N>s; exiting (re-run with --resume to continue)`. Replace `<barrier>` with `ready/<effective_name>`, `done/<effective_name>`, `clock_resync/<effective_name>`, or `resume_manifest`.
+   - **Exit code 75** (`EX_TEMPFAIL` from `<sysexits.h>` — canonical for "transient failure, retry"). Document the choice in `runner/CUSTOM.md` and `metak-shared/api-contracts/runner-coordination.md` so wrapper scripts and operators can rely on it. Exit 1 is reserved for real config / panic errors and must NOT be used here.
+   - Before exiting: terminate any in-flight variant child this runner spawned (only relevant on the done barrier; reuse the existing kill path used by per-variant timeout). Don't leave zombie children.
+   - Flush any open log writers (clock-sync log, summary line if started).
+
+4. **No auto-restart in the runner.** Runner's responsibility ends at "clean exit with code 75."
+
+5. **Wrapper scripts** at `scripts/`:
+   - `scripts/runner-resume.ps1` — Windows PowerShell wrapper. Must work under Windows PowerShell 5.1 (the user's default). No PS 7-only syntax (no `??`, no `?:`, no `?.`).
+   - `scripts/runner-resume.sh` — bash wrapper for Linux/macOS.
+   - **Behavior of both:**
+     - Take the same args as `runner` plus an optional `--max-restarts <N>` (default 5) and `--restart-backoff-secs <N>` (default 2). Both are wrapper-only flags — strip them before forwarding to runner.
+     - First invocation: run `runner` with the user's args. Do NOT pre-append `--resume` on the first call (so a fresh run starts fresh).
+     - On exit:
+       - exit 0 → propagate exit 0 and stop.
+       - exit 75 → log a clear line (`[wrapper] runner exited with code 75 (coordination barrier timeout); restart attempt N/M with --resume after Xs`), sleep the backoff, then re-invoke `runner` with the original args + `--resume` appended. Deduplicate if the user already passed `--resume`.
+       - any other non-zero exit → propagate as-is and stop. The wrapper does NOT auto-restart on panic, config error, or variant-level failure.
+       - Hitting `--max-restarts` → exit non-zero with a final log line including restart count.
+   - Target <80 lines each.
+
+6. **Update [usage-guide.md](usage-guide.md)** with one short section on auto-resume wrappers:
+   - When you might want them (long multi-machine runs).
+   - Exact wrapper invocation (one example for each OS).
+   - The opt-in framing: bare `runner` exits cleanly on barrier timeout; the wrapper is what loops.
+   - One sentence reminding that auto-restart loops can mask real bugs — disable the wrapper if a barrier timeout recurs at the same job twice in a row, and file a task instead.
+
+7. **Update the contract** [metak-shared/api-contracts/runner-coordination.md](metak-shared/api-contracts/runner-coordination.md):
+   - Add a "Barrier Timeout" subsection (single section is fine — apply uniformly to ready / done / clock-resync / resume-manifest) documenting the per-barrier timeout, the default value, the exit-75 contract, and the exclusion of Phase 1 discovery.
+
+8. **Update [runner/CUSTOM.md](runner/CUSTOM.md)** with a short "Coordination barrier timeouts" subsection mirroring the contract update plus the implementation entry points.
+
+#### Tests (in `runner/`)
+
+- Unit: a barrier-wait wrapper returns the timeout error after exactly `N` ms when no message arrives (use a short test value, e.g. 50 ms, with a sham channel that never delivers).
+- Unit: the timeout error translates to exit code 75 in the main-level helper (test via the helper directly, not via spawning a process).
+- Integration: extend [runner/tests/integration.rs](runner/tests/integration.rs) with a configuration that drives a barrier wait with no peer responses. The runner should exit 75 within the timeout window (assert with a generous slack of e.g. 5s on a 1s configured timeout to avoid CI flakes). Confirm exit code is 75 specifically, not 0 or 1.
+- Wrapper smoke test: a tiny stub `runner` binary (or shell script masquerading as one) that exits 75 on first call and 0 on second. Run the wrapper against it and verify it loops once with `--resume` appended on the retry. Bash-side test goes in `scripts/` (or wherever `cargo test` won't pick it up); document the manual PowerShell counterpart in `scripts/README.md` if a PS test harness isn't readily available.
+
+#### Validation against reality
+
+- `cargo build --release -p runner` clean (workspace-rooted).
+- `cargo test --release -p runner` green including new tests.
+- `cargo clippy --release -p runner --all-targets -- -D warnings` clean.
+- `cargo fmt -p runner -- --check` clean.
+- Live smoke: kill bob mid-run on the user's two-machine setup; alice should exit 75 within `--barrier-timeout-secs` rather than hanging forever. Record the runtime in the completion report.
+- Wrapper smoke: run `scripts/runner-resume.ps1` against a stub that exits 75 once and 0 once. Confirm `--resume` is appended on the retry. Paste the wrapper log lines in the completion report.
+
+#### Acceptance criteria
+
+- [ ] `--barrier-timeout-secs` flag added to runner CLI; default 120 (or worker-justified alternative documented in `runner/CUSTOM.md`).
+- [ ] Ready, done, clock-resync, and resume-manifest barriers all honour the timeout.
+- [ ] Discovery is intentionally NOT timed out by this flag (documented in `runner-coordination.md` and `runner/CUSTOM.md`).
+- [ ] Timeout exit is code 75 with a single clear stderr line naming the barrier and effective_name.
+- [ ] In-flight variant children are cleaned up on timeout exit (no zombies).
+- [ ] `scripts/runner-resume.ps1` and `scripts/runner-resume.sh` land at the repo root, both implement the loop-on-75-with-resume semantics, both are <80 lines, both work under their target shells with no version-specific traps.
+- [ ] `usage-guide.md` has a short auto-resume-wrapper section with one example per OS.
+- [ ] `metak-shared/api-contracts/runner-coordination.md` updated.
+- [ ] `runner/CUSTOM.md` updated.
+- [ ] All existing runner tests still pass; new unit + integration tests for the timeout path pass.
+- [ ] `metak-orchestrator/STATUS.md` updated.
+
+#### Out of scope
+
+- Self-exec / auto-restart inside the runner process. Wrapper-only.
+- Tuning the default timeout based on observed slow runs. Pick a generous value, justify it, revisit only if it falsely fires.
+- Any change to discovery's existing retry semantics.
+- Investigating the root cause of the 2026-05-07 hang. That's T-coord.1, deliberately decoupled.
