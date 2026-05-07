@@ -139,6 +139,15 @@ pub struct Coordinator {
     /// for that path; in multi-runner mode it stays `None` until
     /// `discover()` succeeds.
     last_log_subdir: Mutex<Option<String>>,
+    /// Most-recently-completed `done_barrier` outcome — `(variant_name, run,
+    /// status, exit_code)`. Populated at the tail of `done_barrier` just
+    /// before returning. Used by `ready_barrier`,
+    /// `exchange_resume_manifest`, and the discovery linger to re-emit our
+    /// own `Done` in response to a slow peer's stale `Done` request — see
+    /// T-coord.1b / DECISIONS.md D9. The cache is bounded to one entry by
+    /// design: bob only ever asks for the immediately preceding variant.
+    /// Wrapped in a Mutex because `Coordinator` exposes `&self` methods.
+    last_completed: Mutex<Option<(String, String, String, i32)>>,
     /// Whether this is single-runner mode.
     single_runner: bool,
 }
@@ -225,6 +234,7 @@ impl Coordinator {
             peer_addrs,
             peer_hosts: Mutex::new(peer_hosts),
             last_log_subdir: Mutex::new(last_log_subdir),
+            last_completed: Mutex::new(None),
             single_runner,
         })
     }
@@ -554,6 +564,16 @@ impl Coordinator {
                     Some(Message::Done {
                         name, variant, run, ..
                     }) => {
+                        // T-coord.1b: a slow peer (bob) is still asking for
+                        // Done on a variant whose done_barrier we have
+                        // already completed and lingered out of. Re-emit
+                        // our cached Done if `(variant, run)` matches —
+                        // this is gated internally by the cache contents,
+                        // so it's a no-op when the cache is empty or the
+                        // variant doesn't match.
+                        if self.expected.contains(&name) {
+                            self.maybe_reemit_stale_done(socket, &variant, &run);
+                        }
                         if verbose_coord_enabled() {
                             eprintln!(
                                 "[coord verbose] {}: ready_barrier({variant_name}) recv Done name={name} variant={variant} run={run} (ignored — wrong type for this barrier)",
@@ -678,6 +698,15 @@ impl Coordinator {
                         }
                         if accept {
                             results.insert(name, (s, c));
+                        } else if (variant != variant_name || run != self.run)
+                            && self.expected.contains(&name)
+                        {
+                            // T-coord.1b: cross-spawn case — peer is asking
+                            // about a previous variant's Done. If our cache
+                            // matches, re-emit. This protects the path where
+                            // we are the slow peer for spawn N+1 while a peer
+                            // is still trying to close spawn N's done_barrier.
+                            self.maybe_reemit_stale_done(socket, &variant, &run);
                         }
                     }
                     Some(Message::Ready { name, variant, run }) => {
@@ -721,6 +750,24 @@ impl Coordinator {
                     // Drain incoming messages to keep the socket buffer clean.
                     self.drain_and_answer_probe(socket);
                     std::thread::sleep(BROADCAST_INTERVAL);
+                }
+                // T-coord.1b: cache this clean done-barrier outcome so
+                // post-done coordination phases (`ready_barrier`,
+                // `exchange_resume_manifest`) can re-emit our Done in
+                // response to a slow peer's stale request after our linger
+                // has expired. Single-entry cache by design — bob only ever
+                // asks for the immediately preceding variant. Only written
+                // on the success path; the timeout-error branch leaves the
+                // cache untouched so we never re-emit a Done for a variant
+                // whose coordination did not complete cleanly.
+                {
+                    let mut guard = self.last_completed.lock().unwrap();
+                    *guard = Some((
+                        variant_name.to_string(),
+                        self.run.clone(),
+                        status.to_string(),
+                        exit_code,
+                    ));
                 }
                 return Ok(results);
             }
@@ -818,6 +865,19 @@ impl Coordinator {
                             self.maybe_reemit_discover(socket);
                         }
                     }
+                    Some(Message::Done {
+                        name, variant, run, ..
+                    }) => {
+                        // T-coord.1b: a peer might still be in the
+                        // done_barrier of the previous run's last variant
+                        // (relevant in resume mode where the manifest phase
+                        // immediately precedes Phase 2). Re-emit our cached
+                        // Done if it matches; the helper is gated internally
+                        // by the cache contents.
+                        if self.expected.contains(&name) {
+                            self.maybe_reemit_stale_done(socket, &variant, &run);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -891,6 +951,45 @@ impl Coordinator {
             resume: self.resume,
         };
         let _ = self.send(socket, &msg);
+    }
+
+    /// Re-emit our cached `Done` for the most-recently-completed variant if
+    /// the inbound `(variant, run)` matches it (T-coord.1b).
+    ///
+    /// When a fast peer (alice) has already exited `done_barrier` for spawn N
+    /// and moved on to a later coordination phase (`ready_barrier`,
+    /// `exchange_resume_manifest`, or discovery linger), a slow peer (bob)
+    /// arriving at `done_barrier` for spawn N has no peer broadcasting `Done`
+    /// for that variant. Without this hook bob would loop forever; the
+    /// `barrier_linger_prevents_slow_peer_hang` test only covers the case
+    /// where bob shows up inside alice's 2 s linger window. This method
+    /// closes the longer gap by giving alice a way to respond to a stale
+    /// `Done` request after her linger has already expired.
+    ///
+    /// Behaviour:
+    /// - If `last_completed` is `Some((variant, run, status, exit))` and the
+    ///   inbound `(variant, run)` matches, broadcast our own `Done` for that
+    ///   variant via `self.send`.
+    /// - Otherwise (no cache entry, or older / different variant), do
+    ///   nothing — the cache is bounded to a single entry by design and we
+    ///   intentionally let stale requests for older spawns time out.
+    /// - Errors from `send` are swallowed: this is a best-effort recovery
+    ///   hook running inside the hot loop of another barrier; a transient
+    ///   send failure must not abort the active barrier.
+    fn maybe_reemit_stale_done(&self, socket: &Socket, inbound_variant: &str, inbound_run: &str) {
+        let cached = self.last_completed.lock().unwrap().clone();
+        if let Some((variant, run, status, exit_code)) = cached {
+            if variant == inbound_variant && run == inbound_run {
+                let reply = Message::Done {
+                    name: self.name.clone(),
+                    variant,
+                    run,
+                    status,
+                    exit_code,
+                };
+                let _ = self.send(socket, &reply);
+            }
+        }
     }
 
     /// Drain a single inbound message while still answering probe requests.
@@ -1559,40 +1658,44 @@ mod tests {
         assert!(s.contains('b'), "{s}");
     }
 
-    /// Reproduces the 2026-05-07 mid-run hang (T-coord.1).
+    /// Locks in the T-coord.1b fix for the 2026-05-07 mid-run hang.
     ///
     /// Scenario observed in the field: alice finished spawn N's done barrier
     /// (linger included) and moved on to spawn N+1's ready barrier. Bob's
-    /// variant ran longer; bob then entered done_barrier for spawn N and
-    /// hung — alice was no longer broadcasting `Done` for spawn N AND
-    /// alice's `ready_barrier` silently drops inbound `Done` messages
-    /// (lines 322-368, the trailing `_ => {}` arm). No message any peer
-    /// will send satisfies bob's barrier-completion condition.
+    /// variant ran longer; bob then entered done_barrier for spawn N. Before
+    /// the fix, alice was no longer broadcasting `Done` for spawn N AND her
+    /// `ready_barrier` silently dropped inbound `Done` messages, leaving bob
+    /// hung forever (see `metak-orchestrator/DECISIONS.md` D9 for the
+    /// original code-path trace).
     ///
-    /// This test exercises the **same code path** without invoking the
-    /// real `done_barrier` on bob's side (which has no abort mechanism
-    /// and would leak a hung thread across the test runner). Instead:
+    /// With T-coord.1b in place, alice's `done_barrier` caches the most
+    /// recently completed `(variant, run, status, exit_code)` in
+    /// `last_completed` just before returning, and `ready_barrier`'s
+    /// `Some(Message::Done { .. })` arm calls `maybe_reemit_stale_done` —
+    /// re-broadcasting alice's cached Done when bob's stale request matches.
+    /// Bob's done_barrier-N loop then receives a fresh Done from alice and
+    /// can complete.
     ///
-    /// - Alice runs only one Coordinator method: a manual emulation of
-    ///   `ready_barrier(spawn_n_plus_1)`. It broadcasts `Ready` every
-    ///   500 ms and silently drops inbound `Done` — exactly mirroring
-    ///   `ready_barrier`'s `_ => {}` arm. A shutdown flag exits the loop
-    ///   cleanly.
+    /// This test exercises that fixed code path without invoking the real
+    /// `done_barrier` on bob's side (which would leak a hung thread on
+    /// regression). Instead:
+    ///
+    /// - Alice runs a manual emulation of `ready_barrier(spawn_n_plus_1)`
+    ///   that mirrors the **fixed** loop: broadcast `Ready` every 500 ms,
+    ///   answer probes, and on inbound `Done` from an expected peer call
+    ///   `maybe_reemit_stale_done`. We pre-populate alice's
+    ///   `last_completed` cache with the spawn-N-half outcome that bob will
+    ///   ask about — in production that write happens at the tail of
+    ///   `done_barrier`; the test simulates it directly to keep the
+    ///   coordination structure shallow.
     /// - Bob (also manually) sends `Done` for "spawn_n_half" repeatedly
-    ///   for 6 seconds and asks: "did I receive a matching `Done` back
-    ///   from alice?" The buggy answer is **no**, because alice's
-    ///   ready_barrier-emulation never re-broadcasts `Done`. The fixed
-    ///   answer (T-coord.1b) is **yes**, because the fix will have alice
-    ///   re-emit a stale `Done` in response.
+    ///   and waits up to 6 seconds for a matching `Done` back from alice.
+    ///   With the fix in place this should arrive within one re-broadcast
+    ///   cycle (~500 ms).
     ///
-    /// This emulation is faithful: every observable network behaviour of
-    /// the buggy `ready_barrier` is preserved (broadcast cadence,
-    /// silent-Done-drop). And both sides exit cleanly within ~7 s, so
-    /// no thread or socket leaks across test boundaries.
-    ///
-    /// Verdict: H1 confirmed. See `metak-orchestrator/DECISIONS.md` D9.
-    /// When T-coord.1b lands, invert the final assertion to lock in the
-    /// fixed behaviour.
+    /// If this test ever fails, the fix has regressed: alice's
+    /// post-done-barrier coordination phases are no longer responding to
+    /// stale Done requests, and the original mid-run hang is back.
     #[test]
     fn done_barrier_hang_repro_when_peer_already_advanced() {
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -1612,9 +1715,12 @@ mod tests {
 
         // Alice: discover, ready_barrier(spawn_n), done_barrier(spawn_n)
         // (which both complete with bob), then run an in-test loop that
-        // emulates `ready_barrier(spawn_n_plus_1)` without an abort path:
-        // send Ready every 500 ms, drain inbound, silently drop Done.
-        // Exits when `shutdown` flips.
+        // emulates the **fixed** `ready_barrier(spawn_n_plus_1)`: send
+        // Ready every 500 ms, answer probes, and on inbound Done from an
+        // expected peer call `maybe_reemit_stale_done`. We also pre-populate
+        // `last_completed` with the spawn-N-half outcome bob will ask about
+        // — in production that write happens at the tail of `done_barrier`;
+        // the test simulates it directly. Exits when `shutdown` flips.
         let runners_a = runners.clone();
         let hash_a = hash.clone();
         let run_a = run_id.clone();
@@ -1625,7 +1731,7 @@ mod tests {
                 hash_a,
                 port,
                 "log-sub".into(),
-                run_a,
+                run_a.clone(),
                 false,
             )
             .unwrap();
@@ -1637,6 +1743,13 @@ mod tests {
             coord
                 .done_barrier("spawn_n", "success", 0, Duration::from_secs(30))
                 .unwrap();
+
+            // Pretend alice's done_barrier for the prior "spawn_n_half"
+            // also completed cleanly: pre-populate the cache that the real
+            // `done_barrier` would have written. This is the variant bob
+            // will ask about below.
+            *coord.last_completed.lock().unwrap() =
+                Some(("spawn_n_half".to_string(), run_a, "success".to_string(), 0));
 
             let socket = coord.socket.as_deref().unwrap();
             let ready_msg = Message::Ready {
@@ -1650,19 +1763,29 @@ mod tests {
                     coord.send(socket, &ready_msg).ok();
                     last_send = std::time::Instant::now();
                 }
-                if let Some(Message::ProbeRequest { from, to, id, t1 }) = coord.recv(socket) {
-                    if to == coord.name {
-                        let _ = respond_to_probe(
-                            socket,
-                            &coord.peer_addrs,
-                            &coord.name,
-                            &from,
-                            id,
-                            &t1,
-                        );
+                match coord.recv(socket) {
+                    Some(Message::ProbeRequest { from, to, id, t1 }) => {
+                        if to == coord.name {
+                            let _ = respond_to_probe(
+                                socket,
+                                &coord.peer_addrs,
+                                &coord.name,
+                                &from,
+                                id,
+                                &t1,
+                            );
+                        }
                     }
-                    // Important: Done messages are silently dropped here,
-                    // matching the bug.
+                    Some(Message::Done {
+                        name, variant, run, ..
+                    }) => {
+                        // The fix under test: re-emit cached Done so bob's
+                        // stale done_barrier loop can complete.
+                        if coord.expected.contains(&name) {
+                            coord.maybe_reemit_stale_done(socket, &variant, &run);
+                        }
+                    }
+                    _ => {}
                 }
             }
         });
@@ -1737,12 +1860,13 @@ mod tests {
         thread_a.join().expect("alice thread panicked");
 
         assert!(
-            !bob_saw_alice_done,
-            "REGRESSION: bob received alice's Done for 'spawn_n_half' \
-             within 6 s despite alice being parked in a ready_barrier-like \
-             post-done state. The T-coord.1 mid-run hang appears to be \
-             fixed in the source. Invert this assertion to lock in the \
-             fixed behaviour."
+            bob_saw_alice_done,
+            "T-coord.1b regression: bob did NOT receive alice's Done for \
+             'spawn_n_half' within 6 s. With the fix in place, alice's \
+             parked ready_barrier-like loop should re-emit her cached Done \
+             in response to bob's stale request. If this test fails, the \
+             `last_completed` cache and/or `maybe_reemit_stale_done` wiring \
+             in `ready_barrier` has regressed — see DECISIONS.md D9."
         );
     }
 
