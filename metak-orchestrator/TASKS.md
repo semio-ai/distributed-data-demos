@@ -3735,3 +3735,82 @@ and gives operators a clear opt-out.
 - Tuning the default timeout based on observed slow runs. Pick a generous value, justify it, revisit only if it falsely fires.
 - Any change to discovery's existing retry semantics.
 - Investigating the root cause of the 2026-05-07 hang. That's T-coord.1, deliberately decoupled.
+
+### T-coord.1b: runner — fix done-barrier hang by re-broadcasting Done from ready_barrier on demand
+
+**Repo**: `runner/`
+**Status**: pending — follow-up to T-coord.1's diagnosis (see
+`metak-orchestrator/DECISIONS.md` D9).
+**Depends on**: nothing (parallel with T-coord.2's safety net).
+
+#### Background
+
+T-coord.1's investigation confirmed H1: when a fast peer (alice)
+completes spawn N's done_barrier and moves on to spawn N+1's
+ready_barrier, alice silently drops any inbound `Done` for spawn N.
+A slow peer (bob) that enters done_barrier-N after alice's 2-second
+linger has expired will broadcast `Done` forever and never receive
+alice's matching `Done`. See DECISIONS.md D9 for the full code-path
+trace.
+
+#### Scope
+
+1. **Track the most-recent-completed (variant_name, run, status, exit_code)
+   per runner.** Bob never asks for Done from anyone other than alice;
+   the cache only needs the immediately preceding variant — a single
+   `Option<(String, String, String, i32)>` field on `Coordinator`.
+   Update it from the tail of `done_barrier` just before returning
+   (after the linger).
+
+2. **In `ready_barrier`, on inbound `Done` whose `(variant, run)`
+   matches the most-recent-completed entry**, immediately re-broadcast
+   our own `Done` for that same variant via `self.send(...)`. This
+   gives bob's done-barrier loop a fresh response to lock onto. Do
+   NOT update `seen` or otherwise affect the ready_barrier's progress
+   towards spawn N+1.
+
+3. **Apply the same rule in `exchange_resume_manifest` and the
+   discovery linger** for completeness — these phases come after a
+   completed previous run isn't really a concern, but the cache value
+   is unchanged across them so the cost is one extra match arm.
+
+4. **Unit test**: invert the assertion in
+   `runner/src/protocol.rs::done_barrier_hang_repro_when_peer_already_advanced`
+   so the test now requires bob's done_barrier to complete within the
+   6-second window after alice has parked in ready_barrier(spawn_n_plus_1).
+   Update the doc-comment to describe the locked-in fixed behaviour.
+
+5. **Optional: add a second test** asserting that the most-recent-completed
+   cache is NOT used to satisfy a request for an OLDER variant — bob
+   asking for Done on `spawn_n_minus_1` (two spawns ago) should still
+   hang. This locks in the bounded-cache semantics.
+
+#### Validation
+
+- `cargo build --release -p runner` clean.
+- `cargo test --release -p runner` green, including the inverted
+  reproducer test and any new tests.
+- `cargo clippy --release -p runner --all-targets -- -D warnings` clean.
+- `cargo fmt -p runner -- --check` clean.
+- Live smoke (optional, on the user's two-machine setup): re-run the
+  Hybrid full-matrix or a synthetic config with deliberately skewed
+  per-machine variants. Confirm no hang at the spawn N → N+1 boundary.
+
+#### Acceptance criteria
+
+- [ ] `Coordinator` carries a most-recent-completed cache populated by
+      `done_barrier`.
+- [ ] `ready_barrier` re-emits `Done` for cached entries on demand.
+- [ ] Reproducer test inverted; passes.
+- [ ] Existing `barrier_linger_prevents_slow_peer_hang` test still
+      passes (the new behaviour is strictly additive).
+- [ ] Contract `metak-shared/api-contracts/runner-coordination.md`
+      updated to document the "ready barrier responds to stale done
+      requests" rule (one short subsection under Phase 2).
+- [ ] `metak-orchestrator/STATUS.md` updated.
+
+#### Out of scope
+
+- Replacing the linger pattern wholesale.
+- Cross-variant cache (we only need the immediately preceding spawn).
+- T-coord.2's barrier timeout / wrapper script work (filed separately).

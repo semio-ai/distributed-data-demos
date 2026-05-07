@@ -393,3 +393,167 @@ measurements between -0.073 and +0.057 ms, zero outliers. The
 previously-failing alice→bob `smoke-quic` measurement is now -0.060 ms.
 
 ---
+
+## D9: T-coord.1 — diagnosis of the 2026-05-07 mid-run hang
+
+**Date**: 2026-05-07
+**Context**: T-coord.1 investigation. During the 2026-05-07 Hybrid full-
+matrix benchmark on alice + bob (commits `6d9a53e` / `16476d3+dirty`),
+both runners completed every spawn through `hybrid-100x1000hz-qos4`
+successfully, then deadlocked at the transition to spawn N+1
+(`hybrid-100x100hz-qos1`). Alice's last log line was
+`[runner:alice] ready barrier for spawn 'hybrid-100x100hz-qos1' ...`;
+bob's last log line was
+`[runner:bob] 'hybrid-100x1000hz-qos4' finished: status=success, exit_code=0`.
+
+### Root cause
+
+**H1 (fast peer stops broadcasting Done) is confirmed.** The done-barrier
+loop in `runner/src/protocol.rs` (lines 372-462) re-broadcasts `Done`
+on every iteration of the wait loop, then runs a 2-second linger after
+`results.len() == self.expected.len()` (lines 446-461) before returning.
+After that, the runner enters `ready_barrier` for the next variant
+(`runner/src/main.rs` line 503: `coordinator.ready_barrier(&job.effective_name)?`).
+**`ready_barrier` only matches `Ready`/`ProbeRequest` and silently drops
+any inbound `Done` message** (lines 327-368, the trailing `_ => {}` arm).
+There is no recovery path on the fast peer once the done-N linger expires.
+
+The code paths trace as follows. On bob:
+
+1. `runner/src/spawn.rs::spawn_and_monitor` returns success.
+2. `runner/src/main.rs:580` prints `'<name>' finished: status=success, exit_code=0` (the last line in bob's log).
+3. `runner/src/main.rs:586` calls `coordinator.done_barrier(&job.effective_name, status, exit_code)`.
+4. Inside `done_barrier` (lines 372-462) bob broadcasts its own Done at every iteration, but never receives alice's Done — alice has already lingered out and moved on. Bob loops indefinitely.
+
+On alice (from her side of the timeline):
+
+1. Alice's variant exits earlier than bob's (per-machine runtime skew).
+2. Alice enters `done_barrier`. Alice broadcasts Done. Alice waits.
+3. Eventually bob's variant exits and bob broadcasts its first Done. Alice receives it on one of her recv windows. `results.len() == self.expected.len()` is true.
+4. Alice enters the 2-second linger (lines 446-461), broadcasting Done at 500 ms intervals (~5 broadcasts).
+5. Alice's linger ends. Alice returns from `done_barrier`.
+6. Alice runs the inter-spawn grace (default 250 ms, `runner/src/main.rs:497-503`).
+7. Alice prints `[runner:alice] ready barrier for spawn '<next>' ...` (line 499).
+8. Alice enters `ready_barrier`. From this moment forward, **alice only re-broadcasts `Ready`, never `Done`**. Inbound `Done` messages from bob are silently dropped (line 360, `_ => {}`).
+
+For bob to hang, bob's recv windows during steps 4-8 above must miss every one of alice's Done broadcasts. The 2-second linger on a quiet LAN is normally enough. What pushes the field run past it:
+
+- **Per-machine runtime skew at high-rate variants**. `hybrid-100x1000hz-qos4` runs the workload at 100 000 values/sec for the configured operate window. On the slower of the two machines, the variant binary itself takes meaningfully longer to finish than on the faster one. Alice can have been waiting for bob's Done for tens of seconds — long enough that bob's UDP receive buffer (Windows default ~64 KB) accumulates a backlog of alice's Done broadcasts during her wait.
+- **OS UDP receive buffer pressure**. While bob's variant is running, bob's runner thread is in `child.try_wait()`/sleep loops — it is NOT draining the coordination socket. Alice's Done broadcasts (~150 bytes, 2 fan-out addresses, every 500 ms) accumulate. With a long-running variant, the receive buffer fills and subsequent datagrams are dropped at the kernel level. If alice's linger broadcasts land in that "dropped" window, bob never sees them even after entering done_barrier.
+- **No defense against this loss pattern**. The linger is the only recovery mechanism. Once it expires, alice's state machine has no way to re-engage with a stale Done request from bob. Bob hangs forever.
+
+### Verdict on the four hypotheses
+
+- **H1 — fast peer stops broadcasting Done: CONFIRMED.** Code-path
+  analysis above. `done_barrier`'s 2-second linger is the only window in
+  which alice will respond to a Done request for spawn N. After that,
+  `ready_barrier(spawn_n_plus_1)` silently discards inbound `Done`
+  messages, leaving bob with no message any peer will ever send that
+  satisfies its barrier-completion condition. Reproducer:
+  `runner/src/protocol.rs::done_barrier_hang_repro_when_peer_already_advanced`
+  (asserts that bob's done_barrier is still hung 6 seconds after alice
+  has parked in `ready_barrier(spawn_n_plus_1)`).
+
+- **H2 — variant-name / message-type filter mismatch: RULED OUT.** Both
+  runners derive `effective_name` deterministically from the same TOML
+  config (config_hash mismatch would have aborted in Phase 1 discovery,
+  see `runner/src/protocol.rs:215-217`). The done_barrier filter is
+  `variant == variant_name && run == self.run && self.expected.contains(&name)`
+  (lines 415-419) which alice's broadcast satisfies for any value bob
+  expects. The bug is not in the matching predicate; it is in the
+  lifetime of the broadcasts.
+
+- **H3 — receive-window race / "post-N limbo" state: RULED OUT.** The
+  done_barrier code path either still has unmet expectations
+  (`results.len() < self.expected.len()`) and therefore continues to
+  loop and re-send, or it transitions to the linger and then returns
+  cleanly. There is no "exited the loop but hasn't yet returned"
+  intermediate state. The actual hang is firmly inside the "still
+  has unmet expectations" loop, not after.
+
+- **H4 — Windows socket-state side effect (variant TCP teardown affecting
+  runner UDP socket): RULED OUT.** The runner's coordination socket
+  (`runner/src/protocol.rs:603-625`) is created with
+  `socket2::Socket::new(Domain::IPV4, Type::DGRAM, ...)` and is owned
+  exclusively by the runner process. `runner/src/spawn.rs:48-51`
+  invokes `Command::new(...).spawn()` with no inheritance flags;
+  Rust's default on Windows does not pass file/socket handles to the
+  child by default. The `os error 997` ("Overlapped I/O operation in
+  progress") observed during variant teardown is on the variant's
+  TCP/UDP transport sockets, not the runner's UDP coordination socket.
+  The two are decoupled.
+
+### Proposed fix (T-coord.1b)
+
+The fix should re-engage the fast peer with stale Done requests from a
+slow peer. Three viable options, in increasing order of invasiveness:
+
+1. **Re-broadcast Done from `ready_barrier` on demand.** When
+   `ready_barrier` receives a `Done` whose `(name, variant, run)` matches
+   a recently-completed spawn, re-emit our own `Done` for that variant.
+   Smallest change; uses an O(1) most-recent-completed cache. ~30 lines
+   in `runner/src/protocol.rs`.
+
+2. **Extend the done-barrier linger to cover an entire spawn duration.**
+   Replace the fixed 2-second linger with one that runs concurrently
+   with the next variant's spawn (or at least the next variant's ready
+   barrier). Larger refactor — the current shape is sequential.
+
+3. **Replace the linger with a sticky "completed Done" state**: keep a
+   `HashSet<(variant, run)>` of completed spawns and have every barrier
+   loop re-broadcast a Done in response to any inbound Done request for
+   a variant in that set. Cleanest semantics, modest implementation
+   complexity. ~50-80 lines.
+
+**Recommendation**: option 1. It surgically patches the failure mode
+without restructuring the state machine, and the most-recent-completed
+cache is bounded (one entry — we only ever care about the immediately
+preceding variant). T-coord.2 (barrier timeouts + auto-resume wrapper)
+lands in parallel and provides the safety net regardless. Filed as
+T-coord.1b; see TASKS.md.
+
+The fix can defer to T-coord.2 ONLY if the operator-experience cost of
+"barrier timeout fires, runner exits, wrapper restarts with --resume,
+30-90 seconds of wall-clock are wasted" is acceptable. For the user's
+multi-hour Hybrid full-matrix runs, that would mean the run loses one
+spawn-cycle every time the skew + buffer-pressure pattern triggers. We
+estimate this happens ~once every several full-matrix runs based on the
+2026-05-07 incident being the first observed case in many prior runs;
+T-coord.2's safety net is strictly necessary, but T-coord.1b's
+surgical fix is preferable for runs where bisect-reproducibility of
+results matters. Land both.
+
+### Files touched in this investigation
+
+- `runner/src/protocol.rs` — added `set_verbose_coord(bool)` /
+  `verbose_coord_enabled()` toggle and per-message verbose tracing in
+  `ready_barrier` and `done_barrier` (default-off, gated by the static
+  `VERBOSE_COORD` `AtomicBool`). Added the
+  `done_barrier_hang_repro_when_peer_already_advanced` unit test in
+  `mod tests` that demonstrates the hang.
+- `runner/src/main.rs` — added the `--verbose-coord` CLI flag wired to
+  `protocol::set_verbose_coord`. Default `false`. No change to the
+  default execution path.
+- `metak-orchestrator/DECISIONS.md` — this entry.
+- `metak-orchestrator/TASKS.md` — T-coord.1b filed.
+- `metak-orchestrator/STATUS.md` — completion report.
+
+### Validation
+
+- `cargo build --release -p runner` clean.
+- `cargo test --release -p runner` — 120 unit + 10 integration + 1
+  stress test, all green. The new reproducer test passes (asserting
+  the hang occurs); the existing `barrier_linger_prevents_slow_peer_hang`
+  test continues to pass (the legitimate slow-peer linger pattern is
+  unaffected — that test's delay is 800 ms, well within the 2-second
+  linger window).
+- `cargo clippy --release -p runner --all-targets -- -D warnings` clean.
+- `cargo fmt -p runner -- --check` clean.
+
+The reproducer test is intentionally an "asserts the bug" test — when
+T-coord.1b lands, the maintainer must invert the assertion. The test's
+panic message spells this out: "REGRESSION: bob's done_barrier
+completed within 6 seconds ... Invert this assertion to lock in the
+fixed behaviour."
+
+---
