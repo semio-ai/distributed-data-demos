@@ -254,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         # Step 4: diagrams.
         if do_diagrams:
             try:
-                from plots import generate_comparison_plot
+                from plots import generate_comparison_plot, generate_latency_cdf_plot
             except ImportError:
                 print(
                     "Error: --diagrams requires matplotlib. "
@@ -265,6 +265,9 @@ def main(argv: list[str] | None = None) -> int:
 
             plot_path = generate_comparison_plot(performance_results, output_dir)
             print(f"Plot saved to: {plot_path}", file=sys.stderr)
+
+            cdf_path = generate_latency_cdf_plot(performance_results, output_dir)
+            print(f"Plot saved to: {cdf_path}", file=sys.stderr)
 
         return 0
     finally:

@@ -28,6 +28,7 @@ def _make_result(
     p50: float = 1.0,
     p95: float = 5.0,
     p99: float = 10.0,
+    latency_samples_ms: list[float] | None = None,
 ) -> PerformanceResult:
     return PerformanceResult(
         variant=variant,
@@ -43,6 +44,7 @@ def _make_result(
         jitter_ms=0.5,
         jitter_p95_ms=1.0,
         loss_pct=0.0,
+        latency_samples_ms=latency_samples_ms or [],
     )
 
 
@@ -409,5 +411,180 @@ class TestGenerateComparisonPlot:
         assert any(math.isfinite(h) and h > 0 for h in heights), (
             f"expected at least one positive finite bar, got {heights}"
         )
+        for f in captured:
+            original_close(f)
+
+
+class TestEmpiricalCdf:
+    """Unit tests for the CDF computation used by ``generate_latency_cdf_plot``.
+
+    Acceptance criteria from T11.4:
+    * ``y`` monotonic non-decreasing
+    * ``y`` bounded in [0, 1]
+    * Output length matches the count of positive finite samples
+    """
+
+    def test_returns_empty_for_empty_input(self) -> None:
+        from plots import empirical_cdf
+
+        x, y = empirical_cdf([])
+        assert x.size == 0
+        assert y.size == 0
+
+    def test_y_monotonic_non_decreasing(self) -> None:
+        from plots import empirical_cdf
+
+        samples = [0.5, 0.1, 1.0, 0.3, 0.8, 0.2, 0.7]
+        _, y = empirical_cdf(samples)
+        for i in range(1, len(y)):
+            assert y[i] >= y[i - 1], (
+                f"CDF y[{i}]={y[i]} < y[{i - 1}]={y[i - 1]}; not monotonic"
+            )
+
+    def test_y_bounded_in_unit_interval(self) -> None:
+        from plots import empirical_cdf
+
+        samples = [10.0, 0.001, 5.0, 50.0, 0.5, 100.0]
+        _, y = empirical_cdf(samples)
+        assert y.size > 0
+        assert y.min() > 0.0
+        assert y.max() == 1.0
+        assert (y <= 1.0).all()
+        assert (y >= 0.0).all()
+
+    def test_output_length_matches_positive_samples(self) -> None:
+        from plots import empirical_cdf
+
+        # Mix of positive, zero, negative, NaN, inf -- only positives kept.
+        samples = [1.0, 2.0, 0.0, -1.0, float("nan"), float("inf"), 3.0, 0.5]
+        x, y = empirical_cdf(samples)
+        assert x.size == 4
+        assert y.size == 4
+        # And x is sorted.
+        assert list(x) == sorted(x)
+
+    def test_step_size_is_one_over_n(self) -> None:
+        """``y[i+1] - y[i]`` is ``1/n`` for distinct samples."""
+        from plots import empirical_cdf
+
+        samples = [1.0, 2.0, 3.0, 4.0, 5.0]
+        _, y = empirical_cdf(samples)
+        n = len(samples)
+        assert abs(y[0] - 1.0 / n) < 1e-12
+        for i in range(1, n):
+            assert abs((y[i] - y[i - 1]) - (1.0 / n)) < 1e-12
+
+
+class TestGenerateLatencyCdfPlot:
+    def test_creates_png(self, tmp_path: Path) -> None:
+        from plots import generate_latency_cdf_plot
+
+        # Ten samples per result; enough to draw a visible CDF.
+        results = [
+            _make_result(
+                "custom-udp-10x100hz-qos1",
+                latency_samples_ms=[
+                    0.001,
+                    0.002,
+                    0.005,
+                    0.01,
+                    0.05,
+                    0.1,
+                    0.5,
+                    1.0,
+                    5.0,
+                    10.0,
+                ],
+            ),
+            _make_result(
+                "zenoh-10x100hz-qos1",
+                latency_samples_ms=[
+                    0.5,
+                    1.0,
+                    1.5,
+                    2.0,
+                    3.0,
+                    5.0,
+                    8.0,
+                    12.0,
+                    20.0,
+                    50.0,
+                ],
+            ),
+        ]
+        out = generate_latency_cdf_plot(results, tmp_path / "out")
+        assert out.exists()
+        assert out.name == "latency_cdf.png"
+        assert out.stat().st_size > 1000
+
+    def test_creates_output_dir(self, tmp_path: Path) -> None:
+        from plots import generate_latency_cdf_plot
+
+        nested = tmp_path / "a" / "b"
+        out = generate_latency_cdf_plot(
+            [_make_result("zenoh-max-qos1", latency_samples_ms=[0.1, 0.2, 0.3])],
+            nested,
+        )
+        assert nested.is_dir()
+        assert out.exists()
+
+    def test_empty_results(self, tmp_path: Path) -> None:
+        from plots import generate_latency_cdf_plot
+
+        out = generate_latency_cdf_plot([], tmp_path)
+        assert out.exists()
+        assert out.name == "latency_cdf.png"
+
+    def test_no_samples_renders_placeholder_per_row(self, tmp_path: Path) -> None:
+        """A QoS row with no positive samples still renders without crashing."""
+        from plots import generate_latency_cdf_plot
+
+        results = [
+            _make_result("custom-udp-10x100hz-qos1", latency_samples_ms=[]),
+            _make_result(
+                "zenoh-10x100hz-qos1",
+                latency_samples_ms=[0.1, 0.2, 0.5, 1.0],
+            ),
+        ]
+        out = generate_latency_cdf_plot(results, tmp_path)
+        assert out.exists()
+        assert out.stat().st_size > 1000
+
+    def test_multi_qos_rows(self, tmp_path: Path) -> None:
+        """Four QoS rows should render four subplots."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = []
+        for q in (1, 2, 3, 4):
+            results.append(
+                _make_result(
+                    f"custom-udp-10x100hz-qos{q}",
+                    latency_samples_ms=[0.001 * q, 0.01 * q, 0.1 * q, 1.0 * q],
+                )
+            )
+
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_latency_cdf_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        # Four QoS rows -> four subplot axes (legend lives on fig, not ax).
+        assert len(fig.axes) == 4
+        for ax in fig.axes:
+            assert ax.get_xscale() == "log"
+            ymin, ymax = ax.get_ylim()
+            assert ymin == 0.0 and ymax == 1.0
         for f in captured:
             original_close(f)

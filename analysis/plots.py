@@ -186,16 +186,46 @@ def _family_palette(
     return {w: tuple(cmap(p)) for w, p in zip(workloads, positions)}
 
 
-def _empty_plot(output_dir: Path) -> Path:
+def _empty_plot(output_dir: Path, filename: str = "comparison.png") -> Path:
     """Render the placeholder used when there is no data."""
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.text(0.5, 0.5, "No data to plot", ha="center", va="center", fontsize=14)
     ax.set_axis_off()
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / "comparison.png"
+    out_path = output_dir / filename
     fig.savefig(str(out_path), dpi=150)
     plt.close(fig)
     return out_path
+
+
+def empirical_cdf(samples: list[float] | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the empirical CDF over ``samples``.
+
+    Returns ``(x, y)`` where ``x`` is the sorted sample values
+    (positive-only, since the consumer plots them on a log axis) and
+    ``y`` is the cumulative fraction in ``[0, 1]``. ``y[i] = (i + 1) / n``
+    so the curve starts at ``1/n`` (not 0) and ends at ``1.0`` -- the
+    standard ECDF convention. Empty input returns two empty arrays.
+
+    Non-finite values (``NaN``, ``+/- inf``) and non-positive values
+    are dropped: the CDF is consumed by a log-scale plot, where
+    non-positive x is undefined; clock-noise artifacts producing
+    negative latency would distort the curve and are not part of any
+    meaningful "delivery latency" distribution.
+    """
+    if isinstance(samples, list):
+        arr = np.asarray(samples, dtype=float)
+    else:
+        arr = np.asarray(samples, dtype=float)
+    if arr.size == 0:
+        return np.empty(0, dtype=float), np.empty(0, dtype=float)
+    finite = arr[np.isfinite(arr) & (arr > 0.0)]
+    if finite.size == 0:
+        return np.empty(0, dtype=float), np.empty(0, dtype=float)
+    x = np.sort(finite)
+    n = x.size
+    y = np.arange(1, n + 1, dtype=float) / float(n)
+    return x, y
 
 
 def generate_comparison_plot(
@@ -436,6 +466,175 @@ def generate_comparison_plot(
     out_path = output_dir / "comparison.png"
     # ``bbox_inches="tight"`` would clip the carefully reserved bottom
     # band, so save at the figure size we computed.
+    fig.savefig(str(out_path), dpi=150)
+    plt.close(fig)
+
+    return out_path
+
+
+def generate_latency_cdf_plot(
+    results: list[PerformanceResult], output_dir: Path
+) -> Path:
+    """Generate a per-QoS latency CDF chart PNG.
+
+    One subplot per observed QoS row, one CDF line per
+    ``(transport, workload)`` combo. ``x`` axis is latency in ms on a
+    log scale; ``y`` axis is the empirical CDF in ``[0, 1]``. The
+    family colormap / tone scheme matches ``generate_comparison_plot``
+    so a viewer can correlate distribution shape with the percentile
+    bars in the comparison chart.
+
+    Source: ``PerformanceResult.latency_samples_ms`` -- a downsampled
+    per-message latency vector (cap ``LATENCY_SAMPLE_CAP`` per result;
+    see ``performance.py``). Results with no samples for a given QoS
+    contribute no line; empty rows are skipped entirely.
+
+    Parameters
+    ----------
+    results:
+        Performance results to visualise.
+    output_dir:
+        Directory where the PNG will be saved (created if needed).
+
+    Returns
+    -------
+    Path to the generated ``latency_cdf.png``.
+    """
+    if not results:
+        return _empty_plot(output_dir, filename="latency_cdf.png")
+
+    # Index results by (transport, workload, qos), keeping the first
+    # entry per key (matches the comparison plot's collapse rule).
+    parsed: dict[tuple[str, str, int | None], PerformanceResult] = {}
+    for r in results:
+        transport, workload, qos = _split_variant_name(r.variant)
+        key = (transport, workload, qos)
+        parsed.setdefault(key, r)
+
+    if not parsed:
+        return _empty_plot(output_dir, filename="latency_cdf.png")
+
+    # Distinct transports, workloads, qos values (deterministic order
+    # mirroring the bar chart so the colour key is consistent).
+    transports_seen = {t for t, _, _ in parsed.keys()}
+    transport_order: list[str] = [t for t in TRANSPORT_FAMILIES if t in transports_seen]
+    if "other" in transports_seen:
+        transport_order.append("other")
+
+    workload_set: set[str] = {w for _, w, _ in parsed.keys()}
+    workload_order: list[str] = sorted(workload_set, key=_workload_load_rank)
+
+    qos_values_seen: set[int | None] = {q for _, _, q in parsed.keys()}
+    qos_order: list[int | None] = sorted(
+        qos_values_seen, key=lambda q: (q is None, q if q is not None else -1)
+    )
+
+    palettes: dict[str, dict[str, tuple[float, float, float, float]]] = {}
+    for t in transport_order:
+        palettes[t] = _family_palette(t, workload_order)
+
+    line_keys: list[tuple[str, str]] = [
+        (t, w) for t in transport_order for w in workload_order
+    ]
+    n_qos_groups = len(qos_order)
+    if not line_keys or n_qos_groups == 0:
+        return _empty_plot(output_dir, filename="latency_cdf.png")
+
+    # Figure layout: one row per QoS, single column. Width comfortably
+    # fits the legend on the right; height grows with QoS rows.
+    fig_width = 14.0
+    per_row_height = 3.5
+    legend_band_height = 1.5
+    fig_height = per_row_height * n_qos_groups + legend_band_height
+    fig, axes = plt.subplots(
+        n_qos_groups,
+        1,
+        figsize=(fig_width, fig_height),
+        squeeze=False,
+    )
+
+    # Build legend handles in the same order as the bars in the
+    # comparison chart so the two figures share a colour key.
+    legend_handles: list[matplotlib.lines.Line2D] = []
+    for transport, workload in line_keys:
+        color = palettes[transport][workload]
+        legend_handles.append(
+            matplotlib.lines.Line2D(
+                [],
+                [],
+                color=color,
+                linewidth=1.4,
+                label=f"{transport} / {workload}" if workload else transport,
+            )
+        )
+
+    for row_idx, q in enumerate(qos_order):
+        ax = axes[row_idx][0]
+        qos_label = f"qos{q}" if q is not None else "n/a"
+
+        plotted_any = False
+        for transport, workload in line_keys:
+            r = parsed.get((transport, workload, q))
+            if r is None:
+                continue
+            samples = r.latency_samples_ms
+            if not samples:
+                continue
+            x, y = empirical_cdf(samples)
+            if x.size == 0:
+                continue
+            color = palettes[transport][workload]
+            ax.plot(x, y, color=color, linewidth=1.4)
+            plotted_any = True
+
+        ax.set_xscale("log")
+        ax.set_xlabel("latency (ms, log scale)")
+        ax.set_ylabel(f"{qos_label} - empirical CDF")
+        ax.set_title(f"{qos_label} - Latency CDF")
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(True, which="both", linestyle="--", alpha=0.5)
+        ax.set_axisbelow(True)
+        if not plotted_any:
+            # Annotate empty rows so the viewer knows the QoS is
+            # absent rather than the data being clipped off-axis.
+            ax.text(
+                0.5,
+                0.5,
+                f"no positive latency samples for {qos_label}",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=10,
+                alpha=0.6,
+            )
+
+    legend_ncol = max(4, min(8, (len(legend_handles) + 3) // 4))
+    legend_rows = (len(legend_handles) + legend_ncol - 1) // legend_ncol
+    row_height_in = 0.22
+    legend_band_in = max(0.6, 0.4 + row_height_in * legend_rows)
+    bottom_reserve = min(0.4, legend_band_in / fig_height)
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.005),
+        ncol=legend_ncol,
+        frameon=True,
+        fontsize=8,
+        title="Transport / workload",
+        title_fontsize=9,
+    )
+
+    top_reserve = max(0.6, fig_height - 0.4) / fig_height
+    fig.subplots_adjust(
+        bottom=bottom_reserve,
+        top=top_reserve,
+        left=0.07,
+        right=0.98,
+        hspace=0.6,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / "latency_cdf.png"
     fig.savefig(str(out_path), dpi=150)
     plt.close(fig)
 
