@@ -5247,3 +5247,135 @@ climb further.
   `variants/zenoh/`. Did NOT touch the production `configs/`
   directory.
 - Did NOT commit, per task rules.
+
+### T-coord.2: runner — barrier timeouts + exit-on-timeout + auto-resume wrappers — done
+
+Added a per-barrier timeout to the runner's coordination state machine,
+mapped the timeout to exit code **75 (EX_TEMPFAIL)**, and shipped bash +
+PowerShell wrapper scripts that loop the runner with `--resume` appended
+specifically on exit 75.
+
+#### What was implemented and where
+
+- New CLI flag `--barrier-timeout-secs` (default 120 s).
+  `runner/src/main.rs:85` (clap derive); plumbed into `run()` body via
+  `let barrier_timeout = Duration::from_secs(cli.barrier_timeout_secs);`
+  at `runner/src/main.rs:155`.
+- New error type `protocol::BarrierTimeoutError` at
+  `runner/src/protocol.rs:31` (with `Display`/`Error` impls). Returned
+  from the timeout path of every barrier method, downcast at the top of
+  `main` (`runner/src/main.rs:127`) and translated to
+  `std::process::exit(EX_TEMPFAIL)` (constant defined at
+  `runner/src/main.rs:98`).
+- `Coordinator::ready_barrier(&str, Duration)` —
+  `runner/src/protocol.rs:380` — gains the overall deadline and emits
+  `BarrierTimeoutError { kind: "ready", .. }` on expiry.
+- `Coordinator::done_barrier(&str, &str, i32, Duration)` —
+  `runner/src/protocol.rs:455` — same pattern, kind `"done"`.
+- `Coordinator::exchange_resume_manifest(Vec<String>, Duration)` —
+  `runner/src/protocol.rs:543` — same pattern, kind `"resume_manifest"`.
+- `Coordinator::discover()` is unchanged (no timeout) and now carries a
+  doc comment explaining why discovery is excluded.
+- Wrapper scripts at `scripts/runner-resume.sh` (53 lines) and
+  `scripts/runner-resume.ps1` (56 lines), plus `scripts/README.md` with
+  manual smoke-test recipes for both shells.
+- Contract update: `metak-shared/api-contracts/runner-coordination.md`
+  gains a "Barrier Timeout" subsection.
+- User docs: `usage-guide.md` "Auto-resume wrappers" section;
+  `runner/CUSTOM.md` "Coordination barrier timeouts (T-coord.2)"
+  subsection.
+
+In-flight child cleanup on timeout exit: the spawn-and-monitor loop
+(`runner/src/spawn.rs`) is synchronous, so by the time a barrier is
+being held the child is always either not yet spawned (ready barrier)
+or already collected (done barrier). There is no orphan to kill on the
+timeout-exit path; documented this in CUSTOM.md and as an inline note
+at the `done_barrier` call site.
+
+The clock-resync path is implicitly bounded by `ClockSyncEngine::
+measure_one`'s 32 samples × 100 ms per-sample timeout (~3.4 s upper
+bound per peer); no separate barrier-style wrap is added. Per-variant
+zero-sample remains a soft warning.
+
+#### Default timeout choice
+
+**120 s.** Long enough to absorb realistic worst-case variant cleanup
+(zenoh shutdown ~30 s, some QUIC linger paths up to ~60 s); short
+enough that the wrapper actually re-launches within an operator's
+attention window. Rationale documented in `runner/CUSTOM.md` and the
+contract.
+
+#### Test results (workspace root)
+
+```
+$ cargo build --release -p runner
+    Finished `release` profile [optimized] target(s) in 4.82s
+
+$ cargo fmt -p runner -- --check
+(no output)
+
+$ cargo clippy --release -p runner --all-targets -- -D warnings
+    Finished `release` profile [optimized] target(s) in 1.62s
+(zero warnings)
+
+$ cargo test --release -p runner
+    runner unit tests: 123 passed (incl. 4 new
+        protocol::tests::ready_barrier_returns_timeout_when_peer_silent,
+        protocol::tests::done_barrier_returns_timeout_when_peer_silent,
+        protocol::tests::resume_manifest_returns_timeout_when_peer_silent,
+        protocol::tests::barrier_timeout_error_display_mentions_kind_and_variant)
+    integration tests: 11 passed (incl. new
+        barrier_timeout_exits_75_when_peer_silent_after_discovery
+        which spawns the runner with a fake silent-after-discovery
+        peer and asserts exit code 75)
+    clock_sync_stress: 1 passed
+```
+
+#### Wrapper smoke tests
+
+bash:
+```
+[runner-resume] attempt 1: /tmp/.../fake-runner.sh --name alice --config bench.toml
+[fake-runner] attempt 1, args: --name alice --config bench.toml
+[runner-resume] runner exited 75 (barrier timeout); retrying with --resume
+[runner-resume] attempt 2: /tmp/.../fake-runner.sh --name alice --config bench.toml --resume
+[fake-runner] attempt 2, args: --name alice --config bench.toml --resume
+wrapper exit: 0
+--- attempt 1 args ---  --name / alice / --config / bench.toml
+--- attempt 2 args ---  --name / alice / --config / bench.toml / --resume
+```
+
+PowerShell (Windows PowerShell 5.1):
+```
+[runner-resume] attempt 1: powershell.exe -NoProfile -File ...\fake-runner.ps1 --name alice --config bench.toml
+[fake-runner] attempt 1, args: --name alice --config bench.toml
+[runner-resume] runner exited 75 (barrier timeout); retrying with --resume
+[runner-resume] attempt 2: powershell.exe -NoProfile -File ...\fake-runner.ps1 --name alice --config bench.toml --resume
+[fake-runner] attempt 2, args: --name alice --config bench.toml --resume
+wrapper exit: 0
+```
+
+Non-75 propagation verified separately for both wrappers — a stub that
+exits 42 produces wrapper exit 42 with no retry.
+
+#### Deviations from the brief
+
+None. The brief allowed for changes to `runner/src/resume.rs` to make
+the Phase 1.25 exchange honour the timeout, but the actual exchange
+loop lives in `protocol.rs::exchange_resume_manifest`; `resume.rs` only
+holds local-disk inventory/intersection/cleanup helpers (no waiting).
+The timeout flows through `main.rs` -> `exchange_resume_manifest()` so
+the requirement is satisfied without touching `resume.rs`.
+
+#### Open concerns
+
+None.
+
+#### Commits (worktree branch)
+
+```
+d5844a9 docs: barrier timeout + auto-resume wrapper sections
+31be2c9 scripts: add runner-resume wrappers (bash + PowerShell)
+4080ffa contract: document barrier timeout in runner-coordination.md
+a03950f runner: add per-barrier timeout with EX_TEMPFAIL exit on expiry
+```
