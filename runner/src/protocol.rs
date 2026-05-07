@@ -125,6 +125,20 @@ pub struct Coordinator {
     /// runner itself (`127.0.0.1`). Wrapped in a Mutex so `discover()` can
     /// populate it through a shared reference.
     peer_hosts: Mutex<HashMap<String, String>>,
+    /// Cached agreed-upon log subfolder, populated by `discover()` just
+    /// before it returns (every runner — leader writes its own proposal,
+    /// non-leaders write the leader's proposal as observed in its
+    /// `Discover`). Used by `maybe_reemit_discover` so that post-discovery
+    /// barrier loops can re-broadcast a fully-formed `Discover` message
+    /// (with the agreed `log_subdir`) to a peer that joined late and is
+    /// still in its own discovery phase. Mutex because barriers run from
+    /// `&self`.
+    ///
+    /// In single-runner mode this is pre-populated with the constructor's
+    /// `log_subdir` argument, so the field is always `Some(_)` after `new()`
+    /// for that path; in multi-runner mode it stays `None` until
+    /// `discover()` succeeds.
+    last_log_subdir: Mutex<Option<String>>,
     /// Whether this is single-runner mode.
     single_runner: bool,
 }
@@ -188,6 +202,17 @@ impl Coordinator {
         let mut peer_hosts: HashMap<String, String> = HashMap::new();
         peer_hosts.insert(name.clone(), "127.0.0.1".to_string());
 
+        // In single-runner mode `discover()` returns immediately without
+        // running the loop, so there is no opportunity to populate
+        // `last_log_subdir` from there. Pre-populate it here so the field's
+        // post-construction invariant is consistent across modes for any
+        // helper that reads it.
+        let last_log_subdir = if single_runner {
+            Some(log_subdir.clone())
+        } else {
+            None
+        };
+
         Ok(Coordinator {
             name,
             expected,
@@ -199,6 +224,7 @@ impl Coordinator {
             socket,
             peer_addrs,
             peer_hosts: Mutex::new(peer_hosts),
+            last_log_subdir: Mutex::new(last_log_subdir),
             single_runner,
         })
     }
@@ -367,8 +393,95 @@ impl Coordinator {
                 self.expected.iter().all(|n| guard.contains_key(n))
             };
             if seen == self.expected && hosts_known {
+                // The exit condition is satisfied — every expected peer has
+                // been observed via *some* message type. But only `Discover`
+                // carries `log_subdir`, and the leader's `Discover` may not
+                // have arrived yet if the leader has already advanced into a
+                // post-discovery barrier (its barrier loops drop our
+                // `Discover` and broadcast only `Ready`/`Done`/etc., which
+                // is what populated `seen` for us). Without recovery this
+                // path used to `.expect("leader log_subdir should be known
+                // after discovery")` and panic — see T-coord.3.
+                //
+                // The fix: post-discovery barrier loops now re-emit
+                // `Discover` (with their cached `last_log_subdir`) when
+                // they observe an inbound `Discover` from an expected peer
+                // — see `maybe_reemit_discover`. So we keep broadcasting
+                // our own `Discover` and reading inbound messages, bounded
+                // by `LATE_DISCOVER_RECOVERY_BUDGET`, until the leader's
+                // `Discover` arrives. Once the fix is in place on both
+                // peers this terminates within a single re-broadcast cycle.
+                const LATE_DISCOVER_RECOVERY_BUDGET: Duration = Duration::from_secs(30);
+                let recovery_deadline = std::time::Instant::now() + LATE_DISCOVER_RECOVERY_BUDGET;
+                while leader_log_subdir.is_none() && std::time::Instant::now() < recovery_deadline {
+                    self.send(socket, &msg)?;
+                    let tick_end = std::time::Instant::now() + BROADCAST_INTERVAL;
+                    while std::time::Instant::now() < tick_end {
+                        if let Some((received, _src)) = self.recv_from(socket) {
+                            match received {
+                                Message::Discover {
+                                    name,
+                                    config_hash,
+                                    log_subdir,
+                                    resume,
+                                } => {
+                                    if self.expected.contains(&name)
+                                        && config_hash != self.config_hash
+                                    {
+                                        bail!(
+                                            "config hash mismatch from runner '{}': expected {}, got {}",
+                                            name,
+                                            &self.config_hash[..8],
+                                            &config_hash[..config_hash.len().min(8)]
+                                        );
+                                    }
+                                    if self.expected.contains(&name) && resume != self.resume {
+                                        bail!(
+                                            "resume-flag mismatch from runner '{}': expected {}, got {}",
+                                            name,
+                                            self.resume,
+                                            resume
+                                        );
+                                    }
+                                    if name == *leader && leader_log_subdir.is_none() {
+                                        leader_log_subdir = Some(log_subdir);
+                                    }
+                                }
+                                Message::ProbeRequest { from, to, id, t1 } => {
+                                    if to == self.name {
+                                        let _ = respond_to_probe(
+                                            socket,
+                                            &self.peer_addrs,
+                                            &self.name,
+                                            &from,
+                                            id,
+                                            &t1,
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                let agreed = match leader_log_subdir {
+                    Some(s) => s,
+                    None => bail!(
+                        "discovery quorum reached but leader '{}' never re-broadcast its \
+                         Discover within {}s — leader may be stuck in a non-cooperating \
+                         state (likely an older binary without the T-coord.3 \
+                         re-emission fix)",
+                        leader,
+                        LATE_DISCOVER_RECOVERY_BUDGET.as_secs()
+                    ),
+                };
+
                 // Linger: keep broadcasting Discover for 2 more seconds so
-                // slower peers can complete their discovery phase.
+                // slower peers can complete their discovery phase. Also
+                // serves the late-arrival case symmetrically: a peer still
+                // missing the leader's `Discover` benefits from us echoing
+                // ours during the linger.
                 let linger_end = std::time::Instant::now() + Duration::from_secs(2);
                 while std::time::Instant::now() < linger_end {
                     self.send(socket, &msg)?;
@@ -378,12 +491,15 @@ impl Coordinator {
                     std::thread::sleep(BROADCAST_INTERVAL);
                 }
 
-                // Return the leader's log subfolder. We always have it at
-                // this point because (a) if we are the leader we set it
-                // above, or (b) we received the leader's Discover message.
-                return Ok(
-                    leader_log_subdir.expect("leader log_subdir should be known after discovery")
-                );
+                // Cache the agreed log subfolder so post-discovery barrier
+                // loops can re-emit `Discover` on demand (T-coord.3
+                // recovery path for late-joining peers).
+                {
+                    let mut guard = self.last_log_subdir.lock().unwrap();
+                    *guard = Some(agreed.clone());
+                }
+
+                return Ok(agreed);
             }
         }
     }
@@ -455,6 +571,14 @@ impl Coordinator {
                                 id,
                                 &t1,
                             );
+                        }
+                    }
+                    Some(Message::Discover { name, .. }) => {
+                        // T-coord.3: a late-joining peer is still in its
+                        // discovery phase. Re-emit our own Discover so it
+                        // can populate its leader_log_subdir.
+                        if self.expected.contains(&name) {
+                            self.maybe_reemit_discover(socket);
                         }
                     }
                     _ => {}
@@ -576,6 +700,14 @@ impl Coordinator {
                             );
                         }
                     }
+                    Some(Message::Discover { name, .. }) => {
+                        // T-coord.3: a late-joining peer is still in its
+                        // discovery phase. Re-emit our own Discover so it
+                        // can populate its leader_log_subdir.
+                        if self.expected.contains(&name) {
+                            self.maybe_reemit_discover(socket);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -678,6 +810,14 @@ impl Coordinator {
                             );
                         }
                     }
+                    Some(Message::Discover { name, .. }) => {
+                        // T-coord.3: a late-joining peer is still in its
+                        // discovery phase. Re-emit our own Discover so it
+                        // can populate its leader_log_subdir.
+                        if self.expected.contains(&name) {
+                            self.maybe_reemit_discover(socket);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -720,6 +860,37 @@ impl Coordinator {
             let _ = socket.send_to(&data, &(*addr).into());
         }
         Ok(())
+    }
+
+    /// Best-effort re-emission of our own `Discover` for the benefit of a
+    /// late-joining peer that is still in its own discovery phase.
+    ///
+    /// Called from the `Some(Message::Discover { .. })` arm of every
+    /// post-discovery barrier loop (`ready_barrier`, `done_barrier`,
+    /// `exchange_resume_manifest`). The contract: if our discovery has
+    /// completed (so `last_log_subdir` is `Some(_)`), we re-broadcast a
+    /// fully-formed `Discover` carrying the agreed `log_subdir`. The slow
+    /// peer's `discover()` will then populate its `leader_log_subdir`
+    /// (via the leader's re-emission, or via the propagation of leader's
+    /// proposal that every other runner already mirrors).
+    ///
+    /// Errors are intentionally swallowed — we cannot abort the active
+    /// barrier on a transient send failure. This is a recovery-only path.
+    ///
+    /// See T-coord.3 (the discovery panic on late bob) for the bug this
+    /// fixes. Mirrors the pattern T-coord.1b uses for stale `Done`.
+    fn maybe_reemit_discover(&self, socket: &Socket) {
+        let subdir = match self.last_log_subdir.lock().unwrap().clone() {
+            Some(s) => s,
+            None => return,
+        };
+        let msg = Message::Discover {
+            name: self.name.clone(),
+            config_hash: self.config_hash.clone(),
+            log_subdir: subdir,
+            resume: self.resume,
+        };
+        let _ = self.send(socket, &msg);
     }
 
     /// Drain a single inbound message while still answering probe requests.
@@ -1572,6 +1743,190 @@ mod tests {
              post-done state. The T-coord.1 mid-run hang appears to be \
              fixed in the source. Invert this assertion to lock in the \
              fixed behaviour."
+        );
+    }
+
+    /// Reproducer for the T-coord.3 discovery panic: a late-joining
+    /// non-leader (bob) panicked at the tail of `Coordinator::discover`
+    /// because the leader (alice) had already advanced into a Phase 2
+    /// barrier and her barrier loops dropped bob's `Discover`.
+    ///
+    /// Failure path before the fix:
+    ///
+    /// 1. Bob's `seen` set is filled via a non-Discover message from
+    ///    alice (a `Ready` broadcast by alice's parked barrier loop —
+    ///    here injected directly so we don't depend on alice's full
+    ///    discovery completing first).
+    /// 2. Bob's `peer_hosts` gets `alice -> 127.0.0.1` from the source
+    ///    of that Ready packet.
+    /// 3. Bob's `seen == expected && hosts_known` becomes true. Without
+    ///    the fix he hits the `.expect("leader log_subdir should be
+    ///    known after discovery")` and panics.
+    ///
+    /// With the fix (T-coord.3):
+    ///
+    /// - Alice's parked barrier loop, on receiving bob's `Discover`,
+    ///   calls `maybe_reemit_discover` which broadcasts a fully-formed
+    ///   `Discover` carrying the agreed `log_subdir`.
+    /// - Bob's `discover()` keeps reading messages past the quorum point
+    ///   until the leader's `Discover` arrives, bounded by an internal
+    ///   30 s recovery budget. Once alice re-emits, bob captures
+    ///   `leader_log_subdir` and `discover()` returns
+    ///   `Ok(<alice's proposal>)`.
+    ///
+    /// Wall-clock budget: bob's recovery loop re-broadcasts every 500 ms
+    /// and alice's barrier-emulation thread responds promptly, so the
+    /// typical end-to-end recovery time is under 5 s. The test caps the
+    /// wait at 10 s.
+    #[test]
+    fn discover_recovers_when_leader_already_in_barrier_t_coord_3() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let runners = vec!["alice".to_string(), "bob".to_string()];
+        let hash = "discover-recover-hash".to_string();
+        let run_id = "discover-recover-run".to_string();
+        let alice_subdir = "alice-proposal-20260507_180000".to_string();
+        let bob_subdir = "bob-proposal-20260507_180001".to_string();
+
+        // Alice's emulator. We do NOT call alice's real discover() /
+        // ready_barrier(); instead we construct her Coordinator to bind
+        // the alice port and to give us access to `maybe_reemit_discover`
+        // and to her configured log_subdir cache. We then pre-populate
+        // her `last_log_subdir` cache directly to the agreed value, as
+        // her completed `discover()` would have done. Then we run a
+        // loop that mirrors `ready_barrier`'s reaction to inbound
+        // Discover (the `Some(Message::Discover { .. })` arm calls
+        // `maybe_reemit_discover`).
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_a = Arc::clone(&shutdown);
+        let runners_a = runners.clone();
+        let hash_a = hash.clone();
+        let run_a = run_id.clone();
+        let alice_subdir_a = alice_subdir.clone();
+        let thread_a = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "alice".into(),
+                &runners_a,
+                hash_a,
+                port,
+                alice_subdir_a.clone(),
+                run_a,
+                false,
+            )
+            .unwrap();
+            // Pretend alice's discover() already completed: cache the
+            // agreed log_subdir. (Alice is the leader, so her own
+            // proposal is the agreed value.)
+            *coord.last_log_subdir.lock().unwrap() = Some(alice_subdir_a);
+
+            // Mirror `ready_barrier`'s loop for the parts that matter to
+            // this test: broadcast Ready, answer probes, and call
+            // `maybe_reemit_discover` on inbound Discover from a peer in
+            // `expected`. This is the exact fix code path we want to
+            // exercise. The real `ready_barrier` would do the same but
+            // has no clean abort path for the test to terminate it.
+            let socket = coord.socket.as_deref().unwrap();
+            let ready_msg = Message::Ready {
+                name: "alice".into(),
+                variant: "spawn_n".into(),
+                run: coord.run.clone(),
+            };
+            let mut last_send = std::time::Instant::now() - BROADCAST_INTERVAL;
+            while !shutdown_a.load(AtomicOrdering::Relaxed) {
+                if last_send.elapsed() >= BROADCAST_INTERVAL {
+                    coord.send(socket, &ready_msg).ok();
+                    last_send = std::time::Instant::now();
+                }
+                match coord.recv(socket) {
+                    Some(Message::ProbeRequest { from, to, id, t1 }) => {
+                        if to == coord.name {
+                            let _ = respond_to_probe(
+                                socket,
+                                &coord.peer_addrs,
+                                &coord.name,
+                                &from,
+                                id,
+                                &t1,
+                            );
+                        }
+                    }
+                    Some(Message::Discover { name, .. }) => {
+                        // The fix under test: re-emit our own Discover so
+                        // bob can populate his leader_log_subdir.
+                        if coord.expected.contains(&name) {
+                            coord.maybe_reemit_discover(socket);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Give alice's emulator a moment to bind its socket and start
+        // broadcasting Ready, so bob sees Ready before the recovery
+        // window opens.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let runners_b = runners;
+        let hash_b = hash;
+        let run_b = run_id;
+        let bob_subdir_b = bob_subdir;
+        let bob_started = std::time::Instant::now();
+        let thread_b = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "bob".into(),
+                &runners_b,
+                hash_b,
+                port,
+                bob_subdir_b,
+                run_b,
+                false,
+            )
+            .unwrap();
+            coord.discover()
+        });
+
+        // Cap the wait at 10 s. The expected time is under 5 s (bob's
+        // discovery linger entry plus one re-broadcast cycle once
+        // alice's emulator answers his Discover with a re-emitted
+        // Discover).
+        let bob_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !thread_b.is_finished() && std::time::Instant::now() < bob_deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let bob_finished = thread_b.is_finished();
+
+        // Tear down alice cleanly so subsequent tests can bind ports.
+        // Do this BEFORE joining bob, so if bob's thread is still alive
+        // alice doesn't keep broadcasting onto a leaked port.
+        shutdown.store(true, AtomicOrdering::Relaxed);
+        thread_a.join().expect("alice thread panicked");
+
+        if !bob_finished {
+            panic!("bob's discover() did not return within 10 s — T-coord.3 fix not in place");
+        }
+        let bob_result = thread_b.join().expect("bob thread panicked");
+        let bob_elapsed = bob_started.elapsed();
+
+        let bob_log_subdir =
+            bob_result.expect("bob's discover() must return Ok after T-coord.3 fix");
+
+        // Bob must have adopted alice's proposal as the agreed log
+        // subdir, since alice is the leader (runners[0]).
+        assert_eq!(
+            bob_log_subdir, alice_subdir,
+            "bob must adopt alice's (leader's) log_subdir proposal after T-coord.3 fix"
+        );
+
+        // Sanity: bob's discovery must complete reasonably fast once
+        // alice's parked barrier loop re-emits Discover. We allow up to
+        // 10 s but expect well under that.
+        assert!(
+            bob_elapsed < Duration::from_secs(10),
+            "bob's discover() took too long ({bob_elapsed:?}) — T-coord.3 recovery is too slow"
         );
     }
 }
