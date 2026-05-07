@@ -193,6 +193,48 @@ The resume protocol adds one new message type:
 The discover message gains two fields documented in Phase 1: `log_subdir`
 (string) and `resume` (bool).
 
+## Barrier Timeout
+
+Each post-discovery coordination barrier — the ready barrier, the done
+barrier, and the Phase 1.25 ResumeManifest exchange — is bounded by a
+per-call timeout. The runner CLI exposes this as `--barrier-timeout-secs`
+with a default of **120 seconds**.
+
+When a barrier fails to reach quorum within its timeout the runner:
+
+1. Stops broadcasting on the affected barrier and emits a single stderr
+   line in the form
+   `[runner:<name>] FATAL: barrier '<kind>' for variant '<v>' timed out after <t>s waiting for peer(s): [<missing>] — exiting 75 (EX_TEMPFAIL); wrapper should retry with --resume`.
+2. Exits with code **75** (`EX_TEMPFAIL` from `<sysexits.h>`). This code
+   is the single signal the auto-resume wrapper scripts gate on; every
+   other non-zero exit (panic, config error, variant failure, child
+   timeout) propagates as-is and stops the wrapper loop.
+3. Performs no in-process self-restart. The runner is the sole source of
+   truth for "did this iteration finish"; the wrapper handles the loop.
+
+In-flight variant child cleanup: the runner's spawn-and-monitor loop is
+synchronous, so the variant child has always either not been spawned
+yet (ready barrier) or already exited (done barrier) by the time a
+barrier timeout fires. There is no orphan child to kill on the
+timeout-exit path.
+
+**Discovery (Phase 1) is intentionally NOT subject to this timeout.** A
+stuck discovery is a config or firewall problem — mismatched runner
+names, blocked UDP multicast, hardware NIC offline — none of which the
+auto-resume wrapper can fix by re-launching with `--resume`. Discovery
+already has its own loss-recovery pattern (re-broadcast every 500 ms);
+if a peer never appears, the operator must intervene. Phase 1.5 / per-
+variant clock sync is similarly bounded by its own per-sample timeouts
+inside `ClockSyncEngine::measure_one` (N=32 samples × 100 ms ≈ 3.4 s
+upper bound per peer) and so does not need a separate barrier-style
+timeout wrapped around it; per-variant zero-sample remains a soft
+warning, never fatal.
+
+The default 120 s is chosen to absorb realistic worst-case variant
+cleanup (zenoh ~30 s, some QUIC linger paths up to ~60 s) without
+masking real peer death. Operators running on slow LANs or stress
+configurations can override via `--barrier-timeout-secs <N>`.
+
 ## Network Requirements
 
 - All runners must be on the same local network subnet.
