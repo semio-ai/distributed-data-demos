@@ -6079,3 +6079,161 @@ All commands run from the worktree root. Final state:
 - Branch: `worktree-agent-a5008f03cb3e17c07`.
 - Commits: see commit log on the branch (will follow the suggested
   three-commit split: protocol + test, contract, docs).
+
+---
+
+## Run report 2026-05-07 21:43 — alice + bob with all-variants config (post-T-coord.3)
+
+**Config**: `configs/two-runner-all-variants.toml` (48 [[variant]]
+entries × QoS expansion = 176 spawns, ~10–15 min nominal).
+**Build**: main HEAD `233ad46+dirty` (T-coord.3 landed).
+**Launch**: orchestrator-driven, alice + bob both started locally on
+the same Windows host. No `--resume`. Stderrs captured at
+`logs/alice.stderr` / `logs/bob.stderr`.
+**Log subfolder**: `all-variants-01-20260507_214325` (both runners
+adopted the leader's proposal — proves the T-coord.3 fix path).
+
+### Discovery: PASS (T-coord.3 verified live)
+
+Both runners completed Phase 1 cleanly, no panic. Discovery,
+peer-host capture, and initial clock sync all succeeded:
+
+```
+[runner:alice] starting discovery...
+[runner:alice] discovery complete
+[runner:alice] log subfolder: all-variants-01-20260507_214325
+[runner:alice] peer_hosts: {"bob": "192.168.1.77", "alice": "127.0.0.1"}
+
+[runner:bob] starting discovery...
+[runner:bob] discovery complete
+[runner:bob] log subfolder: all-variants-01-20260507_214325
+[runner:bob] peer_hosts: {"bob": "127.0.0.1", "alice": "127.0.0.1"}
+```
+
+This is the exact failure path the user hit at 17:00 (`leader log_subdir
+should be known after discovery`); the fix makes it impossible to
+reach the late-recovery branch in this scenario because both peers
+stay alive and re-emit `Discover` from their barrier loops once one
+of them is ahead.
+
+### Phase 2: 7 variants completed cleanly, then T-coord.1b's bug class fired
+
+Both runners successfully completed 7 full lifecycles (ready_barrier
+→ clock_resync → spawn → done_barrier) for the first 7 jobs:
+
+| # | Variant                       |
+| - | ----------------------------- |
+| 1 | custom-udp-1000x100hz-qos1    |
+| 2 | custom-udp-1000x100hz-qos2    |
+| 3 | custom-udp-1000x100hz-qos3    |
+| 4 | custom-udp-1000x100hz-qos4    |
+| 5 | custom-udp-1000x10hz-qos1     |
+| 6 | custom-udp-1000x10hz-qos2     |
+| 7 | custom-udp-1000x10hz-qos3 (variant child finished cleanly on both; bob's done_barrier completed; alice's done_barrier hung) |
+
+By `grep -c "ready barrier for spawn"` alice entered 7 ready barriers,
+bob entered 8 (bob got into ready_barrier for qos4 before the
+timeout fired). Both had 7 `finished: status=success` lines.
+
+### Failure mode (T-coord.1b's bug class — NOT a T-coord.3 regression)
+
+**Alice** (slow peer):
+
+```
+[runner:alice] 'custom-udp-1000x10hz-qos3' finished: status=success, exit_code=0
+[runner:alice] FATAL: barrier 'done' for variant 'custom-udp-1000x10hz-qos3'
+  timed out after 120.0s waiting for peer(s): ["bob"] —
+  exiting 75 (EX_TEMPFAIL); wrapper should retry with --resume
+```
+
+Alice's variant child for qos3 exited cleanly (`success`). Alice
+broadcast `Done(qos3)` and entered the wait. Bob's `Done(qos3)`
+broadcasts never reached alice's `done_barrier` — UDP loss in the
+alice-receive direction during the qos3 done window, asymmetric with
+the bob-receive direction (bob got alice's Done fine).
+
+**Bob** (fast peer):
+
+```
+[runner:bob] 'custom-udp-1000x10hz-qos3' finished: status=success, exit_code=0
+[runner:bob] ready barrier for spawn 'custom-udp-1000x10hz-qos4'
+[runner:bob] FATAL: barrier 'ready' for variant 'custom-udp-1000x10hz-qos4'
+  timed out after 120.0s waiting for peer(s): ["alice"] —
+  exiting 75 (EX_TEMPFAIL); wrapper should retry with --resume
+```
+
+Bob's `done_barrier(qos3)` received alice's `Done(qos3)`, completed
+normally, lingered 2 s, and advanced to `ready_barrier(qos4)`. From
+that point bob's barrier loop drops alice's still-broadcasting
+`Done(qos3)` (the existing `_ => {}` arm — wrong type for this
+barrier). With **no T-coord.1b machinery in place** (it is filed but
+not implemented in main; the user's WIP for it remains stashed), bob
+has no way to re-emit a stale `Done(qos3)` to satisfy alice's
+done-barrier loop. Alice's loop hits the 120 s T-coord.2 cap and
+exits 75. Bob then has no peer for `ready_barrier(qos4)` and exits 75
+itself ~120 s later.
+
+### What worked and what didn't
+
+- ✓ T-coord.3 fix: discovery panic gone. Discovery completed at first
+  attempt for both runners.
+- ✓ T-coord.2 safety net: both runners exited cleanly with code 75
+  and a single descriptive stderr line. No infinite hang. The
+  auto-resume wrapper would have caught both and re-launched with
+  `--resume`.
+- ✗ T-coord.1b: the bug it targets (asymmetric `Done` loss across the
+  spawn-N → spawn-N+1 boundary) is reproducible on the user's
+  machine within the first ~3 minutes of a real run. The benchmark
+  cannot complete a 176-spawn run end-to-end without T-coord.1b
+  landed (each restart with `--resume` would skip the completed
+  spawns but face the same race on the next).
+
+### Recommendation
+
+**Land T-coord.1b** — it is filed in `metak-orchestrator/TASKS.md`
+(search `T-coord.1b:`) and the user already has partial WIP for it
+in `git stash@{0}` (`WIP: partial T-coord.1b cache + helper
+(orchestrator stash 2026-05-07 before T-coord.3 fix)`). The WIP
+contributes:
+
+- The `last_completed: Mutex<Option<(String, String, String, i32)>>`
+  cache field on `Coordinator`.
+- Constructor initialises it to `None`.
+- A `maybe_reemit_stale_done(&self, socket, inbound_variant,
+  inbound_run)` helper.
+
+What's still missing to actually land T-coord.1b:
+
+- `done_barrier` must populate the cache at the tail (just before
+  `return Ok(...)`).
+- `ready_barrier`, `done_barrier` (for cross-spawn requests),
+  `exchange_resume_manifest`, and the discovery linger must call
+  the helper from a `Some(Message::Done { name, variant, run, .. })`
+  arm when the inbound `(variant, run)` matches the cached entry.
+- Invert the existing
+  `done_barrier_hang_repro_when_peer_already_advanced` test
+  assertion to lock in the fix.
+- Update `metak-shared/api-contracts/runner-coordination.md` and
+  `runner/CUSTOM.md`.
+
+There is now a stash-pop conflict between the user's WIP and the
+T-coord.3 fix landed in main (both touch `Coordinator`'s field list
+and the barrier match arms). The conflict is mechanical (both fixes
+add a Mutex field and a per-message arm; the regions are adjacent
+but not contradictory). A worker can resolve it by hand-merging or
+by re-applying the WIP intent on top of main.
+
+### Remaining state
+
+- Main HEAD: `233ad46` (T-coord.3 landed, clean working tree apart
+  from `.claude/worktrees/` and the pre-existing
+  `.claude/scheduled_tasks.lock` deletion).
+- `git stash@{0}` preserved.
+- Worker worktree `agent-a46264d6045b7df9e` retained on disk; branch
+  `worktree-agent-a46264d6045b7df9e` matches main HEAD post-FF and
+  can be removed in a follow-up cleanup commit.
+- 7 successful variant log files exist under
+  `logs/all-variants-01-20260507_214325/`. A `--resume` re-run on
+  T-coord.1b-fixed binaries would skip those 7 spawns and continue
+  from the qos3 done barrier (which hung) onwards — alternatively,
+  blow away the logs subfolder and run fresh.
