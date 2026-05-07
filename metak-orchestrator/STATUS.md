@@ -22,6 +22,18 @@
 on same machine — both runners discover each other, barrier-sync, spawn
 variants, produce JSONL logs (255 writes + 255 receives per runner).
 
+**Open coordination issue (2026-05-07).** During a Hybrid full-matrix
+two-machine run on alice/bob (commits `6d9a53e` / `16476d3+dirty`),
+both runners hung in the transition between spawn N done and spawn
+N+1 ready: alice was waiting at the ready barrier for
+`hybrid-100x100hz-qos1`, bob was silent after logging
+`'hybrid-100x1000hz-qos4' finished: status=success`. User killed
+both and resumed via `--resume` successfully. Two follow-ups
+filed: T-coord.1 (root-cause investigation) and T-coord.2 (barrier
+timeouts + exit code 75 + auto-resume wrapper scripts;
+intentionally decoupled from T-coord.1 so the safety net lands
+regardless of root cause).
+
 ---
 
 ## E0: Variant Exploration — done
