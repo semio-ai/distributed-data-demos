@@ -1,0 +1,44 @@
+# T-zenoh.1 live smoke config: two same-machine peers, qos=1, one
+# 1000-vps fixture and one max-throughput fixture. Used to confirm that
+# the first-tick declare storm is gone and writes are spread across the
+# entire operate window. Generated under variants/zenoh/tests/ to keep
+# the smoke artefact within the worker's working directory; not part of
+# the production benchmark suite.
+
+run = "zenoh-tzenoh1-smoke"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-1000x100hz-qos1"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 30
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+
+[[variant]]
+name = "zenoh-max-qos1"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 30
+  silent_secs = 2
+  workload = "max-throughput"
+  values_per_tick = 1000
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"

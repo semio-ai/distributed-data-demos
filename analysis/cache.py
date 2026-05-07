@@ -326,8 +326,21 @@ def _build_shard(
                     variant = str(v)
                 if r is not None:
                     run = str(r)
-                if e is not None:
-                    is_clocksync = str(e) == "clock_sync"
+                # Mirror the two-check rule in ``_is_clocksync_shard``:
+                # a shard is clock-sync-only if its first row's event
+                # is one of the known clock-sync event names OR if its
+                # variant is empty (broadcast-only sibling log).
+                if e is not None or v is not None:
+                    e_str = str(e) if e is not None else ""
+                    v_str = str(v) if v is not None else ""
+                    is_clocksync = (
+                        e_str
+                        in (
+                            "clock_sync",
+                            "clock_sync_sample",
+                        )
+                        or v_str == ""
+                    )
             row_count += df.height
             typed_batches.append(df)
 
@@ -539,15 +552,28 @@ def _backfill_index_fields(
         variant = head.get_column("variant").cast(pl.Utf8)[0]
         run = head.get_column("run").cast(pl.Utf8)[0]
         event = head.get_column("event").cast(pl.Utf8)[0]
+        # Match ``_is_clocksync_shard``: known clock-sync event names
+        # OR empty-variant fallback both mark the shard as broadcast.
+        if event is not None or variant is not None:
+            event_str = str(event) if event is not None else ""
+            variant_str = str(variant) if variant is not None else ""
+            new_is_clocksync: bool | None = (
+                event_str
+                in (
+                    "clock_sync",
+                    "clock_sync_sample",
+                )
+                or variant_str == ""
+            )
+        else:
+            new_is_clocksync = meta.is_clocksync
         upgraded[stem] = ShardMeta(
             mtime=meta.mtime,
             row_count=meta.row_count,
             schema_version=meta.schema_version,
             variant=str(variant) if variant is not None else meta.variant,
             run=str(run) if run is not None else meta.run,
-            is_clocksync=(str(event) == "clock_sync")
-            if event is not None
-            else meta.is_clocksync,
+            is_clocksync=new_is_clocksync,
         )
     return upgraded
 
@@ -564,19 +590,39 @@ def scan_shards(logs_dir: Path) -> pl.LazyFrame:
 
 
 def _is_clocksync_shard(shard: Path) -> bool:
-    """Return True if the shard's first row is a ``clock_sync`` event.
+    """Return True if the shard is a clock-sync sibling log.
 
-    Clock-sync logs (``<runner>-clock-sync-<run>.jsonl``, see E8)
+    Clock-sync logs (``<runner>-clock-sync-<run>.jsonl`` and the
+    ``<runner>-clock-sync-debug-<run>.jsonl`` debug variant, see E8)
     interleave rows for many variants in a single file. We detect them
     by event type so they can be broadcast across every variant group
     in the run instead of being mis-classified into a single group
     based on their first row's ``variant`` field.
+
+    Two checks are required (defence-in-depth):
+
+    1. Match BOTH ``clock_sync`` (the periodic accepted-offset summary)
+       and ``clock_sync_sample`` (per-sample debug rows emitted by the
+       ``*-clock-sync-debug-*.jsonl`` shards). Either one is sufficient
+       to identify the shard as clock-sync-only.
+    2. Treat any first row with an empty ``variant`` as broadcast-only
+       too. Variant logs always carry a non-empty ``variant`` by log
+       convention; an empty one means the shard is a sibling log
+       (clock-sync or future broadcast types) that must not be exposed
+       as its own ``("", run)`` group. This guards against new
+       broadcast event names that the explicit list above doesn't yet
+       know about.
     """
-    head = pl.read_parquet(shard, columns=["event"], n_rows=1)
+    head = pl.read_parquet(shard, columns=["event", "variant"], n_rows=1)
     if head.is_empty():
         return False
     event = head.get_column("event").cast(pl.Utf8)[0]
-    return event == "clock_sync"
+    if event in ("clock_sync", "clock_sync_sample"):
+        return True
+    variant = head.get_column("variant").cast(pl.Utf8)[0]
+    # Empty-variant fallback: any sibling log without a variant tag is
+    # broadcast-only and must not become its own (variant, run) group.
+    return variant is None or variant == ""
 
 
 def discover_groups(logs_dir: Path) -> list[tuple[str, str, list[Path]]]:

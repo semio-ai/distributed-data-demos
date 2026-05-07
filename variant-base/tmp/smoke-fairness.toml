@@ -1,0 +1,46 @@
+# T-fairness.1 smoke: hybrid-max @ qos4 and quic-max @ qos2 on two
+# same-machine runners. Goal is to confirm the bounded receive-drain
+# fix lets BOTH alice and bob accumulate substantially more than 1000
+# writes during the operate window. Per the task acceptance criteria,
+# target is at least 100k writes each per variant over the operate
+# window.
+
+run = "smoke-fairness"
+runners = ["alice", "bob"]
+default_timeout_secs = 90
+
+[[variant]]
+name = "hybrid-max-qos4"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 30
+  silent_secs = 3
+  workload = "max-throughput"
+  values_per_tick = 1000
+  qos = 4
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19502"
+  tcp_base_port = 19900
+  peers = "127.0.0.1:19900"
+
+[[variant]]
+name = "quic-max-qos2"
+binary = "target/release/variant-quic.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 30
+  silent_secs = 3
+  workload = "max-throughput"
+  values_per_tick = 1000
+  qos = 2
+  log_dir = "./logs"
+
+  [variant.specific]
+  base_port = 19930

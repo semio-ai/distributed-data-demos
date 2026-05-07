@@ -1,10 +1,13 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use zenoh::handlers::FifoChannelHandler;
 use zenoh::pubsub::{Publisher, Subscriber};
 use zenoh::sample::Sample;
@@ -53,22 +56,64 @@ fn zenoh_err(e: zenoh::Error) -> anyhow::Error {
 ///   - payload: [u8; remaining]
 struct MessageCodec;
 
+/// Capacity reserved per encode in the thread-local `BytesMut`. The pool
+/// is split-and-freezed per call so a `BytesMut::reserve` only triggers
+/// when the rolling window of in-flight `Bytes` views exhausts the
+/// underlying allocation. Sized to amortize the syscall to a few times
+/// per second under the heaviest 1000 vps × 100 Hz fixture.
+const ENCODE_CHUNK_BYTES: usize = 64 * 1024;
+
+thread_local! {
+    /// Per-(main-)thread reusable encode buffer. Each `encode` call
+    /// reserves enough room for one message, writes the bytes, and
+    /// `split_to(...).freeze()`s a refcounted `Bytes` view of those
+    /// bytes -- the remaining capacity in the BytesMut is reused on the
+    /// next call. Once the rolling capacity is exhausted, a single
+    /// `reserve(ENCODE_CHUNK_BYTES)` takes over the next chunk.
+    ///
+    /// Why a thread-local rather than a per-publisher-task buffer: in
+    /// the T10.2b bridge architecture, encoding happens on the variant's
+    /// main thread (so the publisher task only spends time on the put,
+    /// not on the codec). The thread-local matches that division of
+    /// labor and avoids forcing the publisher task to re-encode on a
+    /// runtime worker.
+    static ENCODE_BUF: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(ENCODE_CHUNK_BYTES));
+}
+
 impl MessageCodec {
-    fn encode(writer: &str, seq: u64, qos: Qos, path: &str, payload: &[u8]) -> Vec<u8> {
+    /// Encode one outbound message into the thread-local `BytesMut` and
+    /// return a frozen `Bytes` view. The underlying allocation is shared
+    /// with the BytesMut so `bytes::Bytes -> ZBytes` is zero-copy on the
+    /// way down to `publisher.put`.
+    fn encode(writer: &str, seq: u64, qos: Qos, path: &str, payload: &[u8]) -> Bytes {
         let writer_bytes = writer.as_bytes();
         let path_bytes = path.as_bytes();
         let total = 2 + writer_bytes.len() + 8 + 1 + 2 + path_bytes.len() + payload.len();
-        let mut buf = Vec::with_capacity(total);
 
-        buf.extend_from_slice(&(writer_bytes.len() as u16).to_le_bytes());
-        buf.extend_from_slice(writer_bytes);
-        buf.extend_from_slice(&seq.to_le_bytes());
-        buf.push(qos.as_int());
-        buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
-        buf.extend_from_slice(path_bytes);
-        buf.extend_from_slice(payload);
-
-        buf
+        ENCODE_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            // Ensure we can write a contiguous `total` bytes. `BytesMut::reserve`
+            // only allocates when the remaining capacity is insufficient.
+            if buf.capacity() < total {
+                // Grab a fresh ENCODE_CHUNK_BYTES chunk so we amortize
+                // allocator traffic across many encodes. `reserve` requests
+                // additional capacity beyond `len()`, so this gives us
+                // ENCODE_CHUNK_BYTES headroom even if the previous chunk
+                // was just frozen out.
+                buf.reserve(ENCODE_CHUNK_BYTES.max(total));
+            }
+            buf.put_u16_le(writer_bytes.len() as u16);
+            buf.put_slice(writer_bytes);
+            buf.put_u64_le(seq);
+            buf.put_u8(qos.as_int());
+            buf.put_u16_le(path_bytes.len() as u16);
+            buf.put_slice(path_bytes);
+            buf.put_slice(payload);
+            // Split off exactly the bytes we just wrote and freeze them
+            // into a refcounted `Bytes` view. The BytesMut keeps the
+            // remaining capacity for the next encode.
+            buf.split_to(total).freeze()
+        })
     }
 
     fn decode(data: &[u8]) -> Result<ReceivedUpdate> {
@@ -175,12 +220,44 @@ fn path_to_key(path: &str) -> &str {
     path.strip_prefix('/').unwrap_or(path)
 }
 
-/// Default capacity for the publish-side bounded channel. Sized so that one
-/// full tick of the heaviest fixture (1000 values_per_tick) fits comfortably
-/// without back-pressure under normal operation, but the bound still
-/// guarantees the main thread eventually blocks rather than allocating
-/// unboundedly if the publisher task can't keep up.
-const PUBLISH_CHANNEL_CAPACITY: usize = 8192;
+/// Default capacity for the publish-side bounded channel.
+///
+/// Sized small (1024) on purpose so that genuine producer-faster-than-
+/// consumer pressure shows up at the writer's `blocking_send` instead of
+/// being absorbed into a deep queue (which inflates p95 latency and masks
+/// the real stall). The earlier 8192 cap was tuned around the lazy
+/// first-tick `declare_publisher` storm that T-zenoh.1 fixed by
+/// pre-declaring publishers in `connect`; with declares out of the
+/// operate hot path, the publisher task drains at line rate and a small
+/// channel is sufficient.
+const PUBLISH_CHANNEL_CAPACITY: usize = 1024;
+
+/// Recover `--values-per-tick` from the variant process's CLI args.
+///
+/// The `Variant` trait only hands `runner` and the trailing `extra` args
+/// to `Variant::new`; `--values-per-tick` is a top-level arg on
+/// `variant_base::cli::CliArgs` that is *not* propagated into `extra`.
+/// To pre-declare publishers from the workload's path set during
+/// `connect` (T-zenoh.1), we re-parse the same arg from
+/// `std::env::args` -- the same buffer clap reads. The variant is
+/// therefore reading exactly what the runner spawned it with.
+///
+/// Returns `None` if the arg is absent or unparseable; the caller
+/// falls back to lazy declare in that case (e.g. unit tests that
+/// construct `ZenohVariant::new` without a real runner spawn, or
+/// future workloads with non-`scalar-flood` path schemes).
+fn values_per_tick_from_env() -> Option<u32> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--values-per-tick" {
+            return args.next().and_then(|v| v.parse::<u32>().ok());
+        }
+        if let Some(stripped) = arg.strip_prefix("--values-per-tick=") {
+            return stripped.parse::<u32>().ok();
+        }
+    }
+    None
+}
 
 /// Default capacity for the receive-side bounded channel. Sized for the
 /// same heavy-fanout workload; samples that don't fit (channel full) are
@@ -253,10 +330,13 @@ enum OutboundMessage {
         /// Already-derived Zenoh key (no leading slash, no double prefix —
         /// see [`path_to_key`]).
         key: String,
-        /// Already-encoded message body. Encoding happens on the main thread
-        /// to avoid sending the original `&[u8]` payload across the channel
-        /// and to keep the publisher task hot path purely about the put.
-        encoded: Vec<u8>,
+        /// Already-encoded message body, frozen out of the thread-local
+        /// `ENCODE_BUF` (see `MessageCodec::encode`). `bytes::Bytes` is
+        /// refcounted so cloning across the channel is cheap, and zenoh's
+        /// `From<bytes::Bytes> for ZBytes` impl is zero-copy -- the
+        /// publisher task hands the same allocation to `publisher.put`
+        /// without re-allocating.
+        encoded: Bytes,
         /// Sequence number for diagnostic tracing.
         seq: u64,
     },
@@ -398,15 +478,52 @@ async fn publisher_task(
     while let Some(msg) = send_rx.recv().await {
         match msg {
             OutboundMessage::Data { key, encoded, seq } => {
-                // Look up or declare the publisher for this key. Declaring
-                // costs a route resolution; reuse on subsequent puts to the
-                // same key is the cheap path that lets 1000 distinct
-                // keys/tick stay tractable.
-                if !state.publishers.contains_key(&key) {
-                    let key_owned = key.clone();
-                    match state.session.declare_publisher(key_owned.clone()).await {
+                // Standard hot path: publisher was pre-declared in
+                // `connect` from the workload's known path set, so this
+                // lookup is a HashMap hit and the put runs on a routine
+                // tokio worker. The lazy-declare fallback below covers
+                // workloads outside the standard `bench/0..N-1` scheme;
+                // a missing entry on the standard fixture is unexpected
+                // and surfaces as a trace warning so we notice if the
+                // pre-declare contract drifts.
+                if let Some(publisher) = state.publishers.get(&key) {
+                    if let Err(e) = publisher.put(encoded).await {
+                        if trace {
+                            trace_now!(
+                                "publisher_task: put failed seq={} key={} err={}",
+                                seq,
+                                key,
+                                e
+                            );
+                        }
+                    }
+                } else {
+                    // Lazy fallback: declare on first sight. This used to
+                    // be the universal path and was the root cause of
+                    // T-zenoh.1's 8k-message hang -- 1000 declares
+                    // serialised on a 2-worker runtime stalled the
+                    // publisher task while the channel filled. Keep it
+                    // for non-standard workloads, but emit a trace so
+                    // we notice if a fixture starts hitting it.
+                    if trace {
+                        trace_now!(
+                            "publisher_task: lazy declare key={} (pre-declare missed)",
+                            key
+                        );
+                    }
+                    match state.session.declare_publisher(key.clone()).await {
                         Ok(publisher) => {
-                            state.publishers.insert(key_owned, publisher);
+                            if let Err(e) = publisher.put(encoded).await {
+                                if trace {
+                                    trace_now!(
+                                        "publisher_task: put failed seq={} key={} err={}",
+                                        seq,
+                                        key,
+                                        e
+                                    );
+                                }
+                            }
+                            state.publishers.insert(key, publisher);
                         }
                         Err(e) => {
                             if trace {
@@ -418,21 +535,6 @@ async fn publisher_task(
                             }
                             continue;
                         }
-                    }
-                }
-                let publisher = state
-                    .publishers
-                    .get(&key)
-                    .expect("publisher just inserted above");
-
-                if let Err(e) = publisher.put(encoded).await {
-                    if trace {
-                        trace_now!(
-                            "publisher_task: put failed seq={} key={} err={}",
-                            seq,
-                            key,
-                            e
-                        );
                     }
                 }
             }
@@ -667,26 +769,48 @@ impl Variant for ZenohVariant {
 
         let config = build_zenoh_config(&self.zenoh_args)?;
 
-        // Two-worker multi-thread runtime: one worker tends to handle the
-        // publisher task and the put-side socket I/O, the other tends to
-        // handle the subscriber task and Zenoh's internal RX. Two workers
-        // are sufficient to keep the routing path moving even when the
-        // main thread is feeding the publish channel hard, which is the
-        // exact contention pattern DECISIONS.md D7 identified.
+        // Multi-thread runtime sized to the host so the publisher task,
+        // both subscriber tasks, and zenoh's internal driver tasks
+        // (route-resolution, transport TX/RX) all get real worker
+        // threads. The previous 2-worker cap (chosen to keep the bridge
+        // small) was the proximate cause of T-zenoh.1's first-tick
+        // hang: 1000 lazy `declare_publisher().await` calls plus 3
+        // bridge tasks plus zenoh's own background work serialised
+        // onto 2 workers, the publisher task starved, the publish
+        // channel filled, and `blocking_send` deadlocked the writer.
+        // `num_cpus::get().max(4)` gives at least 4 workers even on
+        // small VMs and scales with the host on bigger boxes.
+        let worker_threads = num_cpus::get().max(4);
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(worker_threads)
             .enable_all()
             .thread_name("zenoh-bridge")
             .build()
             .context("failed to build tokio runtime")?;
+        trace_if!(
+            trace,
+            "connect: tokio runtime worker_threads={}",
+            worker_threads,
+        );
 
         // Open the session and declare BOTH subscribers (data + EOT)
         // inside the runtime so any task spawning Zenoh does at
         // construction time happens on the right runtime. Both
         // subscribers share the single session per the T10.2b bridge
         // architecture; do NOT open a second session for EOT.
+        //
+        // Publishers are also pre-declared inside this same `block_on`
+        // when the workload's path set is known (T-zenoh.1, scope
+        // item 1). The standard `scalar-flood` workload publishes to
+        // `bench/0..values_per_tick-1`, which we recover from
+        // `std::env::args` because the `Variant` trait does not pass
+        // `values_per_tick` through. Concurrent declares via a
+        // `JoinSet` so 1000 keys finish in roughly the cost of a few
+        // dozen sequential declares (the runtime now has enough
+        // workers to actually parallelise them).
+        let pre_declare_count = values_per_tick_from_env().unwrap_or(0);
         let t_open = Instant::now();
-        let (session, subscriber, eot_subscriber) = runtime
+        let (session, subscriber, eot_subscriber, predeclared_publishers) = runtime
             .block_on(async {
                 let session = zenoh::open(config).await.map_err(zenoh_err)?;
                 let subscriber = session
@@ -697,12 +821,55 @@ impl Variant for ZenohVariant {
                     .declare_subscriber(EOT_WILDCARD)
                     .await
                     .map_err(zenoh_err)?;
-                Ok::<_, anyhow::Error>((session, subscriber, eot_subscriber))
+
+                // Pre-declare publishers for the workload's known path
+                // set. Concurrent via JoinSet; results collected into
+                // the publisher cache before the publisher task starts
+                // draining the publish channel, so the operate phase
+                // sees zero declares for the standard fixture.
+                let mut publishers: HashMap<String, Publisher<'static>> =
+                    HashMap::with_capacity(pre_declare_count as usize);
+                if pre_declare_count > 0 {
+                    let mut set: JoinSet<(String, zenoh::Result<Publisher<'static>>)> =
+                        JoinSet::new();
+                    for i in 0..pre_declare_count {
+                        let key = format!("bench/{}", i);
+                        let session_clone = session.clone();
+                        let key_for_task = key.clone();
+                        set.spawn(async move {
+                            let res = session_clone.declare_publisher(key_for_task.clone()).await;
+                            (key_for_task, res)
+                        });
+                    }
+                    while let Some(joined) = set.join_next().await {
+                        let (key, res) = joined.context("declare_publisher task panicked")?;
+                        match res {
+                            Ok(publisher) => {
+                                publishers.insert(key, publisher);
+                            }
+                            Err(e) => {
+                                // Don't fail connect on a single
+                                // declare error -- fall back to the
+                                // lazy path on first publish for that
+                                // key. Zenoh's declare can fail
+                                // transiently during scout warm-up.
+                                eprintln!(
+                                    "[zenoh] warning: pre-declare publisher for {} failed: {}",
+                                    key, e
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>((session, subscriber, eot_subscriber, publishers))
             })
-            .context("failed to open zenoh session / declare subscribers")?;
+            .context(
+                "failed to open zenoh session / declare subscribers / pre-declare publishers",
+            )?;
         trace_if!(
             trace,
-            "connect: session opened + subscribers declared in {} ms",
+            "connect: session opened + subscribers declared + {} publishers pre-declared in {} ms",
+            predeclared_publishers.len(),
             t_open.elapsed().as_millis()
         );
 
@@ -720,7 +887,7 @@ impl Variant for ZenohVariant {
 
         let pub_state = PublisherState {
             session,
-            publishers: HashMap::new(),
+            publishers: predeclared_publishers,
         };
 
         runtime.spawn(publisher_task(pub_state, send_rx, trace));

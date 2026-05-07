@@ -4434,7 +4434,9 @@ name = "variant-zenoh"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "num_cpus",
  "rand 0.8.6",
  "serde_json",
  "tempfile",

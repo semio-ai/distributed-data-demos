@@ -18,6 +18,16 @@ rand = "0.8"
 # (Option B in DECISIONS.md D7 / T10.2b). The runtime drives Zenoh's async
 # API end-to-end so the variant's main thread never blocks the routing path.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+# CPU count for the bridge runtime sizing (T-zenoh.1): we size
+# `worker_threads` from the host CPU count so the publisher / subscriber /
+# EOT subscriber tasks aren't all serialized onto two workers.
+num_cpus = "1"
+# `bytes::BytesMut` / `bytes::Bytes` for the per-publisher-task encode
+# buffer (T-zenoh.1). `bytes::Bytes -> zenoh::ZBytes` is zero-copy via
+# zenoh's `BytesWrap`, so we can encode into a reused BytesMut, freeze
+# slices off it, and hand them to `publisher.put(...)` without per-call
+# allocation in the hot path.
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3"

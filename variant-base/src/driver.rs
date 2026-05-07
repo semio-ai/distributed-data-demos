@@ -58,6 +58,20 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     let mut last_resource_sample = Instant::now();
     let mut next_tick = Instant::now();
 
+    // Bound the receive-drain per outer iteration by both a message-count
+    // budget and a wallclock budget. Without this, an unbounded
+    // `while let Some(update) = variant.poll_receive()? { ... }` starves
+    // `publish` whenever a peer publishes faster than the local variant
+    // drains. See T-fairness.1.
+    //
+    // Defaults: drain at most `2 * values_per_tick` messages (so a fair
+    // drain still keeps up with a peer publishing at our rate), and at
+    // most 1ms of wallclock per outer iteration. Whichever trips first
+    // breaks out and lets the next publish tick run; remaining queued
+    // messages stay in the variant's internal buffer.
+    let drain_msg_budget = (config.values_per_tick as usize).saturating_mul(2).max(1);
+    let drain_time_budget = Duration::from_millis(1);
+
     while operate_start.elapsed() < operate_duration {
         // In max-throughput mode, skip the tick sleep entirely.
         if !max_throughput {
@@ -76,15 +90,28 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
             logger.log_write(seq, &op.path, qos, op.payload.len())?;
         }
 
-        // Drain received updates.
-        while let Some(update) = variant.poll_receive()? {
-            logger.log_receive(
-                &update.writer,
-                update.seq,
-                &update.path,
-                update.qos,
-                update.payload.len(),
-            )?;
+        // Drain received updates, bounded by both a message-count and a
+        // wallclock budget. Whichever trips first ends this drain pass;
+        // any remaining queued messages drain on subsequent iterations.
+        let drain_start = Instant::now();
+        let mut drained = 0usize;
+        while drained < drain_msg_budget {
+            match variant.poll_receive()? {
+                Some(update) => {
+                    logger.log_receive(
+                        &update.writer,
+                        update.seq,
+                        &update.path,
+                        update.qos,
+                        update.payload.len(),
+                    )?;
+                    drained += 1;
+                    if drain_start.elapsed() >= drain_time_budget {
+                        break;
+                    }
+                }
+                None => break,
+            }
         }
 
         // Periodic resource sampling.
@@ -135,15 +162,31 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
             }
         }
 
-        // Drain any in-flight data updates while waiting.
-        while let Some(update) = variant.poll_receive()? {
-            logger.log_receive(
-                &update.writer,
-                update.seq,
-                &update.path,
-                update.qos,
-                update.payload.len(),
-            )?;
+        // Drain any in-flight data updates while waiting. Bound each
+        // pass with the same two-budget pattern as the operate phase so a
+        // peer that keeps publishing cannot starve the EOT poll loop.
+        // Overall EOT semantics are unchanged: the outer loop keeps
+        // iterating until every expected peer is seen or the timeout
+        // expires, so total time spent draining can still exceed 1ms.
+        let drain_start = Instant::now();
+        let mut drained = 0usize;
+        while drained < drain_msg_budget {
+            match variant.poll_receive()? {
+                Some(update) => {
+                    logger.log_receive(
+                        &update.writer,
+                        update.seq,
+                        &update.path,
+                        update.qos,
+                        update.payload.len(),
+                    )?;
+                    drained += 1;
+                    if drain_start.elapsed() >= drain_time_budget {
+                        break;
+                    }
+                }
+                None => break,
+            }
         }
 
         if !got_any_new {
@@ -463,6 +506,83 @@ mod tests {
             "driver must dedupe by-writer even if variant emits the same writer twice"
         );
         assert_eq!(received_lines[0]["writer"], "bob");
+    }
+
+    /// A variant whose `poll_receive` returns `Some` forever — modelling
+    /// a peer that publishes faster than we can drain. Used to verify
+    /// that the driver's bounded receive-drain still gives `publish` a
+    /// chance to run (T-fairness.1).
+    struct AlwaysReceiveVariant {
+        publish_calls: u64,
+    }
+
+    impl AlwaysReceiveVariant {
+        fn new() -> Self {
+            Self { publish_calls: 0 }
+        }
+    }
+
+    impl Variant for AlwaysReceiveVariant {
+        fn name(&self) -> &str {
+            "always-receive"
+        }
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            self.publish_calls += 1;
+            Ok(())
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            // Always return Some — simulates an unbounded incoming firehose.
+            Ok(Some(ReceivedUpdate {
+                writer: "peer".to_string(),
+                seq: 0,
+                path: "/firehose".to_string(),
+                qos: Qos::BestEffort,
+                payload: vec![0u8; 8],
+            }))
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_operate_loop_bounds_receive_drain() {
+        // With an always-`Some` peer feed, the unbounded `while let
+        // Some(_)` from before T-fairness.1 would never let `publish`
+        // run more than once. With the bounded drain (default 1ms
+        // wallclock budget), `publish` must be invoked many times
+        // across a 1-second operate window.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(
+            dir.path().to_str().unwrap(),
+            "alice",
+            // Single-runner so the EOT phase exits immediately.
+            "alice=127.0.0.1",
+            1,
+        );
+        // Max-throughput skips the tick sleep, so the outer loop is
+        // dominated by the drain budget itself — easiest to measure.
+        args.workload = "max-throughput".to_string();
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+
+        let mut variant = AlwaysReceiveVariant::new();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        // 1ms drain budget over 1s operate -> conservatively expect at
+        // least ~50 publishes (allows for scheduler jitter and slow CI).
+        // The pre-fix code would publish exactly once per tick — i.e.
+        // it would never get past the first iteration, so `publish_calls`
+        // would equal `values_per_tick = 1`.
+        assert!(
+            variant.publish_calls >= 50,
+            "publish should be called at least once per drain budget; got {}",
+            variant.publish_calls
+        );
     }
 
     #[test]

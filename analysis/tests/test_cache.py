@@ -14,6 +14,7 @@ from cache import (
     CACHE_DIRNAME,
     GLOBAL_SENTINEL_NAME,
     LEGACY_PICKLE_NAME,
+    _is_clocksync_shard,
     cache_dir,
     discover_groups,
     scan_shards,
@@ -389,3 +390,51 @@ class TestClockSyncShardHandling:
         stems = sorted(p.stem for p in paths)
         assert any("clock-sync" in s for s in stems)
         assert sum(1 for s in stems if "clock-sync" not in s) == 2
+
+
+class TestIsClocksyncShard:
+    """Unit tests for ``_is_clocksync_shard``.
+
+    Both checks (event-name match AND empty-variant fallback) are
+    exercised here so future regressions surface immediately. See the
+    docstring on ``_is_clocksync_shard`` for why both are needed.
+    """
+
+    @staticmethod
+    def _write_shard(path: Path, *, event: str, variant: str) -> None:
+        """Write a one-row Parquet shard matching the cache's columnar layout.
+
+        Uses ``events_to_lazy`` so the ``SHARD_SCHEMA`` typing (including
+        the ``Datetime`` column for ``ts``) is handled via the same
+        ``parse.project_line`` path the production cache uses.
+        """
+        from helpers import events_to_lazy, make_event
+
+        ev = make_event(event=event, variant=variant)
+        lf = events_to_lazy([ev])
+        lf.collect().write_parquet(path, compression="snappy")
+
+    def test_clock_sync_event_returns_true(self, tmp_path: Path) -> None:
+        shard = tmp_path / "alice-clock-sync-run01.parquet"
+        self._write_shard(shard, event="clock_sync", variant="")
+        assert _is_clocksync_shard(shard) is True
+
+    def test_clock_sync_sample_event_returns_true(self, tmp_path: Path) -> None:
+        # The debug clock-sync shards (T-analysis.1) emit
+        # ``clock_sync_sample`` rather than ``clock_sync``.
+        shard = tmp_path / "alice-clock-sync-debug-run01.parquet"
+        self._write_shard(shard, event="clock_sync_sample", variant="")
+        assert _is_clocksync_shard(shard) is True
+
+    def test_regular_write_event_returns_false(self, tmp_path: Path) -> None:
+        shard = tmp_path / "test-variant-alice-run01.parquet"
+        self._write_shard(shard, event="write", variant="test-variant")
+        assert _is_clocksync_shard(shard) is False
+
+    def test_empty_variant_returns_true(self, tmp_path: Path) -> None:
+        # Defence-in-depth: even if a future broadcast log uses an
+        # event name we don't yet recognise, an empty variant still
+        # marks it as a sibling log so it never becomes its own group.
+        shard = tmp_path / "alice-broadcast-run01.parquet"
+        self._write_shard(shard, event="some_future_event", variant="")
+        assert _is_clocksync_shard(shard) is True

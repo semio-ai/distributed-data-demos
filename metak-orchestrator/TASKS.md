@@ -3349,3 +3349,191 @@ partial log files — those must be cleanly re-run, not silently kept.
   new jobs simply don't appear in any old runner's manifest, so
   they fall outside the skip set and run normally. No special
   handling required, but call this out in the completion report.
+
+### T-fairness.1: variant-base — bound the receive-drain in the driver loop
+
+**Repo**: `variant-base/`
+**Status**: pending
+**Priority**: P0 — gates re-running same-machine-all-variants. All
+current "max-throughput" benchmark numbers are contaminated by this
+bug.
+
+#### Problem
+
+In `variant-base/src/driver.rs:61-96`, each operate-phase iteration
+publishes a tick's worth of writes, then runs an unbounded
+`while let Some(update) = variant.poll_receive()? { ... }`. When a
+peer publishes faster than the local variant can drain, that inner
+`while` never exits and the writer is starved. Confirmed symptoms in
+`logs/same-mchine-all-variants-01-20260506_223254/`:
+
+- `hybrid-max-qos4-alice` writes seq 1-1000 in 19 ms then logs only
+  receives for 60+ s. Bob writes 429,000 normally.
+- `quic-max-qos2-alice` writes 1000 then receives 6,861,000.
+- `custom-udp` qos1-3 are visibly slower than qos4 because qos1-3's
+  `recv_udp` exhaustively drains the socket per call while qos4's
+  `recv_tcp` reads one frame per stream.
+
+#### Scope
+
+Bound the inner receive-drain by **two** independent budgets, whichever
+trips first:
+
+1. **Message-count budget**: drain at most `N` messages per outer
+   iteration. Default `N = 2 * values_per_tick` (so a fair drain still
+   keeps up with a peer that writes at our rate). Plumb the value
+   from the workload profile if accessible; else hardcode 2000 with a
+   `// TODO` to plumb it.
+2. **Wallclock budget**: drain for at most `D` (default `1ms` —
+   small enough to not let receive starve publish, large enough to
+   avoid syscall thrash). Use `tokio::time::Instant::now()` checks
+   inside the drain loop.
+
+After either budget trips, **break out and continue to the next
+publish tick**, even if `poll_receive` would still return `Some`. The
+remaining queued messages stay in the variant's internal buffer and
+are drained on subsequent iterations.
+
+Add the same two-budget pattern to the EOT-phase wait loop if it has
+the same shape — but DO NOT change EOT semantics (it's allowed to
+spend longer there).
+
+#### Acceptance criteria
+
+- [ ] Driver code changed to bound receive-drain by both message
+      count and wallclock per outer iteration.
+- [ ] Existing `variant-base` tests still pass:
+      `cargo test --release -p variant-base`
+- [ ] New unit test that simulates a stub variant whose
+      `poll_receive` always returns `Some`: confirms the operate
+      loop still calls `publish` at least once per `D` wallclock
+      budget.
+- [ ] Live smoke: rebuild the workspace and run
+      `target/release/runner --config configs/two-runner-all-variants.toml`
+      with two runners on the same machine for at least the
+      `hybrid-max-qos4` and `quic-max-qos2` rows. Verify in the
+      resulting JSONL logs that BOTH alice and bob have substantially
+      more than 1000 writes (target: at least 100k each over the
+      operate window). Attach the relevant log filenames and
+      head/tail timestamps to the completion report.
+- [ ] Completion report appended to `metak-orchestrator/STATUS.md`.
+
+#### Out of scope
+
+- Changing variant-internal threading models (each variant can stay
+  single- or multi-threaded as it currently is).
+- Changing the driver's overall phase structure.
+- Re-running the full benchmark suite (the operator owns that).
+
+### T-zenoh.1: variants/zenoh — eliminate first-tick declare storm + tune runtime
+
+**Repo**: `variants/zenoh/`
+**Status**: pending
+**Priority**: P1 — independent of T-fairness.1, can run in parallel.
+
+#### Problem
+
+`zenoh-1000x100hz-qos1-alice` writes 8,361 messages in ~80 ms
+(≈100k/s instantaneous) then **hangs** for the rest of the operate
+phase. The chart's apparent "8k/s sustained" is `8361 ÷ 30s
+operate-phase`. Hang shape and count match
+`PUBLISH_CHANNEL_CAPACITY = 8192` at
+`variants/zenoh/src/zenoh.rs:183`. The publisher task is stuck in
+~1000 first-tick `declare_publisher().await` calls
+(`zenoh.rs:407, 428`) on a 2-worker tokio runtime
+(`zenoh.rs:676-680`) shared with subscribers and EOT.
+
+`metak-shared/LEARNED.md:62-66` already records a same-host zenoh
+hang. This is the same class of bug.
+
+#### Scope
+
+1. **Pre-declare publishers during `connect`/stabilize** rather than
+   lazily on first `publish`. The workload's path set is known up
+   front (`variant-base` workload profile exposes `paths`); declare
+   one `Publisher` per path before the operate phase starts. Cache
+   them in a `HashMap<String, Publisher>`. Lazy fallback for unknown
+   paths is fine, but the `1000x100hz` and `100x1000hz` profiles
+   must hit zero declares during operate.
+2. **Bump tokio worker_threads** at `zenoh.rs:676-680` from 2 to
+   `num_cpus::get().max(4)`. Add `num_cpus` if not already present.
+3. **Reuse encode buffer**: replace the per-call
+   `MessageCodec::encode -> Vec<u8>` allocation
+   (`zenoh.rs:756, 776-794`) with a thread-local or per-task
+   reusable `Vec<u8>` cleared at start of each encode. Confirm the
+   zenoh API accepts `&[u8]`/`Bytes` such that the buffer can be
+   handed off without forcing a `Vec` move per call.
+4. **Right-size `PUBLISH_CHANNEL_CAPACITY`** to a smaller value
+   (256-1024) once 1-3 are in. Goal: back-pressure shows up at the
+   writer instead of being absorbed into a deep queue that inflates
+   p95 latency.
+
+#### Acceptance criteria
+
+- [ ] All four scope items implemented OR explicitly justified as
+      not needed (with evidence in the completion report).
+- [ ] `cargo test --release -p variant-zenoh` (or the variant's test
+      target) still passes.
+- [ ] Live smoke: with T-fairness.1 NOT YET LANDED is acceptable —
+      run `zenoh-1000x100hz-qos1` and `zenoh-max-qos1` two-runner
+      same-machine. Verify alice writes substantially more than
+      8,300 messages over the operate phase (target: at least 200k
+      and continuing to write at the end of the operate window, not
+      bunched in the first 80 ms).
+- [ ] Completion report appended to `metak-orchestrator/STATUS.md`
+      with before/after write-count numbers, and a note on whether
+      sustained throughput now scales with the workload's nominal
+      rate.
+
+#### Out of scope
+
+- Switching zenoh from peer to client mode.
+- Replacing the bridge architecture (D7) with direct synchronous
+  publish.
+- Cross-machine validation (operator owns that).
+
+### T-analysis.1: analysis — handle clock_sync_sample debug shards
+
+**Repo**: `analysis/`
+**Status**: pending
+**Priority**: P2 — cosmetic chart fix; independent of the other two.
+
+#### Problem
+
+`analysis/cache.py:566-579 _is_clocksync_shard` only matches
+`event == "clock_sync"`, but the debug clock-sync shards
+(`alice/bob-clock-sync-debug-all-variants-01.jsonl`) emit
+`event == "clock_sync_sample"`. Their first row has `variant == ""`,
+so cache discovery registers a bogus `("", "all-variants-01")`
+group. `plots._split_variant_name("")` returns
+`("other", "", None)`, producing the spurious `n/a` 5th row in the
+comparison chart with the "other" transport family.
+
+#### Scope
+
+1. Extend `_is_clocksync_shard` to recognise BOTH `clock_sync` and
+   `clock_sync_sample` events as clock-sync-only shards.
+2. As a defence-in-depth fallback, also skip any shard whose first
+   row has `variant == ""` from group discovery (treat as
+   broadcast-only). Document in code why both checks exist.
+3. Re-run the analysis cache build against
+   `logs/same-mchine-all-variants-01-20260506_223254/` and confirm
+   the regenerated `comparison.png` no longer has an `n/a` row.
+
+#### Acceptance criteria
+
+- [ ] `_is_clocksync_shard` matches both event names.
+- [ ] Empty-variant fallback added with an explanatory comment.
+- [ ] Existing tests still pass: `pytest -q` in `analysis/`.
+- [ ] New unit test for `_is_clocksync_shard` covering both event
+      values and the empty-variant case.
+- [ ] Regenerated `comparison.png` for the affected logs directory
+      attached to the completion report (path only, do NOT commit
+      the PNG).
+- [ ] Completion report appended to `metak-orchestrator/STATUS.md`.
+
+#### Out of scope
+
+- Changing the JSONL log schema or the variant-side debug shard
+  emission.
+- Restructuring the cache.
