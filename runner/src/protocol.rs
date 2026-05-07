@@ -4,13 +4,70 @@ use crate::message::Message;
 use anyhow::{bail, Result};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_MSG_SIZE: usize = 4096;
+
+/// Error returned when a coordination barrier (ready / done / resume manifest)
+/// fails to reach quorum within its configured timeout.
+///
+/// Discovery is intentionally NOT subject to this timeout — a stuck discovery
+/// is a config / firewall problem, not a transient one, so retrying it via the
+/// auto-resume wrapper would just spin. The timeout applies to the in-progress
+/// barriers that follow Phase 1 (and Phase 1.25 in resume mode), where a hang
+/// indicates a peer that crashed mid-run and is the case `--resume` exists to
+/// recover from.
+///
+/// When this error reaches `main`, the runner exits with code 75
+/// (`EX_TEMPFAIL` from `<sysexits.h>`) so the wrapper script can detect the
+/// transient-failure case and re-launch with `--resume` appended. Any other
+/// non-zero exit (panic, config error, variant failure) propagates as-is and
+/// stops the wrapper loop.
+#[derive(Debug, Clone)]
+pub struct BarrierTimeoutError {
+    /// Which barrier hit the timeout (e.g. `"ready"`, `"done"`,
+    /// `"resume_manifest"`). Used in the human-readable stderr line.
+    pub kind: &'static str,
+    /// Effective spawn name (or `""` for the resume-manifest barrier, which
+    /// has no per-variant identity).
+    pub variant: String,
+    /// Duration the barrier waited before giving up.
+    pub elapsed: Duration,
+    /// Names of peers we are still waiting on. Empty in single-runner mode
+    /// (which never times out) — populated only when at least one expected
+    /// peer never reported.
+    pub missing_peers: Vec<String>,
+}
+
+impl fmt::Display for BarrierTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.variant.is_empty() {
+            write!(
+                f,
+                "barrier '{}' timed out after {:.1}s waiting for peer(s): {:?}",
+                self.kind,
+                self.elapsed.as_secs_f64(),
+                self.missing_peers
+            )
+        } else {
+            write!(
+                f,
+                "barrier '{}' for variant '{}' timed out after {:.1}s waiting for peer(s): {:?}",
+                self.kind,
+                self.variant,
+                self.elapsed.as_secs_f64(),
+                self.missing_peers
+            )
+        }
+    }
+}
+
+impl std::error::Error for BarrierTimeoutError {}
 
 /// Multicast group for runner coordination (organization-local scope).
 const COORDINATION_MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 77, 66, 55);
@@ -164,6 +221,14 @@ impl Coordinator {
     /// adopt the leader's proposal.
     ///
     /// In single-runner mode, returns own proposal immediately.
+    ///
+    /// **Discovery is intentionally NOT bounded by a timeout.** A stuck
+    /// discovery is a config or firewall problem (mismatched runner names,
+    /// blocked UDP multicast, hardware NIC offline) — none of which the
+    /// auto-resume wrapper can fix by re-launching. The barrier timeout
+    /// applies only to the post-discovery barriers (ready / done /
+    /// resume_manifest), where a hang typically means a peer crashed
+    /// mid-run and `--resume` is the right recovery.
     pub fn discover(&self) -> Result<String> {
         if self.single_runner {
             return Ok(self.proposed_log_subdir.clone());
@@ -302,14 +367,21 @@ impl Coordinator {
 
     /// Ready barrier for a specific variant.
     ///
-    /// Broadcasts Ready and waits until all runners have signaled ready.
-    /// In single-runner mode, returns immediately.
-    pub fn ready_barrier(&self, variant_name: &str) -> Result<()> {
+    /// Broadcasts Ready and waits until all runners have signaled ready, or
+    /// until `timeout` elapses (whichever comes first). On timeout the call
+    /// returns a `BarrierTimeoutError` wrapped in `anyhow::Error`; main
+    /// detects it via `Error::downcast_ref` and exits 75.
+    ///
+    /// In single-runner mode, returns immediately and never times out
+    /// (there is no peer to wait for).
+    pub fn ready_barrier(&self, variant_name: &str, timeout: Duration) -> Result<()> {
         if self.single_runner {
             return Ok(());
         }
 
         let socket = self.socket.as_deref().unwrap();
+        let started = Instant::now();
+        let overall_deadline = started + timeout;
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(self.name.clone());
 
@@ -322,8 +394,9 @@ impl Coordinator {
         loop {
             self.send(socket, &msg)?;
 
-            let deadline = std::time::Instant::now() + BROADCAST_INTERVAL;
-            while std::time::Instant::now() < deadline {
+            let next_tick = std::time::Instant::now() + BROADCAST_INTERVAL;
+            let recv_deadline = next_tick.min(overall_deadline);
+            while std::time::Instant::now() < recv_deadline {
                 match self.recv(socket) {
                     Some(Message::Ready { name, variant, run }) => {
                         if variant == variant_name
@@ -351,7 +424,9 @@ impl Coordinator {
 
             if seen == self.expected {
                 // Linger: keep broadcasting Ready for 2 more seconds so
-                // slower peers can complete their barrier.
+                // slower peers can complete their barrier. Linger is bounded
+                // and not gated by `timeout` — we already have quorum, so
+                // sticking around briefly only helps; it cannot hang.
                 let linger_end = std::time::Instant::now() + Duration::from_secs(2);
                 while std::time::Instant::now() < linger_end {
                     self.send(socket, &msg)?;
@@ -361,19 +436,41 @@ impl Coordinator {
                 }
                 return Ok(());
             }
+
+            if std::time::Instant::now() >= overall_deadline {
+                let missing: Vec<String> = self
+                    .expected
+                    .iter()
+                    .filter(|n| !seen.contains(*n))
+                    .cloned()
+                    .collect();
+                return Err(BarrierTimeoutError {
+                    kind: "ready",
+                    variant: variant_name.to_string(),
+                    elapsed: started.elapsed(),
+                    missing_peers: missing,
+                }
+                .into());
+            }
         }
     }
 
     /// Done barrier for a specific variant.
     ///
     /// Broadcasts Done with this runner's outcome and waits until all runners
-    /// have reported. Returns a map of runner_name -> (status, exit_code).
-    /// In single-runner mode, returns immediately with own result.
+    /// have reported, or until `timeout` elapses (whichever comes first). On
+    /// timeout returns a `BarrierTimeoutError`; main detects it via
+    /// `Error::downcast_ref` and exits 75. Returns a map of
+    /// `runner_name -> (status, exit_code)` on success.
+    ///
+    /// In single-runner mode returns immediately with own result and never
+    /// times out.
     pub fn done_barrier(
         &self,
         variant_name: &str,
         status: &str,
         exit_code: i32,
+        timeout: Duration,
     ) -> Result<HashMap<String, (String, i32)>> {
         let mut results: HashMap<String, (String, i32)> = HashMap::new();
         results.insert(self.name.clone(), (status.to_string(), exit_code));
@@ -383,6 +480,8 @@ impl Coordinator {
         }
 
         let socket = self.socket.as_deref().unwrap();
+        let started = Instant::now();
+        let overall_deadline = started + timeout;
         let msg = Message::Done {
             name: self.name.clone(),
             variant: variant_name.to_string(),
@@ -394,8 +493,9 @@ impl Coordinator {
         loop {
             self.send(socket, &msg)?;
 
-            let deadline = std::time::Instant::now() + BROADCAST_INTERVAL;
-            while std::time::Instant::now() < deadline {
+            let next_tick = std::time::Instant::now() + BROADCAST_INTERVAL;
+            let recv_deadline = next_tick.min(overall_deadline);
+            while std::time::Instant::now() < recv_deadline {
                 match self.recv(socket) {
                     Some(Message::Done {
                         name,
@@ -439,6 +539,22 @@ impl Coordinator {
                 }
                 return Ok(results);
             }
+
+            if std::time::Instant::now() >= overall_deadline {
+                let missing: Vec<String> = self
+                    .expected
+                    .iter()
+                    .filter(|n| !results.contains_key(*n))
+                    .cloned()
+                    .collect();
+                return Err(BarrierTimeoutError {
+                    kind: "done",
+                    variant: variant_name.to_string(),
+                    elapsed: started.elapsed(),
+                    missing_peers: missing,
+                }
+                .into());
+            }
         }
     }
 
@@ -459,6 +575,7 @@ impl Coordinator {
     pub fn exchange_resume_manifest(
         &self,
         local_complete_jobs: Vec<String>,
+        timeout: Duration,
     ) -> Result<HashMap<String, Vec<String>>> {
         let mut all: HashMap<String, Vec<String>> = HashMap::new();
         all.insert(self.name.clone(), local_complete_jobs.clone());
@@ -468,6 +585,8 @@ impl Coordinator {
         }
 
         let socket = self.socket.as_deref().unwrap();
+        let started = Instant::now();
+        let overall_deadline = started + timeout;
         let msg = Message::ResumeManifest {
             name: self.name.clone(),
             run: self.run.clone(),
@@ -477,8 +596,9 @@ impl Coordinator {
         loop {
             self.send(socket, &msg)?;
 
-            let deadline = std::time::Instant::now() + BROADCAST_INTERVAL;
-            while std::time::Instant::now() < deadline {
+            let next_tick = std::time::Instant::now() + BROADCAST_INTERVAL;
+            let recv_deadline = next_tick.min(overall_deadline);
+            while std::time::Instant::now() < recv_deadline {
                 match self.recv(socket) {
                     Some(Message::ResumeManifest {
                         name,
@@ -519,6 +639,22 @@ impl Coordinator {
                     std::thread::sleep(BROADCAST_INTERVAL);
                 }
                 return Ok(all);
+            }
+
+            if std::time::Instant::now() >= overall_deadline {
+                let missing: Vec<String> = self
+                    .expected
+                    .iter()
+                    .filter(|n| !all.contains_key(*n))
+                    .cloned()
+                    .collect();
+                return Err(BarrierTimeoutError {
+                    kind: "resume_manifest",
+                    variant: String::new(),
+                    elapsed: started.elapsed(),
+                    missing_peers: missing,
+                }
+                .into());
             }
         }
     }
@@ -662,7 +798,10 @@ mod tests {
             false,
         )
         .unwrap();
-        coord.ready_barrier("test-variant").unwrap();
+        // Single-runner mode never blocks; even a tiny timeout returns Ok.
+        coord
+            .ready_barrier("test-variant", Duration::from_millis(1))
+            .unwrap();
     }
 
     #[test]
@@ -677,7 +816,9 @@ mod tests {
             false,
         )
         .unwrap();
-        let results = coord.done_barrier("test-variant", "success", 0).unwrap();
+        let results = coord
+            .done_barrier("test-variant", "success", 0, Duration::from_millis(1))
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results.get("local"), Some(&("success".to_string(), 0)));
     }
@@ -706,8 +847,10 @@ mod tests {
 
             let log_subdir = coord.discover().unwrap();
             let hosts = coord.peer_hosts();
-            coord.ready_barrier("v1").unwrap();
-            let results = coord.done_barrier("v1", "success", 0).unwrap();
+            coord.ready_barrier("v1", Duration::from_secs(30)).unwrap();
+            let results = coord
+                .done_barrier("v1", "success", 0, Duration::from_secs(30))
+                .unwrap();
             (log_subdir, results, hosts)
         });
 
@@ -727,8 +870,10 @@ mod tests {
 
             let log_subdir = coord.discover().unwrap();
             let hosts = coord.peer_hosts();
-            coord.ready_barrier("v1").unwrap();
-            let results = coord.done_barrier("v1", "success", 0).unwrap();
+            coord.ready_barrier("v1", Duration::from_secs(30)).unwrap();
+            let results = coord
+                .done_barrier("v1", "success", 0, Duration::from_secs(30))
+                .unwrap();
             (log_subdir, results, hosts)
         });
 
@@ -837,7 +982,7 @@ mod tests {
             // Signal that the socket is bound and ready to receive.
             sync_clone.wait();
 
-            coord.ready_barrier("v1")
+            coord.ready_barrier("v1", Duration::from_secs(30))
         });
 
         // Wait until the Coordinator's socket is bound.
@@ -908,8 +1053,10 @@ mod tests {
             )
             .unwrap();
 
-            coord.ready_barrier("v1").unwrap();
-            coord.done_barrier("v1", "success", 0).unwrap();
+            coord.ready_barrier("v1", Duration::from_secs(30)).unwrap();
+            coord
+                .done_barrier("v1", "success", 0, Duration::from_secs(30))
+                .unwrap();
         });
 
         let hash_b = hash;
@@ -929,8 +1076,10 @@ mod tests {
             )
             .unwrap();
 
-            coord.ready_barrier("v1").unwrap();
-            coord.done_barrier("v1", "success", 0).unwrap();
+            coord.ready_barrier("v1", Duration::from_secs(30)).unwrap();
+            coord
+                .done_barrier("v1", "success", 0, Duration::from_secs(30))
+                .unwrap();
         });
 
         // Use a timeout to detect hangs: both threads must finish within 10 seconds.
@@ -1026,7 +1175,7 @@ mod tests {
         .unwrap();
         let local_manifest = vec!["v1".to_string(), "v2".to_string()];
         let all = coord
-            .exchange_resume_manifest(local_manifest.clone())
+            .exchange_resume_manifest(local_manifest.clone(), Duration::from_millis(1))
             .unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all.get("local"), Some(&local_manifest));
@@ -1055,7 +1204,7 @@ mod tests {
             )
             .unwrap();
             coord.discover().unwrap();
-            coord.exchange_resume_manifest(vec!["v1".into(), "v2".into()])
+            coord.exchange_resume_manifest(vec!["v1".into(), "v2".into()], Duration::from_secs(30))
         });
 
         let runners_b = runners;
@@ -1071,7 +1220,7 @@ mod tests {
             )
             .unwrap();
             coord.discover().unwrap();
-            coord.exchange_resume_manifest(vec!["v2".into(), "v3".into()])
+            coord.exchange_resume_manifest(vec!["v2".into(), "v3".into()], Duration::from_secs(30))
         });
 
         let res_a = thread_a.join().unwrap().unwrap();
@@ -1095,5 +1244,94 @@ mod tests {
             res_b.get("rb"),
             Some(&vec!["v2".to_string(), "v3".to_string()])
         );
+    }
+
+    /// Helper: build a two-runner Coordinator on a unique port whose peer
+    /// will never appear, so any barrier method invoked on it will reach the
+    /// timeout path.
+    fn coord_with_silent_peer(self_name: &str, peer_name: &str, port: u16) -> Coordinator {
+        let runners = vec![self_name.to_string(), peer_name.to_string()];
+        Coordinator::new(
+            self_name.into(),
+            &runners,
+            "timeout-hash".into(),
+            port,
+            "timeout-sub".into(),
+            "timeout-run".into(),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ready_barrier_returns_timeout_when_peer_silent() {
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let coord = coord_with_silent_peer("rb_alone", "rb_ghost", port);
+        // Skip discovery (we don't want to wait for the ghost). Directly hit
+        // the ready barrier with a tight timeout so the test is fast.
+        let started = std::time::Instant::now();
+        let err = coord
+            .ready_barrier("v-tmo", Duration::from_millis(300))
+            .expect_err("ready_barrier with silent peer must time out");
+        let elapsed = started.elapsed();
+        // The timeout must fire within a small fudge of the configured value.
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(5),
+            "expected ~300ms timeout, got {elapsed:?}"
+        );
+        let bt = err
+            .downcast_ref::<BarrierTimeoutError>()
+            .expect("error must downcast to BarrierTimeoutError");
+        assert_eq!(bt.kind, "ready");
+        assert_eq!(bt.variant, "v-tmo");
+        assert_eq!(bt.missing_peers, vec!["rb_ghost".to_string()]);
+    }
+
+    #[test]
+    fn done_barrier_returns_timeout_when_peer_silent() {
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let coord = coord_with_silent_peer("db_alone", "db_ghost", port);
+        let err = coord
+            .done_barrier("v-tmo", "success", 0, Duration::from_millis(300))
+            .expect_err("done_barrier with silent peer must time out");
+        let bt = err
+            .downcast_ref::<BarrierTimeoutError>()
+            .expect("error must downcast to BarrierTimeoutError");
+        assert_eq!(bt.kind, "done");
+        assert_eq!(bt.variant, "v-tmo");
+        assert_eq!(bt.missing_peers, vec!["db_ghost".to_string()]);
+    }
+
+    #[test]
+    fn resume_manifest_returns_timeout_when_peer_silent() {
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let coord = coord_with_silent_peer("rm_alone", "rm_ghost", port);
+        let err = coord
+            .exchange_resume_manifest(vec!["a".into()], Duration::from_millis(300))
+            .expect_err("exchange_resume_manifest with silent peer must time out");
+        let bt = err
+            .downcast_ref::<BarrierTimeoutError>()
+            .expect("error must downcast to BarrierTimeoutError");
+        assert_eq!(bt.kind, "resume_manifest");
+        assert_eq!(bt.variant, "");
+        assert_eq!(bt.missing_peers, vec!["rm_ghost".to_string()]);
+    }
+
+    #[test]
+    fn barrier_timeout_error_display_mentions_kind_and_variant() {
+        let e = BarrierTimeoutError {
+            kind: "ready",
+            variant: "myvar".into(),
+            elapsed: Duration::from_secs(5),
+            missing_peers: vec!["b".into()],
+        };
+        let s = e.to_string();
+        assert!(s.contains("ready"), "{s}");
+        assert!(s.contains("myvar"), "{s}");
+        assert!(s.contains("5"), "{s}");
+        assert!(s.contains('b'), "{s}");
     }
 }

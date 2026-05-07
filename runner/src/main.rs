@@ -66,7 +66,36 @@ struct Cli {
     /// opened in append mode so prior measurements are preserved.
     #[arg(long, default_value_t = false)]
     resume: bool,
+
+    /// Per-barrier timeout in seconds (default: 120).
+    ///
+    /// Applies to the ready barrier, done barrier, and the Phase 1.25
+    /// ResumeManifest exchange. If any one of these fails to reach quorum
+    /// within this duration the runner exits with code 75 (`EX_TEMPFAIL`)
+    /// and a clear stderr line describing which barrier and which peers
+    /// were still missing. The wrapper scripts in `scripts/` re-launch the
+    /// runner with `--resume` appended on exit 75 and propagate every other
+    /// non-zero exit unchanged.
+    ///
+    /// Discovery is intentionally NOT bounded by this timeout — a stuck
+    /// discovery is a config/firewall problem (mismatched runner names,
+    /// blocked UDP multicast) that retrying will not fix. Only the
+    /// post-discovery barriers, where a hang typically means a peer
+    /// crashed mid-run, are subject to the timeout.
+    #[arg(long, default_value_t = 120)]
+    barrier_timeout_secs: u64,
 }
+
+/// Exit code returned to the OS when a coordination barrier hits its timeout.
+///
+/// 75 is `EX_TEMPFAIL` from `<sysexits.h>` — "service unavailable, retry
+/// later". Picked because (a) it is a stable, well-known transient-failure
+/// code, (b) it is unlikely to collide with whatever a variant binary might
+/// use to signal real failure (variants exit 0/1/2 in practice), and (c) the
+/// wrapper scripts use it as the single signal to re-launch with `--resume`.
+/// Any other non-zero exit (panic, config error, variant failure, child
+/// timeout) propagates as-is and stops the wrapper loop.
+pub const EX_TEMPFAIL: i32 = 75;
 
 /// Build identifier baked in at compile time by `../build_info.rs`.
 ///
@@ -91,9 +120,43 @@ fn main() -> Result<()> {
         cli.name, BUILD_GIT_SHA, dirty_suffix, BUILD_RUSTC
     );
 
+    // Run the actual benchmark, intercepting `BarrierTimeoutError` so we
+    // can map it to exit code 75 (EX_TEMPFAIL) for the wrapper scripts.
+    // Any other anyhow::Error propagates back to the runtime and aborts
+    // with the standard non-zero exit (which the wrappers do NOT retry).
+    match run(&cli) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if let Some(bt) = e.downcast_ref::<protocol::BarrierTimeoutError>() {
+                // Single, specific stderr line so the wrapper logs are
+                // greppable. The runner has already cleaned up any in-flight
+                // child process: spawn::spawn_and_monitor is synchronous,
+                // so by the time we are inside a barrier the child has
+                // already exited (ready barrier: not yet spawned; done
+                // barrier: already collected). No orphan to kill.
+                eprintln!(
+                    "[runner:{}] FATAL: {} — exiting {} (EX_TEMPFAIL); wrapper should retry with --resume",
+                    cli.name, bt, EX_TEMPFAIL
+                );
+                std::process::exit(EX_TEMPFAIL);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Body of the runner. Extracted from `main` so the `BarrierTimeoutError`
+/// interception in `main` has a single place to catch it.
+fn run(cli: &Cli) -> Result<()> {
     // Wire the process-wide clock-sync verbose toggle so the engine and
     // coordinator emit per-datagram traces while diagnosing field issues.
     clock_sync::set_verbose(cli.verbose_clock_sync);
+
+    let barrier_timeout = Duration::from_secs(cli.barrier_timeout_secs);
+    eprintln!(
+        "[runner:{}] barrier timeout: {}s",
+        cli.name, cli.barrier_timeout_secs
+    );
 
     // Load and validate config.
     let (bench_config, config_hash) = config::BenchConfig::from_file(&cli.config)?;
@@ -243,10 +306,12 @@ fn main() -> Result<()> {
         );
 
         // Exchange manifests with peers. Single-runner mode short-circuits
-        // and returns just our own.
-        let manifests = coordinator
-            .exchange_resume_manifest(local.complete_jobs.clone())
-            .map_err(|e| anyhow::anyhow!("resume manifest exchange failed: {e:#}"))?;
+        // and returns just our own. A barrier timeout here propagates as a
+        // `BarrierTimeoutError` and is caught at the top of `main` to map
+        // to exit code 75 — do NOT wrap it in another anyhow::anyhow! that
+        // would erase the type and prevent that downcast.
+        let manifests =
+            coordinator.exchange_resume_manifest(local.complete_jobs.clone(), barrier_timeout)?;
 
         let inter = resume::intersect_complete_jobs(&manifests, &bench_config.runners);
         eprintln!(
@@ -486,7 +551,7 @@ fn main() -> Result<()> {
             "[runner:{}] ready barrier for spawn '{}' (hz={}, vpt={}, qos={})",
             cli.name, job.effective_name, job.tick_rate_hz, job.values_per_tick, job.qos
         );
-        coordinator.ready_barrier(&job.effective_name)?;
+        coordinator.ready_barrier(&job.effective_name, barrier_timeout)?;
 
         // Per-variant clock resync: catches drift across the run. Logged
         // with the spawn's effective name so analysis joins the latest
@@ -571,7 +636,12 @@ fn main() -> Result<()> {
         );
 
         // Done barrier identified by the effective spawn name.
-        let done_results = coordinator.done_barrier(&job.effective_name, status, exit_code)?;
+        // The variant child has already exited (spawn_and_monitor is
+        // synchronous), so on a `BarrierTimeoutError` here there is no
+        // in-flight child to clean up; the error simply propagates to
+        // `main` and triggers the EX_TEMPFAIL exit.
+        let done_results =
+            coordinator.done_barrier(&job.effective_name, status, exit_code, barrier_timeout)?;
 
         for (runner_name, (s, c)) in &done_results {
             summary.push(SummaryRow {

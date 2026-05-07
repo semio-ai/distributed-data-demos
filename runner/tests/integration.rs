@@ -774,6 +774,267 @@ binary = "../target/release/variant-dummy.exe"
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+/// Drive a barrier timeout by having the runner believe a peer exists, run a
+/// small fake-peer process that participates in discovery and then goes
+/// silent, and assert the runner exits with code 75 (EX_TEMPFAIL) on the
+/// ready-barrier timeout.
+///
+/// Architecture:
+/// - Two runners declared in the config: `local` (the runner under test) and
+///   `ghost` (the fake peer).
+/// - The fake peer is implemented as a small UDP responder bound to the
+///   coordination port for runner index 1. It answers Discover messages with
+///   its own Discover (so the runner-under-test can complete Phase 1 and
+///   capture its host) and then drops every subsequent Ready / Done /
+///   ResumeManifest message — the silent-peer scenario.
+/// - With `--barrier-timeout-secs 3`, the runner-under-test reaches its
+///   ready barrier, broadcasts Ready, never sees a peer Ready, and exits 75
+///   after ~3 seconds.
+#[test]
+fn barrier_timeout_exits_75_when_peer_silent_after_discovery() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    // Pick a port range above the production-test port pool so we don't
+    // collide with parallel protocol unit tests.
+    let base_port: u16 = 32100;
+
+    let tmp_dir = std::env::temp_dir().join("runner-barrier-timeout-it");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let log_dir = tmp_dir.join("logs");
+    let log_dir_escaped = log_dir.to_string_lossy().replace('\\', "/");
+
+    // Two-runner config; `ghost` is the fake peer thread defined below.
+    let config_content = format!(
+        r#"run = "btmo"
+runners = ["local", "ghost"]
+default_timeout_secs = 30
+inter_qos_grace_ms = 0
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+  [variant.common]
+  tick_rate_hz = 5
+  stabilize_secs = 0
+  operate_secs = 0
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  log_dir = "{log_dir_escaped}"
+  [variant.specific]
+"#
+    );
+    let config_path = tmp_dir.join("btmo.toml");
+    std::fs::write(&config_path, &config_content).unwrap();
+
+    // Spawn the fake-peer thread before launching the runner so discovery
+    // can succeed quickly.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ghost = run_silent_peer(base_port, stop.clone());
+
+    let mut child = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .arg("--port")
+        .arg(base_port.to_string())
+        .arg("--barrier-timeout-secs")
+        .arg("3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn runner");
+
+    // Hard cap so a regression that re-introduces the hang fails fast in CI
+    // instead of taking down the test runner.
+    let started = std::time::Instant::now();
+    let hard_cap = std::time::Duration::from_secs(60);
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {
+                if started.elapsed() > hard_cap {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "runner did not exit within {}s after barrier timeout fired",
+                        hard_cap.as_secs()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => panic!("error waiting for runner child: {e}"),
+        }
+    };
+
+    // Stop the ghost thread and join.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = ghost.join();
+
+    let mut stderr_out = String::new();
+    use std::io::Read;
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_string(&mut stderr_out);
+    }
+    let mut stdout_out = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut stdout_out);
+    }
+    eprintln!("--- stdout ---\n{stdout_out}");
+    eprintln!("--- stderr ---\n{stderr_out}");
+
+    assert_eq!(
+        exit_code,
+        Some(75),
+        "expected exit 75 (EX_TEMPFAIL), got {exit_code:?}; stderr was:\n{stderr_out}"
+    );
+    assert!(
+        stderr_out.contains("EX_TEMPFAIL")
+            || stderr_out.contains("barrier")
+            || stderr_out.contains("timed out"),
+        "expected a barrier-timeout stderr line, got:\n{stderr_out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Spawn a UDP responder that participates in runner coordination just well
+/// enough to let the runner-under-test complete Phase 1 (discovery), then
+/// drops all subsequent traffic. The thread exits when `stop` becomes true.
+///
+/// The responder binds to `base_port + 1` (the index-1 slot for the `ghost`
+/// runner in the config), joins the coordination multicast group, and
+/// periodically broadcasts a Discover message with the same config_hash and
+/// log_subdir the runner-under-test will propose. Probe requests are
+/// answered to keep clock-sync from blowing up; everything else is ignored.
+fn run_silent_peer(
+    base_port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use socket2::{Domain, Protocol as SockProto, Socket as Sock, Type};
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    std::thread::spawn(move || {
+        let port = base_port + 1;
+        let s = Sock::new(Domain::IPV4, Type::DGRAM, Some(SockProto::UDP)).unwrap();
+        s.set_reuse_address(true).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        s.set_nonblocking(false).unwrap();
+        s.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())
+            .unwrap();
+        let group = Ipv4Addr::new(239, 77, 66, 55);
+        s.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED).unwrap();
+        s.set_multicast_loop_v4(true).unwrap();
+
+        // Compute the same config hash the runner will use. We don't have
+        // direct access to BenchConfig from the integration test, so the
+        // peer mirrors the runner's hash by lifting it from the runner's
+        // first inbound Discover. The runner's `expected.contains(name)`
+        // check requires the hash to match; otherwise it would bail with
+        // "config hash mismatch".
+        let mut peer_hash: Option<String> = None;
+        let mut last_subdir: Option<String> = None;
+
+        let mut buf = [std::mem::MaybeUninit::uninit(); 4096];
+        let mut last_send = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(10))
+            .unwrap_or_else(std::time::Instant::now);
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            // Periodically broadcast our own Discover message every 200 ms,
+            // but only after we've seen one from the runner under test
+            // (which gives us its hash and log_subdir to mirror).
+            if let (Some(h), Some(sub)) = (peer_hash.as_ref(), last_subdir.as_ref()) {
+                if last_send.elapsed() >= std::time::Duration::from_millis(200) {
+                    let msg = serde_json::json!({
+                        "type": "discover",
+                        "name": "ghost",
+                        "config_hash": h,
+                        "log_subdir": sub,
+                        "resume": false,
+                    });
+                    let bytes = serde_json::to_vec(&msg).unwrap();
+                    // Send to every runner's per-index port (multicast +
+                    // localhost loopback) so the runner-under-test gets it.
+                    for i in 0..2u16 {
+                        let p = base_port + i;
+                        let _ = s.send_to(&bytes, &SocketAddrV4::new(group, p).into());
+                        let _ =
+                            s.send_to(&bytes, &SocketAddrV4::new(Ipv4Addr::LOCALHOST, p).into());
+                    }
+                    last_send = std::time::Instant::now();
+                }
+            }
+
+            match s.recv_from(&mut buf) {
+                Ok((n, _src)) => {
+                    let data: Vec<u8> = buf[..n]
+                        .iter()
+                        .map(|b| unsafe { b.assume_init() })
+                        .collect();
+                    let v: serde_json::Value = match serde_json::from_slice(&data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                    match ty {
+                        "discover" => {
+                            // Capture the runner-under-test's hash + subdir.
+                            if v.get("name").and_then(|x| x.as_str()) == Some("local") {
+                                if let Some(h) = v.get("config_hash").and_then(|x| x.as_str()) {
+                                    peer_hash = Some(h.to_string());
+                                }
+                                if let Some(sub) = v.get("log_subdir").and_then(|x| x.as_str()) {
+                                    last_subdir = Some(sub.to_string());
+                                }
+                            }
+                        }
+                        "probe_request" => {
+                            // Always-respond rule: emit a ProbeResponse so
+                            // the runner's clock-sync engine does not bail.
+                            // We stamp t2/t3 = t1 so the offset and rtt
+                            // computations are well-defined.
+                            let to = v.get("to").and_then(|x| x.as_str()).unwrap_or("");
+                            if to == "ghost" {
+                                let from = v.get("from").and_then(|x| x.as_str()).unwrap_or("");
+                                let id = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+                                let t1 = v.get("t1").and_then(|x| x.as_str()).unwrap_or("");
+                                let resp = serde_json::json!({
+                                    "type": "probe_response",
+                                    "from": "ghost",
+                                    "to": from,
+                                    "id": id,
+                                    "t1": t1,
+                                    "t2": t1,
+                                    "t3": t1,
+                                });
+                                let rb = serde_json::to_vec(&resp).unwrap();
+                                for i in 0..2u16 {
+                                    let p = base_port + i;
+                                    let _ = s.send_to(&rb, &SocketAddrV4::new(group, p).into());
+                                    let _ = s.send_to(
+                                        &rb,
+                                        &SocketAddrV4::new(Ipv4Addr::LOCALHOST, p).into(),
+                                    );
+                                }
+                            }
+                        }
+                        // Drop everything else — that's the silent-peer behaviour.
+                        _ => {}
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+    })
+}
+
 /// Resume mode aborts cleanly when no matching log subfolder exists.
 #[test]
 fn resume_aborts_when_no_matching_log_subfolder() {
