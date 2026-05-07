@@ -399,6 +399,80 @@ For each variant's `tests/two_runner_regression.rs`:
 
 ---
 
+## Visualization Follow-ups (analysis)
+
+### T11.4: Latency CDF chart + relax epsilon clamp in comparison plot
+
+**Repo**: `analysis/`
+**Status**: done — landed in `6488362` (clamp lowered to 1e-5 ms +
+NaN-on-non-positive), `a05fd62` (downsampled latency samples on
+`PerformanceResult`, cap 50_000), `2891f63` (CDF chart + CLI wire-up,
+emits `latency_cdf.png` next to `comparison.png` under `--diagrams`).
+142 tests pass. Worker report at STATUS.md commit `c95a5c0`. Visual
+reproduction of the user-reported sub-µs floor wasn't possible
+against `two-machines-all-variants-01` (zero deliveries for
+custom-udp/quic in that dataset); mechanism verified via unit test
+`test_nonpositive_p95_renders_as_nan_bar` and the new CDF view.
+**Depends on**: nothing — independent enhancement.
+
+User feedback: the current `generate_comparison_plot` latency subplots
+pin sub-microsecond transports (custom-udp, quic) at the
+`_LATENCY_EPSILON_MS = 1e-3` floor, hiding signal in the µs region and
+making it impossible to compare those transports against each other.
+Add a CDF view that exposes distribution shape, and lower the epsilon
+clamp so genuine sub-µs values aren't pancaked.
+
+#### Scope
+
+1. **Add a CDF visualisation** to `analysis/plots.py`. New entry point
+   `generate_latency_cdf_plot(results, output_path)` that produces a
+   per-QoS row of CDF subplots (one column per QoS, or N rows × 1 col
+   — pick whichever stays legible at 4 QoS levels and ~6 transport
+   families). One line per `(transport, workload)` combo, x = latency
+   in ms (log scale), y = empirical CDF in [0, 1]. Reuse the family
+   colormap / tone scheme from `_FAMILY_COLORMAPS` so it reads
+   consistently with the bar chart.
+   - Source data: per-message `latency_ms` column already aggregated
+     by `performance.py`. Confirm whether the raw delivery records
+     are exposed on `PerformanceResult`; if only percentiles are kept,
+     extend the result struct minimally to also carry a sampled
+     latency vector (cap at e.g. 50k samples per result to bound
+     memory) and have the cache rebuild forward it.
+   - Wire it into the analysis CLI alongside the existing comparison
+     plot — same flag/output dir, separate file (e.g.
+     `latency_cdf.png`).
+
+2. **Relax the epsilon clamp** in `generate_comparison_plot`.
+   - Lower `_LATENCY_EPSILON_MS` from `1e-3` to `1e-5` ms (10 ns) —
+     well below any plausible measurement, so it only kicks in to
+     avoid log-axis warnings on negative/zero quantiles from clock
+     noise.
+   - Where a percentile is ≤ 0, prefer skipping the bar (NaN) over
+     clamping, so the chart visually communicates "no positive data"
+     rather than implying ~1 µs.
+
+#### Acceptance criteria
+
+- `latency_cdf.png` is generated alongside `comparison.png` for an
+  existing logs dir; CDF curves for custom-udp / quic at qos1-2 show
+  visible separation in the µs region rather than collapsing.
+- The existing `comparison.png` no longer pins distinct sub-µs
+  results to the same 1e-3 ms floor; running it on the same logs as
+  the chart the user shared shows custom-udp and quic at lower
+  positions than before, with their relative ordering visible.
+- Existing analysis tests pass; add at least one unit test for the
+  CDF computation (e.g. monotonic non-decreasing y, bounded in
+  [0, 1], correct length).
+- No changes outside `analysis/`.
+
+#### Out of scope
+
+- Changing the bar-chart layout itself (faceted multiples, scatter,
+  heatmap) — captured as separate follow-ups if desired.
+- Touching variant code or the JSONL schema.
+
+---
+
 ## Previous Sprint — E11: Analysis Tool — Large-Dataset Cache Rework
 
 T11.1 is **done** (worker delivered the architecture before hitting a
@@ -3814,3 +3888,148 @@ trace.
 - Replacing the linger pattern wholesale.
 - Cross-variant cache (we only need the immediately preceding spawn).
 - T-coord.2's barrier timeout / wrapper script work (filed separately).
+
+### T-coord.3: runner — fix discovery panic when bob never receives leader's Discover
+
+**Repo**: `runner/`
+**Status**: pending — field report from 2026-05-07 17:00.
+**Depends on**: nothing (parallel with T-coord.1b).
+
+#### Background
+
+User launched alice + bob locally with `configs/two-runner-all-variants.toml`.
+Bob panicked during discovery with:
+
+```
+leader log_subdir should be known after discovery
+```
+
+This is the `.expect(...)` at the tail of `Coordinator::discover` in
+`runner/src/protocol.rs:395`.
+
+#### Diagnosis
+
+Discovery's exit condition is `seen == self.expected && hosts_known`.
+The `seen` set is populated by **any** message type (Discover, Ready,
+Done, ResumeManifest) — see lines 295–353. Only `Discover` carries the
+`log_subdir` field, however, and `leader_log_subdir` is set only when
+the leader's `Discover` is received (lines 327–330).
+
+Failure path:
+
+1. Alice (leader, runners[0]) starts first. Broadcasts `Discover`,
+   sees bob, hits the 2 s linger, returns.
+2. Alice advances to `clock_sync` and the Phase 2 ready barrier; her
+   barrier loop drops `Discover` messages (`_ => {}` arms at lines 470,
+   589, 691).
+3. Bob starts after alice has already exited her discovery linger.
+4. Bob broadcasts `Discover`. Bob's first inbound message from alice
+   is a `Ready` (or `Done`), not a `Discover`. Bob marks alice as
+   seen, but `leader_log_subdir` stays `None`.
+5. Bob's `seen == expected && hosts_known` becomes true. Bob enters
+   the 2 s discovery linger. During the linger bob keeps broadcasting
+   `Discover`, but alice (in a barrier) ignores them.
+6. Bob's linger ends, hits `.expect("leader log_subdir should be known
+   after discovery")` → **panic**.
+
+This is the same bug class as T-coord.1 (the done-barrier hang) but
+for `Discover` instead of `Done`: peers in a later phase silently drop
+inbound messages from earlier phases, leaving the slow peer with no
+way to obtain a piece of state it needs from the fast peer.
+
+T-coord.2's barrier-timeout safety net does NOT cover discovery (by
+design — see T-coord.2 scope item 1, the discovery exclusion). T-coord.1b
+covers `Done` re-emission only. Neither addresses this gap.
+
+#### Scope
+
+1. **Add a `last_log_subdir` cache field** on `Coordinator` storing
+   the agreed-upon log subfolder once discovery completes (every
+   runner — leader writes its own proposal, non-leaders write the
+   leader's proposal). Single-runner mode populates it from the
+   constructor's `log_subdir` argument.
+
+2. **Re-emit `Discover` on demand** from every coordination phase that
+   runs after discovery — `ready_barrier`, `done_barrier`,
+   `exchange_resume_manifest`. When one of these loops receives an
+   inbound `Discover` from a peer in `expected`, broadcast our own
+   `Discover` (with `log_subdir = cached log_subdir`, `resume = self.resume`,
+   `config_hash = self.config_hash`) so the slow peer can populate
+   its `leader_log_subdir`.
+   - Mirrors the `maybe_reemit_stale_done` pattern T-coord.1b is
+     introducing for `Done`. Suggested helper: `maybe_reemit_discover`,
+     called from the `_ => {}` arm (matching `Some(Message::Discover { .. })`)
+     in each barrier loop.
+   - Errors swallowed (`let _ = self.send(...)`) — best-effort,
+     cannot abort the active barrier.
+
+3. **Remove the `.expect("leader log_subdir should be known after
+   discovery")` panic** at `protocol.rs:395`. Replace with a graceful
+   fallback: if `leader_log_subdir` is still `None` after the linger,
+   either (a) keep looping until it arrives (but with an internal
+   bounded retry of, say, 30 s before bailing with a clear `bail!`)
+   or (b) extend non-Discover message handling so the leader's
+   `log_subdir` gets carried on `Ready`/`Done`/`ResumeManifest` as a
+   fallback (more invasive — needs schema bump).
+   - Pick (a) unless there's a strong reason against. Keep the loop
+     bounded with a reasonable timeout so a misconfigured peer doesn't
+     hang discovery forever (the discovery exclusion is justified by
+     "config / firewall problems where retry won't help" — but this
+     is a coordination-protocol bug, not a config error, and once
+     fixed the loop terminates within the first re-broadcast cycle).
+   - Document the chosen retry budget in `runner/CUSTOM.md`.
+
+4. **Reproducer test** in `runner/src/protocol.rs::tests`. Construct
+   two `Coordinator` instances. Drive alice through `discover` (clean
+   exit) and into a parked `ready_barrier(spawn_n)`. Then start bob's
+   `discover()`. Without the fix, bob's discover panics. With the fix,
+   bob's discover returns `Ok(<alice's proposed log_subdir>)` within
+   the discovery linger plus one re-broadcast cycle (~3 s). Use the
+   existing `multicast_test_lock` to serialise with other multicast
+   tests. Cap the test at ~10 s.
+
+5. **Optional: add a second test** asserting that the bounded retry
+   in scope item 3 fires when the peer never re-emits `Discover` (e.g.
+   peer permanently stuck in a barrier with the fix-emitting code
+   gated off). Confirms the fallback bound and the failure message.
+
+#### Validation
+
+From workspace root (the worktree root):
+- `cargo build --release -p runner` clean.
+- `cargo test --release -p runner` green, including the new
+  reproducer.
+- Existing tests still pass — `barrier_linger_prevents_slow_peer_hang`
+  is a critical regression target.
+- `cargo clippy --release -p runner --all-targets -- -D warnings` clean.
+- `cargo fmt -p runner -- --check` clean.
+
+#### Acceptance criteria
+
+- [ ] `last_log_subdir` cache on `Coordinator`, populated by
+      `discover()` just before returning.
+- [ ] `ready_barrier`, `done_barrier`, `exchange_resume_manifest`
+      each re-emit `Discover` for inbound `Discover` messages.
+- [ ] `protocol.rs:395` `.expect(...)` panic replaced by a bounded
+      retry that returns `Ok(...)` once the leader's `Discover`
+      arrives, and a clean `bail!` if the budget elapses.
+- [ ] New reproducer test passes (asserting the fix; not the bug).
+- [ ] All existing tests still green (`barrier_linger_prevents_slow_peer_hang`,
+      `done_barrier_hang_repro_when_peer_already_advanced`, the
+      T-coord.2 timeout suite).
+- [ ] `metak-shared/api-contracts/runner-coordination.md` updated
+      with a short "Discovery responds to late-arriving discoveries"
+      subsection.
+- [ ] `runner/CUSTOM.md` updated.
+- [ ] `metak-orchestrator/STATUS.md` updated with completion report.
+
+#### Out of scope
+
+- Carrying `log_subdir` on non-Discover message types. Schema-bump
+  is too invasive for this fix.
+- Touching T-coord.1b's `Done` re-emission infrastructure. The two
+  fixes are independent and may land in either order.
+- Removing the discovery-not-subject-to-barrier-timeout policy. That
+  policy still holds; the bounded retry inside `discover()` is
+  internal and not the same thing as T-coord.2's external barrier
+  timeout.

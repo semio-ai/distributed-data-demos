@@ -325,6 +325,53 @@ is always either not yet spawned (ready barrier) or already collected
 ever changes (e.g. async-spawn refactor), revisit the cleanup path in
 `main::run` where the `BarrierTimeoutError` is caught.
 
+### Late-arriving discovery handling (T-coord.3)
+
+A non-leader that joins late — leader has already exited its discovery
+linger and advanced into a Phase 2 barrier — can populate its `seen`
+set via `Ready`/`Done`/`ResumeManifest` from the leader without ever
+seeing the leader's `Discover`, leaving `leader_log_subdir = None` at
+the discovery exit point. Two cooperating mechanisms cover this:
+
+- **`Coordinator::last_log_subdir`** caches the agreed `log_subdir`
+  once `discover()` succeeds (every runner — leader writes its own
+  proposal, non-leaders write the leader's proposal). Pre-populated
+  in single-runner mode at construction; otherwise stays `None` until
+  `discover()` returns.
+- **`Coordinator::maybe_reemit_discover`** broadcasts our cached
+  `Discover` (with the agreed `log_subdir`) when invoked. It is
+  invoked from a `Some(Message::Discover { name, .. })` arm in
+  `ready_barrier`, `done_barrier`, and `exchange_resume_manifest`,
+  gated on `self.expected.contains(&name)`. Best-effort: send errors
+  are swallowed because the active barrier must not be aborted by a
+  transient network failure.
+- **`Coordinator::discover` late-recovery loop**: once
+  `seen == expected && hosts_known` becomes true but
+  `leader_log_subdir.is_none()`, the call keeps broadcasting
+  `Discover` and reading inbound for up to **30 seconds** (constant
+  `LATE_DISCOVER_RECOVERY_BUDGET`) before bailing with a clear
+  message. With the `maybe_reemit_discover` rule active on every
+  runner, the leader answers within one re-broadcast cycle (~500 ms)
+  and the loop terminates immediately after.
+
+The 30-second budget is internal to `discover()` and **not** the
+external `--barrier-timeout-secs` budget — discovery as a whole is
+still exempt from external timeouts (a stuck discovery is a config /
+firewall problem; auto-resume cannot fix it). The 30 s value is
+calibrated for the realistic case where the leader is in a long
+variant's `done_barrier` linger plus `clock_resync` plus the next
+variant's ready barrier broadcast — comfortably above one full
+post-discovery barrier cycle but below any sane operator's "is this
+hung?" patience threshold. If a future workload routinely triggers
+the bail!, raise the constant or add a CLI knob.
+
+The original `.expect("leader log_subdir should be known after
+discovery")` panic at the discover-return site is gone. A late
+non-leader that observes the recovery branch but never receives the
+leader's `Discover` (e.g. an old peer binary running in mixed-version
+mode without the re-emit rule) gets a controlled `bail!` rather than a
+process panic.
+
 ### Variant templates + multi-dimensional expansion (T-config.2)
 
 Two further config-side mechanisms layer on top of QoS expansion:

@@ -5601,6 +5601,73 @@ Performed after the fast-forward merge:
 
 ---
 
+## Field report 2026-05-07 17:00 — discovery panic in bob (T-coord.3 filed)
+
+**Reporter**: user (via interactive session)
+**Run**: local two-runner launch with
+`configs/two-runner-all-variants.toml`. Alice + bob on the same
+machine, loopback addresses.
+
+### Symptom
+
+Bob panicked during the discovery phase with a message that included
+the substring `leader log_subdir should be known after discovery`.
+
+### Diagnosis (orchestrator, immediate)
+
+The panic site is `runner/src/protocol.rs:395`:
+
+```rust
+return Ok(
+    leader_log_subdir.expect("leader log_subdir should be known after discovery")
+);
+```
+
+Discovery's exit condition `seen == self.expected && hosts_known`
+treats **any** message type from a peer as proof that peer exists
+(the "fast peer race" handling — see lines 295–353). But only
+`Message::Discover` carries the `log_subdir` field that fills
+`leader_log_subdir` (lines 327–330). All other message types
+(`Ready`, `Done`, `ResumeManifest`) update `seen` but leave
+`leader_log_subdir = None`.
+
+If bob (non-leader) starts late enough that alice has already exited
+her own discovery linger, alice is in a Phase 2 barrier and her
+barrier loops drop bob's `Discover` messages (`_ => {}` arm in each
+of `ready_barrier`, `done_barrier`, `exchange_resume_manifest`).
+Bob's first inbound message from alice is a `Ready` or `Done`. Bob
+marks alice as seen, hits the linger end, and panics on the
+`.expect(...)`.
+
+Same bug class as T-coord.1 (the done-barrier hang fixed by
+T-coord.1b) but for `Discover` instead of `Done`. T-coord.2's
+barrier-timeout safety net deliberately excludes discovery, so this
+sails past it as a panic rather than a clean exit-75.
+
+### Action
+
+- T-coord.3 filed in TASKS.md with full scope, validation, and
+  acceptance criteria. See `metak-orchestrator/TASKS.md` search
+  string `T-coord.3:`.
+- Worker delegated to a fresh worktree branched from `c95a5c0` (main
+  HEAD before this report).
+- Pending: orchestrator stash holds the user's WIP partial T-coord.1b
+  cache infrastructure (cache field + `maybe_reemit_stale_done`
+  helper, no integration into the barrier loops). Stash entry is
+  labelled `WIP: partial T-coord.1b cache + helper (orchestrator
+  stash 2026-05-07 before T-coord.3 fix)` and will be popped after
+  the T-coord.3 fix lands. If the pop conflicts, the stash will be
+  preserved for the user to resolve.
+
+### Followups after T-coord.3 lands
+
+- Rebuild runner (`cargo build --release -p runner`).
+- Re-run alice + bob against `configs/two-runner-all-variants.toml`
+  to validate end-to-end.
+- Append the run report to this STATUS.md.
+
+---
+
 ## T11.4: Latency CDF chart + relax epsilon clamp - DONE
 
 **Repo**: `analysis/`
@@ -5729,3 +5796,130 @@ steady-state) the stride sample could over-represent the warm-up
 phase. Marking this as a future consideration -- the percentiles in
 the bar chart are unaffected (they're computed on the full
 delivery set before downsampling).
+
+---
+
+## T-coord.3 completion report — discovery panic fix landed
+
+**Date**: 2026-05-07
+**Worker**: subagent on `worktree-agent-a46264d6045b7df9e` (hit
+Anthropic API rate limit mid-task; orchestrator validated the worker's
+already-written code, completed the docs deliverables, and committed).
+
+### Summary of changes (one bullet per file)
+
+- `runner/src/protocol.rs`:
+  - Added `last_log_subdir: Mutex<Option<String>>` field on
+    `Coordinator`, pre-populated in single-runner mode and populated
+    from `discover()` just before returning in multi-runner mode.
+  - Replaced the `.expect("leader log_subdir should be known after
+    discovery")` panic at the discover-return site with a bounded
+    late-recovery loop (constant `LATE_DISCOVER_RECOVERY_BUDGET = 30 s`)
+    that keeps broadcasting `Discover` and reading inbound messages
+    until the leader's `Discover` arrives, then `bail!`s with a clear
+    message if the budget elapses.
+  - Added `fn maybe_reemit_discover(&self, socket: &Socket)` which
+    re-broadcasts a fully-formed `Discover` carrying the cached
+    `log_subdir`; errors swallowed (best-effort recovery hook).
+  - Added a `Some(Message::Discover { name, .. })` arm in each of
+    `ready_barrier`, `done_barrier`, and `exchange_resume_manifest`,
+    gated on `self.expected.contains(&name)`, calling
+    `maybe_reemit_discover`.
+  - Added reproducer test
+    `protocol::tests::discover_recovers_when_leader_already_in_barrier_t_coord_3`
+    in the standard "asserts the FIX" style; runtime ~3 s (well below
+    the 10 s test cap).
+- `metak-shared/api-contracts/runner-coordination.md`: new `### Discovery
+  responds to late-arriving discoveries` subsection under Phase 1 documenting
+  the two cooperating rules (late-recovery loop + barrier re-emission).
+- `runner/CUSTOM.md`: new `### Late-arriving discovery handling
+  (T-coord.3)` subsection mirroring the contract update plus
+  implementation entry points.
+- `metak-orchestrator/STATUS.md`: this completion report (the field
+  report at the same date is also in this file).
+- `metak-orchestrator/TASKS.md`: T-coord.3 task entry filed.
+
+### Test results (workspace root, post-fix)
+
+- `cargo build --release -p runner` clean.
+- `cargo test --release -p runner` — all-green:
+  - unit tests: **125 passed** (124 baseline + new T-coord.3 reproducer).
+    Includes:
+    - `discover_recovers_when_leader_already_in_barrier_t_coord_3` —
+      passes asserting the FIX (bob's late `discover()` returns
+      `Ok(<alice's proposal>)` within the recovery budget).
+    - `barrier_linger_prevents_slow_peer_hang` — passes (regression target).
+    - `done_barrier_hang_repro_when_peer_already_advanced` — passes
+      asserting the BUG (T-coord.1b will invert separately).
+    - `barrier_timeout_exits_75_when_peer_silent_after_discovery` and
+      the rest of the T-coord.2 timeout suite — pass.
+  - clock_sync_stress: 1 passed.
+  - integration tests: 11 passed.
+- `cargo clippy --release -p runner --all-targets -- -D warnings`:
+  zero warnings.
+- `cargo fmt -p runner -- --check`: clean.
+
+### Confirmation that the fix asserts the FIX (not the bug)
+
+The new reproducer `discover_recovers_when_leader_already_in_barrier_t_coord_3`
+constructs alice with `last_log_subdir` pre-cached (the state alice
+would be in after a completed `discover()`), parks an alice-emulator
+loop that mirrors `ready_barrier`'s receive logic — including the
+new `Some(Message::Discover { .. })` arm that calls
+`maybe_reemit_discover` — then drives bob's real `discover()` after
+alice's emulator is broadcasting `Ready`. The test asserts that bob
+returns `Ok(<alice's proposal>)` within 10 s; observed runtime ~3 s.
+This is the locked-in fixed behaviour.
+
+The pre-fix bug path is structurally still present in the test: if
+the `Some(Message::Discover { .. })` arm is removed from alice's
+emulator (or if the late-recovery loop in `discover()` is reverted),
+bob's call would return `Err(...)` from the `bail!` after 30 s, or
+panic if the `.expect(...)` is restored. The test would then time
+out at the 10 s cap and panic with `bob's discover() did not return
+within 10 s — T-coord.3 fix not in place`.
+
+### Confirmation that existing regression-target tests still pass
+
+- `barrier_linger_prevents_slow_peer_hang`: PASS (T-coord.0 regression
+  target — the new behaviour is strictly additive).
+- `done_barrier_hang_repro_when_peer_already_advanced`: PASS (T-coord.1
+  reproducer — still asserts the BUG; T-coord.1b will invert).
+- T-coord.2 timeout suite (4 tests): all PASS.
+
+### Deviations from the spec
+
+- The worker hit the Anthropic API rate limit mid-task after writing
+  all the code (cache field, late-recovery loop, helper, barrier
+  arms, reproducer test) but BEFORE running validation, writing the
+  docs deliverables (contract / `runner/CUSTOM.md` / completion
+  report), or committing. The orchestrator validated the worker's
+  code (build, full test suite, clippy, fmt — all clean), wrote the
+  three docs deliverables (orchestrator-allowed surfaces), and
+  committed. **No application code was written by the orchestrator.**
+- The `Some(Message::Discover { name, .. })` arms were placed BEFORE
+  the existing `_ => {}` arm in each barrier loop (worker's choice).
+  This preserves the wrong-type-for-this-barrier silent-drop behaviour
+  for `Ready`/`Done` cross-typing (those have explicit arms with
+  verbose-coord tracing), and only triggers re-emission on
+  `Discover`.
+
+### Worker context preserved
+
+The worker agent (id `a46264d6045b7df9e`) is still resumable via
+`SendMessage` if the user wants to add anything (e.g. the optional
+"older variant still hangs" symmetry test that T-coord.3 lists). At
+the time of the orchestrator handoff the worker's worktree was clean
+of its own changes (all committed) and its branch matched main HEAD
+post-fast-forward. The worktree itself can be removed in a follow-up
+cleanup commit.
+
+### Followups (still pending)
+
+- Restore the user's stashed protocol.rs WIP (partial T-coord.1b
+  cache + `maybe_reemit_stale_done` helper). Stash entry:
+  `WIP: partial T-coord.1b cache + helper (orchestrator stash
+  2026-05-07 before T-coord.3 fix)`.
+- Re-run alice + bob locally with `configs/two-runner-all-variants.toml`
+  to validate end-to-end. Expected: bob's discovery completes without
+  panic; benchmark proceeds. Run report to be appended below.
