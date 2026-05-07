@@ -13,7 +13,11 @@ that arrived after a writer's ``eot_sent_ts`` but before
 
 Output is a list of ``PerformanceResult`` dataclasses with the same
 shape as Phase 1 plus a ``late_receives`` field, so ``tables.py``
-and ``plots.py`` consumers can opt into the new metric.
+and ``plots.py`` consumers can opt into the new metric. The result
+also carries a downsampled per-message ``latency_samples_ms`` vector
+(cap ``LATENCY_SAMPLE_CAP`` per result) so plots that need
+distribution shape -- the latency CDF in particular -- do not have
+to re-correlate the source shards.
 """
 
 from __future__ import annotations
@@ -22,6 +26,22 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import polars as pl
+
+# Maximum number of per-message latency samples retained on each
+# ``PerformanceResult`` for distribution-shape plots (e.g. the CDF in
+# ``plots.generate_latency_cdf_plot``). 50k samples gives a faithful
+# empirical CDF -- the 99.99th percentile is bracketed within ~5 samples
+# -- while keeping memory bounded: a Python ``list[float]`` of 50k
+# entries is ~3 MB, so 64 (variant, run) groups stay under 200 MB.
+# When a group has more than ``LATENCY_SAMPLE_CAP`` deliveries we
+# downsample with a deterministic stride ``ceil(n / cap)`` over the
+# delivery-record order. The order is the polars-emitted row order from
+# ``correlate_lazy``: receives sorted by (receiver, writer, receive_ts)
+# after the asof join, which is a stable temporal traversal -- a
+# stride-sample of it is unbiased w.r.t. latency distribution. We do
+# NOT reservoir-sample because determinism across runs is more useful
+# for diff-debugging plots than the marginal accuracy improvement.
+LATENCY_SAMPLE_CAP: int = 50_000
 
 
 @dataclass
@@ -80,6 +100,13 @@ class PerformanceResult:
     # for any writer in this group (legacy logs without EOT) -- the
     # tables render this as ``-``.
     late_receives: int | None = None
+    # Downsampled per-message latency vector for distribution-shape
+    # plots (latency CDF). Capped at ``LATENCY_SAMPLE_CAP``; see the
+    # module docstring for the sampling strategy. Empty when the group
+    # had no deliveries. Populated from the same delivery DataFrame
+    # that produces ``latency_p50_ms`` etc., so values are already
+    # clock-skew-corrected when ``has_uncorrected_latency`` is False.
+    latency_samples_ms: list[float] = field(default_factory=list)
 
 
 def _percentile(data: list[float], p: float) -> float:
@@ -238,6 +265,31 @@ def _operate_duration_seconds(windows: _OperateWindows) -> float:
     if delta <= 0:
         return 0.001
     return float(delta)
+
+
+def _latency_samples(deliveries: pl.DataFrame) -> list[float]:
+    """Downsample the per-message latency column to at most ``LATENCY_SAMPLE_CAP``.
+
+    Strategy: take every ``stride``-th row in the delivery record's
+    natural order, where ``stride = ceil(n / LATENCY_SAMPLE_CAP)``.
+    For ``n <= LATENCY_SAMPLE_CAP`` the full vector is returned. Null
+    values are filtered (a null latency would also be excluded from the
+    percentile pipeline, so the sample vector mirrors that contract).
+    """
+    if deliveries.is_empty() or "latency_ms" not in deliveries.columns:
+        return []
+
+    col = deliveries.get_column("latency_ms").drop_nulls()
+    n = col.len()
+    if n == 0:
+        return []
+    if n <= LATENCY_SAMPLE_CAP:
+        return [float(v) for v in col.to_list()]
+
+    # ceil-division stride keeps us at or below the cap.
+    stride = (n + LATENCY_SAMPLE_CAP - 1) // LATENCY_SAMPLE_CAP
+    sampled = col.gather_every(stride)
+    return [float(v) for v in sampled.to_list()]
 
 
 def _latency_stats(deliveries: pl.DataFrame) -> tuple[float, float, float, float]:
@@ -528,6 +580,7 @@ def performance_for_group(
     """
     connect_mean, connect_max = _connection_metrics(group, variant, run)
     p50, p95, p99, mx = _latency_stats(deliveries)
+    latency_samples = _latency_samples(deliveries)
     windows = _operate_windows(group)
     write_count, receive_count = _write_receive_counts(group, windows)
     duration = _operate_duration_seconds(windows)
@@ -559,4 +612,5 @@ def performance_for_group(
         resources=resources,
         has_uncorrected_latency=has_uncorrected_latency,
         late_receives=late_receives,
+        latency_samples_ms=latency_samples,
     )
