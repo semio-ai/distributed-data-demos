@@ -89,7 +89,13 @@ _MAX_WORKLOAD_RANK: int = 10**12
 
 # Small positive epsilon used to clamp lower whisker bounds so the
 # log-scale latency axis does not emit "non-positive value" warnings.
-_LATENCY_EPSILON_MS: float = 1e-3
+# Set well below any plausible measurement (10 ns) so it only protects
+# against log-scale crashes from clock-noise quantiles, never silently
+# pancakes genuinely sub-microsecond latencies onto a visible floor.
+# Where a percentile itself is <= 0 the bar is dropped (NaN) rather
+# than clamped, so the chart visibly communicates "no positive data"
+# instead of implying ~10 ns.
+_LATENCY_EPSILON_MS: float = 1e-5
 
 
 def _split_variant_name(name: str) -> tuple[str, str, int | None]:
@@ -333,20 +339,30 @@ def generate_comparison_plot(
 
         # Latency bars use p95 with whiskers from p50 (lower) to p99
         # (upper). Under log scale the lower whisker must be strictly
-        # positive, so clamp to ``_LATENCY_EPSILON_MS`` and zero the
-        # whisker rows that are NaN entirely.
+        # positive, so the epsilon floor only protects against
+        # log-axis warnings -- a percentile <= 0 (clock-noise artifact)
+        # is dropped to NaN so the bar disappears rather than visually
+        # implying a measurement near the floor.
         bar_p95: list[float] = []
         yerr_lower: list[float] = []
         yerr_upper: list[float] = []
         for p50, p95, p99 in zip(p50_vals, p95_vals, p99_vals):
-            if np.isnan(p95):
+            if np.isnan(p95) or p95 <= 0.0:
                 bar_p95.append(float("nan"))
                 yerr_lower.append(0.0)
                 yerr_upper.append(0.0)
                 continue
+            # p95 is strictly positive -- clamp only protects log-scale
+            # rendering against any tiny float underflow on the lower
+            # whisker arithmetic.
             safe_p95 = max(p95, _LATENCY_EPSILON_MS)
             bar_p95.append(safe_p95)
-            lower = max(safe_p95 - max(p50, _LATENCY_EPSILON_MS), 0.0)
+            # ``p50`` may legitimately be <= 0 even when p95 > 0 (e.g.
+            # half the rows have clock-skew artifacts). Floor the
+            # subtraction at the epsilon so the lower whisker stays in
+            # log-positive space without hiding the bar.
+            safe_p50 = max(p50, _LATENCY_EPSILON_MS)
+            lower = max(safe_p95 - safe_p50, 0.0)
             upper = max(p99 - safe_p95, 0.0)
             yerr_lower.append(lower)
             yerr_upper.append(upper)

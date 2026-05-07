@@ -361,3 +361,53 @@ class TestGenerateComparisonPlot:
         r = _make_result("custom-udp-10x100hz-qos1", p50=2.0, p95=5.0, p99=8.0)
         assert r.latency_p95_ms - r.latency_p50_ms >= 0
         assert r.latency_p99_ms - r.latency_p95_ms >= 0
+
+    def test_nonpositive_p95_renders_as_nan_bar(self, tmp_path: Path) -> None:
+        """A percentile <= 0 (clock-noise artifact) is dropped to NaN.
+
+        Regression test for the relaxed epsilon clamp: previously a
+        non-positive p95 was clamped to ``_LATENCY_EPSILON_MS`` and
+        rendered as a visible "1 us" bar that misled the reader. After
+        the relaxation it should disappear entirely (height NaN).
+        """
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("custom-udp-10x100hz-qos1", p50=-1.0, p95=-0.5, p99=0.0),
+            _make_result("zenoh-10x100hz-qos1", p50=1.0, p95=2.0, p99=3.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        # Find the latency axis. Pull bar heights -- the custom-udp bar
+        # should be NaN, the zenoh bar finite.
+        import math
+
+        lat_axes = [
+            ax for ax in fig.axes if "latency" in (ax.get_ylabel() or "").lower()
+        ]
+        assert lat_axes
+        bars = [p for p in lat_axes[0].patches]
+        heights = [b.get_height() for b in bars]
+        assert any(math.isnan(h) for h in heights), (
+            f"expected at least one NaN bar height, got {heights}"
+        )
+        assert any(math.isfinite(h) and h > 0 for h in heights), (
+            f"expected at least one positive finite bar, got {heights}"
+        )
+        for f in captured:
+            original_close(f)
