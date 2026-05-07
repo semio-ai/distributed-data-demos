@@ -5506,3 +5506,226 @@ parallel with T-coord.2's barrier timeout safety net.
   today). The maintainer of T-coord.1b will invert the assertion as
   part of that task; the panic message and doc-comment in the test
   spell this out.
+
+## T-coord.1 integration into main (post-T-coord.2)
+
+**Date**: 2026-05-07
+**Worker**: integration agent
+**Status**: complete — T-coord.1 rebased onto post-T-coord.2 main and
+fast-forwarded.
+
+### Rebase outcome
+
+Rebased the 3-commit T-coord.1 worktree branch
+(`worktree-agent-ab23c8a6a287b64d7`) onto `41d919f` (T-coord.2 head on
+main). Conflicts arose on the expected files and were resolved as
+follows:
+
+- `runner/src/main.rs` — kept T-coord.2's extracted `run(&Cli)` body
+  and `--barrier-timeout-secs` flag; placed
+  `protocol::set_verbose_coord(cli.verbose_coord)` immediately after
+  the existing `clock_sync::set_verbose(...)` call inside `run()`,
+  preserving the barrier-timeout setup that follows.
+- `runner/src/protocol.rs` — kept both `BarrierTimeoutError` (T-coord.2)
+  and `VERBOSE_COORD` / `set_verbose_coord` / `verbose_coord_enabled`
+  (T-coord.1) at the top of the file. Inside the timeout-aware
+  `ready_barrier` and `done_barrier` loops, kept the T-coord.1 verbose
+  tracing in the `Some(Message::Ready { .. })` / `Some(Message::Done
+  { .. })` arms with the wrong-type-for-this-barrier branch that
+  T-coord.1 added. Updated the reproducer test
+  `done_barrier_hang_repro_when_peer_already_advanced` to use the new
+  `Duration` argument (30 s) on its inner `ready_barrier` /
+  `done_barrier` calls (alice + bob) — well above the ~17 s test
+  runtime so neither pre-`spawn_n` barrier can falsely time out.
+- `metak-orchestrator/TASKS.md` — kept main's T-coord.1 / T-coord.2
+  entries (with their `Out of scope` blocks) and appended T-coord.1b
+  after them.
+- `metak-orchestrator/STATUS.md` — kept main's T-coord.2 completion
+  report and appended T-coord.1's report after it.
+
+Two small follow-up touch-ups to the resolved test were needed and
+folded back into the original T-coord.1 commit via `--fixup` +
+`rebase --autosquash`:
+1. `cargo fmt` rewrap of the `let Some(Message::Done { .. }) =
+   coord.recv(socket)` and `if name == "alice" && variant == ... && run
+   == coord.run` lines in the reproducer test.
+2. `cargo clippy::collapsible_match` — collapsed the nested
+   `if let Some(msg) = coord.recv(socket) { if let Message::ProbeRequest
+   { .. } = msg { ... } }` in alice's emulation loop into a single
+   `if let Some(Message::ProbeRequest { .. }) = coord.recv(socket)`.
+
+After autosquash, the integrated branch is 3 commits on top of main:
+1. `runner: add --verbose-coord tracing and done-barrier hang
+   reproducer (T-coord.1)`
+2. `docs: T-coord.1 diagnosis (D9) and T-coord.1b follow-up task`
+3. `status: T-coord.1 completion report`
+
+Then fast-forwarded into main with `git merge --ff-only`.
+
+### Test results (workspace root, post-merge)
+
+- `cargo build --release -p runner`: clean.
+- `cargo fmt -p runner -- --check`: clean.
+- `cargo clippy --release -p runner --all-targets -- -D warnings`:
+  zero warnings.
+- `cargo test --release -p runner`:
+  - unit tests: **124 passed** (incl. the T-coord.1 reproducer
+    `done_barrier_hang_repro_when_peer_already_advanced` and the four
+    T-coord.2 timeout tests).
+  - sleeper helper: 0 tests.
+  - clock_sync_stress: 1 passed.
+  - integration tests: 11 passed (incl. T-coord.2's
+    `barrier_timeout_exits_75_when_peer_silent_after_discovery`).
+
+The reproducer test still passes asserting the BUG — i.e. bob's
+done-barrier emulation does NOT receive a stale Done from alice within
+6 s while alice is parked in `ready_barrier(spawn_n_plus_1)`. Per the
+task brief and DECISIONS.md D9, the assertion will be inverted by
+T-coord.1b when the fix lands.
+
+### Deviations from the plan
+
+None of substance. The two clippy / fmt nits in the reproducer test
+were squashed back into the original T-coord.1 commit so the public
+commit history shows a clean, lint-passing T-coord.1 commit rather
+than a follow-up "fix lints" commit. The `Coordinator` struct and the
+verbose-tracing branch contents are byte-equivalent to what T-coord.1
+delivered; only the test plumbing changed (Duration arguments + lint
+adjustments).
+
+### Worktree cleanup
+
+Performed after the fast-forward merge:
+- `git worktree remove .claude/worktrees/agent-ab23c8a6a287b64d7`
+- `git branch -D worktree-agent-ab23c8a6a287b64d7`
+
+---
+
+## T11.4: Latency CDF chart + relax epsilon clamp - DONE
+
+**Repo**: `analysis/`
+**Date**: 2026-05-07
+
+### Part A: Latency CDF visualization
+
+- **`analysis/performance.py`**: extended `PerformanceResult` with a new
+  `latency_samples_ms: list[float]` field (capped at
+  `LATENCY_SAMPLE_CAP = 50_000`). Added module-level constant + helper
+  `_latency_samples()` that downsamples the per-message `latency_ms`
+  column from the delivery DataFrame using a deterministic stride
+  (`ceil(n / cap)`). Determinism beats reservoir sampling here for
+  diff-debug stability across runs.
+- Cap rationale documented in the module docstring: 50k samples gives
+  a faithful empirical CDF (the 99.99th percentile is bracketed within
+  ~5 samples), at ~3 MB per result for ~64 groups -> ~200 MB ceiling.
+  No cache schema bump required: `PerformanceResult` is computed at
+  the analysis-output boundary, not stored in any Parquet shard.
+- **`analysis/plots.py`**: new public functions:
+  - `empirical_cdf(samples) -> (x, y)` -- pure helper. Drops non-finite
+    and non-positive samples; returns sorted `x` and ECDF `y[i] = (i+1)/n`.
+  - `generate_latency_cdf_plot(results, output_dir) -> Path` -- saves
+    `latency_cdf.png` with one row per observed QoS, one CDF line per
+    `(transport, workload)` combo. Reuses `_FAMILY_COLORMAPS` /
+    `_family_palette` so colours match the bar chart. `x` axis log
+    latency (ms), `y` in `[0, 1]`. QoS rows with no positive samples
+    get an inline "no positive latency samples" label rather than an
+    empty axis.
+  - Refactored `_empty_plot` to take a `filename` parameter so the
+    placeholder can be reused for both charts.
+- **`analysis/analyze.py`**: CLI now imports and invokes
+  `generate_latency_cdf_plot` alongside `generate_comparison_plot`
+  whenever diagrams are produced. Same `--output` directory, separate
+  output file `latency_cdf.png`. Same `--diagrams` flag.
+
+### Part B: Relax the epsilon clamp
+
+- **`analysis/plots.py`**: `_LATENCY_EPSILON_MS` lowered from `1e-3` to
+  `1e-5` ms (10 ns). Module-level docstring on the constant explains
+  it now only protects log-axis arithmetic, never silently pancakes
+  positive latencies onto a visible floor.
+- The latency-bar loop in `generate_comparison_plot` now drops bars
+  to `NaN` when `p95 <= 0` (e.g. clock-noise artifact) instead of
+  clamping to the epsilon. The chart now visibly communicates "no
+  positive data" rather than implying ~10 ns. The lower whisker
+  arithmetic still guards against tiny float underflow via the new
+  much smaller epsilon.
+
+### Validation
+
+- **Unit tests added (analysis/tests/test_plots.py)**:
+  - `TestEmpiricalCdf` (5 cases): empty input, monotonic non-decreasing
+    `y`, bounded in `[0, 1]`, output length matches positive-finite
+    sample count, step size `1/n` for distinct samples.
+  - `TestGenerateLatencyCdfPlot` (5 cases): PNG creation, output dir
+    creation, empty results, per-row no-samples placeholder, multi-QoS
+    figure shape (4 axes, all log x-scale, y in [0, 1]).
+  - `test_nonpositive_p95_renders_as_nan_bar`: regression test for the
+    relaxed epsilon -- a `p95 <= 0` produces a NaN bar height; finite
+    bars elsewhere render normally.
+
+- **Existing test suite**: full `pytest tests/ -q` from `analysis/`:
+  ```
+  142 passed, 5 skipped in 15.80s
+  ```
+  (5 skipped are pre-existing acceptance-only tests.)
+
+- **Lint**: `ruff format --check .` clean; `ruff check .` clean (after
+  one auto-format on the new test additions).
+
+- **End-to-end**: ran
+  `python analyze.py ../logs/two-machines-all-variants-01-20260507_093412 --diagrams --output /tmp/t11-4-out`
+  Both `comparison.png` (387 KB) and `latency_cdf.png` (463 KB)
+  produced. Visually inspected:
+  - `latency_cdf.png` shows a clear distribution shape per QoS row.
+    Hybrid (purple) and zenoh (green) lines show the long tails and
+    multi-modal structure that the percentile bars hide. Sub-ms
+    zenoh variants (e.g. `zenoh-100x1000hz-qos1`, p95 ~0.69 ms) are
+    visible as steep curves around `10^-1` to `10^0` ms.
+  - `comparison.png` qos1/qos2 latency cells: custom-udp and quic
+    bars are absent (NaN) where they previously would have been
+    pinned to the epsilon floor. In this dataset those transports
+    happened to have **zero** cross-runner deliveries (lossy two-
+    machine run), so the new behaviour correctly renders "no bar"
+    rather than the misleading "1 us bar" the old clamp produced.
+    The relaxed epsilon (`1e-5` instead of `1e-3`) is verified by
+    inspection of the constant, and would surface sub-microsecond
+    positive latencies at their actual position rather than the
+    1 us floor on any future dataset that produces them.
+
+### Deviations from the spec
+
+- The user's example chart showed custom-udp / quic clamped at the
+  1 us floor; the available `two-machines-all-variants-01-...` log
+  dataset has 0 deliveries for those transports, so we cannot
+  visually verify the change against THAT specific reproduction.
+  However:
+  1. The constant is verifiably lowered (1e-3 -> 1e-5).
+  2. The unit test `test_nonpositive_p95_renders_as_nan_bar`
+     explicitly covers the "positive but tiny" / "zero or negative"
+     branches.
+  3. The CDF chart sidesteps the issue entirely by exposing the
+     full distribution.
+
+### Files changed
+
+- `analysis/performance.py` -- `LATENCY_SAMPLE_CAP`,
+  `_latency_samples()`, `latency_samples_ms` field, plumbed into
+  `performance_for_group`.
+- `analysis/plots.py` -- `_LATENCY_EPSILON_MS = 1e-5`, NaN-on-<=0
+  bar logic, `empirical_cdf`, `generate_latency_cdf_plot`,
+  `_empty_plot(filename=...)`.
+- `analysis/analyze.py` -- import + invoke `generate_latency_cdf_plot`
+  in the diagrams branch.
+- `analysis/tests/test_plots.py` -- new test classes
+  `TestEmpiricalCdf`, `TestGenerateLatencyCdfPlot`, and the regression
+  test for the relaxed epsilon.
+
+### Open concerns
+
+None blocking. The downsampling is stride-based (deterministic) rather
+than reservoir-sampled (statistically optimal). For datasets with
+strong temporal clustering (e.g. a long warm-up burst followed by
+steady-state) the stride sample could over-represent the warm-up
+phase. Marking this as a future consideration -- the percentiles in
+the bar chart are unaffected (they're computed on the full
+delivery set before downsampling).
