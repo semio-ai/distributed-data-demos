@@ -44,6 +44,18 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     verbose_clock_sync: bool,
 
+    /// Emit verbose coordination-protocol tracing to stderr.
+    ///
+    /// When enabled, the runner prints one line per inbound coordination
+    /// message handled inside `ready_barrier`, `done_barrier`, and
+    /// `exchange_resume_manifest` — recording the message type, sender,
+    /// variant/run fields, and whether it was accepted or rejected (and
+    /// why). Off by default. Used to diagnose mid-run barrier hangs (see
+    /// `metak-orchestrator/DECISIONS.md` T-coord.1 entry). The default
+    /// path produces no extra output.
+    #[arg(long, default_value_t = false)]
+    verbose_coord: bool,
+
     /// Resume an interrupted multi-runner benchmark.
     ///
     /// When set, the runner picks the lexicographically greatest existing
@@ -151,6 +163,10 @@ fn run(cli: &Cli) -> Result<()> {
     // Wire the process-wide clock-sync verbose toggle so the engine and
     // coordinator emit per-datagram traces while diagnosing field issues.
     clock_sync::set_verbose(cli.verbose_clock_sync);
+
+    // Wire the process-wide coordination-protocol verbose toggle so the
+    // barrier loops emit per-message traces while diagnosing barrier hangs.
+    protocol::set_verbose_coord(cli.verbose_coord);
 
     let barrier_timeout = Duration::from_secs(cli.barrier_timeout_secs);
     eprintln!(

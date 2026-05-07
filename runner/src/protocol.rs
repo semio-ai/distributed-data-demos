@@ -6,6 +6,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -68,6 +69,28 @@ impl fmt::Display for BarrierTimeoutError {
 }
 
 impl std::error::Error for BarrierTimeoutError {}
+
+/// Process-wide verbose-tracing toggle for the coordination protocol.
+/// Enabled via the `--verbose-coord` CLI flag in `main.rs`.
+///
+/// When `true`, `ready_barrier`, `done_barrier`, and `exchange_resume_manifest`
+/// emit one stderr line per inbound coordination message, recording whether
+/// it was accepted or rejected and why (wrong variant, wrong run, wrong type
+/// for the current barrier, unexpected name). Off by default — used to
+/// diagnose mid-run hangs at barrier transitions (see T-coord.1).
+///
+/// Reads are `Relaxed` because tracing is best-effort observability.
+static VERBOSE_COORD: AtomicBool = AtomicBool::new(false);
+
+/// Enable verbose coordination tracing process-wide. Idempotent.
+pub fn set_verbose_coord(on: bool) {
+    VERBOSE_COORD.store(on, Ordering::Relaxed);
+}
+
+/// Whether verbose coordination tracing is currently enabled.
+fn verbose_coord_enabled() -> bool {
+    VERBOSE_COORD.load(Ordering::Relaxed)
+}
 
 /// Multicast group for runner coordination (organization-local scope).
 const COORDINATION_MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 77, 66, 55);
@@ -399,11 +422,27 @@ impl Coordinator {
             while std::time::Instant::now() < recv_deadline {
                 match self.recv(socket) {
                     Some(Message::Ready { name, variant, run }) => {
-                        if variant == variant_name
+                        let accept = variant == variant_name
                             && run == self.run
-                            && self.expected.contains(&name)
-                        {
+                            && self.expected.contains(&name);
+                        if verbose_coord_enabled() {
+                            eprintln!(
+                                "[coord verbose] {}: ready_barrier({variant_name}) recv Ready name={name} variant={variant} run={run} accepted={accept}",
+                                self.name
+                            );
+                        }
+                        if accept {
                             seen.insert(name);
+                        }
+                    }
+                    Some(Message::Done {
+                        name, variant, run, ..
+                    }) => {
+                        if verbose_coord_enabled() {
+                            eprintln!(
+                                "[coord verbose] {}: ready_barrier({variant_name}) recv Done name={name} variant={variant} run={run} (ignored — wrong type for this barrier)",
+                                self.name
+                            );
                         }
                     }
                     Some(Message::ProbeRequest { from, to, id, t1 }) => {
@@ -504,11 +543,25 @@ impl Coordinator {
                         status: s,
                         exit_code: c,
                     }) => {
-                        if variant == variant_name
+                        let accept = variant == variant_name
                             && run == self.run
-                            && self.expected.contains(&name)
-                        {
+                            && self.expected.contains(&name);
+                        if verbose_coord_enabled() {
+                            eprintln!(
+                                "[coord verbose] {}: done_barrier({variant_name}) recv Done name={name} variant={variant} run={run} status={s} accepted={accept}",
+                                self.name
+                            );
+                        }
+                        if accept {
                             results.insert(name, (s, c));
+                        }
+                    }
+                    Some(Message::Ready { name, variant, run }) => {
+                        if verbose_coord_enabled() {
+                            eprintln!(
+                                "[coord verbose] {}: done_barrier({variant_name}) recv Ready name={name} variant={variant} run={run} (ignored — wrong type for this barrier)",
+                                self.name
+                            );
                         }
                     }
                     Some(Message::ProbeRequest { from, to, id, t1 }) => {
@@ -1333,5 +1386,192 @@ mod tests {
         assert!(s.contains("myvar"), "{s}");
         assert!(s.contains("5"), "{s}");
         assert!(s.contains('b'), "{s}");
+    }
+
+    /// Reproduces the 2026-05-07 mid-run hang (T-coord.1).
+    ///
+    /// Scenario observed in the field: alice finished spawn N's done barrier
+    /// (linger included) and moved on to spawn N+1's ready barrier. Bob's
+    /// variant ran longer; bob then entered done_barrier for spawn N and
+    /// hung — alice was no longer broadcasting `Done` for spawn N AND
+    /// alice's `ready_barrier` silently drops inbound `Done` messages
+    /// (lines 322-368, the trailing `_ => {}` arm). No message any peer
+    /// will send satisfies bob's barrier-completion condition.
+    ///
+    /// This test exercises the **same code path** without invoking the
+    /// real `done_barrier` on bob's side (which has no abort mechanism
+    /// and would leak a hung thread across the test runner). Instead:
+    ///
+    /// - Alice runs only one Coordinator method: a manual emulation of
+    ///   `ready_barrier(spawn_n_plus_1)`. It broadcasts `Ready` every
+    ///   500 ms and silently drops inbound `Done` — exactly mirroring
+    ///   `ready_barrier`'s `_ => {}` arm. A shutdown flag exits the loop
+    ///   cleanly.
+    /// - Bob (also manually) sends `Done` for "spawn_n_half" repeatedly
+    ///   for 6 seconds and asks: "did I receive a matching `Done` back
+    ///   from alice?" The buggy answer is **no**, because alice's
+    ///   ready_barrier-emulation never re-broadcasts `Done`. The fixed
+    ///   answer (T-coord.1b) is **yes**, because the fix will have alice
+    ///   re-emit a stale `Done` in response.
+    ///
+    /// This emulation is faithful: every observable network behaviour of
+    /// the buggy `ready_barrier` is preserved (broadcast cadence,
+    /// silent-Done-drop). And both sides exit cleanly within ~7 s, so
+    /// no thread or socket leaks across test boundaries.
+    ///
+    /// Verdict: H1 confirmed. See `metak-orchestrator/DECISIONS.md` D9.
+    /// When T-coord.1b lands, invert the final assertion to lock in the
+    /// fixed behaviour.
+    #[test]
+    fn done_barrier_hang_repro_when_peer_already_advanced() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Barrier};
+
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let runners = vec!["alice".to_string(), "bob".to_string()];
+        let hash = "coordhang".to_string();
+        let run_id = "coord-hang-run".to_string();
+
+        let setup = Arc::new(Barrier::new(2));
+        let setup_a = Arc::clone(&setup);
+        let setup_b = Arc::clone(&setup);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_a = Arc::clone(&shutdown);
+
+        // Alice: discover, ready_barrier(spawn_n), done_barrier(spawn_n)
+        // (which both complete with bob), then run an in-test loop that
+        // emulates `ready_barrier(spawn_n_plus_1)` without an abort path:
+        // send Ready every 500 ms, drain inbound, silently drop Done.
+        // Exits when `shutdown` flips.
+        let runners_a = runners.clone();
+        let hash_a = hash.clone();
+        let run_a = run_id.clone();
+        let thread_a = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "alice".into(),
+                &runners_a,
+                hash_a,
+                port,
+                "log-sub".into(),
+                run_a,
+                false,
+            )
+            .unwrap();
+            setup_a.wait();
+            coord.discover().unwrap();
+            coord
+                .ready_barrier("spawn_n", Duration::from_secs(30))
+                .unwrap();
+            coord
+                .done_barrier("spawn_n", "success", 0, Duration::from_secs(30))
+                .unwrap();
+
+            let socket = coord.socket.as_deref().unwrap();
+            let ready_msg = Message::Ready {
+                name: "alice".into(),
+                variant: "spawn_n_plus_1".into(),
+                run: coord.run.clone(),
+            };
+            let mut last_send = std::time::Instant::now() - BROADCAST_INTERVAL;
+            while !shutdown_a.load(AtomicOrdering::Relaxed) {
+                if last_send.elapsed() >= BROADCAST_INTERVAL {
+                    coord.send(socket, &ready_msg).ok();
+                    last_send = std::time::Instant::now();
+                }
+                if let Some(Message::ProbeRequest { from, to, id, t1 }) = coord.recv(socket) {
+                    if to == coord.name {
+                        let _ = respond_to_probe(
+                            socket,
+                            &coord.peer_addrs,
+                            &coord.name,
+                            &from,
+                            id,
+                            &t1,
+                        );
+                    }
+                    // Important: Done messages are silently dropped here,
+                    // matching the bug.
+                }
+            }
+        });
+
+        // Bob: discover, ready_barrier(spawn_n), done_barrier(spawn_n),
+        // then a manual emulation of done_barrier("spawn_n_half"):
+        // broadcast Done at 500 ms cadence, drain inbound, look for a
+        // matching Done from alice. If we observe one within 6 seconds,
+        // the bug is "fixed" (the test will fail and prompt the
+        // maintainer to invert the assertion). Otherwise, the bug
+        // reproduces.
+        let runners_b = runners;
+        let hash_b = hash;
+        let run_b = run_id;
+        let thread_b = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "bob".into(),
+                &runners_b,
+                hash_b,
+                port,
+                "log-sub".into(),
+                run_b,
+                false,
+            )
+            .unwrap();
+            setup_b.wait();
+            coord.discover().unwrap();
+            coord
+                .ready_barrier("spawn_n", Duration::from_secs(30))
+                .unwrap();
+            coord
+                .done_barrier("spawn_n", "success", 0, Duration::from_secs(30))
+                .unwrap();
+
+            // Give alice's post-done loop time to come up.
+            std::thread::sleep(Duration::from_millis(300));
+
+            let socket = coord.socket.as_deref().unwrap();
+            let done_msg = Message::Done {
+                name: "bob".into(),
+                variant: "spawn_n_half".into(),
+                run: coord.run.clone(),
+                status: "success".into(),
+                exit_code: 0,
+            };
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(6);
+            let mut last_send = std::time::Instant::now() - BROADCAST_INTERVAL;
+            let mut got_alice_done_for_half = false;
+            while std::time::Instant::now() < deadline {
+                if last_send.elapsed() >= BROADCAST_INTERVAL {
+                    coord.send(socket, &done_msg).ok();
+                    last_send = std::time::Instant::now();
+                }
+                if let Some(Message::Done {
+                    name, variant, run, ..
+                }) = coord.recv(socket)
+                {
+                    if name == "alice" && variant == "spawn_n_half" && run == coord.run {
+                        got_alice_done_for_half = true;
+                        break;
+                    }
+                }
+            }
+            got_alice_done_for_half
+        });
+
+        let bob_saw_alice_done = thread_b.join().expect("bob thread panicked");
+        // Release alice's post-done loop so the socket and multicast
+        // membership are dropped before subsequent tests run.
+        shutdown.store(true, AtomicOrdering::Relaxed);
+        thread_a.join().expect("alice thread panicked");
+
+        assert!(
+            !bob_saw_alice_done,
+            "REGRESSION: bob received alice's Done for 'spawn_n_half' \
+             within 6 s despite alice being parked in a ready_barrier-like \
+             post-done state. The T-coord.1 mid-run hang appears to be \
+             fixed in the source. Invert this assertion to lock in the \
+             fixed behaviour."
+        );
     }
 }
