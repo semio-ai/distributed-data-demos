@@ -76,6 +76,45 @@ the config's `runners` array is the leader; its proposal wins for the run.
 - If a runner finds NO matching folder locally, it aborts immediately
   before sending discover (resume requires a previous run to exist).
 
+### Discovery responds to late-arriving discoveries
+
+Discovery's exit condition admits any inbound message type — `Discover`,
+`Ready`, `Done`, `ResumeManifest` — as proof that the sending peer
+exists. Only `Discover` carries the `log_subdir` field. A non-leader
+that joins late (so the leader has already advanced into a Phase 2
+barrier and stopped broadcasting `Discover`) can therefore observe
+`seen == expected && hosts_known` while never having received the
+leader's `log_subdir`.
+
+To prevent this from being a fatal panic, two cooperating rules apply:
+
+1. **Late-discovery recovery loop in `discover()`.** Once the quorum
+   condition is met but `leader_log_subdir` is still `None`, the
+   non-leader keeps broadcasting `Discover` and reading inbound
+   messages, bounded by an internal 30-second budget, until the
+   leader's `Discover` arrives. If the budget elapses, `discover()`
+   returns an `Err` describing the situation rather than panicking
+   (the typical cause is an older peer binary without rule 2 below).
+   This bound is internal to `discover()` and is **not** the same as
+   the external `--barrier-timeout-secs` budget — discovery remains
+   exempt from that timeout.
+
+2. **Post-discovery loops re-emit `Discover` on demand.** When
+   `ready_barrier`, `done_barrier`, or the Phase 1.25 ResumeManifest
+   exchange receives an inbound `Discover` from a peer in the
+   expected set, the runner re-broadcasts a fully-formed `Discover`
+   message carrying the agreed `log_subdir`. This is best-effort
+   (errors swallowed) and does not affect the active barrier's
+   progress. It mirrors the "ready barrier responds to stale done
+   requests" rule that protects the spawn-N → spawn-N+1 boundary on
+   `Done` (T-coord.1b).
+
+Together these rules make the discovery exit symmetric with the
+barrier-linger pattern: the fast peer keeps responding to the slow
+peer's earlier-phase messages long after its own discovery has
+completed, and the slow peer is willing to keep listening for a
+bounded period beyond quorum.
+
 ## Phase 1.25: Resume Inventory (only when `resume = true`)
 
 After discovery completes (config hashes matched, log_subdir agreed, peer
