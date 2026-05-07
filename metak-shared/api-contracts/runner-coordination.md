@@ -218,6 +218,74 @@ picks the most recent measurement preceding the variant's writes.
 - Waits until all runners have reported done.
 - Proceeds to the next variant, or finishes if all variants are complete.
 
+### Ready barrier responds to stale done requests
+
+The done barrier's 2-second linger covers slow peers that arrive at done-N
+within ~2 s of the fast peer reaching quorum, but it does **not** cover
+the case where the slow peer arrives later (per-machine runtime skew on a
+high-rate variant plus UDP receive-buffer pressure on the slow peer's
+runner can push that gap past the linger). After the linger expires, the
+fast peer enters `ready_barrier` for spawn N+1 and would otherwise drop
+inbound `Done` messages on the floor — leaving the slow peer's done-N
+loop with no message any peer will ever send that satisfies its
+barrier-completion condition (see DECISIONS.md D9).
+
+To prevent this longer-tail hang, the post-done coordination phases
+re-emit a cached `Done` on demand:
+
+1. **Most-recent-completed cache.** `Coordinator` maintains a single-entry
+   cache of the most recently completed `done_barrier` outcome —
+   `(variant, run, status, exit_code)`. The cache is written at the tail
+   of `done_barrier` just before returning, only on the success path; the
+   timeout-error branch leaves it untouched (we did not complete that
+   variant's coordination cleanly, so re-emitting a `Done` for it would
+   misrepresent the outcome). The cache is **bounded to one entry by
+   design**: a slow peer never asks for a `Done` from any spawn earlier
+   than the immediately preceding one — older variants intentionally
+   time out via the post-discovery barrier-timeout safety net (T-coord.2).
+
+2. **Re-emit hook in post-done loops.** When `ready_barrier`,
+   `done_barrier` (cross-spawn case: inbound `Done` for a different
+   variant than the current one), or the Phase 1.25 ResumeManifest
+   exchange receives an inbound `Done` from a peer in the expected set,
+   it consults the cache. If the cache is `Some((variant, run, …))` and
+   the inbound `(variant, run)` matches, the runner broadcasts its own
+   cached `Done` for that variant. Otherwise (cache empty, older variant,
+   or mismatched run id) the inbound message is dropped without effect on
+   the active barrier — the helper is a strict no-op outside the matching
+   case.
+
+3. **Best-effort.** Send errors from the re-emit are swallowed; this is a
+   recovery-only path running inside the hot loop of another barrier and
+   must not abort the active barrier on a transient failure. The active
+   barrier's progress (inserts into `seen` / `results`, the `expected`-set
+   completion check, the overall deadline) is unaffected.
+
+What this rule does **not** cover:
+
+- **Older variants.** Bob asking for `Done` on spawn N-1 (or earlier)
+  while alice's cache holds spawn N gets nothing. The bounded cache is
+  intentional — chained mid-run hangs across multiple spawns are out of
+  scope; the barrier-timeout safety net catches them.
+- **Cache empty.** A runner that has not yet completed any `done_barrier`
+  has nothing to re-emit; a stale `Done` request received during the
+  Phase 1.5 / Phase 1.25 windows of its first variant is dropped silently.
+  In practice this is structurally inert: a peer that has already entered
+  `done_barrier` for variant X must itself have seen this runner reach
+  the same point in `ready_barrier` for X, which means this runner has
+  not yet completed any `done_barrier` to cache.
+- **The discovery linger.** In principle the discovery linger could also
+  re-emit cached `Done` on inbound `Done`. In practice the cache is
+  always `None` at that point (no `done_barrier` has run yet on a fresh
+  process, and resume-mode runs reset the cache through a process
+  restart), so the wiring is omitted as structurally inert. Documented
+  here for symmetry with the discovery-recovery rule above.
+
+This rule mirrors the "discovery responds to late-arriving discoveries"
+rule (Phase 1, T-coord.3): the fast peer keeps a small piece of state
+about its last completed coordination event and is willing to replay it
+in response to a slow peer's stale request, bounded so the cost is O(1).
+
 ## Message Format
 
 _To be defined during implementation. The protocol must be simple and
