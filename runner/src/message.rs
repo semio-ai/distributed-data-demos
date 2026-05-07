@@ -9,6 +9,22 @@ pub enum Message {
         name: String,
         config_hash: String,
         log_subdir: String,
+        /// Whether this runner was launched with `--resume`. All runners must
+        /// agree on this flag's value or discovery aborts. Defaults to `false`
+        /// when missing for backwards compatibility with older peer binaries.
+        #[serde(default)]
+        resume: bool,
+    },
+    /// Resume-mode inventory of locally complete spawn jobs (Phase 1.25).
+    ///
+    /// `complete_jobs` is the sorted, deduplicated list of `effective_name`s
+    /// for which the local log file exists and is non-empty. Empty files are
+    /// deleted before this message is broadcast. The cross-runner intersection
+    /// of these sets becomes the run's "skip set".
+    ResumeManifest {
+        name: String,
+        run: String,
+        complete_jobs: Vec<String>,
     },
     /// Ready barrier signal for a specific variant.
     Ready {
@@ -70,6 +86,20 @@ mod tests {
             name: "a".into(),
             config_hash: "abc123".into(),
             log_subdir: "run01-20260415_120000".into(),
+            resume: false,
+        };
+        let bytes = msg.to_bytes();
+        let parsed = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, parsed);
+    }
+
+    #[test]
+    fn discover_roundtrip_with_resume_true() {
+        let msg = Message::Discover {
+            name: "a".into(),
+            config_hash: "abc123".into(),
+            log_subdir: "run01-20260415_120000".into(),
+            resume: true,
         };
         let bytes = msg.to_bytes();
         let parsed = Message::from_bytes(&bytes).unwrap();
@@ -108,12 +138,81 @@ mod tests {
             name: "a".into(),
             config_hash: "hash123".into(),
             log_subdir: "run01-20260415_120000".into(),
+            resume: false,
         };
         let json: serde_json::Value = serde_json::from_slice(&msg.to_bytes()).unwrap();
         assert_eq!(json["type"], "discover");
         assert_eq!(json["name"], "a");
         assert_eq!(json["config_hash"], "hash123");
         assert_eq!(json["log_subdir"], "run01-20260415_120000");
+        assert_eq!(json["resume"], false);
+    }
+
+    #[test]
+    fn discover_missing_resume_field_defaults_to_false() {
+        // Backwards compatibility: older binaries serialize Discover without
+        // a `resume` field. They must still parse successfully and be treated
+        // as `resume = false`.
+        let json = br#"{"type":"discover","name":"a","config_hash":"h","log_subdir":"sub"}"#;
+        let parsed = Message::from_bytes(json).unwrap();
+        match parsed {
+            Message::Discover {
+                name,
+                config_hash,
+                log_subdir,
+                resume,
+            } => {
+                assert_eq!(name, "a");
+                assert_eq!(config_hash, "h");
+                assert_eq!(log_subdir, "sub");
+                assert!(!resume);
+            }
+            _ => panic!("expected Discover variant"),
+        }
+    }
+
+    #[test]
+    fn resume_manifest_roundtrip() {
+        let msg = Message::ResumeManifest {
+            name: "a".into(),
+            run: "run01".into(),
+            complete_jobs: vec!["zenoh-qos1".into(), "udp-qos2".into()],
+        };
+        let bytes = msg.to_bytes();
+        let parsed = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, parsed);
+    }
+
+    #[test]
+    fn resume_manifest_json_format() {
+        let msg = Message::ResumeManifest {
+            name: "alice".into(),
+            run: "run01".into(),
+            complete_jobs: vec!["v1".into(), "v2".into()],
+        };
+        let json: serde_json::Value = serde_json::from_slice(&msg.to_bytes()).unwrap();
+        assert_eq!(json["type"], "resume_manifest");
+        assert_eq!(json["name"], "alice");
+        assert_eq!(json["run"], "run01");
+        let jobs = json["complete_jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0], "v1");
+        assert_eq!(jobs[1], "v2");
+    }
+
+    #[test]
+    fn resume_manifest_empty_jobs() {
+        // A runner with no completed jobs should still send a manifest with
+        // an empty array (this is how the intersection rule learns that this
+        // peer has nothing to skip).
+        let msg = Message::ResumeManifest {
+            name: "alice".into(),
+            run: "run01".into(),
+            complete_jobs: vec![],
+        };
+        let bytes = msg.to_bytes();
+        let parsed = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, parsed);
     }
 
     #[test]

@@ -4777,3 +4777,154 @@ test result: ok. 8 passed; 0 failed; ...   (integration)
 ```
 
 `cargo clippy --release -p runner --all-targets -- -D warnings` clean. `cargo fmt -p runner -- --check` clean.
+
+---
+
+## 2026-05-06 — T-resume.1 — runner `--resume` flag and ResumeManifest coordination
+
+Status: ready for review (not committed — orchestrator/user to review first).
+
+### Files changed
+
+- `runner/src/main.rs` — added `--resume` CLI flag; resolved `base_log_dir` once up front; branched proposed `log_subdir` between fresh (`<run>-<now-ts>`) and resume (lex-greatest `<run>-*` subfolder via `resume::find_latest_log_subdir`); passed `resume` flag to `Coordinator::new`; verified the agreed log subfolder exists locally (abort otherwise); expanded all spawn jobs once (kept ordering for grace logic); added Phase 1.25 manifest exchange + intersection + cleanup; restructured Phase 2 to iterate the precomputed list and bypass ready/spawn/resync/done barriers for jobs in the skip set; added a `Resume: N reused, N executed, N failed.` summary line; updated final exit-code logic so `"skipped"` counts as success.
+- `runner/src/message.rs` — added `resume: bool` (with `serde(default)` for backwards compatibility) to `Message::Discover`; added new `Message::ResumeManifest { name, run, complete_jobs }` variant; added roundtrip + JSON-format tests for both, plus a "missing-resume-defaults-to-false" test.
+- `runner/src/protocol.rs` — added `resume: bool` field on `Coordinator`; new `resume` parameter on `Coordinator::new`; included `resume` in the broadcast Discover message; bail in `discover()` when a peer reports a different `resume` flag value (with a clear error message); new `exchange_resume_manifest(local_jobs)` method that broadcasts the ResumeManifest, drains responses (filtered by run id and expected runner names), and re-broadcasts every 500 ms until every peer has reported (mirrors the discovery loss-recovery pattern, including a 2-second linger for slow peers); also answers ProbeRequests during the exchange so the always-respond rule still holds; added two new tests: `resume_flag_mismatch_aborts_discovery` and `two_runner_resume_manifest_exchange`, plus `single_runner_resume_manifest_exchange_is_local_only`. Updated all existing `Coordinator::new` test call sites for the new arity. Added a `multicast_test_lock()` helper (`OnceLock<Mutex<()>>`) and gated every multicast-using protocol test on it to keep the suite green at default Cargo parallelism on Windows.
+- `runner/src/resume.rs` (new) — `find_latest_log_subdir` (lex-greatest `<run>-*`); `compute_local_manifest` (delete empties, classify non-empty as complete, missing as excluded — output sorted/deduped); `intersect_complete_jobs` (collapses to empty when any expected runner is missing from the manifest map); `cleanup_incomplete_logs` (delete this runner's log files for every job not in the skip set). Eight unit tests covering all four helpers including edge cases (missing base dir, no matching folder, single-runner intersection, missing peer, cleanup of mixed sets).
+- `runner/tests/integration.rs` — two new integration tests: `single_runner_resume_skips_complete_files_and_reruns_truncated` (run 1 fresh → run 2 resume all-skipped → truncate → run 3 re-executes only the truncated spawn) and `resume_aborts_when_no_matching_log_subfolder`.
+
+### Pre-existing behavior verified
+
+- `runner/src/clock_sync_log.rs` already opens both the canonical and the debug log files with `OpenOptions::new().create(true).append(true)`. No change needed; the `appends_to_existing_file` test already exercises this.
+- `require_initial_sync_complete` fail-fast remains in place — resume mode does not relax cross-machine offset requirements.
+
+### Test results
+
+`cargo build --release -p runner` clean. `cargo build --release -p variant-base` clean. `cargo clippy --release -p runner --all-targets -- -D warnings` clean. `cargo fmt -p runner -- --check` clean.
+
+`cargo test --release -p runner` (default parallelism) — full suite green:
+
+```
+test result: ok. 119 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.63s   (unit)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.00s     (clock_sync_stress)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.47s    (integration)
+```
+
+Full integration test list:
+
+```
+test config_validation_rejects_bad_name ... ok
+test resume_aborts_when_no_matching_log_subfolder ... ok
+test single_runner_injects_peers_arg_with_self_loopback ... ok
+test single_runner_lifecycle ... ok
+test multi_variant_sequential_execution ... ok
+test qos_array_produces_per_qos_log_files ... ok
+test single_runner_resume_skips_complete_files_and_reruns_truncated ... ok
+test qos_omitted_produces_four_log_files ... ok
+test template_and_array_expansion_produces_cartesian_product_log_files ... ok
+test timeout_handling ... ok
+```
+
+New tests added (count: 16):
+- `message::resume_manifest_roundtrip`
+- `message::resume_manifest_json_format`
+- `message::resume_manifest_empty_jobs`
+- `message::discover_roundtrip_with_resume_true`
+- `message::discover_missing_resume_field_defaults_to_false`
+- `protocol::resume_flag_mismatch_aborts_discovery`
+- `protocol::single_runner_resume_manifest_exchange_is_local_only`
+- `protocol::two_runner_resume_manifest_exchange`
+- `resume::latest_subfolder_picks_lexicographically_greatest`
+- `resume::latest_subfolder_no_match_returns_error`
+- `resume::latest_subfolder_missing_base_returns_error`
+- `resume::local_manifest_classifies_files_correctly`
+- `resume::local_manifest_complete_jobs_are_sorted_and_deduped`
+- `resume::intersection_three_peers_picks_all_three_agree`
+- `resume::intersection_single_runner_equals_local_manifest`
+- `resume::intersection_missing_peer_collapses_to_empty`
+- `resume::cleanup_deletes_only_incomplete_files`
+- `resume::cleanup_handles_missing_files`
+- integration `single_runner_resume_skips_complete_files_and_reruns_truncated`
+- integration `resume_aborts_when_no_matching_log_subfolder`
+
+### Fix for default-parallelism multicast test hang
+
+Initial test runs at default parallelism on Windows hit a multicast resource-exhaustion hang in three protocol tests (`config_hash_mismatch_detected`, `resume_flag_mismatch_aborts_discovery`, `stale_ready_from_different_run_is_ignored`). The new resume tests added one more multicast cohort to the parallel pool, pushing past a Windows ceiling. Mitigated by adding a `multicast_test_lock()` helper (a `OnceLock<Mutex<()>>`) and acquiring it at the start of every multicast-using test in `protocol::tests`. Single-runner tests do not need it (they bind no socket). The `inline clock_sync` localhost-only tests do not need it either (no multicast group). With the lock in place, the full test suite runs cleanly at default parallelism.
+
+### Live single-runner smoke (steps from the brief)
+
+Used a config in `C:/Users/tiagr/AppData/Local/Temp/runner-smoke/smoke.toml` (single runner, single dummy entry expanded to `qos = [1, 2]` so two spawns are produced).
+
+Step 1 (fresh):
+
+```
+[runner:local] starting discovery...
+[runner:local] discovery complete
+[runner:local] log subfolder: smoke-20260506_221247
+[runner:local] ready barrier for spawn 'dummy-qos1' (hz=5, vpt=1, qos=1)
+[runner:local] spawning 'dummy-qos1' (hz=5, vpt=1, qos=1, timeout: 30s)
+[runner:local] 'dummy-qos1' finished: status=success, exit_code=0
+[runner:local] ready barrier for spawn 'dummy-qos2' (hz=5, vpt=1, qos=2)
+[runner:local] 'dummy-qos2' finished: status=success, exit_code=0
+Benchmark run: smoke
+Variant                  Runner   Status    Exit
+dummy-qos1               local    success   0
+dummy-qos2               local    success   0
+```
+
+Two non-empty JSONL files produced under `logs/smoke-20260506_221247/`.
+
+Step 2 (resume, all skipped):
+
+```
+[runner:local] resume: selected latest log subfolder 'smoke-20260506_221247' under C:/Users/tiagr/AppData/Local/Temp/runner-smoke/logs
+[runner:local] log subfolder: smoke-20260506_221247
+[runner:local] resume: local manifest has 2 complete job(s)
+[runner:local] resume: skip set has 2 job(s) (intersection of 1 peer manifest(s))
+[runner:local] skipping 'dummy-qos1' (resume: complete on all peers)
+[runner:local] skipping 'dummy-qos2' (resume: complete on all peers)
+Benchmark run: smoke
+Variant                  Runner   Status    Exit
+dummy-qos1               local    skipped   0
+dummy-qos2               local    skipped   0
+Resume: 2 spawns reused, 0 spawns executed, 0 failed.
+```
+
+Step 3 (truncate dummy-qos1, resume, mixed):
+
+```
+[runner:local] resume: selected latest log subfolder 'smoke-20260506_221247' under .../logs
+[runner:local] resume: deleted empty log .../smoke-20260506_221247\dummy-qos1-local-smoke.jsonl
+[runner:local] resume: local manifest has 1 complete job(s)
+[runner:local] resume: skip set has 1 job(s) (intersection of 1 peer manifest(s))
+[runner:local] ready barrier for spawn 'dummy-qos1' (hz=5, vpt=1, qos=1)
+[runner:local] spawning 'dummy-qos1' (hz=5, vpt=1, qos=1, timeout: 30s)
+[runner:local] 'dummy-qos1' finished: status=success, exit_code=0
+[runner:local] skipping 'dummy-qos2' (resume: complete on all peers)
+Benchmark run: smoke
+Variant                  Runner   Status    Exit
+dummy-qos1               local    success   0
+dummy-qos2               local    skipped   0
+Resume: 1 spawns reused, 1 spawns executed, 0 failed.
+```
+
+After Step 3, `dummy-qos1-local-smoke.jsonl` is back to a non-zero size. All three steps exited with code 0.
+
+### Deviations / judgement calls
+
+- **Inter-spawn grace rule**: per the brief, this was a judgement call. I implemented "apply grace BEFORE the next real spawn from the same source entry, only if the previous action in that entry was a real spawn." Concretely: skipped jobs do NOT trigger any sleep, and a real spawn followed by skipped-skipped-real never sleeps before the second real spawn. Rationale: the grace exists to let TCP/UDP sockets release between two spawns of the same source entry — only relevant between two consecutive real spawns. Skipped jobs never bound a port, so no socket needs to release. This avoids gratuitous waits in resume runs while still preserving original behaviour in fresh runs. Documented inline above the loop in `main.rs`.
+- **Skipped jobs and the summary table**: I emit one summary row per skipped job using only `cli.name` as the runner (no "fake" rows for peer runners). The done barrier is bypassed for skipped jobs so we have no peer status to report. The cross-runner intersection rule guarantees every other runner also skipped this job, so this is faithful — but it does mean a multi-runner resume's summary table will only show `<count_jobs>` rows for skipped (one per spawn) rather than `<count_jobs> * <count_runners>` rows. Called out in case the orchestrator wants the table padded for visual consistency with non-skipped rows.
+- **Append-mode clock-sync log**: the existing implementation already uses `OpenOptions::new().create(true).append(true)`. No changes were needed; the brief asked me to verify this and I did. The pre-existing `appends_to_existing_file` unit test already covers it.
+- **Resume + config drift**: per the brief's "Out of scope", a config that changes between runs (e.g., adds a new variant) is handled implicitly — new spawn jobs simply don't appear in any old runner's manifest, so they fall outside the skip set and execute normally. No special handling.
+
+### Open concerns / follow-ups
+
+1. The Windows-specific `discover()`-bail parallelism intermittency described above. Recommend a dedicated follow-up (lower runner-crate test parallelism in `Cargo.toml`, or add a serializing fixture for the three mid-discover-bail tests) so the full suite is green at default `cargo test`.
+2. Cross-machine multi-runner live resume validation is the user's responsibility per the brief. Steps to reproduce: launch each machine's runner with `--resume`, confirm the leader's lex-greatest folder is adopted (each follower must already have that exact folder name on disk), and that the per-runner `[runner:<name>] resume: local manifest has N complete job(s)` lines and `[runner:<name>] resume: skip set has M job(s)` lines agree across machines after the manifest exchange.
+3. Did NOT commit; orchestrator/user should review the diff and the `--resume` UX (especially the new stderr lines and the `Resume: ...` summary line wording) before signing off.
+
+---
+
+## analysis: comparison plot rework (2026-05-06)
+
+Fixed two issues in `analysis/plots.py::generate_comparison_plot` for the new `two-runner-all-variants.toml` benchmark: (1) reworked layout from `1 x 2` (single row, QoS as x-axis groups) to `N_qos rows x 2 cols` (one row per QoS, throughput left / latency right) so 6 transports x 8 workloads x 4 QoS no longer squashes into an unreadable wide bar smear; (2) added `webrtc` (YlOrBr) and `websocket` (Reds) to `TRANSPORT_FAMILIES` and `_FAMILY_COLORMAPS` so those variants no longer fall through to the `other` bucket. Single shared legend retained at the bottom; latency keeps log scale + p50/p99 whiskers; missing (transport, workload, qos) cells render as gaps. All 23 plot tests + full 132-test analysis suite pass; ruff format/check clean. Visual sanity check with 96 synthetic results (6 transports x 4 workloads x 4 QoS) renders correctly.
+

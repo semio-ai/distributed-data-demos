@@ -157,3 +157,32 @@ it as a contract change touching every variant — not just the ones the new
 arg is "for." Either run the full all-variants config end-to-end before
 claiming the contract change done, or pick injected arg names that can't
 collide with existing variant-specific args (e.g. `--runner-peers`).
+
+## Windows: too many parallel multicast cohorts hang `cargo test -p runner`
+
+**Discovery (T-resume.1, 2026-05-06)**: `runner/src/protocol.rs` tests
+each spin up an in-process `Coordinator` that joins a multicast group
+on a per-test port and runs the discovery / barrier / resume-manifest
+loops over real UDP sockets. At default Cargo parallelism (one
+test thread per logical CPU on Windows), once the protocol-test pool
+crossed a threshold (around 6+ concurrent multicast cohorts on the
+test machine) several tests started intermittently hanging mid-
+discover-bail — `config_hash_mismatch_detected`,
+`stale_ready_from_different_run_is_ignored`, and the new
+`resume_flag_mismatch_aborts_discovery`. The symptom was the test
+never receiving the disagreeing peer's discover, even though both
+sides were sending. Single-test runs (`cargo test --test integration
+<name>`) and lower `--test-threads` runs were green — only the
+default-parallelism mass run hung.
+
+**Implication**: any new test that constructs a `Coordinator` and
+binds the multicast group MUST acquire `protocol::tests::multicast_test_lock()`
+at the start of the test (a process-wide `OnceLock<Mutex<()>>`). The
+guard must live for the full lifetime of the Coordinator. Tests that
+only exercise single-runner mode (no socket bound) do not need it,
+nor do the `inline clock_sync` localhost-only tests (no multicast
+group). With the lock in place, the full `cargo test -p runner` runs
+green at default parallelism. Long-term follow-up: lower the runner-
+crate test parallelism in `Cargo.toml` (`[profile.test]` or `harness`
+config) so the lock isn't needed; for now it is the cheapest correct
+fix and is documented in the helper's doc comment.

@@ -29,6 +29,8 @@ pub struct Coordinator {
     run: String,
     /// This runner's proposed log subfolder.
     proposed_log_subdir: String,
+    /// Whether this runner was launched with `--resume`.
+    resume: bool,
     /// UDP socket (None in single-runner mode since no network I/O is needed).
     /// Wrapped in `Arc` so the `ClockSyncEngine` can share ownership without
     /// reopening the port.
@@ -63,6 +65,7 @@ impl Coordinator {
         port: u16,
         log_subdir: String,
         run: String,
+        resume: bool,
     ) -> Result<Self> {
         let expected: HashSet<String> = runners.iter().cloned().collect();
         let single_runner = runners.len() == 1 && runners[0] == name;
@@ -112,6 +115,7 @@ impl Coordinator {
             config_hash,
             run,
             proposed_log_subdir: log_subdir,
+            resume,
             socket,
             peer_addrs,
             peer_hosts: Mutex::new(peer_hosts),
@@ -181,6 +185,7 @@ impl Coordinator {
             name: self.name.clone(),
             config_hash: self.config_hash.clone(),
             log_subdir: self.proposed_log_subdir.clone(),
+            resume: self.resume,
         };
 
         loop {
@@ -197,6 +202,7 @@ impl Coordinator {
                             name,
                             config_hash,
                             log_subdir,
+                            resume,
                         } => {
                             if self.expected.contains(name) && *config_hash != self.config_hash {
                                 bail!(
@@ -206,12 +212,27 @@ impl Coordinator {
                                     &config_hash[..config_hash.len().min(8)]
                                 );
                             }
+                            // Resume-mode agreement: every peer must report the
+                            // same `resume` flag value. Mixing resume and fresh
+                            // runs in the same coordination group is incoherent
+                            // (the fresh runner would create a new log subfolder
+                            // while the resume runner would reuse an existing
+                            // one).
+                            if self.expected.contains(name) && *resume != self.resume {
+                                bail!(
+                                    "resume-flag mismatch from runner '{}': expected {}, got {}",
+                                    name,
+                                    self.resume,
+                                    resume
+                                );
+                            }
                             // Capture the leader's log subfolder proposal.
                             if name == leader && leader_log_subdir.is_none() {
                                 leader_log_subdir = Some(log_subdir.clone());
                             }
                             Some(name.clone())
                         }
+                        Message::ResumeManifest { ref name, .. } => Some(name.clone()),
                         Message::Ready { ref name, .. } => Some(name.clone()),
                         Message::Done { ref name, .. } => Some(name.clone()),
                         Message::ProbeRequest { from, to, id, t1 } => {
@@ -421,6 +442,87 @@ impl Coordinator {
         }
     }
 
+    /// Exchange `ResumeManifest` messages with all peers (Phase 1.25).
+    ///
+    /// Each runner has already computed its local `complete_jobs` list
+    /// (effective_names whose log file exists locally and is non-empty).
+    /// This method broadcasts the local manifest, listens for one from
+    /// every peer in `runners`, and returns a `HashMap<runner_name,
+    /// complete_jobs>` containing every peer's report keyed by name.
+    /// This runner's own manifest is also included in the returned map.
+    ///
+    /// Periodic re-broadcast every 500 ms mirrors the discovery loss-
+    /// recovery pattern. Probe requests addressed to this runner are still
+    /// answered while waiting (the always-respond rule). In single-runner
+    /// mode this method is a no-op and returns a map containing only the
+    /// caller's own manifest.
+    pub fn exchange_resume_manifest(
+        &self,
+        local_complete_jobs: Vec<String>,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut all: HashMap<String, Vec<String>> = HashMap::new();
+        all.insert(self.name.clone(), local_complete_jobs.clone());
+
+        if self.single_runner {
+            return Ok(all);
+        }
+
+        let socket = self.socket.as_deref().unwrap();
+        let msg = Message::ResumeManifest {
+            name: self.name.clone(),
+            run: self.run.clone(),
+            complete_jobs: local_complete_jobs,
+        };
+
+        loop {
+            self.send(socket, &msg)?;
+
+            let deadline = std::time::Instant::now() + BROADCAST_INTERVAL;
+            while std::time::Instant::now() < deadline {
+                match self.recv(socket) {
+                    Some(Message::ResumeManifest {
+                        name,
+                        run,
+                        complete_jobs,
+                    }) => {
+                        // Defensive: drop messages from a different run id.
+                        // After discovery agreement these should not exist,
+                        // but a stale broadcast from a previous run could
+                        // theoretically arrive on the wire.
+                        if run == self.run && self.expected.contains(&name) {
+                            all.entry(name).or_insert(complete_jobs);
+                        }
+                    }
+                    Some(Message::ProbeRequest { from, to, id, t1 }) => {
+                        if to == self.name {
+                            let _ = respond_to_probe(
+                                socket,
+                                &self.peer_addrs,
+                                &self.name,
+                                &from,
+                                id,
+                                &t1,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if all.len() == self.expected.len() {
+                // Linger: keep broadcasting so slower peers can collect
+                // ours after they finish their own waits.
+                let linger_end = std::time::Instant::now() + Duration::from_secs(2);
+                while std::time::Instant::now() < linger_end {
+                    self.send(socket, &msg)?;
+                    self.drain_and_answer_probe(socket);
+                    std::thread::sleep(BROADCAST_INTERVAL);
+                }
+                return Ok(all);
+            }
+        }
+    }
+
     /// Send a message to all peer runner ports via UDP broadcast.
     fn send(&self, socket: &Socket, msg: &Message) -> Result<()> {
         let data = msg.to_bytes();
@@ -501,11 +603,30 @@ fn create_coordination_socket(port: u16) -> Result<Socket> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU16, Ordering};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     /// Allocate a unique port for each test to avoid conflicts when tests run in parallel.
     fn next_test_port() -> u16 {
         static PORT_COUNTER: AtomicU16 = AtomicU16::new(29800);
         PORT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Serialize multicast-using tests on Windows.
+    ///
+    /// Multiple tests joining the same multicast group simultaneously (each
+    /// with two-thread coordination loops) can exhaust Windows multicast
+    /// resources and cause `recv_from` to drop packets reliably enough that
+    /// the `discover()` bail-on-mismatch tests never see the peer's first
+    /// Discover and hang indefinitely. Per-test unique ports avoid port
+    /// collisions but not the global multicast-membership pressure. Holding
+    /// this mutex around the test body ensures only one multicast cohort is
+    /// active at a time. Single-runner tests do not need this since they
+    /// do not bind a socket.
+    fn multicast_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     #[test]
@@ -517,6 +638,7 @@ mod tests {
             0, // port unused in single-runner
             "run01-20260415_120000".into(),
             "run01".into(),
+            false,
         )
         .unwrap();
         assert!(coord.single_runner);
@@ -537,6 +659,7 @@ mod tests {
             0,
             "run01-20260415_120000".into(),
             "run01".into(),
+            false,
         )
         .unwrap();
         coord.ready_barrier("test-variant").unwrap();
@@ -551,6 +674,7 @@ mod tests {
             0,
             "run01-20260415_120000".into(),
             "run01".into(),
+            false,
         )
         .unwrap();
         let results = coord.done_barrier("test-variant", "success", 0).unwrap();
@@ -560,6 +684,7 @@ mod tests {
 
     #[test]
     fn two_runner_localhost_coordination() {
+        let _guard = multicast_test_lock();
         let port = next_test_port();
 
         let hash = "testhash123".to_string();
@@ -575,6 +700,7 @@ mod tests {
                 port,
                 "run-a-20260415_120000".into(),
                 "test-run".into(),
+                false,
             )
             .unwrap();
 
@@ -595,6 +721,7 @@ mod tests {
                 port,
                 "run-b-20260415_120001".into(),
                 "test-run".into(),
+                false,
             )
             .unwrap();
 
@@ -629,6 +756,7 @@ mod tests {
 
     #[test]
     fn config_hash_mismatch_detected() {
+        let _guard = multicast_test_lock();
         let port = next_test_port();
         let runners = vec!["a".to_string(), "b".to_string()];
 
@@ -641,6 +769,7 @@ mod tests {
                 port,
                 "run-20260415_120000".into(),
                 "test-run".into(),
+                false,
             )
             .unwrap();
             coord.discover()
@@ -655,6 +784,7 @@ mod tests {
                 port,
                 "run-20260415_120001".into(),
                 "test-run".into(),
+                false,
             )
             .unwrap();
             coord.discover()
@@ -678,6 +808,7 @@ mod tests {
     fn stale_ready_from_different_run_is_ignored() {
         use std::sync::{Arc, Barrier};
 
+        let _guard = multicast_test_lock();
         let port = next_test_port();
         let runners = vec!["runner_a".to_string(), "runner_b".to_string()];
 
@@ -699,6 +830,7 @@ mod tests {
                 port,
                 "log-subdir".into(),
                 "new-run".into(),
+                false,
             )
             .unwrap();
 
@@ -754,6 +886,7 @@ mod tests {
         // allows a slow peer to complete even when the fast peer finishes
         // the barrier first. Without linger, the fast peer would stop
         // broadcasting and the slow peer would hang forever.
+        let _guard = multicast_test_lock();
         let port = next_test_port();
         let hash = "lingerhash".to_string();
         let runners = vec!["a".to_string(), "b".to_string()];
@@ -771,6 +904,7 @@ mod tests {
                 port,
                 "log-sub".into(),
                 "linger-run".into(),
+                false,
             )
             .unwrap();
 
@@ -791,6 +925,7 @@ mod tests {
                 port,
                 "log-sub".into(),
                 "linger-run".into(),
+                false,
             )
             .unwrap();
 
@@ -814,5 +949,151 @@ mod tests {
             "runner a hung past the 10-second deadline"
         );
         result_a.expect("runner a thread panicked");
+    }
+
+    #[test]
+    fn resume_flag_mismatch_aborts_discovery() {
+        // Resume is an all-or-nothing property: a runner with --resume must
+        // refuse to coordinate with a peer that does not have --resume.
+        // Use runner names unique to this test (rfm_a/rfm_b) so we don't
+        // share names with other tests that also exchange Discover messages
+        // on the same multicast group.
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let runners = vec!["rfm_a".to_string(), "rfm_b".to_string()];
+        let hash = "rfm_hash_matching".to_string();
+
+        let runners_a = runners.clone();
+        let hash_a = hash.clone();
+        let thread_a = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "rfm_a".into(),
+                &runners_a,
+                hash_a,
+                port,
+                "rfm-sub".into(),
+                "rfm-run".into(),
+                true, // resume
+            )
+            .unwrap();
+            coord.discover()
+        });
+
+        let runners_b = runners;
+        let thread_b = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "rfm_b".into(),
+                &runners_b,
+                hash,
+                port,
+                "rfm-sub".into(),
+                "rfm-run".into(),
+                false, // fresh
+            )
+            .unwrap();
+            coord.discover()
+        });
+
+        let result_a = thread_a.join().unwrap();
+        let result_b = thread_b.join().unwrap();
+        let any_mismatch = result_a.is_err() || result_b.is_err();
+        assert!(any_mismatch, "expected resume-flag mismatch to abort");
+        if let Err(e) = &result_a {
+            assert!(
+                e.to_string().contains("resume-flag mismatch"),
+                "expected resume-flag mismatch error in a, got: {e}"
+            );
+        }
+        if let Err(e) = &result_b {
+            assert!(
+                e.to_string().contains("resume-flag mismatch"),
+                "expected resume-flag mismatch error in b, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_runner_resume_manifest_exchange_is_local_only() {
+        let coord = Coordinator::new(
+            "local".into(),
+            &["local".to_string()],
+            "h".into(),
+            0,
+            "sub".into(),
+            "run01".into(),
+            true,
+        )
+        .unwrap();
+        let local_manifest = vec!["v1".to_string(), "v2".to_string()];
+        let all = coord
+            .exchange_resume_manifest(local_manifest.clone())
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all.get("local"), Some(&local_manifest));
+    }
+
+    #[test]
+    fn two_runner_resume_manifest_exchange() {
+        // End-to-end: two runners on localhost exchange manifests and each
+        // ends up with both peers' lists.
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let runners = vec!["ra".to_string(), "rb".to_string()];
+        let hash = "rmhash".to_string();
+
+        let runners_a = runners.clone();
+        let hash_a = hash.clone();
+        let thread_a = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "ra".into(),
+                &runners_a,
+                hash_a,
+                port,
+                "sub".into(),
+                "run01".into(),
+                true,
+            )
+            .unwrap();
+            coord.discover().unwrap();
+            coord.exchange_resume_manifest(vec!["v1".into(), "v2".into()])
+        });
+
+        let runners_b = runners;
+        let thread_b = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "rb".into(),
+                &runners_b,
+                hash,
+                port,
+                "sub".into(),
+                "run01".into(),
+                true,
+            )
+            .unwrap();
+            coord.discover().unwrap();
+            coord.exchange_resume_manifest(vec!["v2".into(), "v3".into()])
+        });
+
+        let res_a = thread_a.join().unwrap().unwrap();
+        let res_b = thread_b.join().unwrap().unwrap();
+
+        assert_eq!(res_a.len(), 2);
+        assert_eq!(res_b.len(), 2);
+        assert_eq!(
+            res_a.get("ra"),
+            Some(&vec!["v1".to_string(), "v2".to_string()])
+        );
+        assert_eq!(
+            res_a.get("rb"),
+            Some(&vec!["v2".to_string(), "v3".to_string()])
+        );
+        assert_eq!(
+            res_b.get("ra"),
+            Some(&vec!["v1".to_string(), "v2".to_string()])
+        );
+        assert_eq!(
+            res_b.get("rb"),
+            Some(&vec!["v2".to_string(), "v3".to_string()])
+        );
     }
 }

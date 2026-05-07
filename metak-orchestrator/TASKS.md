@@ -3122,3 +3122,230 @@ size reduction in new configs.
   multi-machine execution.
 - Re-enabling webrtc for N>2 peers. Flag the limitation in the header
   comment of the 10-peer config and leave it.
+
+---
+
+### T-resume.1: runner — `--resume` flag and ResumeManifest coordination
+
+**Repo**: `runner/`
+**Status**: pending
+**Depends on**: contract update in
+`metak-shared/api-contracts/runner-coordination.md` (landed; Phase 1
+discover-message extension, Phase 1.25 ResumeManifest, Phase 2 skip rule,
+clock-sync append behavior).
+
+User goal: pick up an interrupted multi-machine benchmark without
+redoing completed spawns. Runs that crashed mid-spawn produce empty or
+partial log files — those must be cleanly re-run, not silently kept.
+
+#### Scope
+
+1. **CLI flag** in [runner/src/main.rs](runner/src/main.rs):
+   - Add `#[arg(long, default_value_t = false)] resume: bool` to `Cli`.
+   - Surface it through to discovery and to the new resume-inventory
+     phase.
+
+2. **Discover message extension**
+   ([runner/src/message.rs](runner/src/message.rs)):
+   - Add `resume: bool` to `Message::Discover` (placed alongside the
+     existing `log_subdir`).
+   - Add a new `Message::ResumeManifest { name: String, run: String,
+     complete_jobs: Vec<String> }` variant (snake_case JSON tag).
+   - Update existing tests to include `resume: false` in the
+     pre-existing fixtures; add roundtrip + JSON-format tests for
+     `ResumeManifest`. Mirror the structure of `discover_*` tests.
+
+3. **Log subfolder selection**
+   ([runner/src/main.rs](runner/src/main.rs:104-105) and `protocol.rs`):
+   - Resolve `base_log_dir` the same way main.rs already does
+     (lines 132-138). Move that resolution earlier so the resume
+     branch can use it.
+   - Fresh mode: keep current behavior
+     (`<bench_config.run>-<now_ts>`).
+   - Resume mode: enumerate `base_log_dir` for entries whose name
+     starts with `<bench_config.run>-`; pick the lexicographically
+     greatest one (the timestamp suffix sorts correctly). Abort with
+     a clear error if none exists.
+   - Pass the proposal into `Coordinator::new` exactly as today.
+
+4. **Discovery: resume-flag agreement and folder verification**
+   ([runner/src/protocol.rs](runner/src/protocol.rs)):
+   - The coordinator already negotiates `log_subdir` via the leader's
+     proposal. Extend the discover handler to ALSO verify peers'
+     `resume` flag matches this runner's; if any peer disagrees,
+     abort with a clear error message naming the disagreeing peer.
+   - After the agreed `log_subdir` is known, in resume mode, verify
+     that `<base_log_dir>/<agreed_log_subdir>/` exists locally. If
+     not (i.e. follower's latest folder name differs from the leader's
+     pick), abort with a clear error.
+
+5. **Phase 1.25 — ResumeManifest exchange** (new module
+   `runner/src/resume.rs` is fine; or extend `protocol.rs`):
+   - Computes the local manifest BEFORE broadcasting:
+     - Expand the config into spawn jobs the same way as Phase 2
+       (use [runner/src/spawn_job.rs](runner/src/spawn_job.rs)
+       `expand_variant`).
+     - For each `effective_name`, check
+       `<run_log_dir>/<effective_name>-<self_name>-<run>.jsonl`:
+       - non-empty → include in `complete_jobs`
+       - empty → DELETE the file and exclude
+       - missing → exclude
+   - Broadcasts the `ResumeManifest` and listens for one from each
+     peer in `runners` (excluding self). Re-broadcasts every 500 ms
+     for loss recovery. Reuse the existing UDP coordination socket and
+     the existing `recv_with_timeout`-style loop pattern from
+     discovery / barriers.
+   - Validates received manifests: `run` must equal this runner's
+     run id; ignore manifests with a wrong run id (defensive — they
+     should not exist after discovery agreement, but be safe).
+   - Computes the intersection: a job is "skip" iff it appears in
+     every runner's `complete_jobs` (including this runner's own).
+   - Cleanup: for each spawn job NOT in the skip set, delete this
+     runner's
+     `<run_log_dir>/<effective_name>-<self_name>-<run>.jsonl` if
+     present (regardless of size).
+   - Returns the skip set (`HashSet<String>` of effective names) to
+     the main loop.
+   - Single-runner mode: skip the network exchange (intersection is
+     trivially the local manifest). Empty-file cleanup still applies.
+
+6. **Phase 1.5 / per-variant clock-sync — append mode**
+   ([runner/src/clock_sync_log.rs](runner/src/clock_sync_log.rs) or
+   wherever `open_clock_sync_log` lives):
+   - Resume mode passes a flag (or always opens with
+     `OpenOptions::new().create(true).append(true)`). Verify the
+     existing implementation; if it already appends, no change needed
+     beyond confirming it. If it truncates, fix it to append in
+     resume mode and unit-test that prior content is preserved.
+   - The fail-fast `require_initial_sync_complete` check in
+     [runner/src/main.rs:263](runner/src/main.rs#L263) still applies
+     in resume mode: cross-machine resumes still need correct
+     offsets.
+
+7. **Phase 2 skip integration**
+   ([runner/src/main.rs](runner/src/main.rs:293-413)):
+   - Thread the skip set into the variant loop. For each `job`,
+     if `skip_set.contains(&job.effective_name)`, log
+     `[runner:<name>] skipping '<effective_name>' (resume: complete on all peers)`
+     and `continue` — no ready barrier, no spawn, no resync, no
+     done barrier. Add a row to the summary with status `"skipped"`
+     and exit_code `0`.
+   - Make sure `print_summary` and the final exit-code logic treat
+     `"skipped"` as success (not as a failure). The end-of-run
+     summary should distinguish `success` and `skipped` rows so the
+     operator can see what was reused.
+   - Inter-spawn grace logic
+     ([runner/src/main.rs:408-411](runner/src/main.rs#L408-L411))
+     should still apply between two consecutive non-skipped jobs of
+     the same source entry, but skipped jobs should not consume a
+     grace period (they're effectively instant).
+
+8. **Final summary clarity**: after the run, print a one-line
+   summary like
+   `Resume: 7 spawns reused, 4 spawns executed, 0 failed.` (only when
+   `--resume` was set). Keep the existing per-row table.
+
+#### Tests (in `runner/`)
+
+- `message.rs` unit tests:
+  - `ResumeManifest` roundtrip + JSON-format test (mirror existing
+    `discover_*` tests).
+  - `Discover` JSON now includes `resume: false` by default in
+    fixtures.
+
+- `resume.rs` (or wherever the inventory logic lives) unit tests
+  using a temp dir:
+  - Empty file gets deleted and excluded from complete_jobs.
+  - Non-empty file gets included.
+  - Missing file is excluded without error.
+  - Intersection rule with a fixture of three peers' manifests:
+    correctly picks the all-three-agree subset.
+  - Single-runner intersection equals the local manifest.
+  - Cleanup: incomplete-set files deleted; complete-set files
+    preserved.
+
+- Latest-folder picker unit test using a temp dir with mixed
+  prefixes:
+  - Multiple `run01-YYYYMMDD_HHMMSS` folders → greatest selected.
+  - Wrong-prefix folders ignored.
+  - No matching folder → returns an error (so main.rs aborts).
+
+- Integration test (extend
+  `runner/tests/integration.rs`): single-runner `--resume`
+  end-to-end with `variant-dummy`. Two runs:
+  1. First run, 2 spawns, both complete with non-empty JSONL.
+  2. Second run with `--resume`: both spawns must be skipped, exit
+     code 0, summary reports both as `skipped`.
+  3. Variant: same setup but truncate one of the JSONL files to
+     zero bytes between runs; the second run must DELETE that file
+     and re-execute that one spawn (exit code 0, mixed summary).
+
+- Multi-runner integration test if the harness supports it (the
+  existing two-runner same-machine test in `tests/integration.rs`
+  is the model). If too costly, document why and rely on the
+  unit-tested intersection logic + a manual two-runner check by
+  the user.
+
+#### Validation against reality
+
+- `cargo build --release -p runner` (workspace-rooted, per
+  CUSTOM.md) and `cargo build --release -p variant-base`.
+- `cargo test --release -p runner` — full runner test suite green
+  including new tests.
+- `cargo clippy --release -p runner --all-targets -- -D warnings`
+  clean.
+- `cargo fmt -p runner -- --check` clean.
+- Live single-runner smoke against an existing log dir:
+  1. Run `runner --name alice --config configs/two-runner-test.toml`
+     once and let it finish. Note the produced log subfolder.
+  2. Re-run with `--resume`. Confirm all spawns are reported
+     `skipped` and exit code is 0.
+  3. Truncate one JSONL file to 0 bytes. Re-run with `--resume`.
+     Confirm that one spawn re-runs and the empty file is deleted
+     and replaced.
+  4. Show the runner stdout for each step in the completion report.
+- A multi-runner same-machine resume run is the user's
+  responsibility. The worker should describe what to test, but
+  not block on running it.
+
+#### Acceptance criteria
+
+- [ ] `runner --resume` parses cleanly; default off.
+- [ ] Discover message carries `resume: bool` and `log_subdir`;
+      mismatch on either is a clear-error abort.
+- [ ] Latest-folder picker selects the lexicographically greatest
+      `<run>-*` subfolder; no match → abort.
+- [ ] Phase 1.25 `ResumeManifest` exchange: every runner sends and
+      collects from every peer; intersection rule used to compute the
+      skip set.
+- [ ] Empty JSONL log files are deleted in Phase 1.25 (regardless
+      of intersection).
+- [ ] Incomplete-set files are deleted before Phase 2 starts.
+- [ ] Phase 2 bypasses ready, spawn, per-variant resync, and done
+      barriers for skipped jobs. Skipped rows appear in the summary
+      with status `skipped` and exit_code `0`, treated as success
+      by the final exit-code logic.
+- [ ] Clock-sync log file is opened in append mode in resume mode
+      (existing measurements preserved); initial sync still
+      enforced fail-fast.
+- [ ] `cargo test --release -p runner`, clippy, fmt all green.
+- [ ] Live single-runner smoke (3 steps above) demonstrated in the
+      completion report.
+- [ ] Completion report appended to
+      `metak-orchestrator/STATUS.md` summarizing implementation,
+      tests run, and any deviations from this brief.
+
+#### Out of scope
+
+- Variant-side changes. Variants are unaware of resume; they
+  continue to receive identical CLI args.
+- Cross-machine multi-runner live execution. The user owns that
+  validation; the worker should leave clear instructions.
+- A `--resume <log_subdir>` form that lets the operator name a
+  specific folder. Latest-only is the agreed scope; flag if the
+  user later wants explicit selection.
+- Resuming a run with a config different from the original (e.g.
+  newly added variants). The intersection naturally handles this:
+  new jobs simply don't appear in any old runner's manifest, so
+  they fall outside the skip set and run normally. No special
+  handling required, but call this out in the completion report.

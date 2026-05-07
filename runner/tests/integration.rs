@@ -606,3 +606,231 @@ fn template_and_array_expansion_produces_cartesian_product_log_files() {
 
     let _ = std::fs::remove_dir_all(&log_dir);
 }
+
+/// Single-runner end-to-end resume: first run produces non-empty JSONL files;
+/// second run with `--resume` skips both spawns; third run with one file
+/// truncated re-runs only that one spawn.
+#[test]
+fn single_runner_resume_skips_complete_files_and_reruns_truncated() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    // Build a config inside a private tmp dir so this test does not collide
+    // with any other test's `./test-logs` folder.
+    let tmp_dir = std::env::temp_dir().join("runner-resume-it");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    // The runner resolves the variant binary path relative to its CWD.
+    // We invoke runner from the runner crate manifest dir, so use the
+    // existing relative path that other tests use.
+    let log_dir = tmp_dir.join("logs");
+    let log_dir_escaped = log_dir.to_string_lossy().replace('\\', "/");
+    let config_content = format!(
+        r#"run = "resumeit"
+runners = ["local"]
+default_timeout_secs = 30
+inter_qos_grace_ms = 0
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+  [variant.common]
+  tick_rate_hz = 5
+  stabilize_secs = 0
+  operate_secs = 1
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = [1, 2]
+  log_dir = "{log_dir_escaped}"
+  [variant.specific]
+"#
+    );
+    let config_path = tmp_dir.join("resume-it.toml");
+    std::fs::write(&config_path, &config_content).unwrap();
+
+    // Run 1: fresh — produce non-empty JSONL files.
+    let out1 = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner (run 1)");
+    let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
+    eprintln!("--- run 1 stdout ---\n{stdout1}");
+    eprintln!("--- run 1 stderr ---\n{stderr1}");
+    assert!(out1.status.success(), "run 1 should exit 0");
+
+    // Find the timestamped subfolder.
+    let subdirs: Vec<_> = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert_eq!(subdirs.len(), 1, "expected one timestamped subfolder");
+    let run_subdir = subdirs[0].path();
+
+    let jsonl_paths: Vec<std::path::PathBuf> = std::fs::read_dir(&run_subdir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .filter(|p| {
+            // The variant-dummy log files have names like
+            // <variant>-<runner>-<run>.jsonl. We only want those, not
+            // clock-sync sibling files (which are skipped in single-runner
+            // anyway).
+            let n = p.file_name().unwrap().to_string_lossy().to_string();
+            !n.contains("clock-sync")
+        })
+        .collect();
+    assert_eq!(jsonl_paths.len(), 2, "expected 2 variant log files");
+    for p in &jsonl_paths {
+        let len = std::fs::metadata(p).unwrap().len();
+        assert!(len > 0, "log file should be non-empty: {}", p.display());
+    }
+
+    // Run 2: resume — both spawns must be skipped, exit 0, summary mentions skipped.
+    let out2 = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .arg("--resume")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner (run 2)");
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    eprintln!("--- run 2 stdout ---\n{stdout2}");
+    eprintln!("--- run 2 stderr ---\n{stderr2}");
+    assert!(
+        out2.status.success(),
+        "run 2 (resume, all skipped) should exit 0"
+    );
+    assert!(
+        stdout2.contains("skipped"),
+        "summary should mention skipped, got:\n{stdout2}"
+    );
+    assert!(
+        stdout2.contains("Resume:"),
+        "should print resume summary line, got:\n{stdout2}"
+    );
+    // The selected log subfolder should be the same one from run 1.
+    let subdirs2: Vec<_> = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert_eq!(
+        subdirs2.len(),
+        1,
+        "resume must reuse, not create, log subfolders"
+    );
+
+    // Run 3: truncate one log file to zero bytes; resume must delete it
+    // and re-execute that one spawn.
+    let truncate_path = &jsonl_paths[0];
+    std::fs::write(truncate_path, b"").unwrap();
+    assert_eq!(std::fs::metadata(truncate_path).unwrap().len(), 0);
+
+    let out3 = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .arg("--resume")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner (run 3)");
+    let stdout3 = String::from_utf8_lossy(&out3.stdout);
+    let stderr3 = String::from_utf8_lossy(&out3.stderr);
+    eprintln!("--- run 3 stdout ---\n{stdout3}");
+    eprintln!("--- run 3 stderr ---\n{stderr3}");
+    assert!(out3.status.success(), "run 3 should exit 0");
+    // Mixed: at least one skipped, at least one success.
+    assert!(
+        stdout3.contains("skipped"),
+        "expected at least one skipped row"
+    );
+    assert!(
+        stdout3.contains("success"),
+        "expected at least one success row"
+    );
+    // The truncated file should now be non-empty again.
+    let len_after = std::fs::metadata(truncate_path).unwrap().len();
+    assert!(
+        len_after > 0,
+        "previously truncated file should be re-populated: {}",
+        truncate_path.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Resume mode aborts cleanly when no matching log subfolder exists.
+#[test]
+fn resume_aborts_when_no_matching_log_subfolder() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+    let tmp_dir = std::env::temp_dir().join("runner-resume-no-folder");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let log_dir = tmp_dir.join("logs");
+    std::fs::create_dir_all(&log_dir).unwrap(); // base exists, but no <run>-* subfolder.
+    let log_dir_escaped = log_dir.to_string_lossy().replace('\\', "/");
+    let config_content = format!(
+        r#"run = "noresume"
+runners = ["local"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+  [variant.common]
+  tick_rate_hz = 5
+  stabilize_secs = 0
+  operate_secs = 0
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  log_dir = "{log_dir_escaped}"
+  [variant.specific]
+"#
+    );
+    let config_path = tmp_dir.join("noresume.toml");
+    std::fs::write(&config_path, &config_content).unwrap();
+
+    let out = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .arg("--resume")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    eprintln!("--- stderr ---\n{stderr}");
+    assert!(
+        !out.status.success(),
+        "resume with no existing folder must fail"
+    );
+    assert!(
+        stderr.contains("no log subfolder")
+            || stderr.contains("could not select an existing log subfolder"),
+        "expected 'no log subfolder' message, got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

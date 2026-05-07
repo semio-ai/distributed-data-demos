@@ -1,24 +1,26 @@
 """Comparison bar chart generation for benchmark analysis.
 
-The figure layout chosen for the post-E9 ``<transport>-<workload>-qos<N>``
-variant naming is **Option A**: a single 1x2 row with throughput on the
-left and latency on the right. The x-axis is QoS level (qos1..qos4 in
-ascending order), and within each QoS group the bars are arranged by
-transport family then by workload load-intensity. Each transport family
-gets its own sequential matplotlib colormap (Oranges/Purples/Blues/
-Greens) and within a family the workload tone tracks the load-intensity
-ranking. The latency y-axis is log-scaled so reliable sub-millisecond
-transports (qos3/qos4) and high-rate lossy transports (qos1/qos2) are
-both legible on the same panel. Missing (transport, workload, qos)
-combinations are rendered as gaps -- not zero-height bars -- so a
-qos3-only entry does not collapse the y-axis at qos1/qos2.
+The figure layout for the post-E9 ``<transport>-<workload>-qos<N>``
+variant naming is **N_qos rows x 2 cols**: one row per observed QoS
+level, throughput on the left column and latency on the right column.
+Within each row the bars are the (transport, workload) combinations for
+that QoS, arranged by transport family then by workload load-intensity.
+Each transport family gets its own sequential matplotlib colormap
+(Oranges/Purples/Blues/Greens/Reds/YlOrBr) and within a family the
+workload tone tracks the load-intensity ranking. The latency y-axis is
+log-scaled so reliable sub-millisecond transports (qos3/qos4) and high-
+rate lossy transports (qos1/qos2) remain legible. Missing (transport,
+workload, qos) combinations are rendered as gaps -- not zero-height
+bars -- so a qos3-only entry does not collapse the y-axis at qos1/qos2.
 
-Rationale for Option A: the user wants relative throughput / latency at
-a glance across all transports. Stacking 4 small-multiple rows (Option
-B) would give per-transport y-scaling but obscures cross-family
-comparisons, which is the primary read of this chart. The grouped-bar
-layout keeps every (transport, workload, qos) datapoint in one panel
-while the colormap coding gives the family/load-intensity context.
+Rationale for the per-QoS row layout: the previous single-row layout
+collapsed all QoS levels into x-axis groups, which became unreadable
+once 6+ transport families x 8 workloads x 4 QoS levels were drawn into
+the same two cells. Splitting QoS levels into separate rows keeps each
+cell to a single bar group, restores legibility, and still allows
+cross-family comparisons row-by-row. A single shared legend at the
+bottom of the figure carries the (transport, workload) colour key for
+every row.
 """
 
 from __future__ import annotations
@@ -37,18 +39,35 @@ import numpy as np  # noqa: E402
 from performance import PerformanceResult  # noqa: E402
 
 # Known transport prefixes. Order is preserved for legend ordering and
-# colormap assignment. Adding a fifth family is a one-line change here
-# plus a colormap entry in ``_FAMILY_COLORMAPS``.
-TRANSPORT_FAMILIES: tuple[str, ...] = ("custom-udp", "hybrid", "quic", "zenoh")
+# colormap assignment. The four original families (``custom-udp``,
+# ``hybrid``, ``quic``, ``zenoh``) come first, then ``websocket`` and
+# ``webrtc`` so the legend reads with the established families first
+# and the newer browser-style transports grouped together at the end.
+# Adding another family is a one-line change here plus a colormap entry
+# in ``_FAMILY_COLORMAPS``.
+TRANSPORT_FAMILIES: tuple[str, ...] = (
+    "custom-udp",
+    "hybrid",
+    "quic",
+    "zenoh",
+    "websocket",
+    "webrtc",
+)
 
 # One sequential colormap per transport family. Anything not in
 # ``TRANSPORT_FAMILIES`` falls back to "Greys" under the synthetic
-# transport label "other".
+# transport label "other". The websocket/webrtc colormaps are picked to
+# stay distinguishable from the four originals (Oranges/Purples/Blues/
+# Greens) and from each other: Reds is a clean primary contrast for
+# websocket; YlOrBr (yellow->brown) gives webrtc a warm earth tone that
+# does not clash with Reds or Oranges at typical workload tones.
 _FAMILY_COLORMAPS: dict[str, str] = {
     "custom-udp": "Oranges",
     "hybrid": "Purples",
     "quic": "Blues",
     "zenoh": "Greens",
+    "websocket": "Reds",
+    "webrtc": "YlOrBr",
     "other": "Greys",
 }
 
@@ -221,7 +240,6 @@ def generate_comparison_plot(
     qos_order: list[int | None] = sorted(
         qos_values_seen, key=lambda q: (q is None, q if q is not None else -1)
     )
-    qos_labels: list[str] = [f"qos{q}" if q is not None else "n/a" for q in qos_order]
 
     # Build per-family palettes keyed by (transport, workload).
     palettes: dict[str, dict[str, tuple[float, float, float, float]]] = {}
@@ -240,30 +258,58 @@ def generate_comparison_plot(
     if n_bars == 0 or n_qos_groups == 0:
         return _empty_plot(output_dir)
 
-    # Bar width / x-positions. ``0.85`` of the slot reserved per QoS
-    # group leaves a small gap between groups so the bar block is
-    # visually distinct from its neighbours.
-    bar_width = 0.85 / n_bars
-    x = np.arange(n_qos_groups)
+    # Bar width / x-positions. Each row plots the same set of
+    # (transport, workload) bars for a single QoS, so the x-axis carries
+    # the bar keys themselves rather than QoS groups. Bars are evenly
+    # spaced at integer x positions.
+    x = np.arange(n_bars)
+    bar_width = 0.85
 
-    fig_width = max(20.0, 0.45 * n_bars + 4.0)
-    fig, (ax_tp, ax_lat) = plt.subplots(1, 2, figsize=(fig_width, 8.0))
+    # Figure sizing: width tracks the per-row bar count; height grows
+    # with the number of QoS rows so dense charts do not squish.
+    fig_width = max(14.0, 0.45 * n_bars + 4.0)
+    per_row_height = 3.5
+    legend_band_height = 1.5
+    fig_height = per_row_height * n_qos_groups + legend_band_height
+    fig, axes = plt.subplots(
+        n_qos_groups,
+        2,
+        figsize=(fig_width, fig_height),
+        squeeze=False,
+    )
 
     # Track legend handles in (transport, workload) order so the shared
     # legend reads in the same family/load-intensity order as the bars.
+    # Build the handles once -- they do not depend on the QoS row.
     legend_handles: list[matplotlib.patches.Patch] = []
-
-    for i, (transport, workload) in enumerate(bar_keys):
+    bar_colors: list[tuple[float, float, float, float]] = []
+    for transport, workload in bar_keys:
         color = palettes[transport][workload]
-        offset = (i - (n_bars - 1) / 2) * bar_width
+        bar_colors.append(color)
+        legend_handles.append(
+            matplotlib.patches.Patch(
+                facecolor=color,
+                edgecolor="black",
+                linewidth=0.3,
+                label=f"{transport} / {workload}" if workload else transport,
+            )
+        )
+
+    # Short tick labels per bar -- workload (or transport name when the
+    # workload string is empty). The colour-coded legend carries the
+    # transport family, so the per-bar tick label can stay compact.
+    bar_tick_labels: list[str] = [w if w else t for t, w in bar_keys]
+
+    for row_idx, q in enumerate(qos_order):
+        ax_tp = axes[row_idx][0]
+        ax_lat = axes[row_idx][1]
+        qos_label = f"qos{q}" if q is not None else "n/a"
 
         throughputs: list[float] = []
         p50_vals: list[float] = []
         p95_vals: list[float] = []
         p99_vals: list[float] = []
-        # Track which qos slots are actually populated so we can render
-        # missing entries as gaps (NaN bars).
-        for q in qos_order:
+        for transport, workload in bar_keys:
             r = parsed.get((transport, workload, q))
             if r is None:
                 throughputs.append(float("nan"))
@@ -277,18 +323,18 @@ def generate_comparison_plot(
                 p99_vals.append(float(r.latency_p99_ms))
 
         ax_tp.bar(
-            x + offset,
+            x,
             throughputs,
             bar_width,
-            color=color,
+            color=bar_colors,
             edgecolor="black",
             linewidth=0.3,
         )
 
         # Latency bars use p95 with whiskers from p50 (lower) to p99
         # (upper). Under log scale the lower whisker must be strictly
-        # positive, so clamp to ``_LATENCY_EPSILON_MS`` and skip whisker
-        # rows that are NaN entirely.
+        # positive, so clamp to ``_LATENCY_EPSILON_MS`` and zero the
+        # whisker rows that are NaN entirely.
         bar_p95: list[float] = []
         yerr_lower: list[float] = []
         yerr_upper: list[float] = []
@@ -306,10 +352,10 @@ def generate_comparison_plot(
             yerr_upper.append(upper)
 
         ax_lat.bar(
-            x + offset,
+            x,
             bar_p95,
             bar_width,
-            color=color,
+            color=bar_colors,
             edgecolor="black",
             linewidth=0.3,
             yerr=[yerr_lower, yerr_upper],
@@ -318,52 +364,38 @@ def generate_comparison_plot(
             error_kw={"linewidth": 0.6},
         )
 
-        legend_handles.append(
-            matplotlib.patches.Patch(
-                facecolor=color,
-                edgecolor="black",
-                linewidth=0.3,
-                label=f"{transport} / {workload}" if workload else transport,
-            )
-        )
+        # Throughput axis cosmetics.
+        ax_tp.set_ylabel(f"{qos_label} - writes/s")
+        ax_tp.set_title(f"{qos_label} - Throughput (writes/s)")
+        ax_tp.set_xticks(x)
+        ax_tp.set_xticklabels(bar_tick_labels, rotation=45, ha="right", fontsize=7)
+        ax_tp.yaxis.grid(True, linestyle="--", alpha=0.5)
+        ax_tp.set_axisbelow(True)
 
-    # Throughput axis cosmetics.
-    ax_tp.set_xlabel("QoS")
-    ax_tp.set_ylabel("writes/s")
-    ax_tp.set_title("Throughput (writes/s)")
-    ax_tp.set_xticks(x)
-    ax_tp.set_xticklabels(qos_labels)
-    ax_tp.yaxis.grid(True, linestyle="--", alpha=0.5)
-    ax_tp.set_axisbelow(True)
+        # Latency axis cosmetics. Log scale exposes both reliable sub-ms
+        # and lossy tens-of-ms regimes simultaneously.
+        ax_lat.set_ylabel(f"{qos_label} - latency (ms, log scale)")
+        ax_lat.set_title(f"{qos_label} - Latency p95 with p50/p99 whiskers")
+        ax_lat.set_xticks(x)
+        ax_lat.set_xticklabels(bar_tick_labels, rotation=45, ha="right", fontsize=7)
+        ax_lat.set_yscale("log")
+        ax_lat.yaxis.grid(True, which="both", linestyle="--", alpha=0.5)
+        ax_lat.set_axisbelow(True)
 
-    # Latency axis cosmetics. Log scale exposes both reliable sub-ms and
-    # lossy tens-of-ms regimes simultaneously.
-    ax_lat.set_xlabel("QoS")
-    ax_lat.set_ylabel("latency (ms, log scale)")
-    ax_lat.set_title("Latency p95 with p50/p99 whiskers")
-    ax_lat.set_xticks(x)
-    ax_lat.set_xticklabels(qos_labels)
-    ax_lat.set_yscale("log")
-    ax_lat.yaxis.grid(True, which="both", linestyle="--", alpha=0.5)
-    ax_lat.set_axisbelow(True)
-
-    # Single shared legend outside the plot area. ``ncol`` is chosen so
-    # the legend has a roughly square footprint: with up to ~32 entries
-    # we stretch across 8 columns.
+    # Single shared legend below all rows. ``ncol`` is chosen so the
+    # legend has a roughly square footprint relative to the bar count.
     legend_ncol = max(4, min(8, (n_bars + 3) // 4))
     legend_rows = (len(legend_handles) + legend_ncol - 1) // legend_ncol
     # Reserve a band along the bottom of the figure for the legend. The
-    # band height grows with the number of legend rows so dense (32-bar)
-    # plots still leave the legend fully visible.
-    row_height = 0.025
-    bottom_reserve = min(0.45, 0.08 + row_height * legend_rows)
-    # Anchor the legend inside the reserved band: ``loc="lower center"``
-    # plus ``bbox_to_anchor=(0.5, 0.02)`` keeps the legend inside the
-    # figure boundary instead of clipping it off at y=0.
+    # band's relative height shrinks as the figure grows taller (more
+    # QoS rows) but is bounded so it never collapses to nothing.
+    row_height_in = 0.22
+    legend_band_in = max(0.6, 0.4 + row_height_in * legend_rows)
+    bottom_reserve = min(0.4, legend_band_in / fig_height)
     fig.legend(
         handles=legend_handles,
         loc="lower center",
-        bbox_to_anchor=(0.5, 0.01),
+        bbox_to_anchor=(0.5, 0.005),
         ncol=legend_ncol,
         frameon=True,
         fontsize=8,
@@ -371,7 +403,18 @@ def generate_comparison_plot(
         title_fontsize=9,
     )
 
-    fig.subplots_adjust(bottom=bottom_reserve, top=0.92, left=0.05, right=0.98)
+    # Top reserve is a constant slice of the figure -- enough for the
+    # first row's title -- and ``hspace`` keeps the inter-row titles
+    # from overlapping the row above.
+    top_reserve = max(0.6, fig_height - 0.4) / fig_height
+    fig.subplots_adjust(
+        bottom=bottom_reserve,
+        top=top_reserve,
+        left=0.07,
+        right=0.98,
+        hspace=0.6,
+        wspace=0.18,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "comparison.png"

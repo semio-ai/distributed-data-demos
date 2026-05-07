@@ -1131,7 +1131,10 @@ name = "v"
     fn two_runner_all_variants_expands_to_expected_spawn_list() {
         // Locks in the post-rewrite spawn list for the headline config: every
         // (variant family, vpt, hz, qos) combo from the original config is
-        // present, and no extras have crept in.
+        // present, and no extras have crept in. Five families
+        // (custom-udp, hybrid, quic, zenoh, webrtc) emit the full 4-qos
+        // expansion (32 spawns each = 160), while websocket is restricted to
+        // qos [3, 4] (16 spawns), for a total of 176.
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -1146,7 +1149,7 @@ name = "v"
         }
 
         let mut expected: Vec<String> = Vec::new();
-        let families = ["custom-udp", "hybrid", "quic", "zenoh"];
+        let full_qos_families = ["custom-udp", "hybrid", "quic", "zenoh", "webrtc"];
         let vpt_hz_pairs: &[(u32, u32)] = &[
             (1000, 100),
             (1000, 10),
@@ -1156,7 +1159,7 @@ name = "v"
             (10, 100),
             (10, 1000),
         ];
-        for fam in &families {
+        for fam in &full_qos_families {
             for (vpt, hz) in vpt_hz_pairs {
                 for qos in 1..=4 {
                     expected.push(format!("{fam}-{vpt}x{hz}hz-qos{qos}"));
@@ -1165,6 +1168,15 @@ name = "v"
             for qos in 1..=4 {
                 expected.push(format!("{fam}-max-qos{qos}"));
             }
+        }
+        // websocket family: qos restricted to [3, 4].
+        for (vpt, hz) in vpt_hz_pairs {
+            for qos in [3, 4] {
+                expected.push(format!("websocket-{vpt}x{hz}hz-qos{qos}"));
+            }
+        }
+        for qos in [3, 4] {
+            expected.push(format!("websocket-max-qos{qos}"));
         }
 
         let mut sorted_actual = spawn_names.clone();
@@ -1180,8 +1192,8 @@ name = "v"
         );
         assert_eq!(
             spawn_names.len(),
-            128,
-            "expected 32 entries x 4 qos = 128 spawns"
+            176,
+            "expected 5 families x 32 + websocket 16 = 176 spawns"
         );
     }
 

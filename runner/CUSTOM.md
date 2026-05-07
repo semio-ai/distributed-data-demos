@@ -212,6 +212,59 @@ that need QoS-disjoint ports use the `base_port + runner_index * runner_stride +
 convention documented in `metak-shared/api-contracts/toml-config-schema.md`,
 which they compute themselves from `--peers`, `--runner`, and `--qos`.
 
+### Resume mode (`--resume`)
+
+Optional CLI flag on the runner. Lets an interrupted multi-machine
+benchmark be picked up where it left off without redoing completed
+spawns.
+
+Behavior:
+
+1. **Resume is all-or-nothing across runners.** The flag's value is
+   carried in the discover message (`resume: bool` field). If runners
+   disagree, the run aborts during discovery.
+
+2. **Log subfolder selection.** Instead of generating
+   `<run>-<now-ts>`, each runner picks the lexicographically greatest
+   subfolder under its resolved `<base_log_dir>/` that starts with
+   `<bench_config.run>-`. That selection is the runner's discover
+   `log_subdir` proposal. The leader's proposal still wins. Followers
+   must have a folder of that exact name on disk; if not, abort.
+   If a runner finds no matching folder locally, abort before sending
+   discover.
+
+3. **Phase 1.25: ResumeManifest exchange.** A new coordination phase
+   runs after discovery and before initial clock sync (only when
+   `resume = true`). Each runner inventories its local log files
+   against the spawn-job expansion of the current config:
+   - `<log_subdir>/<effective_name>-<self_name>-<run>.jsonl`
+     non-empty → include in `complete_jobs`.
+   - Empty file → delete it now (crashed prior attempt) and exclude.
+   Each runner broadcasts its `ResumeManifest`, waits for one from
+   every peer (periodic re-broadcast every 500 ms, same loss-recovery
+   pattern as discovery), then computes the intersection: the "skip
+   set" is the set of `effective_name`s that appear in every peer's
+   manifest. For incomplete jobs, every runner deletes its own
+   matching log file (any size) before proceeding.
+
+4. **Phase 2 with skips.** For each spawn job, if its
+   `effective_name` is in the skip set, bypass ready barrier, spawn,
+   per-variant clock resync, and done barrier. Emit one informational
+   line. Otherwise run normally. The skip set is a property of the
+   run, not per-runner — the network exchange guarantees consistency.
+
+5. **Clock-sync logging.** Always re-run clock sync (initial and
+   per-variant) in resume mode. Open `<runner>-clock-sync-<run>.jsonl`
+   in append mode so prior measurements are preserved.
+
+6. **Single-runner resume.** Same logic; the manifest exchange becomes
+   a no-op (intersection over a single set = the set itself). Empty
+   self-files still get deleted.
+
+Reference contract: `metak-shared/api-contracts/runner-coordination.md`
+(Phase 1 updates, Phase 1.25 added, Phase 2 skip rule, ResumeManifest
+message format).
+
 ### Variant templates + multi-dimensional expansion (T-config.2)
 
 Two further config-side mechanisms layer on top of QoS expansion:
