@@ -5379,3 +5379,130 @@ d5844a9 docs: barrier timeout + auto-resume wrapper sections
 4080ffa contract: document barrier timeout in runner-coordination.md
 a03950f runner: add per-barrier timeout with EX_TEMPFAIL exit on expiry
 ```
+
+## T-coord.1: runner — diagnose mid-run coordination hang (investigation only)
+
+**Date**: 2026-05-07
+**Worker**: worker, isolated worktree `agent-ab23c8a6a287b64d7`
+**Status**: complete (investigation deliverable; no fix in this task).
+**Follow-up filed**: T-coord.1b (see TASKS.md).
+
+### Hypothesis verdicts
+
+- **H1 — fast peer stops broadcasting Done after linger expiry: CONFIRMED.**
+  After `done_barrier`'s 2-second linger (`runner/src/protocol.rs:446-461`),
+  the runner enters `ready_barrier` for the next variant
+  (`runner/src/main.rs:503`). `ready_barrier` (`runner/src/protocol.rs:307-368`)
+  silently drops all inbound `Done` messages via the trailing `_ => {}`
+  arm at line 360. A slow peer entering `done_barrier` for the same
+  variant after this point has no message any peer will ever send that
+  satisfies its barrier-completion condition. The 2-second linger is
+  NOT enough on a real LAN under per-machine variant runtime skew + UDP
+  receive-buffer pressure during the long-running variant.
+- **H2 — variant-name / message-type filter mismatch: RULED OUT.** Both
+  runners derive `effective_name` deterministically from the same
+  config (config_hash mismatch would have aborted in Phase 1 — see
+  `runner/src/protocol.rs:215-217`). The done_barrier filter at
+  `runner/src/protocol.rs:415-419` is satisfied by any peer's matching
+  `Done`. The bug is in the broadcast lifetime, not the predicate.
+- **H3 — receive-window race / "post-N limbo": RULED OUT.** The
+  done_barrier loop has no intermediate state between "still waiting"
+  and "finished linger, returned cleanly." The hang is firmly in the
+  "still waiting" loop on the slow peer; the fast peer has cleanly
+  exited and moved on.
+- **H4 — Windows socket-state side effect from variant TCP teardown:
+  RULED OUT.** The runner's UDP coordination socket
+  (`runner/src/protocol.rs:603-625`) is owned exclusively by the
+  runner. `runner/src/spawn.rs:48-51` invokes `Command::new(..).spawn()`
+  with no inheritance flags; Rust's default on Windows does not pass
+  socket handles to children. The variant's `os error 997` was on its
+  own TCP/UDP transport sockets, not the runner's coordination socket.
+
+### Reproducer
+
+`runner/src/protocol.rs::done_barrier_hang_repro_when_peer_already_advanced`
+(in the `mod tests` block). Constructs two `Coordinator` instances,
+runs alice through `discover` → `ready_barrier(spawn_n)` →
+`done_barrier(spawn_n)` → `ready_barrier(spawn_n_plus_1)` (parked,
+never returns), and bob through the same path then a second
+`done_barrier("spawn_n_half", ...)` (a synthesised name alice never
+emits Done for, mirroring the field-report condition where alice has
+moved past the variant bob is waiting on). Asserts bob's barrier
+remains hung 6 seconds after entry. Test passes today (i.e. the bug
+reproduces); when T-coord.1b lands, the maintainer is instructed in
+the doc-comment + panic message to invert the assertion.
+
+Run with:
+
+```
+cargo test --release -p runner --bin runner done_barrier_hang_repro_when_peer_already_advanced
+```
+
+Runtime ~17 s (most of which is alice's parked thread sleep). Does
+not require multicast — uses the existing `multicast_test_lock` to
+serialise with other multicast-using tests.
+
+No additional fixture file under `runner/tests/fixtures/` was needed
+since the bug reproduces purely at the `Coordinator` level; a
+multi-runner end-to-end TOML fixture would have to coordinate per-
+machine variant runtime skew which is unergonomic on a single host.
+
+### Diagnostic tracing (gated)
+
+Added a `--verbose-coord` CLI flag on the runner. When enabled, the
+barrier loops in `runner/src/protocol.rs` emit one stderr line per
+inbound coordination message documenting the sender, type, variant,
+run, and accept/reject decision. Off by default. Implemented as a
+process-wide `static AtomicBool` (`VERBOSE_COORD`) read with
+`Ordering::Relaxed`, mirroring the existing `--verbose-clock-sync`
+toggle pattern.
+
+The flag complements (does not replace) `--verbose-clock-sync` —
+they emit different events. An operator diagnosing a future
+barrier-related field issue should set both.
+
+### Recommendation on the fix
+
+T-coord.1b filed in TASKS.md. Recommended approach: extend
+`ready_barrier` (and any other post-done state) to re-broadcast our
+own `Done` for the most-recent-completed variant on demand, when an
+inbound `Done` for that same variant arrives from a peer. Bounded
+cache of one entry; ~30 lines change. Lands as a surgical fix in
+parallel with T-coord.2's barrier timeout safety net.
+
+### Validation
+
+- `cargo build --release -p runner`: clean.
+- `cargo test --release -p runner`:
+  - 120 unit tests pass (incl. new reproducer).
+  - 10 integration tests pass.
+  - 1 stress test passes.
+  - All barriers tests including `barrier_linger_prevents_slow_peer_hang`
+    continue to pass — the new code paths are strictly additive.
+- `cargo clippy --release -p runner --all-targets -- -D warnings`: clean.
+- `cargo fmt -p runner -- --check`: clean.
+
+### Files touched
+
+- `runner/src/protocol.rs` — added `set_verbose_coord` /
+  `verbose_coord_enabled` and per-message tracing in `ready_barrier`
+  and `done_barrier`. Added the
+  `done_barrier_hang_repro_when_peer_already_advanced` unit test.
+- `runner/src/main.rs` — added the `--verbose-coord` CLI flag wired to
+  `protocol::set_verbose_coord`. Default `false`. The default execution
+  path is unchanged.
+- `metak-orchestrator/DECISIONS.md` — D9 entry with the full diagnosis.
+- `metak-orchestrator/TASKS.md` — T-coord.1b filed.
+
+### Notes
+
+- Did NOT write the fix. Per task scope, T-coord.1 is investigation-
+  only; T-coord.1b carries the fix.
+- Did NOT modify `metak-shared/` (treated as read-only per worker
+  rules). The T-coord.1b task notes that the contract update for
+  "ready barrier responds to stale done requests" should be made by
+  the orchestrator.
+- The reproducer test deliberately asserts the BUG (i.e. passes
+  today). The maintainer of T-coord.1b will invert the assertion as
+  part of that task; the panic message and doc-comment in the test
+  spell this out.
