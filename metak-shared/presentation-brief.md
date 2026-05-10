@@ -137,14 +137,207 @@ the latency. Clocks across machines are reconciled separately via PTP
 sync. We then aggregate those per-delivery latencies into the
 percentiles above.
 
-## 5. Suggested slide flow
+## 5. Results from the all-variants matrix
+
+Two runs of `configs/two-runner-all-variants.toml` (48 [[variant]]
+entries × QoS expansion = 176 spawns) form the basis below. Both ran
+on Windows hosts.
+
+### 5.1 Same-machine run (2026-05-07, log_subdir `…_183143`)
+
+Both runners on one host, loopback addresses. Complete log set for
+alice and bob — paired latency and delivery numbers are real. **This
+is the run with the most interpretable data.**
+
+#### What worked as designed
+
+At "easy" rates — standard 100 hz × ≤100 vpt with QoS 1 (best-effort)
+or QoS 2 (latest-value) — every protocol that finished its spawn
+delivered ~100 % and stayed under 10 ms p99. Concretely:
+
+| Variant | Sample row (100 hz × 100 vpt, QoS 1) | Delivery | p50 | p99 |
+|---|---|---|---|---|
+| custom-udp | `100x100hz-qos1` | 100 % | 5.5 ms | 21.7 ms |
+| quic | `100x100hz-qos1` | 100 % | 0.78 ms | 11.3 ms |
+| zenoh | `100x100hz-qos1` | 100 % | 30.3 ms | 170.8 ms |
+| hybrid | `100x100hz-qos1` | 100 % | 145.7 ms | 203.9 ms |
+| webrtc | `100x100hz-qos1` | 100 % | 2.26 ms | 157.4 ms |
+
+QUIC and Custom UDP are the headline performers at this rate — sub-ms
+to single-digit-ms p50, sub-25 ms p99, no observed loss. Hybrid and
+Zenoh add their own framing/scheduling overhead. WebRTC works when
+its DataChannel signaling completes (see "where it breaks" below).
+
+#### Where it breaks
+
+The matrix exposes failure modes that didn't show up in the unit / integration
+tests:
+
+1. **Loopback UDP is not lossless under sustained 100k+ pkt/s.** Every
+   transport with a UDP-based unreliable path drops 60–99 % at
+   1000 vpt × 100 hz combos:
+   - `custom-udp 1000x100hz-qos1`: 24.9 % delivery, 75 % loss, p50 389 ms.
+   - `zenoh 1000x100hz-qos1`: 26 % loss-equivalent (mass `Late` deliveries),
+     p50 435 ms.
+   - `hybrid 1000x100hz-qos1`: 85 % loss, p50 1.0 s.
+   The Windows kernel UDP receive buffer overflows when the writer
+   sustains faster than the receiver thread drains. This is a
+   *workload-shape* finding, not a per-protocol verdict.
+
+2. **TCP-backed reliable QoS gets *worse* than UDP at overload, not
+   better.** Counter-intuitive: at 1000 vpt × 100 hz the QoS 4 (kernel
+   TCP) variants of custom-udp and hybrid show 99 %+ "loss" and
+   25–60 second p50 latencies. The explanation is back-pressure:
+   the writer crams data into the kernel send buffer faster than TCP
+   can drain it, so the operate window expires while data is still
+   queued. The receiver reports "didn't get it" because nothing
+   arrived before the spawn ended, not because TCP dropped it. This
+   would be invisible on a longer operate window or with explicit
+   backpressure in the variant.
+
+3. **`workload = max-throughput` is a stress test, not a normal
+   profile.** Across all transports the `*-max-*` rows show 75–99 %
+   loss and tens-of-seconds p50. Useful as a saturation point but
+   not a "real" measurement.
+
+4. **WebSocket is fully broken on one host.** Every `websocket-*`
+   spawn shows 0 writes/s and 100 % loss. Two same-machine processes
+   can't both bind the WebSocket server port. WebSocket can only be
+   evaluated in a real two-machine setup.
+
+5. **WebRTC has signaling-fragility on one host.** Many `webrtc-*`
+   high-rate spawns produce no data at all (`0 ms / 0 writes`) —
+   the DataChannel handshake didn't complete before the operate
+   window opened. The spawns that *do* connect look fine.
+
+6. **Latency labelled "(uncorrected)".** Most p50 / p95 / p99 values
+   in the same-machine run carry the "(uncorrected)" tag. Clock
+   sync engine produced too few samples per variant for the
+   timestamp pipeline to apply skew correction. On a single host the
+   wall-clock should be identical anyway, so the numbers are still
+   directionally correct, but the absolute values for hybrid /
+   custom-udp at high QoS shouldn't be read as physical-time delivery
+   latencies; they are a *spawn-window timing* relative measurement.
+
+7. **Zenoh's high-rate sub-ms zenoh-100x1000hz-qos1 / qos3 / qos4
+   p50 of ~0.4 ms** are too good to be true at 100 vpt × 1000 hz,
+   suggesting Zenoh's local subscriber path bypasses the wire and
+   reads from a same-process publisher cache. That's a feature for
+   real workloads but means the same-machine numbers for Zenoh are
+   not comparable to the network-based transports at sub-ms.
+
+### 5.2 Two-machine run (2026-05-07, log_subdir `two-machines-…_093412`)
+
+Alice's logs only — bob's logs from the second host were never copied
+back. The analysis tool can therefore only compute `alice → alice`
+self-paths, which makes the cross-machine comparison **incomplete**.
+Reporting what's there for completeness, with that caveat:
+
+- Variants with broadcast / multicast architectures (zenoh, hybrid,
+  custom-udp's multicast send path) produce some self-delivery rows
+  with realistic numbers — `zenoh 100x100hz-qos2` reports 0.42 ms
+  p50, 0.75 ms p95, 0 % loss on alice → alice. Suggests the in-process
+  Zenoh path is fast even when crossing the publish/subscribe cycle.
+- Pure point-to-point variants (quic, websocket, the unicast paths of
+  custom-udp / hybrid) report 0 ms / 100 % "loss" because alice's
+  log has no matching receiver — bob is simply absent from the
+  dataset.
+- Connect times are universally ~500 ms higher than same-machine,
+  matching the cross-machine TCP/QUIC handshake cost.
+
+**Action item before any future presentation:** copy bob's logs from
+the second machine into this folder and re-run `analyze.py`. Without
+them the two-machine run cannot make a real cross-machine claim. A
+re-run is also warranted now that T-coord.3 + T-coord.1b are landed —
+a full clean run should complete without the 9-spawn hang we hit on
+2026-05-07.
+
+## 6. Findings — divergences from expectation
+
+What the design assumed vs what we measured:
+
+1. **Assumed**: same-machine = ground truth, no noise. **Measured**:
+   loopback drops UDP at sustained high pkt/s; TCP overload looks
+   like loss because the operate window expires mid-drain. The
+   benchmark needs *longer operate windows* or *backpressured
+   writers* before any high-rate row can be trusted.
+
+2. **Assumed**: TCP-based QoS 4 = "boring but reliable." **Measured**:
+   under the current operate-window length it is the worst performer
+   on the high-rate matrix. The kernel queue absorbs everything and
+   then dies on operate end. Recommend either capping writer rate
+   to drain rate, lengthening the operate window, or (best) reading
+   the variant's send-side queue depth and refusing to start a new
+   tick if the queue is full.
+
+3. **Assumed**: WebSocket is a "control" — well-understood reliable
+   transport. **Measured**: unusable on a single host because it
+   wants a single server port. Real-world deployment isn't
+   single-host, so this is a benchmark-harness limitation, not a
+   protocol verdict.
+
+4. **Assumed**: Clock sync would just work and we'd get
+   skew-corrected latencies for free. **Measured**: many spawns
+   produce too few samples for the corrector to apply, so we're
+   reading "(uncorrected)" timestamps on critical rows. Need to
+   investigate the per-variant resync sample count under load.
+
+5. **Assumed**: A failed spawn would be obvious. **Measured**: many
+   spawns ran their 12 s window and produced log files but with
+   `0 writes / 0 ms` because the variant's own setup phase didn't
+   finish in time (webrtc signaling, websocket port bind,
+   hybrid-1000x10hz-qos3 / 100x100hz-qos3 etc.). Need a
+   `connection_failed` event from variants so analysis can
+   distinguish "ran and lost packets" from "couldn't even start."
+
+6. **Assumed**: Two-machine results would just take a manifest
+   exchange and a copy. **Measured**: bob's logs need to physically
+   move back to alice's machine; we don't yet have an automated
+   step for that. Plus, the resume-manifest message size for 176
+   completed jobs is 4262 bytes against a 4096-byte recv buffer —
+   the runner's manifest-exchange path needs the buffer raised
+   before any cross-machine resume actually round-trips. (Filed:
+   T-coord.4 in `metak-orchestrator/TASKS.md`.)
+
+## 7. Where this leaves us
+
+Confident claims we can make today:
+
+- **At ≤100 hz × ≤100 vpt the lightweight transports (custom-udp,
+  quic) hit sub-ms p50 and sub-25 ms p99 with zero loss.** That's
+  comfortably inside the original "<10 ms p99 sub-100K agg"
+  envelope for those rate combos.
+- **Zenoh and WebRTC are usable**, with framing overhead trade-offs.
+- **The benchmark harness itself works end-to-end** — discovery,
+  multi-variant spawn cadence, JSONL ingest, integrity checks,
+  delivery / latency / jitter / loss / resource summaries all
+  produce cross-comparable rows.
+
+Open questions that the same-machine matrix can't answer:
+
+- **Cross-machine relative ranking** — needs both machines' logs
+  collected; same matrix re-run on a real LAN.
+- **Steady-state throughput ceiling** — current 12 s operate window
+  conflates ramp-up + steady state + drain. A longer window
+  (≥30 s) would give a clean steady-state rate.
+- **Backpressure-correct rate matching** — without it, every
+  high-rate row says "100 % loss, 60 s p50" when really the writer
+  pumped 5× the receiver could drain.
+
+## 8. Suggested slide flow
+
+Five-minute read; nine slides. See `metak-shared/slides.md`.
 
 1. **Title + the question** — "How much does the transport choice matter?"
-2. **The setup** — one figure: two runners, identical workload, six
-   variants take turns over the same data.
-3. **The variants** — one bullet each, grouped as in §2.
-4. **The QoS matrix** — the table from §3 (variants × QoS levels).
-5. **What we measure** — latency p50/p95/p99, throughput, loss, jitter,
-   connection time. One line each.
-6. **Then the actual results** — the latency CDF, throughput bars, and
-   the radar chart from `analyze.py --diagrams`.
+2. **Setup** — two runners, six variants, four QoS, 176 spawns.
+3. **Variants** — one line each, grouped as in §2.
+4. **QoS matrix** — the table from §3 (variants × QoS levels).
+5. **What we measure** — latency p50/p95/p99, throughput, loss,
+   jitter, connect time, resources.
+6. **Results — what works** — sub-ms / sub-25 ms p99 at standard
+   rates for custom-udp + quic.
+7. **Results — where it breaks** — UDP loopback drop, TCP-overload
+   tail, websocket / webrtc setup fragility on one host.
+8. **Findings / divergences from expectation** — the six bullets in §6.
+9. **Where this leaves us** — confident claims + open questions
+   from §7.
