@@ -249,3 +249,103 @@ unit tests (`scalar_flood_drain_msg_budget_is_four_x_vpt`,
 `scalar_flood_drain_does_not_overrun_tick`,
 `max_throughput_drain_bounded_to_five_ms`,
 `empty_queue_drain_still_early_exits`).
+
+### Threading-mode dimension (T14.1)
+
+The `Variant` trait now carries a `ThreadingMode { Single, Multi }`
+dimension. The runner injects `--threading-mode` (E14, see
+`metak-shared/api-contracts/variant-cli.md` "E14 additions"); the
+driver passes the chosen mode to `Variant::connect` and to a pair of
+new lifecycle hooks. Each variant decides what the mode means inside
+its own implementation. T14.1 ships the trait surface, CLI plumbing,
+JSONL field, and a `[Single, Multi]`-capable `VariantDummy`;
+T14.2-T14.7 add real `Multi` support per variant; T14.8 teaches the
+runner to inject the arg and expand the `threading_modes` config
+dimension.
+
+**Trait surface (in `variant_trait.rs`)**
+
+- `fn supported_threading_modes(&self) -> &'static [ThreadingMode]`
+  -- default `&[ThreadingMode::Single]`. Variants override to declare
+  multi-mode support.
+- `fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()>`
+  -- the breaking signature change. Variants that don't branch on mode
+  may accept it and ignore.
+- `fn start_reader_threads(&mut self, mode: ThreadingMode) -> Result<()>`
+  -- default no-op. Called by the driver immediately AFTER
+  `connect` returns Ok. Variants that spawn per-peer reader threads
+  do it here, not inside `connect`, so the `connected` event is
+  emitted before any reader thread starts running.
+- `fn stop_reader_threads(&mut self) -> Result<()>` -- default
+  no-op. Called by the driver BEFORE `disconnect`, so reader threads
+  can drain pending receives cleanly before the transport tears down.
+
+**Driver wiring (in `driver::run_protocol`)**
+
+The connect path now reads:
+
+```
+variant.connect(config.threading_mode)?;
+variant.start_reader_threads(config.threading_mode)?;
+logger.log_connected(..., threading_mode, recv_buffer_kb)?;
+```
+
+and the disconnect path reads:
+
+```
+variant.stop_reader_threads()?;
+variant.disconnect()?;
+```
+
+If a variant supports only Single mode, both hooks remain default
+no-ops and the driver behaviour is identical to pre-E14.
+
+**CLI args (in `cli::CliArgs`)**
+
+- `--threading-mode <single|multi>` -- parsed via `FromStr` on
+  `ThreadingMode`. Defaults to `single` during the E14 rollout
+  because T14.1 ships before T14.8: the runner does not yet inject
+  the arg, and the default keeps existing runner integration tests
+  passing without modification. Once T14.8 lands, the runner always
+  injects it and the default becomes a fallback for ad-hoc manual
+  invocations.
+- `--recv-buffer-kb <u32>` -- optional, default `4096` (4 MiB),
+  range `64..=65536` (64 KiB to 64 MiB). Variants apply
+  `setsockopt(SO_RCVBUF, recv_buffer_kb * 1024)` on every recv-side
+  socket they own. Async-only variants whose transport library hides
+  the socket may treat this as advisory but must still record the
+  value in the `connected` event.
+
+**JSONL impact**
+
+The `connected` event gains two fields, `threading_mode` and
+`recv_buffer_kb`. Both are optional during the E14 rollout (pre-T14.8
+logs may omit them) and become required once T14.8 lands. See
+`metak-shared/api-contracts/jsonl-log-schema.md`.
+
+**`VariantDummy` capabilities**
+
+`VariantDummy` overrides `supported_threading_modes()` to return
+`&[ThreadingMode::Single, ThreadingMode::Multi]`. The dummy has no
+real I/O, so both modes do the same thing internally; the point is
+to exercise the new threading-mode infrastructure end-to-end (in
+unit tests, integration tests, and runner smoke runs) regardless of
+which mode the runner picks. The dummy records the mode it was
+asked for so tests can confirm propagation -- this is a test hook,
+not part of the trait surface.
+
+**Open concern for T14.2 follow-up**
+
+`stop_reader_threads` is called BEFORE `disconnect` deliberately so
+reader threads can drain in-flight messages from the underlying
+sockets before those sockets close. A real reader thread will be
+blocking inside `WebSocket::read_message` (or the equivalent) at the
+moment `stop_reader_threads` runs; the natural way to signal it to
+wake up and exit is to either (a) set an `AtomicBool` and rely on a
+short `SO_RCVTIMEO` to surface a periodic poll, or (b) shutdown the
+socket on the variant side first. The trait does not prescribe a
+mechanism -- T14.2 (websocket) will set the precedent. The current
+ordering is intentional: variants that need to issue a peer-side
+shutdown (e.g. send a close frame) want a still-live transport to
+do it from, so `stop_reader_threads` cannot itself tear the socket
+down.
