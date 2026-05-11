@@ -138,6 +138,8 @@ Parquet shard and read by every analysis step.
 | `peer` | `Utf8` (nullable) | `clock_sync` (E8) |
 | `offset_ms` | `Float64` (nullable) | `clock_sync` |
 | `rtt_ms` | `Float64` (nullable) | `clock_sync` |
+| `threading_mode` | `Utf8` (nullable) | `connected` (E14 / T11.5; null on pre-T14.8 logs -- analysis defaults the grouping value to `"single"`) |
+| `recv_buffer_kb` | `UInt32` (nullable) | `connected` (E14 / T11.5; captured for offline reproducibility) |
 
 Categorical encoding is essential: `variant`, `runner`, `run`, `event` are
 low-cardinality (under ~50 distinct values across an entire dataset).
@@ -280,6 +282,17 @@ Derived from delivery records (§4.1).
 | p50, p95, p99, max | Percentiles over all delivery records for a given `(variant, run)` |
 | Per-path breakdown | Same percentiles grouped by `path`, to detect hot-path outliers |
 | Per-receiver breakdown | Same percentiles grouped by `receiver`, to detect slow nodes |
+| `late_receives_tail_count` | Count of deliveries whose latency exceeds `10 * p99` (T11.5) -- extreme outliers within the distribution |
+| `late_receives_tail_pct` | `100 * late_receives_tail_count / total_receives` -- the percentage of deliveries that landed in the late tail |
+
+The late-receive-tail metric (T11.5) is distinct from the
+`late_receives` field (which counts post-EOT pre-silent receives per
+E12). The tail metric operates on the delivery latency distribution
+itself: any receive whose corrected latency exceeds ten times the
+group's 99th-percentile latency is flagged as a tail outlier. The
+integrity report annotates rows from groups with a non-zero tail
+percentage as `[late_tail_present]` so the operator sees the
+outlier signal alongside delivery integrity data.
 
 ### 6.3 Throughput
 
@@ -287,9 +300,17 @@ Derived from `write` and `receive` event counts within the operate phase.
 
 | Statistic | Description |
 |---|---|
-| Write rate | `writes / operate_duration` per writer |
-| Receive rate | `receives / operate_duration` per receiver |
+| Receive rate | `receives / operate_duration` per receiver -- **headline metric** (T11.5) |
+| Write rate | `writes / operate_duration` per writer -- "requested rate" context |
+| Delivery percentage | `100 * receive_rate / write_rate` -- ratio derived from the two throughputs |
 | Aggregate | Sum of all writers' write rates |
+
+The receive rate is the headline because receiver-side handling
+(buffer pressure, parse cost, application work) is the actual sync
+bottleneck in the project's "keep peers in sync under huge change
+diffs" use case. Writers almost always ship at requested rate; the
+write rate is shown next so the gap between request and delivery is
+visible at a glance.
 
 ### 6.4 Jitter
 
@@ -309,14 +330,29 @@ statistics (mean, peak) per `(variant, runner, run)`.
 
 ### 6.7 Performance Summary Table
 
+Column ordering (T11.5) puts the receive throughput first as the
+headline metric. The write rate is labelled as the "requested" rate
+and the derived delivery percentage follows. Latency percentiles,
+jitter, loss, the existing `Late` (post-EOT) column, and the new
+`LateTail%` outlier column come after. A `Thread` column reports the
+group's `threading_mode` (defaulting to `"single"` for pre-T14.8
+logs).
+
+Grouping dimension: `(writer, receiver, variant, qos, threading_mode)`.
+The per-(variant, run) summary inherits the threading_mode value from
+the connected events in the group; the integrity report continues to
+break out the (writer, receiver, qos) sub-grouping.
+
 ```
 Performance Report
-────────────────────────────────────────────────────────────────────────────────────
-Variant                  Run     Connect(ms)  Latency p50  p95     p99     Writes/s   Loss%
-zenoh-replication        run01   487          1.2ms        3.4ms   7.1ms   98,750     0.13%
-zenoh-replication        run02   512          1.3ms        3.5ms   6.8ms   99,100     0.09%
-custom-udp-replication   run01   102          0.8ms        2.1ms   4.3ms   99,900     0.00%
+─────────────────────────────────────────────────────────────────────────────────────────────────────
+Variant                  Run     Thread  Receives/s  Writes/s(req)  Delivery%  Connect(ms)  Lat p50  ... LateTail%
+zenoh-replication        run01   single  98,500      98,750         99.74%     487          1.2ms    ... 0
+custom-udp-replication   run01   single  99,900      99,900         100.00%    102          0.8ms    ... 0
 ```
+
+No metric is removed relative to pre-T11.5 output: the column ORDER
+and EMPHASIS shifts but every previously-reported value is preserved.
 
 ## 7. Diagrams
 
