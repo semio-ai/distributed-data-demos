@@ -665,6 +665,165 @@ class TestGenerateComparisonPlot:
         for f in captured:
             original_close(f)
 
+    def test_tier_markers_one_star_for_1k_target(self, tmp_path: Path) -> None:
+        """A 10x100hz workload targets 1 K/s -> the throughput bar carries ``*``.
+
+        Single bar -> exactly one ``*`` text artist on the qos1
+        throughput axis. The latency axis must not be annotated.
+        """
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=900.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes, "expected at least one throughput axis"
+        ax_tp = tp_axes[0]
+        star_texts = [t for t in ax_tp.texts if t.get_text() == "*"]
+        assert len(star_texts) == 1, (
+            f"expected exactly one '*' marker on throughput axis, "
+            f"got {[t.get_text() for t in ax_tp.texts]}"
+        )
+        # Latency axis must not carry star annotations.
+        lat_axes = [
+            ax for ax in fig.axes if "latency" in (ax.get_ylabel() or "").lower()
+        ]
+        assert lat_axes
+        for ax_lat in lat_axes:
+            lat_stars = [t for t in ax_lat.texts if set(t.get_text() or "") == {"*"}]
+            assert lat_stars == [], (
+                f"latency axis should not carry tier markers, found {lat_stars}"
+            )
+        for f in captured:
+            original_close(f)
+
+    def test_tier_markers_three_stars_for_100k_target(self, tmp_path: Path) -> None:
+        """A 1000x100hz workload targets 100 K/s -> the bar carries ``***``."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("custom-udp-1000x100hz-qos1", writes_per_sec=95_000.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes
+        ax_tp = tp_axes[0]
+        triple_star_texts = [t for t in ax_tp.texts if t.get_text() == "***"]
+        assert len(triple_star_texts) >= 1, (
+            f"expected '***' marker on throughput axis, "
+            f"got {[t.get_text() for t in ax_tp.texts]}"
+        )
+        for f in captured:
+            original_close(f)
+
+    def test_tier_markers_omitted_for_max(self, tmp_path: Path) -> None:
+        """The ``max`` workload has no fixed target -> no star annotation."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("custom-udp-max-qos1", writes_per_sec=400_000.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes
+        ax_tp = tp_axes[0]
+        star_only_texts = [
+            t for t in ax_tp.texts if t.get_text() and set(t.get_text()) == {"*"}
+        ]
+        assert star_only_texts == [], (
+            f"expected no '*' / '**' / '***' marker for max workload, "
+            f"got {[t.get_text() for t in star_only_texts]}"
+        )
+        for f in captured:
+            original_close(f)
+
+    def test_tier_markers_present_on_log_scale_too(self, tmp_path: Path) -> None:
+        """Under ``log_throughput=True`` the ``***`` marker still appears."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("custom-udp-1000x100hz-qos1", writes_per_sec=95_000.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(
+                results, tmp_path, log_throughput=True
+            )
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes
+        ax_tp = tp_axes[0]
+        assert ax_tp.get_yscale() == "log"
+        triple_star_texts = [t for t in ax_tp.texts if t.get_text() == "***"]
+        assert len(triple_star_texts) >= 1, (
+            f"expected '***' marker on log-scale throughput axis, "
+            f"got {[t.get_text() for t in ax_tp.texts]}"
+        )
+        for f in captured:
+            original_close(f)
+
     def test_nonpositive_p95_renders_as_nan_bar(self, tmp_path: Path) -> None:
         """A percentile <= 0 (clock-noise artifact) is dropped to NaN.
 

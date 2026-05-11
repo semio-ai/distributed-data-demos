@@ -98,6 +98,47 @@ _MAX_WORKLOAD_RANK: int = 10**12
 _LATENCY_EPSILON_MS: float = 1e-5
 
 
+def _tier_marker_for_target(target: int | None) -> str | None:
+    """Return the star-tier marker for an aggregate write-rate target.
+
+    Each 10x of target adds one star, with 1 K/s as the 1-star anchor:
+    1 K/s -> ``*``, 10 K/s -> ``**``, 100 K/s -> ``***``, 1 M/s -> ``****``.
+    Targets below 1000 (or unknown, i.e. ``max`` / parser returned None)
+    yield ``None`` so the caller skips the annotation entirely rather
+    than rendering an empty string.
+
+    The mapping is computed as ``int(round(log10(target))) - 2`` so any
+    future order-of-magnitude target (e.g. 1 M, 10 M) extends the scheme
+    without a table edit. Off-decade targets (e.g. 30 K/s) round to the
+    nearest decade and still get a marker -- useful for forward
+    compatibility, since the canonical workload grid only produces clean
+    powers of 10 today.
+
+    Examples
+    --------
+    >>> _tier_marker_for_target(1_000)
+    '*'
+    >>> _tier_marker_for_target(10_000)
+    '**'
+    >>> _tier_marker_for_target(100_000)
+    '***'
+    >>> _tier_marker_for_target(1_000_000)
+    '****'
+    >>> _tier_marker_for_target(500) is None
+    True
+    >>> _tier_marker_for_target(None) is None
+    True
+    """
+    if target is None or target < 1000:
+        return None
+    # log10 of a positive integer >= 1000 is always >= 3, so the
+    # subtraction never goes below 1.
+    n_stars = int(round(np.log10(float(target)))) - 2
+    if n_stars < 1:
+        return None
+    return "*" * n_stars
+
+
 def _format_target_rate_label(target: float) -> str:
     """Format an aggregate write-rate target as a short SI string.
 
@@ -416,6 +457,23 @@ def generate_comparison_plot(
     # transport family, so the per-bar tick label can stay compact.
     bar_tick_labels: list[str] = [w if w else t for t, w in bar_keys]
 
+    # Per-bar tier marker (``*`` / ``**`` / ``***`` / ...). The marker
+    # depends only on the workload's intended write rate (``vpt * hz``),
+    # which is identical across QoS rows, so compute it once here and
+    # reuse for every row. ``max`` workloads and unparseable workloads
+    # yield ``None`` -> no annotation is drawn for that bar.
+    bar_tier_markers: list[str | None] = []
+    for _, workload in bar_keys:
+        if workload == "max":
+            bar_tier_markers.append(None)
+            continue
+        m = _WORKLOAD_VPS_HZ_RE.match(workload)
+        if m is None:
+            bar_tier_markers.append(None)
+            continue
+        target = int(m.group(1)) * int(m.group(2))
+        bar_tier_markers.append(_tier_marker_for_target(target))
+
     for row_idx, q in enumerate(qos_order):
         ax_tp = axes[row_idx][0]
         ax_lat = axes[row_idx][1]
@@ -542,6 +600,50 @@ def generate_comparison_plot(
                 fontsize=8,
                 color="grey",
                 alpha=0.8,
+            )
+
+        # Per-bar tier markers. Each bar gets a ``*`` / ``**`` / ``***``
+        # annotation just above its top, identifying which target line
+        # the bar's workload was aiming at. ``max`` workloads (and any
+        # workload with no parseable target) get no marker. Placement
+        # depends on the scale: a multiplicative offset for log-scale
+        # axes keeps the visible gap above the bar roughly constant,
+        # while a small fraction of the linear panel height does the
+        # same on linear-scale axes. NaN bars on log scale have no
+        # valid y position and are skipped entirely; NaN bars on
+        # linear scale still get a marker just above the x-axis so the
+        # reader can see which target the column was meant to hit.
+        is_log_tp = ax_tp.get_yscale() == "log"
+        if not is_log_tp:
+            linear_offset = 0.02 * ax_tp.get_ylim()[1]
+        else:
+            linear_offset = 0.0  # unused on log scale
+        for bar_x, bar_height, marker in zip(x, throughputs, bar_tier_markers):
+            if marker is None:
+                continue
+            if is_log_tp:
+                if np.isnan(bar_height) or bar_height <= 0.0:
+                    # No valid y position on a log axis -- skip rather
+                    # than render at an arbitrary floor.
+                    continue
+                y_pos = bar_height * 1.15
+            else:
+                if np.isnan(bar_height):
+                    # NaN bar on linear scale: anchor the marker just
+                    # above the x-axis so the target tier is still
+                    # legible for columns like a zero-write spawn.
+                    y_pos = linear_offset
+                else:
+                    y_pos = bar_height + linear_offset
+            ax_tp.text(
+                bar_x,
+                y_pos,
+                marker,
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                color="dimgrey",
+                alpha=0.85,
             )
 
         # Latency axis cosmetics. Log scale exposes both reliable sub-ms
