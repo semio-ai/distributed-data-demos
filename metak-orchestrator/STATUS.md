@@ -6237,3 +6237,169 @@ by re-applying the WIP intent on top of main.
   T-coord.1b-fixed binaries would skip those 7 spawns and continue
   from the qos3 done barrier (which hung) onwards — alternatively,
   blow away the logs subfolder and run fresh.
+
+---
+
+## T-impl.9 completion report (2026-05-11, worker `runner/`)
+
+### What was implemented
+
+Added a post-mortem diagnostic block immediately after the existing
+`'<name>' finished: status=<...>, exit_code=<...>` status line. On a
+`failed` or `timeout` outcome the runner now also prints, to its own
+stderr:
+
+1. The absolute path to the per-spawn stderr capture file
+   (`<log_subdir>/<effective_name>-<runner_name>-stderr.txt`).
+2. The absolute path to the variant's JSONL log
+   (`<log_subdir>/<effective_name>-<runner_name>-<run>.jsonl`) -- only
+   when the file exists on disk; missing pointer skipped silently per
+   spec.
+3. The last 20 lines of the stderr capture, framed by
+   `---- stderr tail (last 20 lines) ----` /
+   `---- end stderr tail ----` separators. The read is bounded to the
+   last 64 KiB of the capture file so a runaway child cannot OOM the
+   runner. Non-UTF-8 bytes are sanitised via `String::from_utf8_lossy`.
+4. If the capture file is empty (the motivating
+   TerminateProcess-before-flush case) a single notice line replaces
+   the bracketed tail block:
+   `(stderr capture is empty -- child likely killed before writing any output)`.
+
+`success` and `skipped` (resume mode) spawns stay silent -- existing
+behaviour preserved. The existing status line is untouched.
+
+Implementation split across three commits per the orchestrator's
+small-commit rule. The stderr-tail logic lives in
+`runner/src/spawn.rs::tail_stderr_file` and the JSONL-path computation
+in `runner/src/spawn.rs::jsonl_log_path`, both unit-testable. The
+wiring lives in `runner/src/main.rs::print_failure_diagnostics`.
+
+### Commands run and their results
+
+- `cargo build --release -p runner` -- clean.
+- `cargo test --release -p runner` -- 139 + 15 + 1 passing, 0 failed
+  (unit + integration + clock_sync_stress).
+- `cargo clippy --release -p runner --all-targets -- -D warnings` --
+  zero warnings.
+- `cargo fmt -p runner -- --check` -- clean.
+
+New tests:
+
+- Unit (`spawn.rs::tests`): 7 new tests for `tail_stderr_file`
+  (missing, empty, fewer-lines, more-lines, no-trailing-newline,
+  byte-bounded huge file, non-UTF-8 bytes) plus 1 for `jsonl_log_path`.
+- Integration (`tests/integration.rs`): 4 new tests
+  (`t9_timeout_with_stderr_prints_capture_path_and_tail`,
+  `t9_failed_with_empty_stderr_prints_empty_notice`,
+  `t9_failed_with_stderr_prints_tail`, `t9_success_stays_quiet_no_tail`).
+  All four pass; the success-stays-quiet case is an extra regression
+  guard beyond the task spec's minimum of three.
+
+The `stderr-writer` helper binary at
+`runner/tests/helpers/stderr_writer.rs` was extended with three new
+modes (`lines_then_sleep`, `lines_then_fail`, `silent_fail`) to drive
+the integration tests. Existing `plain` / `panic` / `sleep` modes are
+unchanged.
+
+### End-to-end smoke
+
+Ran two runners on localhost against
+`configs/two-runner-websocket-qos4.toml` (one in background, one in
+foreground). The first spawn (`websocket-1000x100hz`) failed exactly
+as in the motivating diagnostic session. The new diagnostic block
+appeared on both runners' stderr.
+
+alice (timed out, capture file held only the build banner):
+
+```
+[runner:alice] spawning 'websocket-1000x100hz' (hz=100, vpt=1000, qos=4, timeout: 60s)
+[runner:alice] 'websocket-1000x100hz' finished: status=timeout, exit_code=-1
+[runner:alice] stderr capture: ./logs/websocket-all-20260511_213214\websocket-1000x100hz-alice-stderr.txt
+[runner:alice] jsonl log:      ./logs/websocket-all-20260511_213214\websocket-1000x100hz-alice-websocket-all.jsonl
+[runner:alice] ---- stderr tail (last 20 lines) ----
+[websocket] build: c8c1808+dirty (rustc 1.94.1)
+[runner:alice] ---- end stderr tail ----
+```
+
+bob (variant crashed with a meaningful error before the runner could
+time it out):
+
+```
+[runner:bob] spawning 'websocket-1000x100hz' (hz=100, vpt=1000, qos=4, timeout: 60s)
+[runner:bob] 'websocket-1000x100hz' finished: status=failed, exit_code=1
+[runner:bob] stderr capture: ./logs/websocket-all-20260511_213214\websocket-1000x100hz-bob-stderr.txt
+[runner:bob] jsonl log:      ./logs/websocket-all-20260511_213214\websocket-1000x100hz-bob-websocket-all.jsonl
+[runner:bob] ---- stderr tail (last 20 lines) ----
+[websocket] build: c8c1808+dirty (rustc 1.94.1)
+warning: dropping WS peer alice (127.0.0.1:52381) after write error: IO error: An existing connection was forcibly closed by the remote host. (os error 10054)
+Error: all WS peers dropped after write errors: WS write error: IO error: An existing connection was forcibly closed by the remote host. (os error 10054)
+[runner:bob] ---- end stderr tail ----
+```
+
+Compare against the original lone status line that motivated this
+task:
+
+```
+[runner:bob] 'websocket-1000x100hz' finished: status=timeout, exit_code=-1
+```
+
+The new output gives the operator both file pointers AND the in-line
+tail.
+
+### Deviations from spec
+
+- Empty file convention: chose `Ok(Some(""))` (not `Ok(None)`) for an
+  empty file, documented in `tail_stderr_file`'s rustdoc. This matches
+  the task spec's hint "Some("") or None -- pick one and document it";
+  `Ok(Some(""))` is the natural fit because the file exists and we
+  want to distinguish "file missing" (defensive) from "child wrote
+  nothing" (the motivating Windows TerminateProcess case). `Ok(None)`
+  is reserved for the missing-file defensive path where we silently
+  skip rather than printing a misleading notice.
+- Tail line count capped at 20 as specified. The byte cap inside
+  `tail_stderr_file` is 64 KiB from EOF; I used a seek-then-read
+  approach so the helper allocation is bounded by 64 KiB regardless of
+  input size (no need for the spec's alternative "reject > 1 MiB and
+  print a too-large notice" fallback).
+- One extra integration test added (`t9_success_stays_quiet_no_tail`)
+  as a regression guard against accidentally tripping the diagnostic
+  block on the success path. Task asked for three failure-mode tests;
+  I shipped four. Unit-test count also exceeds the spec minimum but
+  all new tests are documented behaviour of `tail_stderr_file`.
+- No `(stderr capture too large: N bytes; see <path>)` notice emitted:
+  not needed because the seek-from-EOF read is unconditionally bounded
+  by 64 KiB. The spec phrased this as a fallback for the "read whole
+  file then reject" approach which is the path I did not take.
+- Mid-task git-stash incident: between completing commit 1 and
+  starting commit 2, an external process (orchestrator hook based on
+  the stash subject) stashed all runner working-tree changes
+  unexpectedly. Recovered the work via
+  `git checkout stash@{0} -- runner/...` for the runner-only files;
+  the stash was then dropped. No user-visible deviation, only a minor
+  delay.
+
+### Open concerns
+
+- `tail_stderr_file`'s byte cap is a soft 64 KiB from EOF -- if a
+  child writes a single 70 KiB line with no embedded newlines, only
+  the last 64 KiB of that line will print (the partial-line trimming
+  rule preserves at most one boundary trim). Documented in the
+  function rustdoc; not expected in practice, where any reasonable
+  child writes line-buffered stderr.
+- Paths printed by the runner mix forward-slashes and backslashes on
+  Windows (e.g. `./logs/websocket-all-XXX\filename`). This is the
+  natural `Path::display()` output and is operator-readable; cleaning
+  it up would require an extra normalisation pass that I declined to
+  add for the post-mortem path.
+- The integration tests are Windows-friendly (they use the helper
+  binary path verbatim and only depend on visible stderr substrings).
+  No platform-conditional gates were added.
+
+### Commits (new since main pre-T-impl.9)
+
+- `d614a43` feat(runner): add tail_stderr_file and jsonl_log_path helpers
+- `c8c1808` feat(runner): surface stderr capture + JSONL pointer on spawn failure
+- `d501ec9` style(runner): cargo fmt on print_failure_diagnostics
+- `f5587b7` docs(runner): document T-impl.9 failure-diagnostic block in CUSTOM.md
+
+The orchestrator will verify acceptance criteria.
