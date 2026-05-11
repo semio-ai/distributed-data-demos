@@ -127,6 +127,40 @@ class TestPerformanceTableColumnOrder:
         body = "\n".join(table.splitlines()[4:])
         assert "50.00%" in body
 
+    def test_threading_mode_column_present(self) -> None:
+        """T11.5: the new Thread column shows the threading_mode value.
+
+        Default for pre-T14.8 logs (no threading_mode field on
+        ``connected``) is ``"single"``; the column renders that value.
+        """
+        events = [
+            make_event(
+                "connected",
+                runner="alice",
+                launch_ts="2025-04-15T09:35:49Z",
+                elapsed_ms=42.0,
+                offset_ms=42,
+            ),
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000),
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=1001,
+            ),
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000),
+        ]
+        r = _perf(events)
+        table = format_performance_table([r])
+        header = self._table_header(table)
+        assert "Thread" in header
+        # Default 'single' appears in the body row.
+        body = "\n".join(table.splitlines()[4:])
+        assert "single" in body
+
     def test_existing_metrics_still_present(self) -> None:
         """No metric is removed in T11.5; only the column ORDER changes."""
         events = [

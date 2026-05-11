@@ -94,6 +94,14 @@ class PerformanceResult:
     loss_pct: float
     resources: list[ResourceMetric] = field(default_factory=list)
     has_uncorrected_latency: bool = False
+    # Threading-mode dimension (E14 / T11.5). Read from the
+    # ``connected`` event's ``threading_mode`` field; defaults to
+    # ``"single"`` for pre-T14.8 logs where the field is absent. When
+    # a group has multiple distinct values across runners (mixed
+    # spawn -- unusual), the first sorted value is used; in practice
+    # all runners in a single run share the same mode because the
+    # runner sets it from the expanded TOML dimension.
+    threading_mode: str = "single"
     # Late receives (E12): receives whose ``ts`` falls strictly after a
     # writer's ``eot_sent_ts`` but at or before the group's
     # ``silent_start``. ``None`` when no ``eot_sent`` events are present
@@ -157,6 +165,45 @@ def _connection_metrics(
         return 0.0, 0.0
     elapsed = df.get_column("elapsed_ms")
     return float(elapsed.mean() or 0.0), float(elapsed.max() or 0.0)
+
+
+def _threading_mode(group: pl.LazyFrame) -> str:
+    """Threading-mode dimension for this group.
+
+    Read from the ``threading_mode`` column on ``connected`` events.
+    Defaults to ``"single"`` when:
+
+    - the column is null on every connected row (pre-T14.8 logs); or
+    - there are no ``connected`` events in the group.
+
+    When multiple distinct values are present (rare -- a mixed spawn),
+    the lexicographically-first non-null value is chosen for stability
+    across runs. The contract in ``api-contracts/variant-cli.md`` is
+    that the runner picks a single mode per spawn from the expanded
+    TOML dimension, so a stable single-value choice matches reality.
+    """
+    # ``collect_schema().names()`` is the polars-recommended way to
+    # ask for column names without triggering the eager-schema warning
+    # that ``LazyFrame.columns`` emits.
+    if "threading_mode" not in group.collect_schema().names():
+        # Pre-T11.5 cached shards predate the column; absence means
+        # "default" by definition.
+        return "single"
+
+    df = (
+        group.filter(pl.col("event") == "connected")
+        .filter(pl.col("threading_mode").is_not_null())
+        .select(pl.col("threading_mode"))
+        .unique()
+        .sort("threading_mode")
+        .collect()
+    )
+    if df.is_empty():
+        return "single"
+    value = df.item(0, "threading_mode")
+    if value is None or value == "":
+        return "single"
+    return str(value)
 
 
 @dataclass(frozen=True)
@@ -639,6 +686,7 @@ def performance_for_group(
     has_uncorrected_latency = _any_uncorrected(deliveries)
     late_receives = _late_receives_count(group, windows)
     late_tail_count, late_tail_pct = _late_tail_stats(deliveries, p99)
+    threading_mode = _threading_mode(group)
 
     return PerformanceResult(
         variant=variant,
@@ -660,4 +708,5 @@ def performance_for_group(
         late_receives_tail_count=late_tail_count,
         late_receives_tail_pct=late_tail_pct,
         latency_samples_ms=latency_samples,
+        threading_mode=threading_mode,
     )

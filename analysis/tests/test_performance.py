@@ -97,6 +97,88 @@ class TestLateTailStats:
         assert r.late_receives_tail_pct == 0.0
 
 
+class TestThreadingMode:
+    """T11.5: threading_mode grouping dimension with single-default fallback."""
+
+    def test_defaults_to_single_when_absent(self) -> None:
+        """Pre-T14.8 logs omit threading_mode -> grouping value is 'single'."""
+        events = [
+            make_event(
+                "connected",
+                runner="alice",
+                launch_ts="2025-04-15T09:35:49Z",
+                elapsed_ms=42.0,
+                offset_ms=42,
+            ),
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000),
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=1001,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=1010,
+            ),
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000),
+        ]
+        r = _perf(events)
+        assert r.threading_mode == "single"
+
+    def test_reads_explicit_single(self) -> None:
+        """T14.8 logs with threading_mode='single' surface unchanged."""
+        events = [
+            make_event(
+                "connected",
+                runner="alice",
+                launch_ts="2025-04-15T09:35:49Z",
+                elapsed_ms=42.0,
+                threading_mode="single",
+                offset_ms=42,
+            ),
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000),
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000),
+        ]
+        r = _perf(events)
+        assert r.threading_mode == "single"
+
+    def test_reads_explicit_multi(self) -> None:
+        """T14.8 logs with threading_mode='multi' surface unchanged."""
+        events = [
+            make_event(
+                "connected",
+                runner="alice",
+                launch_ts="2025-04-15T09:35:49Z",
+                elapsed_ms=42.0,
+                threading_mode="multi",
+                offset_ms=42,
+            ),
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000),
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000),
+        ]
+        r = _perf(events)
+        assert r.threading_mode == "multi"
+
+    def test_no_connected_events_yields_single(self) -> None:
+        """Empty / connected-less groups default to 'single' too."""
+        events = [
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000),
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000),
+        ]
+        r = _perf(events)
+        assert r.threading_mode == "single"
+
+
 class TestPercentile:
     def test_empty(self) -> None:
         assert _percentile([], 50) == 0.0

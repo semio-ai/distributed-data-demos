@@ -209,6 +209,28 @@ def project_line(line: str) -> dict | None:
         except (TypeError, ValueError):
             wait_ms = None
 
+    # Threading-mode + recv-buffer (E14 / T11.5). Both are recorded on
+    # the ``connected`` event per ``api-contracts/variant-cli.md``. The
+    # fields are optional during the E14 rollout (pre-T14.8 logs may
+    # omit them) -- absence is signalled by a null column value and the
+    # analysis pipeline defaults the grouping value to ``"single"``.
+    threading_mode_raw = obj.get("threading_mode")
+    threading_mode: str | None = (
+        str(threading_mode_raw) if threading_mode_raw is not None else None
+    )
+
+    recv_buffer_kb_raw = obj.get("recv_buffer_kb")
+    recv_buffer_kb: int | None
+    if recv_buffer_kb_raw is None:
+        recv_buffer_kb = None
+    else:
+        try:
+            recv_buffer_kb = int(recv_buffer_kb_raw)
+            if recv_buffer_kb < 0:
+                recv_buffer_kb = None
+        except (TypeError, ValueError):
+            recv_buffer_kb = None
+
     return {
         "ts": ts_ns,
         "variant": obj["variant"],
@@ -231,6 +253,8 @@ def project_line(line: str) -> dict | None:
         "eot_id": eot_id,
         "eot_missing": eot_missing,
         "wait_ms": wait_ms,
+        "threading_mode": threading_mode,
+        "recv_buffer_kb": recv_buffer_kb,
     }
 
 

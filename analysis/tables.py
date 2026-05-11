@@ -175,6 +175,7 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     # the table.
     w_variant = 22
     w_run = 16
+    w_thread = 8
     w_rate = 14
     w_deliv = 11
     w_conn = 13
@@ -187,6 +188,7 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     header = (
         _pad("Variant", w_variant)
         + _pad("Run", w_run)
+        + _pad("Thread", w_thread)
         + _rpad("Receives/s", w_rate)
         + _rpad("Writes/s(req)", w_rate)
         + _rpad("Delivery%", w_deliv)
@@ -227,6 +229,7 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
         row = (
             _pad(r.variant, w_variant)
             + _pad(r.run, w_run)
+            + _pad(r.threading_mode, w_thread)
             + _rpad(_fmt_rate(r.receives_per_sec), w_rate)
             + _rpad(_fmt_rate(r.writes_per_sec), w_rate)
             + _rpad(_fmt_pct(delivery_pct), w_deliv)

@@ -14,7 +14,14 @@ import polars as pl
 # Bump this string when ``SHARD_SCHEMA`` changes in a non-additive way.
 # Bumping forces every cached shard to be rebuilt on the next run via the
 # global ``_cache_schema_version.json`` sentinel.
-SCHEMA_VERSION: str = "2"
+#
+# Bumped to "3" by T11.5: the ``connected`` event gained a
+# ``threading_mode`` field (E14) which we project into a new
+# ``threading_mode`` column. Older shards predating this column would
+# fail the schema-equality check; bumping forces a rebuild from the
+# source JSONL so all shards carry the new column (null for pre-E14
+# connected lines).
+SCHEMA_VERSION: str = "3"
 
 # Flat columnar event schema. One row per JSONL line. Event-specific
 # fields share the same row; columns that don't apply to a given event
@@ -55,6 +62,19 @@ SHARD_SCHEMA: dict[str, pl.DataType] = {
     "eot_id": pl.UInt64,
     "eot_missing": pl.Utf8,
     "wait_ms": pl.UInt64,
+    # Threading-mode dimension (E14 / T11.5). Populated on ``connected``
+    # events from the runner-injected --threading-mode CLI flag. Value
+    # is one of ``"single"`` / ``"multi"`` per the contract in
+    # ``api-contracts/variant-cli.md``. Optional during E14 rollout:
+    # pre-T14.8 logs omit the JSON field, in which case the column is
+    # null and the analysis defaults the grouping value to ``"single"``.
+    "threading_mode": pl.Utf8,
+    # Receive-buffer hint (E14): the --recv-buffer-kb value the runner
+    # supplied to the variant on launch. Recorded alongside
+    # threading_mode for offline reproducibility; not currently used by
+    # the analysis pipeline but kept in-schema so future grouping or
+    # plotting work can reach it without a rebuild.
+    "recv_buffer_kb": pl.UInt32,
 }
 
 

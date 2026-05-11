@@ -139,6 +139,30 @@ class TestProjectLine:
         row = project_line(line)
         assert row is not None
         assert abs(row["elapsed_ms"] - 56.6997) < 0.001
+        # T11.5: threading_mode column exists; null when the JSON field
+        # is absent (pre-T14.8 logs).
+        assert row["threading_mode"] is None
+        assert row["recv_buffer_kb"] is None
+
+    def test_connected_event_with_threading_mode(self) -> None:
+        """T14.8: ``connected`` carries threading_mode + recv_buffer_kb."""
+        line = json.dumps(
+            {
+                "ts": "2026-04-15T09:35:50.002908800Z",
+                "variant": "custom-udp",
+                "runner": "alice",
+                "run": "r",
+                "event": "connected",
+                "launch_ts": "2026-04-15T09:35:49.946206400Z",
+                "elapsed_ms": 56.6997,
+                "threading_mode": "multi",
+                "recv_buffer_kb": 8192,
+            }
+        )
+        row = project_line(line)
+        assert row is not None
+        assert row["threading_mode"] == "multi"
+        assert row["recv_buffer_kb"] == 8192
 
     def test_clock_sync_event(self) -> None:
         """``clock_sync`` lines populate peer/offset_ms/rtt_ms columnar fields.
