@@ -229,7 +229,10 @@ def empirical_cdf(samples: list[float] | np.ndarray) -> tuple[np.ndarray, np.nda
 
 
 def generate_comparison_plot(
-    results: list[PerformanceResult], output_dir: Path
+    results: list[PerformanceResult],
+    output_dir: Path,
+    *,
+    log_throughput: bool = False,
 ) -> Path:
     """Generate the comparison bar chart PNG.
 
@@ -239,6 +242,14 @@ def generate_comparison_plot(
         Performance results to visualise.
     output_dir:
         Directory where the PNG will be saved (created if needed).
+    log_throughput:
+        When True, render the throughput panels on a log y-axis. Bars
+        with non-positive ``writes_per_sec`` (a spawn that produced
+        zero writes, e.g. ``websocket-max-qos4`` rows in dense runs)
+        cannot be plotted on a log axis; those entries are dropped to
+        NaN -- matching the latency-panel convention -- so the bar
+        disappears rather than being clamped to a misleading visible
+        floor. Default ``False`` keeps the existing linear scale.
 
     Returns
     -------
@@ -358,6 +369,16 @@ def generate_comparison_plot(
                 p95_vals.append(float(r.latency_p95_ms))
                 p99_vals.append(float(r.latency_p99_ms))
 
+        # Under log scale a non-positive throughput cannot render; drop
+        # those bars to NaN so the bar disappears rather than being
+        # clamped to a visible "1" floor. This mirrors the latency-panel
+        # treatment of non-positive percentiles below.
+        if log_throughput:
+            throughputs = [
+                t if (not np.isnan(t) and t > 0.0) else float("nan")
+                for t in throughputs
+            ]
+
         ax_tp.bar(
             x,
             throughputs,
@@ -410,12 +431,19 @@ def generate_comparison_plot(
             error_kw={"linewidth": 0.6},
         )
 
-        # Throughput axis cosmetics.
+        # Throughput axis cosmetics. Optional log scale (opt-in via
+        # ``log_throughput``) brings high-rate transports (~400k
+        # writes/s) onto the same panel as low-rate transports (~10k
+        # writes/s) without the slow bars collapsing to near-zero.
         ax_tp.set_ylabel(f"{qos_label} - writes/s")
         ax_tp.set_title(f"{qos_label} - Throughput (writes/s)")
         ax_tp.set_xticks(x)
         ax_tp.set_xticklabels(bar_tick_labels, rotation=45, ha="right", fontsize=7)
-        ax_tp.yaxis.grid(True, linestyle="--", alpha=0.5)
+        if log_throughput:
+            ax_tp.set_yscale("log")
+            ax_tp.yaxis.grid(True, which="both", linestyle="--", alpha=0.5)
+        else:
+            ax_tp.yaxis.grid(True, linestyle="--", alpha=0.5)
         ax_tp.set_axisbelow(True)
 
         # Latency axis cosmetics. Log scale exposes both reliable sub-ms

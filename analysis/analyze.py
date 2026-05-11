@@ -150,6 +150,15 @@ def build_parser() -> argparse.ArgumentParser:
         "the peak to stderr. Requires psutil. Default off so the "
         "steady-state pipeline stays instrumentation-free.",
     )
+    parser.add_argument(
+        "--log-throughput",
+        action="store_true",
+        help="Render the throughput panels of comparison.png on a log "
+        "y-axis. Useful when one variant (e.g. WebRTC max-qos4 at "
+        "~400 K writes/s) dwarfs slower transports (e.g. custom-udp "
+        "qos4 at ~10 K writes/s) in the same panel. Bars with zero "
+        "writes are skipped (NaN) rather than clamped. Default off.",
+    )
     return parser
 
 
@@ -263,7 +272,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 1
 
-            plot_path = generate_comparison_plot(performance_results, output_dir)
+            plot_path = generate_comparison_plot(
+                performance_results,
+                output_dir,
+                log_throughput=args.log_throughput,
+            )
             print(f"Plot saved to: {plot_path}", file=sys.stderr)
 
             cdf_path = generate_latency_cdf_plot(performance_results, output_dir)
