@@ -272,4 +272,50 @@ mod tests {
         assert_eq!(derived.listen_addr.port(), 19960 + 20);
         assert!(derived.peers.is_empty());
     }
+
+    /// T-impl.4: same-host port collision avoidance.
+    ///
+    /// With `--runner alice --peers alice=127.0.0.1,bob=127.0.0.1` and
+    /// `base_port=19200`, alice binds at the base port (offset 0 for
+    /// runner_index 0) and connects to bob's port one above the base
+    /// (offset 1 for runner_index 1). With `--runner bob` and the same
+    /// peers list, bob binds at base+1 and connects to alice at base.
+    /// QoS 3 is the lowest reliable level supported by the variant, so
+    /// the qos offset is 20 (`(3-1) * 10`). The test asserts both the
+    /// raw "base + runner_index" delta (i.e. ports diverge by exactly
+    /// 1 on the same host) and the mirrored peer-port resolution.
+    #[test]
+    fn t_impl_4_same_host_port_offset_alice_and_bob() {
+        let peers = parse_peers("alice=127.0.0.1,bob=127.0.0.1").unwrap();
+        let base_port: u16 = 19200;
+
+        let alice = derive_endpoints(&peers, "alice", base_port, 3).unwrap();
+        let bob = derive_endpoints(&peers, "bob", base_port, 3).unwrap();
+
+        // alice listens at base + 0*RUNNER_STRIDE + qos_offset; bob at base + 1*RUNNER_STRIDE + qos_offset.
+        let qos_offset: u16 = (3 - 1) * QOS_STRIDE;
+        assert_eq!(alice.listen_addr.port(), base_port + qos_offset);
+        assert_eq!(
+            bob.listen_addr.port(),
+            base_port + RUNNER_STRIDE + qos_offset
+        );
+
+        // Critical property: the listen ports MUST differ by RUNNER_STRIDE
+        // on the same host. If this regresses, both runners will try to
+        // bind the same port and one will fail with EADDRINUSE.
+        assert_eq!(
+            bob.listen_addr.port() - alice.listen_addr.port(),
+            RUNNER_STRIDE,
+            "T-impl.4: alice and bob must bind ports that differ by RUNNER_STRIDE on the same host"
+        );
+
+        // Each side connects to the peer's listen port (same formula
+        // with the peer's runner_index).
+        let alice_peer = &alice.peers[0];
+        assert_eq!(alice_peer.name, "bob");
+        assert_eq!(alice_peer.addr.port(), bob.listen_addr.port());
+        let bob_peer = &bob.peers[0];
+        assert_eq!(bob_peer.name, "alice");
+        assert_eq!(bob_peer.addr.port(), alice.listen_addr.port());
+    }
 }
