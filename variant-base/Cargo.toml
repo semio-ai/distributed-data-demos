@@ -18,6 +18,11 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# socket2 is used by the `socket` module to query/tune SO_RCVBUF / SO_SNDBUF
+# on UDP sockets owned by concrete variants. The variants each already
+# depend on socket2 directly; centralising the tuning helper here keeps
+# every UDP creation site honest.
+socket2 = "0.5"
 sysinfo = "0.33"
 thiserror = "2"
 
