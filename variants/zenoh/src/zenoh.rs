@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use zenoh::handlers::FifoChannelHandler;
 use zenoh::pubsub::{Publisher, Subscriber};
+use zenoh::qos::CongestionControl;
 use zenoh::sample::Sample;
 
 use variant_base::types::{Qos, ReceivedUpdate};
@@ -339,6 +340,10 @@ enum OutboundMessage {
         encoded: Bytes,
         /// Sequence number for diagnostic tracing.
         seq: u64,
+        /// QoS level the message was published with. Drives which
+        /// publisher cache (Drop vs Block congestion control) the
+        /// publisher task selects per T-impl.7.
+        qos: Qos,
     },
     /// A one-shot EOT publish to `bench/__eot__/<self_runner>`. The variant
     /// blocks on `done` to confirm the publish has been committed inside
@@ -358,9 +363,28 @@ enum OutboundMessage {
 /// Shared state held inside the dedicated tokio runtime. Owned by the
 /// publisher task; the subscriber task only ever reads from the
 /// `Subscriber` it was given at spawn time.
+///
+/// T-impl.7: two separate publisher caches, one per congestion-control
+/// policy, so each QoS path gets its appropriate behaviour:
+///
+/// - `publishers_drop` (`CongestionControl::Drop`) is used for QoS 1/2
+///   (BestEffort, LatestValue). Zenoh drops messages internally if its
+///   outgoing queue is full -- which means our `try_publish` returns
+///   `Ok(true)` even when Zenoh later drops, and we cannot count those
+///   internal drops in `backpressure_skipped`. The honest backpressure
+///   signal we *do* surface is the **publish channel full** condition
+///   on our own bridge mpsc -- if `try_send` returns `Full`,
+///   `try_publish` returns `Ok(false)`. See CUSTOM.md
+///   "Backpressure semantics (T-impl.7)" for the full rationale and
+///   limitation note.
+/// - `publishers_block` (`CongestionControl::Block`) is used for QoS
+///   3/4 (ReliableUdp, ReliableTcp). `publisher.put(...).await` blocks
+///   inside Zenoh until queue space is available, so the reliable path
+///   never produces a seq gap. `try_publish` returns `Ok(true)`.
 struct PublisherState {
     session: zenoh::Session,
-    publishers: HashMap<String, Publisher<'static>>,
+    publishers_drop: HashMap<String, Publisher<'static>>,
+    publishers_block: HashMap<String, Publisher<'static>>,
 }
 
 /// Zenoh variant implementing the `Variant` trait.
@@ -532,7 +556,30 @@ async fn publisher_task(
 ) {
     while let Some(msg) = send_rx.recv().await {
         match msg {
-            OutboundMessage::Data { key, encoded, seq } => {
+            OutboundMessage::Data {
+                key,
+                encoded,
+                seq,
+                qos,
+            } => {
+                // T-impl.7: pick the publisher cache that matches the
+                // QoS's congestion-control policy. QoS 1/2 -> Drop
+                // (Zenoh silently drops if its queue is full; bridge
+                // already short-circuited at try_send if our channel
+                // was full). QoS 3/4 -> Block (publisher.put().await
+                // back-pressures inside Zenoh's queue, so the reliable
+                // path never produces a seq gap).
+                let reliable = matches!(qos, Qos::ReliableUdp | Qos::ReliableTcp);
+                let (cache, cc_label) = if reliable {
+                    (&mut state.publishers_block, "block")
+                } else {
+                    (&mut state.publishers_drop, "drop")
+                };
+                let cc = if reliable {
+                    CongestionControl::Block
+                } else {
+                    CongestionControl::Drop
+                };
                 // Standard hot path: publisher was pre-declared in
                 // `connect` from the workload's known path set, so this
                 // lookup is a HashMap hit and the put runs on a routine
@@ -541,11 +588,12 @@ async fn publisher_task(
                 // a missing entry on the standard fixture is unexpected
                 // and surfaces as a trace warning so we notice if the
                 // pre-declare contract drifts.
-                if let Some(publisher) = state.publishers.get(&key) {
+                if let Some(publisher) = cache.get(&key) {
                     if let Err(e) = publisher.put(encoded).await {
                         if trace {
                             trace_now!(
-                                "publisher_task: put failed seq={} key={} err={}",
+                                "publisher_task: put failed cc={} seq={} key={} err={}",
+                                cc_label,
                                 seq,
                                 key,
                                 e
@@ -562,28 +610,36 @@ async fn publisher_task(
                     // we notice if a fixture starts hitting it.
                     if trace {
                         trace_now!(
-                            "publisher_task: lazy declare key={} (pre-declare missed)",
+                            "publisher_task: lazy declare cc={} key={} (pre-declare missed)",
+                            cc_label,
                             key
                         );
                     }
-                    match state.session.declare_publisher(key.clone()).await {
+                    match state
+                        .session
+                        .declare_publisher(key.clone())
+                        .congestion_control(cc)
+                        .await
+                    {
                         Ok(publisher) => {
                             if let Err(e) = publisher.put(encoded).await {
                                 if trace {
                                     trace_now!(
-                                        "publisher_task: put failed seq={} key={} err={}",
+                                        "publisher_task: put failed cc={} seq={} key={} err={}",
+                                        cc_label,
                                         seq,
                                         key,
                                         e
                                     );
                                 }
                             }
-                            state.publishers.insert(key, publisher);
+                            cache.insert(key, publisher);
                         }
                         Err(e) => {
                             if trace {
                                 trace_now!(
-                                    "publisher_task: declare_publisher({}) failed: {}",
+                                    "publisher_task: declare_publisher cc={} ({}) failed: {}",
+                                    cc_label,
                                     key,
                                     e
                                 );
@@ -617,13 +673,18 @@ async fn publisher_task(
         }
     }
 
-    // Channel closed: drain the publisher cache. Undeclaring explicitly
-    // gives consistent teardown timing and surfaces errors via the trace
-    // log; without this the publishers would Drop-undeclare on session
-    // close, which is fine but less observable.
-    let pub_count = state.publishers.len();
+    // Channel closed: drain both publisher caches. Undeclaring
+    // explicitly gives consistent teardown timing and surfaces errors
+    // via the trace log; without this the publishers would
+    // Drop-undeclare on session close, which is fine but less
+    // observable.
+    let pub_count = state.publishers_drop.len() + state.publishers_block.len();
     let t = Instant::now();
-    for (_, publisher) in state.publishers.drain() {
+    for (_, publisher) in state
+        .publishers_drop
+        .drain()
+        .chain(state.publishers_block.drain())
+    {
         if let Err(e) = publisher.undeclare().await {
             if trace {
                 trace_now!("publisher_task: undeclare failed: {}", e);
@@ -865,7 +926,13 @@ impl Variant for ZenohVariant {
         // workers to actually parallelise them).
         let pre_declare_count = values_per_tick_from_env().unwrap_or(0);
         let t_open = Instant::now();
-        let (session, subscriber, eot_subscriber, predeclared_publishers) = runtime
+        let (
+            session,
+            subscriber,
+            eot_subscriber,
+            predeclared_publishers_drop,
+            predeclared_publishers_block,
+        ) = runtime
             .block_on(async {
                 let session = zenoh::open(config).await.map_err(zenoh_err)?;
                 let subscriber = session
@@ -878,30 +945,50 @@ impl Variant for ZenohVariant {
                     .map_err(zenoh_err)?;
 
                 // Pre-declare publishers for the workload's known path
-                // set. Concurrent via JoinSet; results collected into
-                // the publisher cache before the publisher task starts
+                // set. T-impl.7: we declare *two* publishers per key, one
+                // per congestion-control policy, so the publisher task
+                // can route messages to the appropriate cache by QoS
+                // without paying a declare cost on the hot path.
+                // Concurrent via JoinSet; results collected into the
+                // publisher caches before the publisher task starts
                 // draining the publish channel, so the operate phase
                 // sees zero declares for the standard fixture.
-                let mut publishers: HashMap<String, Publisher<'static>> =
+                let mut publishers_drop: HashMap<String, Publisher<'static>> =
+                    HashMap::with_capacity(pre_declare_count as usize);
+                let mut publishers_block: HashMap<String, Publisher<'static>> =
                     HashMap::with_capacity(pre_declare_count as usize);
                 if pre_declare_count > 0 {
-                    let mut set: JoinSet<(String, zenoh::Result<Publisher<'static>>)> =
-                        JoinSet::new();
+                    let mut set: JoinSet<(
+                        String,
+                        CongestionControl,
+                        zenoh::Result<Publisher<'static>>,
+                    )> = JoinSet::new();
                     for i in 0..pre_declare_count {
                         let key = format!("bench/{}", i);
-                        let session_clone = session.clone();
-                        let key_for_task = key.clone();
-                        set.spawn(async move {
-                            let res = session_clone.declare_publisher(key_for_task.clone()).await;
-                            (key_for_task, res)
-                        });
+                        for cc in [CongestionControl::Drop, CongestionControl::Block] {
+                            let session_clone = session.clone();
+                            let key_for_task = key.clone();
+                            set.spawn(async move {
+                                let res = session_clone
+                                    .declare_publisher(key_for_task.clone())
+                                    .congestion_control(cc)
+                                    .await;
+                                (key_for_task, cc, res)
+                            });
+                        }
                     }
                     while let Some(joined) = set.join_next().await {
-                        let (key, res) = joined.context("declare_publisher task panicked")?;
+                        let (key, cc, res) =
+                            joined.context("declare_publisher task panicked")?;
                         match res {
-                            Ok(publisher) => {
-                                publishers.insert(key, publisher);
-                            }
+                            Ok(publisher) => match cc {
+                                CongestionControl::Drop => {
+                                    publishers_drop.insert(key, publisher);
+                                }
+                                CongestionControl::Block => {
+                                    publishers_block.insert(key, publisher);
+                                }
+                            },
                             Err(e) => {
                                 // Don't fail connect on a single
                                 // declare error -- fall back to the
@@ -909,22 +996,29 @@ impl Variant for ZenohVariant {
                                 // key. Zenoh's declare can fail
                                 // transiently during scout warm-up.
                                 eprintln!(
-                                    "[zenoh] warning: pre-declare publisher for {} failed: {}",
-                                    key, e
+                                    "[zenoh] warning: pre-declare publisher for {} cc={:?} failed: {}",
+                                    key, cc, e
                                 );
                             }
                         }
                     }
                 }
-                Ok::<_, anyhow::Error>((session, subscriber, eot_subscriber, publishers))
+                Ok::<_, anyhow::Error>((
+                    session,
+                    subscriber,
+                    eot_subscriber,
+                    publishers_drop,
+                    publishers_block,
+                ))
             })
             .context(
                 "failed to open zenoh session / declare subscribers / pre-declare publishers",
             )?;
         trace_if!(
             trace,
-            "connect: session opened + subscribers declared + {} publishers pre-declared in {} ms",
-            predeclared_publishers.len(),
+            "connect: session opened + subscribers declared + {}/{} publishers pre-declared (drop/block) in {} ms",
+            predeclared_publishers_drop.len(),
+            predeclared_publishers_block.len(),
             t_open.elapsed().as_millis()
         );
 
@@ -942,7 +1036,8 @@ impl Variant for ZenohVariant {
 
         let pub_state = PublisherState {
             session,
-            publishers: predeclared_publishers,
+            publishers_drop: predeclared_publishers_drop,
+            publishers_block: predeclared_publishers_block,
         };
 
         runtime.spawn(publisher_task(pub_state, send_rx, trace));
@@ -999,6 +1094,7 @@ impl Variant for ZenohVariant {
             key: key.clone(),
             encoded,
             seq,
+            qos,
         };
         let send_result = match send_tx.try_send(outbound) {
             Ok(()) => Ok(()),
@@ -1048,6 +1144,82 @@ impl Variant for ZenohVariant {
         }
 
         Ok(())
+    }
+
+    /// Backpressure-aware publish for Zenoh (T-impl.7).
+    ///
+    /// - **QoS 1 / QoS 2 (best-effort / latest-value)**: encode the
+    ///   message on the variant's main thread and `try_send` it onto
+    ///   the bounded bridge channel. If the channel is full we report
+    ///   `Ok(false)` and the driver logs `backpressure_skipped`
+    ///   instead of letting `publish`'s `blocking_send` stall the
+    ///   write loop. The downstream publisher uses
+    ///   `CongestionControl::Drop` so Zenoh itself may silently drop
+    ///   messages once they're accepted by our bridge -- those internal
+    ///   drops are NOT counted in `backpressure_skipped` and have to
+    ///   be inferred from receive-side delivery rate (Zenoh 1.9 does
+    ///   not expose a public dropped-message counter on the
+    ///   Publisher). See CUSTOM.md "Backpressure semantics (T-impl.7)"
+    ///   for the trade-off rationale.
+    /// - **QoS 3 / QoS 4 (reliable)**: delegate to `publish`. The
+    ///   downstream publisher uses `CongestionControl::Block` so
+    ///   `publisher.put(...).await` back-pressures inside Zenoh's
+    ///   queue; the bridge channel may also back-pressure via
+    ///   `blocking_send` upstream of that. Either way the driver sees
+    ///   `Ok(true)` and no seq gap, which is the reliable-QoS
+    ///   contract.
+    fn try_publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<bool> {
+        // Reliable path: full delegation to publish() which uses
+        // try_send + blocking_send fallback. Publish-side back-pressure
+        // is absorbed inside Zenoh's per-publisher Block queue.
+        if matches!(qos, Qos::ReliableUdp | Qos::ReliableTcp) {
+            self.publish(path, payload, qos, seq)?;
+            return Ok(true);
+        }
+
+        let trace = self.zenoh_args.debug_trace;
+        let send_tx = self
+            .send_tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("not connected"))?;
+
+        let key = path_to_key(path).to_string();
+        let encoded = MessageCodec::encode(&self.runner, seq, qos, path, payload);
+        let outbound = OutboundMessage::Data {
+            key: key.clone(),
+            encoded,
+            seq,
+            qos,
+        };
+
+        match send_tx.try_send(outbound) {
+            Ok(()) => {
+                if trace {
+                    self.publish_count += 1;
+                }
+                Ok(true)
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Bridge channel is full -- the publisher task hasn't
+                // drained yet. This is the honest backpressure signal
+                // we surface to the driver for QoS 1/2: refuse the
+                // write rather than blocking, so the driver logs a
+                // `backpressure_skipped` event and the seq gap is
+                // recorded explicitly instead of being hidden behind
+                // a tick-stretching `blocking_send`.
+                if trace {
+                    trace_now!(
+                        "try_publish: bridge channel full seq={} qos={:?} -- Ok(false)",
+                        seq,
+                        qos
+                    );
+                }
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow::anyhow!("publish channel closed"))
+            }
+        }
     }
 
     fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
@@ -1547,5 +1719,139 @@ mod tests {
             received as f64 / N as f64 >= 0.8,
             "bridge stress test received {received}/{N} -- bridge may be deadlocking or dropping excessively",
         );
+    }
+
+    /// T-impl.7: an un-connected `try_publish` returns an error rather
+    /// than `Ok(false)`. Mirrors the QUIC variant's contract: the
+    /// no-connection state is a user error, not a backpressure signal.
+    #[test]
+    fn test_try_publish_without_connect_errors() {
+        let mut variant = ZenohVariant::new("solo", &[]).expect("construct variant");
+        let r = variant.try_publish("/bench/0", &[0u8; 8], Qos::BestEffort, 1);
+        assert!(r.is_err(), "try_publish before connect must error");
+    }
+
+    /// T-impl.7: when the bridge mpsc channel is full,
+    /// `try_publish` for QoS 1/2 MUST return `Ok(false)`. We exercise
+    /// the path WITHOUT a real Zenoh session by swapping in our own
+    /// `(tx, rx)` pair sized identically to the production bridge and
+    /// then dropping the receiver -- `try_send` will then fail with
+    /// `Full` once the channel saturates. The test does not need a
+    /// running runtime; it isolates the synchronous `try_publish` logic.
+    #[test]
+    fn test_try_publish_qos1_returns_ok_false_when_channel_full() {
+        let mut variant = ZenohVariant::new("solo", &[]).expect("construct variant");
+
+        // Wire a tiny bridge channel directly into the variant. Capacity
+        // 2 ensures we hit Full quickly. We deliberately keep the
+        // receiver alive (in a held variable) so try_send returns
+        // `Full` rather than `Closed`.
+        let (tx, _rx_held) = mpsc::channel::<OutboundMessage>(2);
+        variant.send_tx = Some(tx);
+
+        // First two sends should fit (Ok(true)). The third must
+        // observe a full channel and return Ok(false).
+        for seq in 0..2u64 {
+            let r = variant
+                .try_publish("/bench/0", &[0u8; 8], Qos::BestEffort, seq)
+                .expect("try_publish should not error while there is room");
+            assert!(r, "fill-up send {} should have returned Ok(true)", seq);
+        }
+        let r = variant
+            .try_publish("/bench/0", &[0u8; 8], Qos::BestEffort, 99)
+            .expect("try_publish should not error when channel is full");
+        assert!(
+            !r,
+            "try_publish must return Ok(false) when the bridge channel is full"
+        );
+
+        // QoS 2 (LatestValue) takes the same path -- assert consistent
+        // behaviour. Capacity is already saturated so we expect
+        // Ok(false) without ever filling further.
+        let r = variant
+            .try_publish("/bench/0", &[0u8; 8], Qos::LatestValue, 100)
+            .expect("try_publish should not error when channel is full");
+        assert!(
+            !r,
+            "try_publish QoS 2 must return Ok(false) when the bridge channel is full"
+        );
+    }
+
+    /// T-impl.7: QoS 3/4 (reliable) MUST never produce `Ok(false)`.
+    /// The reliable path delegates to `publish`, which uses
+    /// `try_send` then `blocking_send`. We model "channel under
+    /// pressure but a consumer eventually drains" by spawning a
+    /// background drain thread; the variant's main thread keeps
+    /// pushing reliable writes and never sees Ok(false).
+    #[test]
+    fn test_try_publish_qos3_and_qos4_never_return_ok_false() {
+        let mut variant = ZenohVariant::new("solo", &[]).expect("construct variant");
+
+        // Match production channel capacity so the test mirrors the
+        // real bridge timing pattern (occasional Full -> blocking_send
+        // -> consumer drains -> writer continues).
+        let (tx, mut rx) = mpsc::channel::<OutboundMessage>(PUBLISH_CHANNEL_CAPACITY);
+        variant.send_tx = Some(tx);
+
+        // Drain in a worker thread: receive each message and discard
+        // it. No sleeps — the goal is to keep the channel from blocking
+        // the writer indefinitely while still verifying the reliable
+        // path's Ok(true) contract under a brief burst.
+        let drain_handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("drain rt");
+            rt.block_on(async move { while rx.recv().await.is_some() {} });
+        });
+
+        // Burst reliable writes spanning 2x the channel capacity to
+        // exercise the try_send -> blocking_send fallback. We do not
+        // care whether some end up calling blocking_send -- only that
+        // the return value is always Ok(true).
+        let burst = (PUBLISH_CHANNEL_CAPACITY as u64) * 2;
+        for seq in 0..burst {
+            for qos in [Qos::ReliableUdp, Qos::ReliableTcp] {
+                let r = variant
+                    .try_publish("/bench/0", &[0u8; 8], qos, seq)
+                    .expect("try_publish reliable should not error");
+                assert!(
+                    r,
+                    "try_publish for qos {:?} seq {} must return Ok(true)",
+                    qos, seq
+                );
+            }
+        }
+
+        // Drop the sender to let the drain task finish.
+        variant.send_tx.take();
+        drain_handle.join().expect("drain thread join");
+    }
+
+    /// T-impl.7 default-path sanity: `try_publish` with an empty
+    /// channel returns `Ok(true)` and pushes onto the bridge. We
+    /// confirm by pulling the message off the receive side.
+    #[test]
+    fn test_try_publish_qos1_default_path_returns_ok_true() {
+        let mut variant = ZenohVariant::new("solo", &[]).expect("construct variant");
+        let (tx, mut rx) = mpsc::channel::<OutboundMessage>(PUBLISH_CHANNEL_CAPACITY);
+        variant.send_tx = Some(tx);
+
+        let r = variant
+            .try_publish("/bench/0", &[1u8, 2, 3, 4], Qos::BestEffort, 42)
+            .expect("try_publish should succeed");
+        assert!(r, "empty channel must accept the write");
+
+        // The message must have been enqueued with the right qos tag
+        // so the publisher_task can route it to the Drop cache.
+        let msg = rx.try_recv().expect("message should be enqueued");
+        match msg {
+            OutboundMessage::Data { qos, seq, key, .. } => {
+                assert_eq!(qos, Qos::BestEffort);
+                assert_eq!(seq, 42);
+                assert_eq!(key, "bench/0");
+            }
+            OutboundMessage::Eot { .. } => panic!("unexpected EOT message"),
+        }
     }
 }

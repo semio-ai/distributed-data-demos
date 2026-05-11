@@ -204,3 +204,72 @@ Keep it simple.
     [variant.specific]
     zenoh_mode = "peer"
   ```
+
+### Backpressure semantics (T-impl.7)
+
+`Variant::try_publish` is implemented honestly on the QoS 1/2 best-effort
+path and delegates to the default `publish` for the QoS 3/4 reliable path.
+
+**Publisher cache split — congestion control per QoS**
+
+`PublisherState` now carries two pre-declared publisher caches keyed by Zenoh
+key expression: `publishers_drop` (`CongestionControl::Drop`) for QoS 1/2
+and `publishers_block` (`CongestionControl::Block`) for QoS 3/4. Each cache
+is pre-declared concurrently in `connect`'s `block_on` via a `JoinSet`, so
+the operate phase pays zero per-message declare cost regardless of which
+QoS the workload uses. The publisher task picks the right cache from
+`OutboundMessage::Data { qos, .. }` (the `qos` field was added in this
+task) and awaits `publisher.put(...).await` against it.
+
+- **QoS 1 / QoS 2 (best-effort / latest-value)**: Publisher uses
+  `CongestionControl::Drop`. Zenoh will silently drop messages from its
+  internal outgoing queue if a downstream link cannot keep up. The
+  variant's `try_publish` surfaces a different backpressure signal:
+  the **bridge mpsc channel between the variant's main thread and the
+  publisher task**. We `try_send` onto the bounded channel
+  (`PUBLISH_CHANNEL_CAPACITY = 1024`); on `TrySendError::Full` we return
+  `Ok(false)` and the driver logs `backpressure_skipped`.
+
+  **Limitation (option (b) per the T-impl.7 task brief)**: Zenoh 1.9's
+  public Publisher API does not expose a "messages dropped due to
+  congestion" counter, nor does it surface a return code from `put` that
+  distinguishes "delivered" from "internally dropped". Once a message
+  clears our bridge channel, Zenoh's CongestionControl::Drop happens
+  transparently inside the publisher and is **not** counted in our
+  `backpressure_skipped` metric. The honest interpretation in analysis
+  output is therefore: `backpressure_skipped` for Zenoh measures
+  **bridge-saturation drops only**; any additional gap between
+  per-runner `write` count and the global delivery rate is attributable
+  to Zenoh's own internal CC=Drop policy and must be inferred from
+  receive-side delivery rate rather than from a discrete counter.
+
+- **QoS 3 / QoS 4 (reliable)**: Publisher uses `CongestionControl::Block`.
+  `try_publish` delegates to `publish`, which `try_send`s onto the
+  bridge channel and falls back to `blocking_send` if the channel is
+  full. The publisher task then awaits `publisher.put(...).await`; with
+  `CongestionControl::Block` Zenoh's queue applies back-pressure
+  inside the runtime task rather than dropping. `try_publish` therefore
+  always returns `Ok(true)` on the reliable path -- no seq gap, no
+  `backpressure_skipped` events.
+
+**Exact Zenoh API path used**
+
+Per-publisher congestion control is configured at declare time via
+`session.declare_publisher(key).congestion_control(cc).await`, where
+`cc` is one of `zenoh::qos::CongestionControl::{Drop, Block}`. Both
+caches are populated this way during `connect`; lazy-declare fallback
+inside `publisher_task` likewise applies the matching CC for the QoS
+on first sight, so a workload using a key outside the pre-declared
+`bench/0..N-1` set still gets the right congestion control on its
+first publish.
+
+Tests covering this contract live in `src/zenoh.rs` `tests` mod:
+- `test_try_publish_qos1_returns_ok_false_when_channel_full` -- saturates
+  the bridge channel and asserts `Ok(false)` for both BestEffort and
+  LatestValue.
+- `test_try_publish_qos3_and_qos4_never_return_ok_false` -- bursts 2x the
+  channel capacity through reliable QoS and asserts every call returns
+  `Ok(true)` (including across the implicit `blocking_send` fallback).
+- `test_try_publish_qos1_default_path_returns_ok_true` -- single-write
+  sanity case verifying the message is enqueued with the right `qos`
+  tag for downstream cache routing.
