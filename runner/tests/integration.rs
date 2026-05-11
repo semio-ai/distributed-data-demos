@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Path to the runner binary built by cargo.
@@ -27,6 +27,21 @@ fn arg_echo_binary() -> String {
     assert!(
         Path::new(path).exists(),
         "arg-echo binary not found at {path}"
+    );
+    path.to_string()
+}
+
+/// Path to the stderr-writer test helper binary.
+///
+/// Used by the T-impl.9 failure-diagnostic tests below. The helper picks
+/// its behaviour from the `STDERR_WRITER_MODE` env var so a single binary
+/// can cover the timeout-with-stderr, failed-with-stderr, and
+/// failed-with-empty-stderr branches of the runner's new failure block.
+fn stderr_writer_binary() -> String {
+    let path = env!("CARGO_BIN_EXE_stderr-writer");
+    assert!(
+        Path::new(path).exists(),
+        "stderr-writer binary not found at {path}"
     );
     path.to_string()
 }
@@ -1091,6 +1106,285 @@ binary = "../target/release/variant-dummy.exe"
         stderr.contains("no log subfolder")
             || stderr.contains("could not select an existing log subfolder"),
         "expected 'no log subfolder' message, got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// T-impl.9: failure diagnostics block. Each of the next four tests drives the
+// runner against a config that points its single variant at the stderr-writer
+// helper, with `STDERR_WRITER_MODE` chosen so the runner observes a specific
+// spawn outcome. The assertions cover the exact stderr lines the operator
+// would need on a real diagnostic session.
+// ---------------------------------------------------------------------------
+
+/// Build a tempdir + minimal single-runner config that points the variant
+/// binary at `stderr-writer`. Returns (tmp_dir, config_path, log_dir).
+///
+/// The config uses `default_timeout_secs = timeout_secs` so the test can
+/// drive either a clean exit (helper exits in <1s) or a timeout
+/// (helper sleeps forever) by choosing the mode env var, without having
+/// to tune the timeout per case.
+fn build_stderr_writer_config(prefix: &str, timeout_secs: u64) -> (PathBuf, PathBuf, PathBuf) {
+    let writer = stderr_writer_binary();
+    let writer_escaped = writer.replace('\\', "/");
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "runner_t9_{prefix}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let log_dir = tmp_dir.join("logs");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let log_dir_escaped = log_dir.to_string_lossy().replace('\\', "/");
+
+    // qos = 1 (a single concrete level) so the spawn job's effective_name
+    // matches `[[variant]].name` exactly. With `qos` omitted the runner
+    // would expand into four jobs (t9var-qos1..t9var-qos4), each repeating
+    // the failure-diagnostics block once -- harmless but wasteful for the
+    // smoke test.
+    let config = format!(
+        r#"run = "t9run"
+runners = ["local"]
+default_timeout_secs = {timeout_secs}
+
+[[variant]]
+name = "t9var"
+binary = "{writer_escaped}"
+
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+  qos = 1
+  log_dir = "{log_dir_escaped}"
+
+  [variant.specific]
+"#
+    );
+    let config_path = tmp_dir.join("t9.toml");
+    std::fs::write(&config_path, &config).unwrap();
+    (tmp_dir, config_path, log_dir)
+}
+
+/// Failure mode: timeout, with stderr lines already on disk.
+///
+/// The helper prints three labelled lines and sleeps; the runner's
+/// 2-second timeout fires; the runner should print the stderr capture
+/// path, optionally the JSONL path, AND the tail block containing the
+/// three lines.
+#[test]
+fn t9_timeout_with_stderr_prints_capture_path_and_tail() {
+    let (tmp_dir, config_path, _log_dir) = build_stderr_writer_config("timeout", 2);
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .env("STDERR_WRITER_MODE", "lines_then_sleep")
+        .env_remove("RUST_BACKTRACE")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}");
+    eprintln!("--- stderr ---\n{stderr}");
+
+    assert!(
+        !output.status.success(),
+        "runner should exit non-zero on timeout"
+    );
+
+    // The existing status line must still be present (we ADD, never modify).
+    assert!(
+        stderr.contains("'t9var' finished: status=timeout"),
+        "existing status line must remain, got:\n{stderr}"
+    );
+
+    // New block: stderr capture path pointer.
+    assert!(
+        stderr.contains("stderr capture: "),
+        "missing 'stderr capture:' pointer line, got:\n{stderr}"
+    );
+    // The capture file path includes the resolved log subdir but the
+    // capture filename's suffix is the load-bearing thing we want to
+    // see (the subdir name is timestamped so we cannot match it exactly).
+    assert!(
+        stderr.contains("t9var-local-stderr.txt"),
+        "expected stderr capture filename in pointer, got:\n{stderr}"
+    );
+
+    // Tail block must be present with the three labelled lines.
+    assert!(
+        stderr.contains("---- stderr tail"),
+        "expected tail opening separator, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("---- end stderr tail ----"),
+        "expected tail closing separator, got:\n{stderr}"
+    );
+    for needle in ["STDERR-LINE-1", "STDERR-LINE-2", "STDERR-LINE-3"] {
+        assert!(
+            stderr.contains(needle),
+            "expected {needle} in tail, got:\n{stderr}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Failure mode: non-zero exit with no stderr output.
+///
+/// The motivating scenario: a child killed before flushing anything. The
+/// runner must print the empty-capture notice INSTEAD of an empty tail
+/// block (no fake separators).
+#[test]
+fn t9_failed_with_empty_stderr_prints_empty_notice() {
+    let (tmp_dir, config_path, _log_dir) = build_stderr_writer_config("silent_fail", 5);
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .env("STDERR_WRITER_MODE", "silent_fail")
+        .env_remove("RUST_BACKTRACE")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}");
+    eprintln!("--- stderr ---\n{stderr}");
+
+    assert!(
+        !output.status.success(),
+        "runner should exit non-zero on failed variant"
+    );
+
+    assert!(
+        stderr.contains("'t9var' finished: status=failed"),
+        "existing status line must remain, got:\n{stderr}"
+    );
+
+    // Capture path still printed.
+    assert!(
+        stderr.contains("t9var-local-stderr.txt"),
+        "expected stderr capture pointer, got:\n{stderr}"
+    );
+
+    // Empty-capture notice must appear, and the tail-bracket separators must NOT.
+    assert!(
+        stderr.contains("stderr capture is empty"),
+        "expected empty-capture notice, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("---- stderr tail"),
+        "must NOT print a tail block for an empty capture, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("---- end stderr tail ----"),
+        "must NOT print a closing tail separator for an empty capture, got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Failure mode: non-zero exit WITH stderr output. Confirms the tail block
+/// appears on `failed` (not just on `timeout`).
+#[test]
+fn t9_failed_with_stderr_prints_tail() {
+    let (tmp_dir, config_path, _log_dir) = build_stderr_writer_config("failed", 5);
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .env("STDERR_WRITER_MODE", "lines_then_fail")
+        .env_remove("RUST_BACKTRACE")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stderr ---\n{stderr}");
+
+    assert!(
+        !output.status.success(),
+        "runner should exit non-zero on failed variant"
+    );
+    assert!(
+        stderr.contains("'t9var' finished: status=failed"),
+        "existing status line must remain, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("---- stderr tail"),
+        "expected tail block on failed exit, got:\n{stderr}"
+    );
+    for needle in ["FAIL-LINE-1", "FAIL-LINE-2"] {
+        assert!(
+            stderr.contains(needle),
+            "expected {needle} in tail, got:\n{stderr}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Success path: a variant that exits 0 (no `[[variant]]` work, just a quick
+/// stderr write) must NOT trigger the failure-diagnostic block. The runner
+/// stays silent on success -- existing behaviour preserved.
+#[test]
+fn t9_success_stays_quiet_no_tail() {
+    let (tmp_dir, config_path, _log_dir) = build_stderr_writer_config("plain", 5);
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .env("STDERR_WRITER_MODE", "plain")
+        .env_remove("RUST_BACKTRACE")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}");
+    eprintln!("--- stderr ---\n{stderr}");
+
+    assert!(
+        output.status.success(),
+        "runner should exit zero when variant exits 0, got: {:?}\nstderr: {stderr}",
+        output.status.code()
+    );
+    assert!(
+        stderr.contains("'t9var' finished: status=success"),
+        "existing status line must remain, got:\n{stderr}"
+    );
+
+    // None of the failure-diagnostic strings must appear.
+    assert!(
+        !stderr.contains("stderr capture: "),
+        "success path must NOT print stderr capture pointer, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("---- stderr tail"),
+        "success path must NOT print tail block, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("stderr capture is empty"),
+        "success path must NOT print empty-capture notice, got:\n{stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);

@@ -670,6 +670,30 @@ fn run(cli: &Cli) -> Result<()> {
             cli.name, job.effective_name, status, exit_code
         );
 
+        // On a non-success spawn (failed or timeout), surface diagnostic
+        // context so the operator can investigate without scavenging the
+        // logs directory:
+        //   1. absolute path to the stderr capture file
+        //   2. absolute path to the variant's JSONL log file (if present)
+        //   3. either a tail of the capture, or an empty-capture notice
+        //
+        // The motivating case: a websocket variant on a 60s runner timeout
+        // was TerminateProcess'd before writing anything to stderr, the
+        // JSONL log was truncated mid-record, and the original status line
+        // gave no pointer at all. This block makes that situation
+        // diagnosable next time.
+        //
+        // Successful and skipped spawns stay silent (existing behaviour).
+        if status != "success" && status != "skipped" {
+            print_failure_diagnostics(
+                &cli.name,
+                &job.effective_name,
+                &stderr_capture,
+                &stderr_dir,
+                &bench_config.run,
+            );
+        }
+
         // Done barrier identified by the effective spawn name.
         // The variant child has already exited (spawn_and_monitor is
         // synchronous), so on a `BarrierTimeoutError` here there is no
@@ -759,6 +783,94 @@ fn print_summary(run_id: &str, rows: &[SummaryRow]) {
             "{:<24} {:<8} {:<9} {}",
             row.variant, row.runner, row.status, row.exit_code
         );
+    }
+}
+
+/// Print the post-mortem diagnostic block immediately after a non-success
+/// status line.
+///
+/// The format is deliberately compact and grep-friendly so it survives
+/// being collected from several runners into one operator's terminal.
+/// Output goes to the runner's own stderr -- same stream as the status
+/// line -- via `eprintln!`.
+///
+/// Block layout:
+///
+/// ```text
+/// [runner:<name>] stderr capture: <abs path>
+/// [runner:<name>] jsonl log:      <abs path>           # only if file exists
+/// [runner:<name>] ---- stderr tail (last 20 lines) ----
+/// <up to 20 lines, last <= 64 KiB of the capture>
+/// [runner:<name>] ---- end stderr tail ----
+/// ```
+///
+/// If the capture file is missing on disk (defensive case -- the spawn
+/// path always creates it before exec) the tail block is omitted
+/// entirely with no notice. If the capture file is empty (the common
+/// child-killed-before-flush case the original bug surfaced) a single
+/// line replaces the bracketed tail block:
+///
+/// ```text
+/// [runner:<name>] (stderr capture is empty -- child likely killed before writing any output)
+/// ```
+fn print_failure_diagnostics(
+    runner_name: &str,
+    effective_name: &str,
+    stderr_capture: &std::path::Path,
+    log_subdir: &std::path::Path,
+    run: &str,
+) {
+    eprintln!(
+        "[runner:{runner_name}] stderr capture: {}",
+        stderr_capture.display()
+    );
+
+    // JSONL log pointer: print only when the file exists on disk. The
+    // schema dictates the filename; the variant may or may not have got
+    // far enough to create it. Courtesy pointer, not a guarantee.
+    let jsonl = spawn::jsonl_log_path(log_subdir, effective_name, runner_name, run);
+    if jsonl.exists() {
+        eprintln!("[runner:{runner_name}] jsonl log:      {}", jsonl.display());
+    }
+
+    // Stderr tail. Cap the displayed lines at 20 to keep the operator's
+    // terminal readable; the byte cap inside the helper handles the
+    // pathological-file case.
+    const TAIL_LINES: usize = 20;
+    match spawn::tail_stderr_file(stderr_capture, TAIL_LINES) {
+        Ok(Some(content)) if content.is_empty() => {
+            eprintln!(
+                "[runner:{runner_name}] (stderr capture is empty -- child likely killed before writing any output)"
+            );
+        }
+        Ok(Some(content)) => {
+            eprintln!(
+                "[runner:{runner_name}] ---- stderr tail (last {TAIL_LINES} lines) ----"
+            );
+            // Print the tail content as-is. Use `eprint!` (not `eprintln!`)
+            // because the tail already carries its own line breaks; adding
+            // another would produce a blank line at the end. If the tail
+            // does NOT end with '\n' (child crashed without flushing the
+            // final newline) we add one so the closing separator lands on
+            // its own line.
+            eprint!("{content}");
+            if !content.ends_with('\n') {
+                eprintln!();
+            }
+            eprintln!("[runner:{runner_name}] ---- end stderr tail ----");
+        }
+        Ok(None) => {
+            // Capture file is unexpectedly missing on disk. The spawn path
+            // creates it before exec, so this is a "should never happen"
+            // case. Silently skip rather than print a misleading notice;
+            // the stderr-capture path line above already tells the operator
+            // where to look.
+        }
+        Err(e) => {
+            eprintln!(
+                "[runner:{runner_name}] WARN: failed to read stderr capture for tail: {e:#}"
+            );
+        }
     }
 }
 
