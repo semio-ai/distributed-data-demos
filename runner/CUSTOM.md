@@ -127,6 +127,43 @@ When a variant exceeds its timeout:
 3. Send SIGKILL if still alive
 4. Record status as "timeout" in the done barrier
 
+### Per-spawn stderr capture
+
+Every variant child's stderr is redirected to a per-spawn file so panic /
+abort / OS-error messages survive even when the JSONL log was truncated
+mid-write. The capture file lives next to the variant's JSONL log:
+
+```
+<log_subdir>/<effective_name>-<runner_name>-stderr.txt
+```
+
+Where `<log_subdir>` is the absolute path the variant's logs go into
+(`log_dir_resolved` when the variant declared its own `log_dir`, otherwise
+the run-level `run_log_dir`), `<effective_name>` is the spawn's synthesized
+name (e.g. `myvariant`, `myvariant-qos3`, `v-1000x100hz-qos2`), and
+`<runner_name>` is this runner's `--name`.
+
+Semantics:
+
+- **Truncate on every spawn.** The file is opened with create-or-truncate
+  before `Command::spawn`, so a `--resume` re-spawn of the same
+  `(variant, runner)` cleanly overwrites the previous attempt. The opening
+  happens *before* the child is spawned, which guarantees the file exists
+  on disk even if the child is killed mid-write during a timeout — nothing
+  the child does can prevent file creation.
+- **`Stdio::from(File::create(...))`.** The OS writes child stderr directly
+  to the file. No intermediate reader thread, no deadlock risk on child
+  closure, no flush from the runner needed — the kernel flushes on child
+  exit or kill.
+- **Runner's own stderr is untouched.** Only the variant child's stderr is
+  redirected. Operators still see runner-side panics, FATAL lines, and
+  coordination tracing on the runner's terminal.
+
+Use these files first when investigating "why did the variant crash under
+load?" questions — they catch the messages the JSONL log can't (panics
+after the writer buffer was discarded, allocator aborts, signal-level
+faults).
+
 ### Peer host capture (E9 Part A)
 
 The discovery loop must use `recv_from` so the source `SocketAddr` of every
