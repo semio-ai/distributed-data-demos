@@ -430,4 +430,101 @@ binary = "./x"
         let peers_idx = args.iter().position(|a| a == "--peers").unwrap();
         assert_eq!(args[peers_idx + 1], "alpha=127.0.0.1,zeta=192.168.1.20");
     }
+
+    #[test]
+    fn build_args_passes_eot_timeout_secs_when_present_in_common() {
+        // [variant.common].eot_timeout_secs = 7 must appear as
+        // `--eot-timeout-secs 7` on the variant CLI. T-impl.3 verifies
+        // that the existing snake_case -> --kebab-case automatic mapping
+        // already covers `eot_timeout_secs` with no special code path.
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 0
+  operate_secs = 30
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  log_dir = "./logs"
+  eot_timeout_secs = 7
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v",
+            1,
+            100,
+            1,
+            &peers,
+        );
+
+        let idx = args
+            .iter()
+            .position(|a| a == "--eot-timeout-secs")
+            .expect("--eot-timeout-secs must be emitted when present in [variant.common]");
+        assert_eq!(args[idx + 1], "7");
+
+        // No duplicate flag.
+        let count = args.iter().filter(|a| *a == "--eot-timeout-secs").count();
+        assert_eq!(count, 1, "--eot-timeout-secs must appear exactly once");
+    }
+
+    #[test]
+    fn build_args_omits_eot_timeout_secs_when_absent_from_common() {
+        // Absence in TOML => no --eot-timeout-secs flag on the child CLI;
+        // the variant falls back to its own driver default
+        // (`max(3 * operate_secs, 30)`).
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 0
+  operate_secs = 30
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  log_dir = "./logs"
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v",
+            1,
+            100,
+            1,
+            &peers,
+        );
+
+        assert!(
+            !args.iter().any(|a| a == "--eot-timeout-secs"),
+            "--eot-timeout-secs must be absent when not in [variant.common]; got args = {args:?}"
+        );
+    }
 }
