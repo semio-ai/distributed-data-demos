@@ -101,6 +101,29 @@ for each (name, host) in --peers where name != --runner:
 If `--runner` is not present in `--peers`, fail loudly with a clear
 error — this indicates a runner/contract bug.
 
+#### Same-host port-collision guarantee (T-impl.4)
+
+The `runner_index * runner_stride` term in the listen-port formula
+exists specifically so that two runners co-located on the same host
+(alice + bob with `--peers alice=127.0.0.1,bob=127.0.0.1`) end up
+binding **different** TCP ports. With `--ws-base-port 19960` and
+`qos = 3`, alice binds `19980` and bob binds `19981`; neither can
+ever observe an `EADDRINUSE` from the other on the same host.
+
+This is verified by two test layers:
+
+1. Unit test `t_impl_4_same_host_port_offset_alice_and_bob` in
+   `src/pairing.rs` asserts that `bob.listen_addr.port() -
+   alice.listen_addr.port() == RUNNER_STRIDE` for the canonical
+   two-runner same-host peer map.
+2. Ignored integration test
+   `two_runner_websocket_same_host_qos3_no_port_collision` in
+   `tests/two_runner_regression.rs` spawns two runner child processes
+   on localhost against `tests/fixtures/two-runner-websocket-100x100hz-qos3.toml`
+   and asserts both runners produce non-zero `write` AND non-zero
+   cross-`receive` counts inside their operate windows. Run via:
+   `cargo test --release -p variant-websocket -- --ignored two_runner_regression`.
+
 ### Symmetric peer pairing — who connects, who accepts
 
 Each peer pair has exactly **one** WebSocket connection, full-duplex.
