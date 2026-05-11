@@ -844,9 +844,7 @@ fn print_failure_diagnostics(
             );
         }
         Ok(Some(content)) => {
-            eprintln!(
-                "[runner:{runner_name}] ---- stderr tail (last {TAIL_LINES} lines) ----"
-            );
+            eprintln!("[runner:{runner_name}] ---- stderr tail (last {TAIL_LINES} lines) ----");
             // Print the tail content as-is. Use `eprint!` (not `eprintln!`)
             // because the tail already carries its own line breaks; adding
             // another would produce a blank line at the end. If the tail
@@ -867,9 +865,7 @@ fn print_failure_diagnostics(
             // where to look.
         }
         Err(e) => {
-            eprintln!(
-                "[runner:{runner_name}] WARN: failed to read stderr capture for tail: {e:#}"
-            );
+            eprintln!("[runner:{runner_name}] WARN: failed to read stderr capture for tail: {e:#}");
         }
     }
 }
