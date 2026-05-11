@@ -177,7 +177,11 @@ impl Variant for HybridVariant {
         "hybrid"
     }
 
-    fn connect(&mut self) -> Result<()> {
+    fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
+        // T14.1 compile-fix only -- the trait signature gained the
+        // threading-mode argument. Real Multi-mode handling for Hybrid
+        // is filed under T14.4.
+        let _ = threading_mode;
         // Set up UDP multicast for QoS 1-2.
         let udp = UdpTransport::new(self.config.bind_addr, self.config.multicast_group)
             .context("failed to set up UDP multicast transport")?;
@@ -489,7 +493,8 @@ mod tests {
         config.qos = Qos::BestEffort;
 
         let mut v = HybridVariant::new("self-udp", config);
-        v.connect().expect("connect must succeed");
+        v.connect(variant_base::ThreadingMode::Single)
+            .expect("connect must succeed");
 
         let id1 = v
             .signal_end_of_test()
@@ -532,7 +537,8 @@ mod tests {
         let _ = &mut config;
 
         let mut v = HybridVariant::new("hybrid-writer", config);
-        v.connect().expect("connect must succeed");
+        v.connect(variant_base::ThreadingMode::Single)
+            .expect("connect must succeed");
 
         // Accept the inbound on the listener side.
         let (mut peer_stream, _) = listener.accept().unwrap();
@@ -738,7 +744,7 @@ mod tests {
         let mut cfg = dummy_config();
         cfg.multicast_group = "239.0.0.1:19952".parse().unwrap();
         let mut v = HybridVariant::new("self", cfg);
-        if v.connect().is_err() {
+        if v.connect(variant_base::ThreadingMode::Single).is_err() {
             // CI without multicast: skip silently.
             return;
         }

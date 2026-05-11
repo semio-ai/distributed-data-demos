@@ -619,7 +619,11 @@ impl Variant for UdpVariant {
         "custom-udp"
     }
 
-    fn connect(&mut self) -> Result<()> {
+    fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
+        // T14.1 compile-fix only -- the trait signature gained the
+        // threading-mode argument. Real Multi-mode handling for
+        // custom-udp is filed under T14.3.
+        let _ = threading_mode;
         self.setup_udp()?;
 
         if self.config.qos == Qos::ReliableTcp {
@@ -735,7 +739,7 @@ mod tests {
         let mut variant = UdpVariant::new(default_config(Qos::BestEffort));
         // connect may fail in CI environments without multicast support,
         // but should not panic.
-        if variant.connect().is_ok() {
+        if variant.connect(variant_base::ThreadingMode::Single).is_ok() {
             assert!(variant.disconnect().is_ok());
         }
     }
@@ -1209,7 +1213,7 @@ mod tests {
         let mut cfg = default_config(Qos::BestEffort);
         cfg.multicast_group = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 19940);
         let mut v = UdpVariant::new(cfg);
-        if v.connect().is_err() {
+        if v.connect(variant_base::ThreadingMode::Single).is_err() {
             // CI without multicast: skip silently. This is the same
             // pattern used by `connect_and_disconnect` above.
             return;

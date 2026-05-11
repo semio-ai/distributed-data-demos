@@ -421,7 +421,11 @@ impl Variant for WebSocketVariant {
         "websocket"
     }
 
-    fn connect(&mut self) -> Result<()> {
+    fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
+        // T14.1 compile-fix only -- the trait signature gained the
+        // threading-mode argument. Real Multi-mode handling for
+        // WebSocket is filed under T14.2.
+        let _ = threading_mode;
         // Defensive: the variant only supports reliable QoS levels (3 and 4).
         // `main` should already have rejected 1/2 before we got here, but
         // re-check so the trait is robust on its own.
@@ -679,7 +683,9 @@ mod tests {
     #[test]
     fn connect_with_qos1_errors() {
         let mut v = WebSocketVariant::new("r", dummy_config(Qos::BestEffort));
-        let err = v.connect().expect_err("connect must reject qos 1");
+        let err = v
+            .connect(variant_base::ThreadingMode::Single)
+            .expect_err("connect must reject qos 1");
         let msg = format!("{err:#}");
         assert!(msg.contains("does not support") || msg.contains("reliable"));
     }

@@ -453,7 +453,11 @@ impl Variant for QuicVariant {
         "quic"
     }
 
-    fn connect(&mut self) -> Result<()> {
+    fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
+        // T14.1 compile-fix only -- the trait signature gained the
+        // threading-mode argument. Real Multi-only capability
+        // declaration + Single-mode rejection is filed under T14.5.
+        let _ = threading_mode;
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
 
         let (send_tx, send_rx) = mpsc::unbounded_channel::<OutboundMessage>();
@@ -1151,7 +1155,8 @@ mod tests {
         // empty after connect(). Use a fresh ephemeral port.
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut v = QuicVariant::new("solo", bind_addr, vec![]);
-        v.connect().expect("connect with no peers");
+        v.connect(variant_base::ThreadingMode::Single)
+            .expect("connect with no peers");
 
         for qos in [
             Qos::BestEffort,
@@ -1202,11 +1207,15 @@ mod tests {
         // continues on a dial timeout, so without this ordering A's
         // connections vec ends up empty and the burst loop returns
         // Ok(true) forever.
-        variant_b.connect().expect("connect b");
+        variant_b
+            .connect(variant_base::ThreadingMode::Single)
+            .expect("connect b");
         // A short delay so B's accept loop is definitely armed before
         // A starts its handshake.
         std::thread::sleep(Duration::from_millis(200));
-        variant_a.connect().expect("connect a");
+        variant_a
+            .connect(variant_base::ThreadingMode::Single)
+            .expect("connect a");
 
         // Wait for A's outbound connection to actually be established
         // -- without this the burst is a no-op (no connections =>
@@ -1267,9 +1276,13 @@ mod tests {
 
         let mut variant_a = QuicVariant::new("a", addr_a, vec![addr_b]);
         let mut variant_b = QuicVariant::new("b", addr_b, vec![addr_a]);
-        variant_b.connect().expect("connect b");
+        variant_b
+            .connect(variant_base::ThreadingMode::Single)
+            .expect("connect b");
         std::thread::sleep(Duration::from_millis(200));
-        variant_a.connect().expect("connect a");
+        variant_a
+            .connect(variant_base::ThreadingMode::Single)
+            .expect("connect a");
         std::thread::sleep(Duration::from_millis(500));
 
         // Reliable path: try_publish must always return Ok(true) even

@@ -766,7 +766,11 @@ impl Variant for WebRtcVariant {
         "webrtc"
     }
 
-    fn connect(&mut self) -> Result<()> {
+    fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
+        // T14.1 compile-fix only -- the trait signature gained the
+        // threading-mode argument. Real Multi-only capability
+        // declaration + Single-mode rejection is filed under T14.6.
+        let _ = threading_mode;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_io()

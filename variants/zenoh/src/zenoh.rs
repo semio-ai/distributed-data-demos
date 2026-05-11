@@ -873,7 +873,12 @@ impl Variant for ZenohVariant {
         "zenoh"
     }
 
-    fn connect(&mut self) -> Result<()> {
+    fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
+        // T14.1 compile-fix only -- the trait signature gained the
+        // threading-mode argument so every variant accepts it now.
+        // Real Multi-mode handling for Zenoh is filed under T14.7
+        // (declare `[Multi]` capability + reject Single at connect).
+        let _ = threading_mode;
         let trace = self.zenoh_args.debug_trace;
         let t0 = Instant::now();
         trace_if!(
@@ -1681,7 +1686,9 @@ mod tests {
         const N: u64 = 10_000;
 
         let mut variant = ZenohVariant::new("stress-runner", &[]).expect("construct variant");
-        variant.connect().expect("connect");
+        variant
+            .connect(variant_base::ThreadingMode::Single)
+            .expect("connect");
 
         // Give Zenoh a moment to warm up its loopback discovery before we
         // start measuring delivery — without a brief settle the first
