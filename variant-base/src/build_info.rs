@@ -7,7 +7,7 @@
 //!
 //!   * `BUILD_GIT_SHA`   -- 7-char short SHA, or "unknown" when unavailable.
 //!   * `BUILD_GIT_DIRTY` -- "true" if the working tree has uncommitted
-//!                          changes at compile time, "false" otherwise.
+//!     changes at compile time, "false" otherwise.
 //!   * `BUILD_RUSTC`     -- rustc version string.
 //!
 //! Binaries pass those values into [`format_banner`] (or [`print_banner`])
@@ -70,12 +70,7 @@ pub fn print_banner(label: &str, sha: &str, dirty: bool, rustc: &str) {
 macro_rules! print_build_banner {
     ($label:expr) => {{
         let dirty = $crate::build_info::is_dirty(env!("BUILD_GIT_DIRTY"));
-        $crate::build_info::print_banner(
-            $label,
-            env!("BUILD_GIT_SHA"),
-            dirty,
-            env!("BUILD_RUSTC"),
-        );
+        $crate::build_info::print_banner($label, env!("BUILD_GIT_SHA"), dirty, env!("BUILD_RUSTC"));
     }};
 }
 
