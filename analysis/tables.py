@@ -125,6 +125,15 @@ _UNCORRECTED_SUFFIX: str = " (uncorrected)"
 def format_performance_table(results: list[PerformanceResult]) -> str:
     """Format the performance report as a CLI table.
 
+    Column order (T11.5): receive throughput leads as the headline
+    metric -- the project goal "keep peers in sync under huge change
+    diffs" is bottlenecked by receivers, not writers, so the receive
+    rate is what decides "in sync". Write rate is shown next as the
+    "requested rate" context, followed by delivery percentage
+    (receives / writes), then latency percentiles, jitter, loss and
+    other existing columns. No metric is removed; only the ORDER and
+    EMPHASIS change relative to pre-T11.5 output.
+
     When a ``PerformanceResult`` carries
     ``has_uncorrected_latency = True`` (at least one underlying delivery
     record had ``offset_applied == False`` because no ``clock_sync``
@@ -148,9 +157,10 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     # the table.
     w_variant = 22
     w_run = 16
+    w_rate = 14
+    w_deliv = 11
     w_conn = 13
     w_lat = 25
-    w_rate = 12
     w_jitter = 12
     w_loss = 9
     w_late = 9
@@ -158,12 +168,14 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     header = (
         _pad("Variant", w_variant)
         + _pad("Run", w_run)
+        + _rpad("Receives/s", w_rate)
+        + _rpad("Writes/s(req)", w_rate)
+        + _rpad("Delivery%", w_deliv)
         + _rpad("Connect(ms)", w_conn)
         + _rpad("Lat p50", w_lat)
         + _rpad("p95", w_lat)
         + _rpad("p99", w_lat)
         + _rpad("Max", w_lat)
-        + _rpad("Writes/s", w_rate)
         + _rpad("Jitter avg", w_jitter)
         + _rpad("Jitter p95", w_jitter)
         + _rpad("Loss%", w_loss)
@@ -175,15 +187,24 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     for r in results:
         suffix = _UNCORRECTED_SUFFIX if r.has_uncorrected_latency else ""
         late_str = "-" if r.late_receives is None else f"{r.late_receives:,}"
+        # Delivery % derived from existing throughput numbers. The
+        # values themselves do not change vs pre-T11.5; only the
+        # ordering does.
+        if r.writes_per_sec > 0:
+            delivery_pct = 100.0 * r.receives_per_sec / r.writes_per_sec
+        else:
+            delivery_pct = 0.0
         row = (
             _pad(r.variant, w_variant)
             + _pad(r.run, w_run)
+            + _rpad(_fmt_rate(r.receives_per_sec), w_rate)
+            + _rpad(_fmt_rate(r.writes_per_sec), w_rate)
+            + _rpad(_fmt_pct(delivery_pct), w_deliv)
             + _rpad(f"{r.connect_mean_ms:.1f}", w_conn)
             + _rpad(_fmt_ms(r.latency_p50_ms) + suffix, w_lat)
             + _rpad(_fmt_ms(r.latency_p95_ms) + suffix, w_lat)
             + _rpad(_fmt_ms(r.latency_p99_ms) + suffix, w_lat)
             + _rpad(_fmt_ms(r.latency_max_ms) + suffix, w_lat)
-            + _rpad(_fmt_rate(r.writes_per_sec), w_rate)
             + _rpad(_fmt_ms(r.jitter_ms), w_jitter)
             + _rpad(_fmt_ms(r.jitter_p95_ms), w_jitter)
             + _rpad(_fmt_pct(r.loss_pct), w_loss)
