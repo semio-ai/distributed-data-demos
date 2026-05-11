@@ -1,5 +1,42 @@
 use clap::Parser;
 
+use crate::types::ThreadingMode;
+
+/// Default value for `--recv-buffer-kb` when the runner does not
+/// inject one. Matches `metak-shared/api-contracts/variant-cli.md`
+/// (E14 additions section).
+pub const DEFAULT_RECV_BUFFER_KB: u32 = 4096;
+
+/// Inclusive lower bound for `--recv-buffer-kb`. 64 KiB sits below
+/// the Windows default recv-buffer size but is harmless on every
+/// platform; the value exists mostly to surface accidental zero / tiny
+/// values rather than to gate legitimate sizes.
+pub const MIN_RECV_BUFFER_KB: u32 = 64;
+
+/// Inclusive upper bound for `--recv-buffer-kb`. 64 MiB is generous
+/// on a Raspberry Pi 4 with 4 GB RAM under a two-peer benchmark and
+/// well above what any sane variant would actually need.
+pub const MAX_RECV_BUFFER_KB: u32 = 65_536;
+
+/// Validate that `kb` falls within the documented `--recv-buffer-kb`
+/// range. Returned by clap's `value_parser`.
+fn parse_recv_buffer_kb(s: &str) -> Result<u32, String> {
+    let kb: u32 = s
+        .parse()
+        .map_err(|e| format!("invalid --recv-buffer-kb value '{s}': {e}"))?;
+    if !(MIN_RECV_BUFFER_KB..=MAX_RECV_BUFFER_KB).contains(&kb) {
+        return Err(format!(
+            "--recv-buffer-kb must be in {MIN_RECV_BUFFER_KB}..={MAX_RECV_BUFFER_KB} (got {kb})"
+        ));
+    }
+    Ok(kb)
+}
+
+/// Parse `--threading-mode <single|multi>` for clap's `value_parser`.
+fn parse_threading_mode(s: &str) -> Result<ThreadingMode, String> {
+    s.parse::<ThreadingMode>().map_err(|e| e.to_string())
+}
+
 /// Common CLI arguments shared by all variant implementations.
 ///
 /// Variant-specific arguments are collected as trailing arguments and
@@ -69,6 +106,34 @@ pub struct CliArgs {
     /// The run identifier from config.
     #[arg(long)]
     pub run: String,
+
+    /// Threading execution model the variant is asked to use.
+    ///
+    /// Set by the runner from the expanded `threading_modes` dimension
+    /// in TOML config (see `metak-shared/api-contracts/variant-cli.md`
+    /// "E14 additions"). Variants declare which modes they support via
+    /// `Variant::supported_threading_modes`.
+    ///
+    /// Optional during the E14 rollout with a default of `single`: the
+    /// runner does not yet inject this arg (the runner-side change is
+    /// T14.8). Once T14.8 lands and the runner always injects
+    /// `--threading-mode`, this becomes effectively required. Existing
+    /// variant binaries and runner integration tests that pre-date
+    /// T14.1 keep working unchanged because the default preserves the
+    /// pre-E14 single-threaded behaviour.
+    #[arg(long, value_parser = parse_threading_mode, default_value_t = ThreadingMode::Single)]
+    pub threading_mode: ThreadingMode,
+
+    /// OS-level recv buffer size in kibibytes (1024-byte units).
+    ///
+    /// Default `4096` (4 MiB), range `64..=65536` (64 KiB to 64 MiB).
+    /// Variants must call `setsockopt(SO_RCVBUF, recv_buffer_kb * 1024)`
+    /// on every recv-side socket they own. Variants whose transport
+    /// library does not expose the underlying socket may treat this as
+    /// advisory but must still record the value in the `connected`
+    /// JSONL event.
+    #[arg(long, value_parser = parse_recv_buffer_kb, default_value_t = DEFAULT_RECV_BUFFER_KB)]
+    pub recv_buffer_kb: u32,
 
     // -- Variant-specific pass-through arguments --
     /// Additional variant-specific arguments (collected as trailing args).
@@ -153,6 +218,8 @@ mod tests {
             "a",
             "--run",
             "run01",
+            "--threading-mode",
+            "single",
         ]);
         assert_eq!(args.tick_rate_hz, 100);
         assert_eq!(args.stabilize_secs, 5);
@@ -166,6 +233,156 @@ mod tests {
         assert_eq!(args.variant, "dummy");
         assert_eq!(args.runner, "a");
         assert_eq!(args.run, "run01");
+        assert_eq!(args.threading_mode, ThreadingMode::Single);
+        // `--recv-buffer-kb` was not provided -> falls back to the default.
+        assert_eq!(args.recv_buffer_kb, DEFAULT_RECV_BUFFER_KB);
+    }
+
+    #[test]
+    fn parse_threading_mode_multi_and_recv_buffer_override() {
+        let args = CliArgs::parse_from([
+            "variant-dummy",
+            "--tick-rate-hz",
+            "100",
+            "--stabilize-secs",
+            "0",
+            "--operate-secs",
+            "1",
+            "--silent-secs",
+            "0",
+            "--workload",
+            "scalar-flood",
+            "--values-per-tick",
+            "1",
+            "--qos",
+            "1",
+            "--log-dir",
+            "/tmp/logs",
+            "--launch-ts",
+            "2026-04-12T14:00:00.000000000Z",
+            "--variant",
+            "dummy",
+            "--runner",
+            "a",
+            "--run",
+            "run01",
+            "--threading-mode",
+            "multi",
+            "--recv-buffer-kb",
+            "8192",
+        ]);
+        assert_eq!(args.threading_mode, ThreadingMode::Multi);
+        assert_eq!(args.recv_buffer_kb, 8192);
+    }
+
+    #[test]
+    fn recv_buffer_kb_rejects_out_of_range() {
+        let res = CliArgs::try_parse_from([
+            "variant-dummy",
+            "--tick-rate-hz",
+            "100",
+            "--stabilize-secs",
+            "0",
+            "--operate-secs",
+            "1",
+            "--silent-secs",
+            "0",
+            "--workload",
+            "scalar-flood",
+            "--values-per-tick",
+            "1",
+            "--qos",
+            "1",
+            "--log-dir",
+            "/tmp/logs",
+            "--launch-ts",
+            "2026-04-12T14:00:00.000000000Z",
+            "--variant",
+            "dummy",
+            "--runner",
+            "a",
+            "--run",
+            "run01",
+            "--threading-mode",
+            "single",
+            "--recv-buffer-kb",
+            "0",
+        ]);
+        assert!(
+            res.is_err(),
+            "--recv-buffer-kb=0 is below the 64-KiB minimum and must be rejected"
+        );
+        let res = CliArgs::try_parse_from([
+            "variant-dummy",
+            "--tick-rate-hz",
+            "100",
+            "--stabilize-secs",
+            "0",
+            "--operate-secs",
+            "1",
+            "--silent-secs",
+            "0",
+            "--workload",
+            "scalar-flood",
+            "--values-per-tick",
+            "1",
+            "--qos",
+            "1",
+            "--log-dir",
+            "/tmp/logs",
+            "--launch-ts",
+            "2026-04-12T14:00:00.000000000Z",
+            "--variant",
+            "dummy",
+            "--runner",
+            "a",
+            "--run",
+            "run01",
+            "--threading-mode",
+            "single",
+            "--recv-buffer-kb",
+            "1000000",
+        ]);
+        assert!(
+            res.is_err(),
+            "--recv-buffer-kb=1_000_000 exceeds the 64-MiB maximum and must be rejected"
+        );
+    }
+
+    #[test]
+    fn threading_mode_defaults_to_single_during_e14_rollout() {
+        // Until T14.8 lands the runner does not inject --threading-mode.
+        // To keep existing runner integration tests working, the CLI
+        // arg defaults to `single` (the pre-E14 effective behaviour).
+        // Once T14.8 lands, the runner always injects this arg.
+        let args = CliArgs::parse_from([
+            "variant-dummy",
+            "--tick-rate-hz",
+            "100",
+            "--stabilize-secs",
+            "0",
+            "--operate-secs",
+            "1",
+            "--silent-secs",
+            "0",
+            "--workload",
+            "scalar-flood",
+            "--values-per-tick",
+            "1",
+            "--qos",
+            "1",
+            "--log-dir",
+            "/tmp/logs",
+            "--launch-ts",
+            "2026-04-12T14:00:00.000000000Z",
+            "--variant",
+            "dummy",
+            "--runner",
+            "a",
+            "--run",
+            "run01",
+        ]);
+        assert_eq!(args.threading_mode, ThreadingMode::Single);
     }
 
     #[test]
@@ -196,6 +413,8 @@ mod tests {
             "a",
             "--run",
             "run01",
+            "--threading-mode",
+            "single",
             "--eot-timeout-secs",
             "7",
         ]);
@@ -230,6 +449,8 @@ mod tests {
             "a",
             "--run",
             "run01",
+            "--threading-mode",
+            "single",
         ]);
         assert_eq!(args.eot_timeout_secs, None);
     }
@@ -312,6 +533,8 @@ mod tests {
             "b",
             "--run",
             "run02",
+            "--threading-mode",
+            "single",
             "--",
             "--zenoh-mode",
             "peer",

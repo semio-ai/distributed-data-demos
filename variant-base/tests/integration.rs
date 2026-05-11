@@ -3,12 +3,17 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-use variant_base::cli::CliArgs;
+use variant_base::cli::{CliArgs, DEFAULT_RECV_BUFFER_KB};
 use variant_base::driver::run_protocol;
 use variant_base::dummy::VariantDummy;
+use variant_base::types::ThreadingMode;
 
 /// Build CLI args for a short test run.
 fn test_args(log_dir: &str) -> CliArgs {
+    test_args_with_mode(log_dir, ThreadingMode::Single)
+}
+
+fn test_args_with_mode(log_dir: &str, threading_mode: ThreadingMode) -> CliArgs {
     CliArgs {
         tick_rate_hz: 10,
         stabilize_secs: 0,
@@ -25,6 +30,8 @@ fn test_args(log_dir: &str) -> CliArgs {
         variant: "dummy".to_string(),
         runner: "test-runner".to_string(),
         run: "run01".to_string(),
+        threading_mode,
+        recv_buffer_kb: DEFAULT_RECV_BUFFER_KB,
         // Single-runner self-loopback peers list -> empty expected set
         // -> EOT phase terminates immediately with no `eot_timeout`.
         extra: vec!["--peers".to_string(), "test-runner=127.0.0.1".to_string()],
@@ -209,6 +216,8 @@ fn test_variant_dummy_binary_exit_code() {
             "bin-test",
             "--run",
             "run-bin",
+            "--threading-mode",
+            "single",
             "--peers",
             "bin-test=127.0.0.1",
         ])
@@ -237,4 +246,80 @@ fn test_variant_dummy_binary_exit_code() {
         })
         .count();
     assert!(line_count > 0, "log file should have at least one line");
+}
+
+/// Run VariantDummy end-to-end in `single` and `multi` modes and
+/// verify the expected JSONL event sequence is produced for both
+/// (T14.1 integration acceptance).
+#[test]
+fn test_variant_dummy_runs_in_both_threading_modes() {
+    for mode in [ThreadingMode::Single, ThreadingMode::Multi] {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().to_str().unwrap();
+        let args = test_args_with_mode(log_dir, mode);
+
+        let mut dummy = VariantDummy::new(&args.runner);
+        run_protocol(&mut dummy, &args)
+            .unwrap_or_else(|e| panic!("protocol completes in {mode} mode: {e}"));
+        // The dummy stored the mode the driver supplied at connect time.
+        assert_eq!(
+            dummy.connected_mode(),
+            Some(mode),
+            "dummy should record the driver-supplied threading mode"
+        );
+
+        let lines = read_log(log_dir);
+        let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
+
+        // The expected phase / lifecycle event sequence must be present
+        // regardless of mode.
+        let phases: Vec<&str> = lines
+            .iter()
+            .filter(|l| l["event"] == "phase")
+            .map(|l| l["phase"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            phases,
+            vec!["connect", "stabilize", "operate", "eot", "silent"],
+            "phase order must be canonical in {mode} mode"
+        );
+
+        // Exactly one `connected` event carrying the mode and the
+        // default recv-buffer size.
+        let connected: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["event"] == "connected").collect();
+        assert_eq!(
+            connected.len(),
+            1,
+            "exactly one connected event in {mode} mode"
+        );
+        assert_eq!(
+            connected[0]["threading_mode"],
+            mode.as_str(),
+            "connected event must record the threading_mode for {mode}"
+        );
+        assert_eq!(
+            connected[0]["recv_buffer_kb"], DEFAULT_RECV_BUFFER_KB,
+            "connected event must record recv_buffer_kb for {mode}"
+        );
+
+        // Exactly one `eot_sent` event (single-runner -> immediate exit).
+        let eot_sent = events.iter().filter(|&&e| e == "eot_sent").count();
+        assert_eq!(eot_sent, 1, "expected exactly one eot_sent in {mode} mode");
+        let eot_timeout = events.iter().filter(|&&e| e == "eot_timeout").count();
+        assert_eq!(
+            eot_timeout, 0,
+            "single-runner self-loopback should not emit eot_timeout in {mode} mode"
+        );
+
+        // The dummy echoes every publish; we expect both writes and
+        // matching receives during the operate phase.
+        let writes = events.iter().filter(|&&e| e == "write").count();
+        let receives = events.iter().filter(|&&e| e == "receive").count();
+        assert!(writes > 0, "expected at least one write in {mode} mode");
+        assert_eq!(
+            writes, receives,
+            "every write should have a matching receive in {mode} mode (dummy echoes)"
+        );
+    }
 }

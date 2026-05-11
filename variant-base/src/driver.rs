@@ -109,8 +109,15 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     let mut workload = create_workload(&config.workload)?;
 
     // -- Phase 1: Connect --
+    //
+    // The threading mode is passed through to the variant so it can
+    // branch its connect-time setup. After `connect` returns Ok, the
+    // driver calls `start_reader_threads(mode)` to spawn any per-peer
+    // reader threads the variant declared support for; the default
+    // impl is a no-op for Single-only variants. See E14 / T14.1.
     logger.log_phase(Phase::Connect, None)?;
-    variant.connect()?;
+    variant.connect(config.threading_mode)?;
+    variant.start_reader_threads(config.threading_mode)?;
 
     let launch_ts = DateTime::parse_from_rfc3339(&config.launch_ts)?;
     let now = chrono::Utc::now();
@@ -118,7 +125,12 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         .num_nanoseconds()
         .unwrap_or(0) as f64
         / 1_000_000.0;
-    logger.log_connected(&config.launch_ts, elapsed_ms)?;
+    logger.log_connected(
+        &config.launch_ts,
+        elapsed_ms,
+        config.threading_mode,
+        config.recv_buffer_kb,
+    )?;
 
     // -- Phase 2: Stabilize --
     logger.log_phase(Phase::Stabilize, None)?;
@@ -371,6 +383,11 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         }
     }
 
+    // Tear down reader threads (if any) BEFORE the variant's own
+    // `disconnect` runs, so any in-flight receives those threads were
+    // about to deliver can drain cleanly. The default impl is a no-op.
+    // See E14 / T14.1.
+    variant.stop_reader_threads()?;
     variant.disconnect()?;
     logger.flush()?;
 
@@ -388,12 +405,12 @@ mod tests {
     use anyhow::Result;
     use tempfile::TempDir;
 
-    use crate::cli::CliArgs;
+    use crate::cli::{CliArgs, DEFAULT_RECV_BUFFER_KB};
     use crate::driver::{
         default_eot_timeout_secs, run_protocol, DEFAULT_EOT_TIMEOUT_OPERATE_MULTIPLIER,
         MIN_DEFAULT_EOT_TIMEOUT_SECS,
     };
-    use crate::types::{Qos, ReceivedUpdate};
+    use crate::types::{Qos, ReceivedUpdate, ThreadingMode};
     use crate::variant_trait::{PeerEot, Variant};
 
     #[test]
@@ -470,7 +487,7 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        fn connect(&mut self) -> Result<()> {
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
             Ok(())
         }
         fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
@@ -508,7 +525,7 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        fn connect(&mut self) -> Result<()> {
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
             Ok(())
         }
         fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
@@ -546,6 +563,8 @@ mod tests {
             variant: "test".to_string(),
             runner: runner.to_string(),
             run: "run01".to_string(),
+            threading_mode: ThreadingMode::Single,
+            recv_buffer_kb: DEFAULT_RECV_BUFFER_KB,
             extra: vec!["--peers".to_string(), peers.to_string()],
         }
     }
@@ -734,7 +753,7 @@ mod tests {
         fn name(&self) -> &str {
             "always-receive"
         }
-        fn connect(&mut self) -> Result<()> {
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
             Ok(())
         }
         fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
@@ -864,7 +883,7 @@ mod tests {
         fn name(&self) -> &str {
             "always-backpressured"
         }
-        fn connect(&mut self) -> Result<()> {
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
             Ok(())
         }
         fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
@@ -974,7 +993,7 @@ mod tests {
         fn name(&self) -> &str {
             "counting-publish"
         }
-        fn connect(&mut self) -> Result<()> {
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
             Ok(())
         }
         fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
@@ -1009,7 +1028,7 @@ mod tests {
         fn name(&self) -> &str {
             "once-backpressured"
         }
-        fn connect(&mut self) -> Result<()> {
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
             Ok(())
         }
         fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
@@ -1055,7 +1074,7 @@ mod tests {
         fn name(&self) -> &str {
             "alternating-backpressured"
         }
-        fn connect(&mut self) -> Result<()> {
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
             Ok(())
         }
         fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
@@ -1440,7 +1459,7 @@ mod tests {
         fn name(&self) -> &str {
             "instrumented-receive"
         }
-        fn connect(&mut self) -> Result<()> {
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
             Ok(())
         }
         fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
@@ -1650,7 +1669,7 @@ mod tests {
         fn name(&self) -> &str {
             "empty-receive-counting"
         }
-        fn connect(&mut self) -> Result<()> {
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
             Ok(())
         }
         fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
@@ -1707,5 +1726,157 @@ mod tests {
             "expected ~100 poll_receive calls (1s at 100Hz, one per iter); got {}",
             variant.poll_receive_calls,
         );
+    }
+
+    // ----- T14.1: threading-mode hook ordering tests -----
+
+    /// Variant that records the order in which its lifecycle methods
+    /// are called and the `ThreadingMode` it received at `connect` /
+    /// `start_reader_threads`. Used to verify the driver invokes the
+    /// new reader-thread hooks in the documented order.
+    struct LifecycleRecordingVariant {
+        connect_mode: Option<ThreadingMode>,
+        start_mode: Option<ThreadingMode>,
+        events: Vec<&'static str>,
+    }
+
+    impl LifecycleRecordingVariant {
+        fn new() -> Self {
+            Self {
+                connect_mode: None,
+                start_mode: None,
+                events: Vec::new(),
+            }
+        }
+    }
+
+    impl Variant for LifecycleRecordingVariant {
+        fn name(&self) -> &str {
+            "lifecycle-recording"
+        }
+        fn supported_threading_modes(&self) -> &'static [ThreadingMode] {
+            &[ThreadingMode::Single, ThreadingMode::Multi]
+        }
+        fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()> {
+            self.connect_mode = Some(threading_mode);
+            self.events.push("connect");
+            Ok(())
+        }
+        fn start_reader_threads(&mut self, mode: ThreadingMode) -> Result<()> {
+            self.start_mode = Some(mode);
+            self.events.push("start_reader_threads");
+            Ok(())
+        }
+        fn stop_reader_threads(&mut self) -> Result<()> {
+            self.events.push("stop_reader_threads");
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            Ok(())
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            Ok(None)
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            self.events.push("disconnect");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_supported_threading_modes_is_single_only() {
+        // StubVariant does not override `supported_threading_modes`, so
+        // the trait default must return `[Single]`.
+        let stub = StubVariant::new("stub");
+        assert_eq!(
+            stub.supported_threading_modes(),
+            &[ThreadingMode::Single],
+            "default trait impl must report Single-only"
+        );
+    }
+
+    #[test]
+    fn default_start_and_stop_reader_threads_are_noops_returning_ok() {
+        // StubVariant does not override either hook, so the trait
+        // default must accept any mode and return Ok(()).
+        let mut stub = StubVariant::new("stub");
+        assert!(stub.start_reader_threads(ThreadingMode::Single).is_ok());
+        assert!(stub.start_reader_threads(ThreadingMode::Multi).is_ok());
+        assert!(stub.stop_reader_threads().is_ok());
+    }
+
+    #[test]
+    fn driver_calls_reader_thread_hooks_in_order_around_connect_disconnect() {
+        // Ordering contract from T14.1:
+        //   connect -> start_reader_threads -> ... -> stop_reader_threads -> disconnect
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(
+            dir.path().to_str().unwrap(),
+            "solo",
+            // Single-runner self-loopback -> empty expected EOT peers.
+            "solo=127.0.0.1",
+            1,
+        );
+        args.operate_secs = 0;
+        args.silent_secs = 0;
+        args.threading_mode = ThreadingMode::Multi;
+
+        let mut variant = LifecycleRecordingVariant::new();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        // `connect` saw Multi mode.
+        assert_eq!(variant.connect_mode, Some(ThreadingMode::Multi));
+        // `start_reader_threads` saw the same Multi mode.
+        assert_eq!(variant.start_mode, Some(ThreadingMode::Multi));
+        // The hooks fired in the documented order.
+        assert_eq!(
+            variant.events,
+            vec![
+                "connect",
+                "start_reader_threads",
+                "stop_reader_threads",
+                "disconnect",
+            ]
+        );
+    }
+
+    #[test]
+    fn driver_passes_threading_mode_single_through_to_connect_and_start() {
+        // Same shape as the Multi test but verifies the Single path so
+        // we know the driver doesn't accidentally hard-code one mode.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "solo", "solo=127.0.0.1", 1);
+        args.operate_secs = 0;
+        args.silent_secs = 0;
+        args.threading_mode = ThreadingMode::Single;
+
+        let mut variant = LifecycleRecordingVariant::new();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        assert_eq!(variant.connect_mode, Some(ThreadingMode::Single));
+        assert_eq!(variant.start_mode, Some(ThreadingMode::Single));
+    }
+
+    #[test]
+    fn connected_event_records_threading_mode_and_recv_buffer_kb() {
+        // The driver must emit a `connected` event tagged with the
+        // exact threading mode and recv-buffer-kb the spawn ran under.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "solo", "solo=127.0.0.1", 1);
+        args.operate_secs = 0;
+        args.silent_secs = 0;
+        args.threading_mode = ThreadingMode::Multi;
+        args.recv_buffer_kb = 8192;
+
+        let mut variant = LifecycleRecordingVariant::new();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        let lines = read_log(dir.path(), "solo");
+        let connected: &serde_json::Value = lines
+            .iter()
+            .find(|l| l["event"] == "connected")
+            .expect("connected event must be present");
+        assert_eq!(connected["threading_mode"], "multi");
+        assert_eq!(connected["recv_buffer_kb"], 8192);
     }
 }

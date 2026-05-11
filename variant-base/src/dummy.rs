@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use anyhow::Result;
 
-use crate::types::{Qos, ReceivedUpdate};
+use crate::types::{Qos, ReceivedUpdate, ThreadingMode};
 use crate::variant_trait::Variant;
 
 /// A no-network variant that echoes writes to itself via an internal queue.
@@ -10,9 +10,18 @@ use crate::variant_trait::Variant;
 /// Used for testing the full pipeline without any real transport. Publishes
 /// are pushed into an internal `VecDeque` and immediately available via
 /// `poll_receive`, simulating instant local delivery.
+///
+/// Declares `[Single, Multi]` capabilities (E14 / T14.1). The dummy has
+/// no real I/O, so both modes do the same thing internally -- the point
+/// is to exercise the new threading-mode infrastructure end-to-end
+/// regardless of which mode the runner picks.
 pub struct VariantDummy {
     runner: String,
     queue: VecDeque<ReceivedUpdate>,
+    /// Mode the driver passed at `connect` time. Kept so introspection
+    /// tests can confirm the dummy received and stored the mode; the
+    /// dummy itself does not branch on it.
+    connected_mode: Option<ThreadingMode>,
 }
 
 impl VariantDummy {
@@ -23,7 +32,14 @@ impl VariantDummy {
         Self {
             runner: runner.to_string(),
             queue: VecDeque::new(),
+            connected_mode: None,
         }
+    }
+
+    /// Threading mode the driver supplied at `connect` time (if any).
+    /// Test-only accessor; not part of the trait surface.
+    pub fn connected_mode(&self) -> Option<ThreadingMode> {
+        self.connected_mode
     }
 }
 
@@ -32,8 +48,18 @@ impl Variant for VariantDummy {
         "dummy"
     }
 
-    fn connect(&mut self) -> Result<()> {
-        // No-op: no network to connect to.
+    fn supported_threading_modes(&self) -> &'static [ThreadingMode] {
+        // The dummy has no real I/O so it trivially supports both
+        // modes. Declaring both lets us drive the new threading-mode
+        // infrastructure end-to-end in tests and smoke runs without
+        // needing a real transport.
+        &[ThreadingMode::Single, ThreadingMode::Multi]
+    }
+
+    fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()> {
+        // Record the mode so tests can confirm it propagated. No
+        // network to connect to.
+        self.connected_mode = Some(threading_mode);
         Ok(())
     }
 
@@ -66,8 +92,24 @@ mod tests {
     #[test]
     fn test_connect_disconnect_noop() {
         let mut dummy = VariantDummy::new("a");
-        assert!(dummy.connect().is_ok());
+        assert!(dummy.connect(ThreadingMode::Single).is_ok());
         assert!(dummy.disconnect().is_ok());
+    }
+
+    #[test]
+    fn test_dummy_declares_both_threading_modes() {
+        let dummy = VariantDummy::new("a");
+        let modes = dummy.supported_threading_modes();
+        assert!(modes.contains(&ThreadingMode::Single));
+        assert!(modes.contains(&ThreadingMode::Multi));
+    }
+
+    #[test]
+    fn test_dummy_stores_connect_mode() {
+        let mut dummy = VariantDummy::new("a");
+        assert_eq!(dummy.connected_mode(), None);
+        dummy.connect(ThreadingMode::Multi).unwrap();
+        assert_eq!(dummy.connected_mode(), Some(ThreadingMode::Multi));
     }
 
     #[test]

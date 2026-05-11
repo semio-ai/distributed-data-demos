@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::types::{Qos, ReceivedUpdate};
+use crate::types::{Qos, ReceivedUpdate, ThreadingMode};
 
 /// A peer end-of-test marker observed by a variant.
 ///
@@ -28,8 +28,60 @@ pub trait Variant {
     /// Human-readable name for logging.
     fn name(&self) -> &str;
 
+    /// Threading modes this variant supports.
+    ///
+    /// Default: `&[ThreadingMode::Single]` -- variants that have not
+    /// opted into the E14 threading-mode dimension declare themselves
+    /// single-threaded-only. Variants that support both modes (websocket,
+    /// hybrid, custom-udp, the dummy) override this with
+    /// `&[ThreadingMode::Single, ThreadingMode::Multi]`. Variants whose
+    /// transport library is fundamentally async (quic, webrtc, zenoh)
+    /// override with `&[ThreadingMode::Multi]` only.
+    ///
+    /// Order does not matter; the runner does declared-set membership
+    /// checks.
+    fn supported_threading_modes(&self) -> &'static [ThreadingMode] {
+        &[ThreadingMode::Single]
+    }
+
     /// Establish the transport connection.
-    fn connect(&mut self) -> Result<()>;
+    ///
+    /// `threading_mode` tells the variant which execution model to use.
+    /// Variants that don't branch on the mode (e.g. those that only
+    /// support `Single`) may ignore the argument. Variants that need
+    /// reader threads should NOT spawn them here -- the driver calls
+    /// [`Variant::start_reader_threads`] immediately after `connect`
+    /// returns successfully. Doing the work in two methods keeps the
+    /// connect-time error path simple and lets variants log a clean
+    /// `connected` event before any reader thread starts running.
+    fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()>;
+
+    /// Spawn per-peer reader threads (or any other multi-thread
+    /// machinery) for the chosen mode.
+    ///
+    /// Called by the driver immediately AFTER `connect` returns
+    /// successfully. The default implementation is a no-op, which is
+    /// the right behaviour for variants that only support `Single` mode
+    /// or that handle their own threading inside `connect`.
+    ///
+    /// Variants that support `Multi` mode override this to spawn the
+    /// reader thread(s) and stash the join handles + shutdown signal
+    /// inside `self` so [`Variant::stop_reader_threads`] can tear them
+    /// down cleanly at disconnect time.
+    fn start_reader_threads(&mut self, _mode: ThreadingMode) -> Result<()> {
+        Ok(())
+    }
+
+    /// Tear down per-peer reader threads (or any other multi-thread
+    /// machinery) started by [`Variant::start_reader_threads`].
+    ///
+    /// Called by the driver during the disconnect path, BEFORE the
+    /// variant's own [`Variant::disconnect`] runs so reader threads can
+    /// drain pending receives cleanly. Default implementation is a
+    /// no-op.
+    fn stop_reader_threads(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Publish a value over the transport.
     fn publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<()>;

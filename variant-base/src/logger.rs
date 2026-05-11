@@ -6,7 +6,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
 
-use crate::types::{Phase, Qos};
+use crate::types::{Phase, Qos, ThreadingMode};
 
 /// Structured JSONL log writer.
 ///
@@ -60,7 +60,20 @@ impl Logger {
     }
 
     /// Log a `connected` event.
-    pub fn log_connected(&mut self, launch_ts: &str, elapsed_ms: f64) -> Result<()> {
+    ///
+    /// Per E14 the event also records the threading mode the spawn ran
+    /// in (`threading_mode`) and the OS-level recv buffer size the
+    /// runner asked the variant to use (`recv_buffer_kb`). Both are
+    /// recorded for offline reproducibility -- the analysis tool keys
+    /// metrics on them in T11.5. See
+    /// `metak-shared/api-contracts/jsonl-log-schema.md`.
+    pub fn log_connected(
+        &mut self,
+        launch_ts: &str,
+        elapsed_ms: f64,
+        threading_mode: ThreadingMode,
+        recv_buffer_kb: u32,
+    ) -> Result<()> {
         let entry = json!({
             "ts": Self::now_ts(),
             "variant": self.variant,
@@ -69,6 +82,8 @@ impl Logger {
             "event": "connected",
             "launch_ts": launch_ts,
             "elapsed_ms": elapsed_ms,
+            "threading_mode": threading_mode.as_str(),
+            "recv_buffer_kb": recv_buffer_kb,
         });
         self.write_line(&entry)
     }
@@ -295,7 +310,12 @@ mod tests {
     fn test_connected_event() {
         let (mut logger, _dir) = create_test_logger();
         logger
-            .log_connected("2026-04-12T14:00:00.000000000Z", 123.456)
+            .log_connected(
+                "2026-04-12T14:00:00.000000000Z",
+                123.456,
+                ThreadingMode::Single,
+                4096,
+            )
             .unwrap();
         logger.flush().unwrap();
 
@@ -304,6 +324,27 @@ mod tests {
         assert_eq!(line["event"], "connected");
         assert_eq!(line["launch_ts"], "2026-04-12T14:00:00.000000000Z");
         assert_eq!(line["elapsed_ms"], 123.456);
+        assert_eq!(line["threading_mode"], "single");
+        assert_eq!(line["recv_buffer_kb"], 4096);
+    }
+
+    #[test]
+    fn test_connected_event_records_multi_mode() {
+        let (mut logger, _dir) = create_test_logger();
+        logger
+            .log_connected(
+                "2026-04-12T14:00:00.000000000Z",
+                7.0,
+                ThreadingMode::Multi,
+                8192,
+            )
+            .unwrap();
+        logger.flush().unwrap();
+
+        let lines = read_lines(&logger);
+        let line = &lines[0];
+        assert_eq!(line["threading_mode"], "multi");
+        assert_eq!(line["recv_buffer_kb"], 8192);
     }
 
     #[test]
