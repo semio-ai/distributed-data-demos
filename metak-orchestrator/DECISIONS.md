@@ -557,3 +557,99 @@ completed within 6 seconds ... Invert this assertion to lock in the
 fixed behaviour."
 
 ---
+
+## D10: T-impl.5 — WebRTC signaling fragility, investigation and disposition
+
+**Date**: 2026-05-07
+**Context**: T-impl.5 was filed against the observation that many
+`webrtc-*` rows in the all-variants matrix were producing 0 writes /
+0 ms wall-time, suggesting the DataChannel handshake had not
+completed before `operate` began. The task asked for an investigation
+phase first, then a fix only if the diagnosis pointed to an
+actionable, in-scope issue.
+
+**Investigation**: I read `variants/webrtc/src/webrtc.rs` end-to-end
+to map the signaling and DataChannel-open path, then spawned the
+exact rate / QoS shape called out in the task — `webrtc-100x100hz-qos1`
+two-runner same-host — three times in a row with verbose stderr capture.
+
+The variant's `connect` path already contains the await-all-channels
+behaviour the task hypothesized was missing:
+
+1. `handle_peer_pair` (`variants/webrtc/src/webrtc.rs` lines ~339-467)
+   spins up an `open_tx` / `open_rx` mpsc and registers `on_open`
+   callbacks for every DataChannel — on both the initiator side
+   (lines ~389-423) and the responder side via `on_data_channel`
+   (lines ~343-386).
+2. After `run_signaling` returns, the function blocks in a
+   `tokio::select!` that drains `open_rx` until **all four**
+   DataChannels for the peer have reported `Open`
+   (lines ~444-467). The wait is bounded by `CONNECT_TIMEOUT = 15 s`.
+3. Only after every expected peer's 4 channels are open does
+   `WebRtcVariant::connect` return, which means
+   `variant_base::driver::run_protocol` cannot enter `stabilize` /
+   `operate` until the data path is ready.
+
+The signaling exchange itself is a small length-prefixed JSON envelope
+protocol (`Offer`/`Answer`/`Candidate`/`Done`) on a per-pair TCP socket
+derived from `signaling_base_port + runner_index + (qos-1) * qos_stride`,
+with `SIGNALING_CONNECT_TIMEOUT = 10 s` and a 500 ms grace timer that
+sends a final `Done` once SDP is exchanged. ICE is host-candidates-only
+(STUN/TURN/mDNS disabled in `build_api`).
+
+**Empirical result**: three back-to-back same-host runs of
+`webrtc-100x100hz-qos1` at `values_per_tick=100`, `operate_secs=10`
+produced (alice writes, alice receives, bob writes, bob receives):
+
+- Run 1: 100100, 100100, 100100, 100100
+- Run 2: 100000, 100100, 100100, 100000
+- Run 3: 100100, 100100, 100100, 100100
+
+All three runs produced non-zero writes AND receives on both sides
+(100% of the smoke acceptance bar of "2 of 3 produce non-zero
+write AND receive"). An additional `webrtc-1000x100hz-qos1` smoke run
+at 10x the load (100k ticks per side over 10 s) also completed end-to-end
+with ~82-86% delivery on the unreliable QoS-1 channel — exactly the
+shape expected for an unreliable transport under sustained pressure
+without application-layer reliability code.
+
+**Diagnosis**: There is no signaling-fragility bug in the WebRTC
+variant at the rates and shapes the task targets. The `connect` phase
+already awaits `data_channel_open` for every expected peer (with a
+15-second cap), the signaling path is bounded by sane timeouts, and
+ICE host-candidate gathering completes well within the 500 ms grace
+timer the variant already applies. Earlier matrix runs that showed
+"0 writes / 0 ms" rows for webrtc were almost certainly produced by
+a now-resolved upstream coordination issue (D9 / T-coord.1b's
+done-barrier hang) rather than by the WebRTC variant itself, since
+the same observation would surface across multiple variants in a
+single matrix run — which the historical data shows.
+
+**Disposition**: **No fix required.** The acceptance criterion in
+T-impl.5 — "at least 2 of 3 same-host smoke runs produce non-zero
+write AND receive counts" — is met by the current implementation
+without modification (3 of 3 actually pass). The matching note is
+added to `variants/webrtc/CUSTOM.md` so future maintainers see this
+diagnosis at the variant boundary.
+
+If a future run does surface 0-write / 0-receive rows for webrtc
+specifically — independent of other variants in the same matrix —
+the most likely first investigation step is to bump `CONNECT_TIMEOUT`
+from 15 s to ~30 s and re-instrument the DataChannel open path; that
+remains the cheapest reversible knob.
+
+### Files touched in this investigation
+
+- `metak-orchestrator/DECISIONS.md` — this entry.
+- `variants/webrtc/CUSTOM.md` — added a "Signaling robustness
+  characterisation" note pointing at this entry.
+- `variants/websocket/src/pairing.rs` — added the T-impl.4 unit
+  test that asserts same-host port offset.
+- `variants/websocket/tests/two_runner_regression.rs` — added the
+  two-runner same-host smoke regression test.
+- `variants/websocket/tests/fixtures/two-runner-websocket-100x100hz-qos3.toml`
+  — fixture for the new regression test.
+- `variants/websocket/CUSTOM.md` — added a "Same-host port-collision
+  guarantee" subsection documenting the T-impl.4 verification chain.
+
+---
