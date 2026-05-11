@@ -6403,3 +6403,230 @@ tail.
 - `f5587b7` docs(runner): document T-impl.9 failure-diagnostic block in CUSTOM.md
 
 The orchestrator will verify acceptance criteria.
+
+## T-impl.10: adaptive receive-drain in operate loop (variant-base) -- COMPLETED WITH NEGATIVE E2E RESULT
+
+Date: 2026-05-11. Worker: variant-base agent.
+
+### Implementation summary
+
+Updated `variant-base/src/driver.rs` to widen the operate-phase receive-drain
+budgets. Two behavioural changes (driver-only; no transport or variant code
+touched):
+
+1. **Tick-aware wallclock budget** -- replaces the hardcoded
+   `Duration::from_millis(1)`. New helper
+   `compute_operate_drain_time_budget(max_throughput, next_tick, now)`:
+   - `scalar-flood`: `max(1ms, (next_tick - now) - 1ms safety margin)`,
+     floored at 1 ms when we already overran the publish phase.
+   - `max-throughput`: flat 5 ms.
+2. **Message-count budget** bumped from `2 * values_per_tick` to
+   `4 * values_per_tick` (floor at 1).
+
+EOT-phase drain retains the pre-T-impl.10 budgets (2 * vpt, 1 ms) -- the
+failure mode is operate-phase-specific.
+
+Four new unit tests added in `variant-base/src/driver.rs::tests`:
+`scalar_flood_drain_msg_budget_is_four_x_vpt`,
+`scalar_flood_drain_does_not_overrun_tick`,
+`max_throughput_drain_bounded_to_five_ms`,
+`empty_queue_drain_still_early_exits`.
+
+Documented in `variant-base/CUSTOM.md` under "Operate-loop drain budgets
+(T-impl.10)" with a back-reference to the 2026-05-11 diagnostic incident.
+
+### Validation commands
+
+| Command | Result |
+| --- | --- |
+| `cargo build --release -p variant-base` | clean |
+| `cargo test --release -p variant-base` | 66 passed (62 prior + 4 new); 2 integration; 0 failed |
+| `cargo test --release --workspace` | all green: 139+1+15+66+2+73+7+1+50+7+30+3+43+4+36+28+23+1 = ~529 unit/integration tests passed across 27 test result groups, plus ignored. **No integrity-gate regressions.** Two transient localhost-coordination failures (`two_runner_localhost_coordination`, `done_barrier_hang_repro_when_peer_already_advanced`, `two_runner_resume_manifest_exchange`) on the first attempt were caused by stray runner processes from a *previous* aborted test run holding sockets; killing the strays and re-running showed all tests pass. |
+| `cargo clippy --release --workspace --all-targets -- -D warnings` | clean (no warnings) |
+| `cargo fmt --check` | clean |
+
+### End-to-end repro -- NEGATIVE RESULT
+
+The driver change ALONE is not sufficient to make
+`websocket-1000x100hz` (100 K msg/s symmetric on websocket QoS 4)
+complete on the same machine. The hypothesis was incomplete -- a
+follow-up websocket-specific task IS needed.
+
+Used a trimmed config (`configs/two-runner-websocket-qos4-first-only.toml`,
+deleted after the run) containing only the first spawn. Identical
+common-section parameters to the failing fixture entry. Launched alice
+and bob as parallel runner processes (different background invocations
+in the same working directory).
+
+Outcome:
+- **alice**: status=timeout, exit_code=-1 (runner killed it after 60s)
+- **bob**: status=failed, exit_code=1, `WSAECONNRESET (10054)` -> "all WS peers dropped"
+
+Delivery counts from the JSONL logs (event histograms):
+
+```
+alice (websocket-1000x100hz-alice-websocket-first-only.jsonl, 7263 lines):
+      1 "event":"connected"
+      3 "event":"phase"
+   1049 "event":"receive"
+   6211 "event":"write"
+
+bob (websocket-1000x100hz-bob-websocket-first-only.jsonl, 8630 lines):
+      1 "event":"connected"
+      3 "event":"phase"
+   1334 "event":"receive"
+      1 "event":"resource"
+   7291 "event":"write"
+```
+
+Both sides have non-zero `write` AND non-zero cross-`receive` counts,
+but NEITHER side has `eot_sent`. The driver never reached the EOT
+phase before bob's TCP connection collapsed.
+
+The publish-vs-receive ratio is essentially unchanged from the
+original 2026-05-11 incident:
+- alice: 6211/1049 ~= 5.9:1 (was 6126/1139 ~= 5.4:1)
+- bob: 7291/1334 ~= 5.5:1 (was 6823/1075 ~= 6.3:1)
+
+Run wall-clock (timestamps from JSONL first/last `write`):
+~1.0 seconds of operate-phase writes before the stall on both sides.
+This is similar to the original incident (~130 ms into operate, with
+slightly more headroom now).
+
+Runner stdout/stderr captures:
+
+```
+# alice
+[runner:alice] build: a397450 (rustc 1.94.1)
+[runner:alice] barrier timeout: 120s
+[runner:alice] config loaded: run=websocket-first-only, 1 variant(s), 2 runner(s), hash=1b5bf9fe3c69
+[runner:alice] starting discovery...
+[runner:alice] discovery complete
+[runner:alice] log subfolder: websocket-first-only-20260511_214111
+[runner:alice] peer_hosts: {"alice": "127.0.0.1", "bob": "127.0.0.1"}
+[runner:alice] clock-sync log opened at ./logs/websocket-first-only-20260511_214111
+[runner:alice] initial clock sync against 1 peer(s)...
+[runner:alice] clock_sync (initial) peer=bob offset_ms=-0.071 rtt_ms=0.411
+[runner:alice] ready barrier for spawn 'websocket-1000x100hz' (hz=100, vpt=1000, qos=4)
+[runner:alice] clock_sync (websocket-1000x100hz) peer=bob offset_ms=0.056 rtt_ms=0.308
+[runner:alice] spawning 'websocket-1000x100hz' (hz=100, vpt=1000, qos=4, timeout: 60s)
+[runner:alice] 'websocket-1000x100hz' finished: status=timeout, exit_code=-1
+[runner:alice] stderr capture: ./logs/websocket-first-only-20260511_214111\websocket-1000x100hz-alice-stderr.txt
+[runner:alice] jsonl log:      ./logs/websocket-first-only-20260511_214111\websocket-1000x100hz-alice-websocket-first-only.jsonl
+[runner:alice] ---- stderr tail (last 20 lines) ----
+[websocket] build: a397450 (rustc 1.94.1)
+[runner:alice] ---- end stderr tail ----
+
+# bob
+[runner:bob] build: a397450 (rustc 1.94.1)
+[runner:bob] barrier timeout: 120s
+[runner:bob] config loaded: run=websocket-first-only, 1 variant(s), 2 runner(s), hash=1b5bf9fe3c69
+[runner:bob] starting discovery...
+[runner:bob] discovery complete
+[runner:bob] log subfolder: websocket-first-only-20260511_214111
+[runner:bob] peer_hosts: {"alice": "127.0.0.1", "bob": "127.0.0.1"}
+[runner:bob] clock-sync log opened at ./logs/websocket-first-only-20260511_214111
+[runner:bob] initial clock sync against 1 peer(s)...
+[runner:bob] clock_sync (initial) peer=alice offset_ms=0.007 rtt_ms=0.260
+[runner:bob] ready barrier for spawn 'websocket-1000x100hz' (hz=100, vpt=1000, qos=4)
+[runner:bob] clock_sync (websocket-1000x100hz) peer=alice offset_ms=0.009 rtt_ms=0.290
+[runner:bob] spawning 'websocket-1000x100hz' (hz=100, vpt=1000, qos=4, timeout: 60s)
+[runner:bob] 'websocket-1000x100hz' finished: status=failed, exit_code=1
+[runner:bob] stderr capture: ./logs/websocket-first-only-20260511_214111\websocket-1000x100hz-bob-stderr.txt
+[runner:bob] jsonl log:      ./logs/websocket-first-only-20260511_214111\websocket-1000x100hz-bob-websocket-first-only.jsonl
+[runner:bob] ---- stderr tail (last 20 lines) ----
+[websocket] build: a397450 (rustc 1.94.1)
+warning: dropping WS peer alice (127.0.0.1:53658) after write error: IO error: An existing connection was forcibly closed by the remote host. (os error 10054)
+Error: all WS peers dropped after write errors: WS write error: IO error: An existing connection was forcibly closed by the remote host. (os error 10054)
+[runner:bob] ---- end stderr tail ----
+```
+
+### Diagnosis of the residual failure mode
+
+Numbers tell the story: bob wrote 7291 messages and received 1334 over
+~1 second of operate, then `WSAECONNRESET`. Pre-fix, bob wrote 6823 and
+received 1075 -- almost identical ratio and absolute counts. The
+driver's drain budget is NOT the dominant bottleneck.
+
+Per-second throughput on bob: 7291 writes/sec is well below the
+target 100,000 writes/sec (100 Hz * 1000 vpt). The publish path
+itself is blocking on send. The 100 K msg/s target is unattainable
+with the websocket variant's current `publish` implementation
+because:
+
+1. websocket `publish` is blocking-write (T-impl.7 deliberately left it
+   that way -- no `try_publish` override -- because returning Ok(false)
+   under reliable QoS would create receiver-visible seq gaps).
+2. When the peer's recv buffer (and thus TCP window) fills, blocking-
+   write stalls.
+3. The driver can drain its OWN inbound queue faster now, but its
+   peer (bob) cannot drain bob's inbound queue any faster -- the
+   websocket variant's frame-parse + client-mask XOR per message is
+   what gates that. So bob's TCP window collapses anyway.
+
+In other words: the original hypothesis was that BOTH sides' drain
+loops were stalling simultaneously and one of them needed more
+wallclock budget per tick. The new evidence is that the websocket
+variant's per-message receive cost is high enough that even with an
+~9-10 ms drain budget per tick (the new scalar-flood scaling at 100 Hz
+with vpt=1000 leaves nearly all of the 10 ms tick), 1000 inbound
+messages per tick cannot be drained. The recv buffer grows, the TCP
+window collapses, the peer's send blocks, the runner times out.
+
+### Follow-up needed
+
+A websocket-specific task is required. Candidate directions (NOT
+implemented here -- out of scope for T-impl.10):
+
+- Move the websocket variant's recv path off the main thread (
+  current implementation parses frames on the variant's poll thread,
+  competing with the publish path for CPU). A dedicated reader
+  thread per peer that decodes frames into a channel would let the
+  driver's drain loop consume parsed messages at the speed of channel
+  receive rather than the speed of frame parse.
+- Or: reconsider T-impl.7 and allow `try_publish` -> `Ok(false)` for
+  reliable QoS, but pair it with a gap-replay mechanism so reliability
+  is preserved. This is a deeper refactor.
+- Or: lower the workload (the analysis task should record that
+  websocket cannot sustain 100 K msg/s symmetric on the current
+  implementation, and adjust the canonical fixture).
+
+Recommend the orchestrator file the follow-up as a separate task with
+a clear pointer back to this report.
+
+### Open concerns
+
+- **No integrity-gate regressions** observed in any variant test
+  suite. All percentage thresholds remain at their main-branch values.
+- The three runner `protocol::tests::two_runner_*` failures observed
+  on the first full-workspace run were transient and caused by leftover
+  runner processes from a previous aborted test run. After cleanup,
+  they pass. Not caused by my driver change.
+- The driver change IS correct on its own merits (better tick-aware
+  pacing, larger msg budget when buffers grow). It just is not
+  sufficient to fix the websocket-1000x100hz deadlock. The change
+  remains landed because it improves operate-loop fairness in
+  general (e.g. for hybrid TCP at its high-rate fixtures, which the
+  diagnosis flagged as "below the same cliff" pre-fix). A future
+  websocket-only task would close the residual gap.
+
+### Deviations from spec
+
+- Created a temporary trimmed config
+  `configs/two-runner-websocket-qos4-first-only.toml` containing only
+  the first spawn, to keep the end-to-end repro to ~60 s instead of
+  ~5 minutes. Same common-section parameters as the original. Deleted
+  after the run -- not committed.
+- The task spec said to update STATUS.md at the bottom with the
+  completion report. Did that.
+- No other deviations.
+
+### Commits
+
+- `e9457eb` feat(variant-base): tick-aware drain budgets in operate loop (T-impl.10)
+- `a397450` docs(variant-base): document operate-loop drain budgets (T-impl.10)
+
+The orchestrator should treat the end-to-end E2E result as a
+meaningful negative finding and file a follow-up task for the
+websocket variant before declaring the integrity gate for
+100 K msg/s symmetric workloads "passing".
