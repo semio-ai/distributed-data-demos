@@ -106,12 +106,21 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
             next_tick += tick_interval;
         }
 
-        // Generate and publish writes.
+        // Generate writes and offer them to the transport via
+        // `try_publish`. If the transport reports backpressure
+        // (`Ok(false)`) we log a `backpressure_skipped` event and move
+        // on to the next value -- the value is NOT delivered, NOT
+        // retried within the same tick, and NOT recorded as a `write`.
+        // Real errors still propagate. See T-impl.6 and
+        // `metak-shared/api-contracts/jsonl-log-schema.md`.
         let ops = workload.generate(config.values_per_tick);
         for op in &ops {
             let seq = seq_gen.next_seq();
-            variant.publish(&op.path, &op.payload, qos, seq)?;
-            logger.log_write(seq, &op.path, qos, op.payload.len())?;
+            if variant.try_publish(&op.path, &op.payload, qos, seq)? {
+                logger.log_write(seq, &op.path, qos, op.payload.len())?;
+            } else {
+                logger.log_backpressure_skipped(&op.path, qos)?;
+            }
         }
 
         // Drain received updates, bounded by both a message-count and a
@@ -718,5 +727,190 @@ mod tests {
             .filter(|l| l["event"] == "eot_received")
             .collect();
         assert!(received.is_empty());
+    }
+
+    /// A variant whose `try_publish` always reports backpressure.
+    /// Used to verify that the driver logs `backpressure_skipped`
+    /// instead of `write` and never calls the underlying `publish`.
+    struct AlwaysBackpressuredVariant {
+        publish_calls: u64,
+        try_publish_calls: u64,
+    }
+
+    impl AlwaysBackpressuredVariant {
+        fn new() -> Self {
+            Self {
+                publish_calls: 0,
+                try_publish_calls: 0,
+            }
+        }
+    }
+
+    impl Variant for AlwaysBackpressuredVariant {
+        fn name(&self) -> &str {
+            "always-backpressured"
+        }
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            // Track stray calls so the assertion can prove try_publish
+            // did NOT fall through to publish on the Ok(false) path.
+            self.publish_calls += 1;
+            Ok(())
+        }
+        fn try_publish(
+            &mut self,
+            _path: &str,
+            _payload: &[u8],
+            _qos: Qos,
+            _seq: u64,
+        ) -> Result<bool> {
+            self.try_publish_calls += 1;
+            Ok(false)
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            Ok(None)
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_backpressured_variant_logs_skipped_not_write() {
+        // Short config: 1s operate, 10 Hz tick, 5 values per tick.
+        // Expected: ~10 ticks * 5 values = ~50 backpressure_skipped
+        // events, zero write events, and publish() never called.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(
+            dir.path().to_str().unwrap(),
+            "alice",
+            // Single-runner self-loopback so EOT exits immediately.
+            "alice=127.0.0.1",
+            1,
+        );
+        args.tick_rate_hz = 10;
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 5;
+
+        let mut variant = AlwaysBackpressuredVariant::new();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        let lines = read_log(dir.path(), "alice");
+        let write_events: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["event"] == "write").collect();
+        let skip_events: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backpressure_skipped")
+            .collect();
+
+        assert_eq!(
+            write_events.len(),
+            0,
+            "no `write` events should be emitted when try_publish returns Ok(false)"
+        );
+        assert!(
+            !skip_events.is_empty(),
+            "expected at least one `backpressure_skipped` event over a 1s operate phase"
+        );
+        // Every skip event must carry path and qos and the common fields.
+        for ev in &skip_events {
+            assert!(ev.get("path").is_some(), "skip event missing path");
+            assert!(ev.get("qos").is_some(), "skip event missing qos");
+            assert!(ev.get("ts").is_some(), "skip event missing ts");
+            assert_eq!(ev["runner"], "alice");
+            assert_eq!(ev["variant"], "test");
+            assert_eq!(ev["run"], "run01");
+        }
+        // The default impl was bypassed -- the override saw every call.
+        assert_eq!(
+            variant.publish_calls, 0,
+            "publish() should not be called when try_publish is overridden to return Ok(false)"
+        );
+        assert!(
+            variant.try_publish_calls > 0,
+            "try_publish() should be called for every intended value"
+        );
+        // Sanity: there were as many try_publish calls as skip events.
+        assert_eq!(
+            variant.try_publish_calls as usize,
+            skip_events.len(),
+            "every Ok(false) call should produce exactly one `backpressure_skipped` event"
+        );
+    }
+
+    /// A variant that does NOT override `try_publish`. Used to verify
+    /// that the trait's default impl falls through to `publish` and
+    /// the driver continues to emit `write` events (no
+    /// `backpressure_skipped` events) -- preserving pre-T-impl.6
+    /// behaviour.
+    struct CountingPublishVariant {
+        publish_calls: u64,
+    }
+
+    impl CountingPublishVariant {
+        fn new() -> Self {
+            Self { publish_calls: 0 }
+        }
+    }
+
+    impl Variant for CountingPublishVariant {
+        fn name(&self) -> &str {
+            "counting-publish"
+        }
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            self.publish_calls += 1;
+            Ok(())
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            Ok(None)
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_default_try_publish_falls_through_to_publish() {
+        // A variant that does not override try_publish must behave
+        // identically to today: every value -> one `write` event, zero
+        // `backpressure_skipped` events.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        args.tick_rate_hz = 10;
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 5;
+
+        let mut variant = CountingPublishVariant::new();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        let lines = read_log(dir.path(), "alice");
+        let write_events: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["event"] == "write").collect();
+        let skip_events: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backpressure_skipped")
+            .collect();
+
+        assert!(
+            !write_events.is_empty(),
+            "default try_publish should produce at least one `write` event over a 1s operate phase"
+        );
+        assert!(
+            skip_events.is_empty(),
+            "default try_publish must not emit any `backpressure_skipped` events"
+        );
+        // Every write event corresponds to one publish() call.
+        assert_eq!(
+            variant.publish_calls as usize,
+            write_events.len(),
+            "publish() call count should match `write` event count"
+        );
     }
 }

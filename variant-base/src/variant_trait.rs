@@ -34,6 +34,31 @@ pub trait Variant {
     /// Publish a value over the transport.
     fn publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<()>;
 
+    /// Try to publish a value over the transport, respecting backpressure.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the value was accepted by the transport.
+    /// - `Ok(false)` if the transport is currently backpressured (the
+    ///   write was NOT delivered; the caller should skip it and move
+    ///   on to the next value rather than retrying within the same tick).
+    /// - `Err(_)` for real errors (propagated to the driver as today).
+    ///
+    /// `Ok(false)` is NOT an error -- it just means "not now". The
+    /// driver logs a `backpressure_skipped` event instead of a `write`
+    /// event so the analysis can distinguish "writer held back" from
+    /// "writer sent and downstream dropped it".
+    ///
+    /// Default implementation: call `publish(...)` and return `Ok(true)`,
+    /// preserving the existing fire-and-forget semantics for variants
+    /// that do not override this method. Transports that can detect
+    /// backpressure cheaply (non-blocking sends returning `WouldBlock`,
+    /// QUIC `SendDatagramError::Blocked`, WebRTC `bufferedAmount`, etc.)
+    /// should override this method per T-impl.7.
+    fn try_publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<bool> {
+        self.publish(path, payload, qos, seq)?;
+        Ok(true)
+    }
+
     /// Poll for a received update. Returns `None` if no update is available.
     fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>>;
 

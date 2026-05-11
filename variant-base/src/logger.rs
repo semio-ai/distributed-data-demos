@@ -108,6 +108,25 @@ impl Logger {
         self.write_line(&entry)
     }
 
+    /// Log a `backpressure_skipped` event.
+    ///
+    /// Emitted when `Variant::try_publish` returns `Ok(false)` for a
+    /// value the driver intended to write this tick. The value is NOT
+    /// delivered and NOT retried within the same tick. See
+    /// `metak-shared/api-contracts/jsonl-log-schema.md`.
+    pub fn log_backpressure_skipped(&mut self, path: &str, qos: Qos) -> Result<()> {
+        let entry = json!({
+            "ts": Self::now_ts(),
+            "variant": self.variant,
+            "runner": self.runner,
+            "run": self.run,
+            "event": "backpressure_skipped",
+            "path": path,
+            "qos": qos.as_int(),
+        });
+        self.write_line(&entry)
+    }
+
     /// Log a `receive` event.
     pub fn log_receive(
         &mut self,
@@ -330,6 +349,29 @@ mod tests {
         assert_eq!(line["path"], "/sensors/lidar");
         assert_eq!(line["qos"], 1);
         assert_eq!(line["bytes"], 256);
+    }
+
+    #[test]
+    fn test_backpressure_skipped_event() {
+        let (mut logger, _dir) = create_test_logger();
+        logger
+            .log_backpressure_skipped("/sensors/lidar", Qos::ReliableTcp)
+            .unwrap();
+        logger.flush().unwrap();
+
+        let lines = read_lines(&logger);
+        let line = &lines[0];
+        assert_eq!(line["event"], "backpressure_skipped");
+        assert_eq!(line["path"], "/sensors/lidar");
+        assert_eq!(line["qos"], 4);
+        // No `seq` or `bytes` -- the skipped value never got a seq.
+        assert!(line.get("seq").is_none());
+        assert!(line.get("bytes").is_none());
+        // Common fields.
+        assert!(line.get("ts").is_some());
+        assert_eq!(line["variant"], "test-variant");
+        assert_eq!(line["runner"], "runner-a");
+        assert_eq!(line["run"], "run01");
     }
 
     #[test]
