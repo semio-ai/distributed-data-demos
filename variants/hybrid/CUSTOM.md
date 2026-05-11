@@ -216,6 +216,44 @@ at Windows-default ~64 KB buffers during 100 K pkt/s same-host runs.
 The TCP path is untouched: TCP back-pressure is the protocol-level
 signal we deliberately measure.
 
+### Backpressure semantics (T-impl.7)
+
+Hybrid overrides `Variant::try_publish` (see `src/hybrid.rs`,
+`impl Variant for HybridVariant::try_publish`) so the driver gets
+honest backpressure signalling instead of always seeing `Ok(true)`.
+The driver assigns and consumes a seq number BEFORE calling
+`try_publish`, so any `Ok(false)` return creates a receiver-visible
+gap in the seq stream. This is fine for some QoS levels and
+catastrophic for others:
+
+- **QoS 1 (BestEffort)** — single non-blocking `UdpSocket::send_to`
+  via `UdpTransport::try_send_nonblocking` (see `src/udp.rs`).
+  `WouldBlock` -> `Ok(false)`. The driver logs `backpressure_skipped`;
+  the receiver tolerates loss by definition. No retry, no kernel-
+  buffer spin — the existing `send_with_retry` loop (1 ms budget,
+  used by `publish`) is bypassed because we want the driver to see
+  the immediate backpressure signal, not absorb it.
+- **QoS 2 (LatestValue)** — same as QoS 1. Gap-tolerant by design;
+  the receiver's stale-discard logic only cares about the highest
+  seen seq.
+- **QoS 3 (ReliableUdp / TCP path)** — blocking `TcpTransport::
+  broadcast`. ALWAYS `Ok(true)`. TCP receivers expect strictly
+  contiguous framed messages; a gap would corrupt the per-peer
+  reader state. The outbound TCP socket is in blocking mode (see
+  "TCP connection management" above), so `write_all` blocks under
+  kernel back-pressure — exactly the signal we want to measure for
+  the QoS-3 NACK-vs-TCP comparison.
+- **QoS 4 (ReliableTcp / TCP path)** — identical to QoS 3 in this
+  variant. Always `Ok(true)`.
+
+Where it lives:
+
+- `src/udp.rs::UdpTransport::try_send_nonblocking` — single attempt,
+  `WouldBlock` surfaces as `Ok(false)`.
+- `src/hybrid.rs::Variant::try_publish` — dispatches by QoS.
+- `src/hybrid.rs::Variant::publish` — unchanged; keeps the
+  spin-on-WouldBlock UDP send and the blocking TCP broadcast.
+
 ### Testing
 
 - Unit test: message serialization/deserialization.

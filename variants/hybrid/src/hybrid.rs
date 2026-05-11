@@ -215,6 +215,39 @@ impl Variant for HybridVariant {
         Ok(())
     }
 
+    /// T-impl.7: honest backpressure for the driver.
+    ///
+    /// QoS 1/2 (UDP multicast) do a single non-blocking `send_to`.
+    /// `WouldBlock` -> `Ok(false)`; the driver logs
+    /// `backpressure_skipped` and moves on. The receiver tolerates the
+    /// resulting seq gap (best-effort by definition, latest-value
+    /// discards anything older than the newest seq anyway).
+    ///
+    /// QoS 3/4 (TCP) use the existing blocking `broadcast` -> always
+    /// `Ok(true)`. TCP receivers expect contiguous sequences and the
+    /// kernel send buffer is the natural pacing mechanism: a full
+    /// send buffer makes `write_all` block, which is the back-pressure
+    /// signal we want to measure for the benchmark. Returning
+    /// `Ok(false)` here would corrupt the per-peer receiver state by
+    /// emitting a seq the receiver will never see.
+    ///
+    /// See `variants/hybrid/CUSTOM.md` "Backpressure semantics (T-impl.7)".
+    fn try_publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<bool> {
+        match qos {
+            Qos::BestEffort | Qos::LatestValue => {
+                let udp = self.udp.as_ref().context("UDP transport not connected")?;
+                let data = protocol::encode(qos, seq, path, &self.runner, payload);
+                udp.try_send_nonblocking(&data)
+            }
+            Qos::ReliableUdp | Qos::ReliableTcp => {
+                let tcp = self.tcp.as_mut().context("TCP transport not connected")?;
+                let data = protocol::encode_framed(qos, seq, path, &self.runner, payload);
+                tcp.broadcast(&data)?;
+                Ok(true)
+            }
+        }
+    }
+
     fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
         // Each iteration probes both paths once. If either returns a data
         // update we return it immediately. If at least one path consumed a
@@ -532,6 +565,187 @@ mod tests {
             other => panic!("expected Frame::Eot, got {other:?}"),
         }
 
+        v.disconnect().ok();
+    }
+
+    // ---- T-impl.7: try_publish backpressure semantics ----
+
+    /// Detect whether the host's UDP loopback path can surface
+    /// `WouldBlock` under SO_SNDBUF pressure. Some platforms (notably
+    /// some Windows NIC configurations) silently drop datagrams at a
+    /// layer below the syscall return without ever reporting
+    /// `WouldBlock`, in which case we can't *force* the override into
+    /// the `Ok(false)` branch with a real socket — we then settle for
+    /// "every `try_publish` call returns `Ok(true)` without erroring".
+    fn host_surfaces_udp_wouldblock() -> bool {
+        use socket2::{Domain, Protocol as P2, SockAddr, Socket, Type};
+        use std::io;
+        use std::net::SocketAddrV4;
+        let Ok(socket) = Socket::new(Domain::IPV4, Type::DGRAM, Some(P2::UDP)) else {
+            return false;
+        };
+        if socket.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let _ = socket.set_send_buffer_size(1024);
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        if socket.bind(&SockAddr::from(bind_addr)).is_err() {
+            return false;
+        }
+        let target = SockAddr::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
+        let payload = vec![0u8; 60_000];
+        for _ in 0..200_000 {
+            match socket.send_to(&payload, &target) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    /// Build a `HybridVariant` whose UDP transport is replaced with
+    /// one bound to a tiny `SO_SNDBUF`, targeting a closed loopback
+    /// port. The variant's `connect()` is NOT called; we splice in the
+    /// transport directly to keep the test deterministic.
+    fn make_pressured_variant(qos: Qos) -> HybridVariant {
+        use crate::udp::UdpTransport;
+        use socket2::{Domain, Protocol as P2, SockAddr, Socket, Type};
+        use std::net::{SocketAddrV4, UdpSocket};
+
+        // Build a real `UdpTransport`, then swap its socket out for a
+        // tiny-SNDBUF one targeting a discard port. `UdpTransport`'s
+        // fields are `pub(crate)` for the socket and `pub(crate)` for
+        // the multicast_addr; both are reachable from this module.
+        let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(P2::UDP)).unwrap();
+        let _ = raw.set_reuse_address(true);
+        raw.set_nonblocking(true).unwrap();
+        let _ = raw.set_send_buffer_size(1024);
+        let bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        raw.bind(&SockAddr::from(bind)).unwrap();
+        let socket: UdpSocket = raw.into();
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1);
+
+        let transport = UdpTransport::from_raw_for_test(socket, target);
+        let mut cfg = dummy_config();
+        cfg.qos = qos;
+        cfg.multicast_group = target;
+        let mut v = HybridVariant::new("test-runner", cfg);
+        v.udp = Some(transport);
+        v
+    }
+
+    /// QoS 1 (BestEffort): `try_publish` honestly reports backpressure
+    /// when the UDP send buffer fills. With a 1 KB SO_SNDBUF and
+    /// 60 KB payloads, a tight loop must hit `Ok(false)` quickly OR
+    /// the host doesn't surface `WouldBlock` for loopback UDP at all
+    /// (in which case the override still must not panic or return
+    /// `Err`, which is checked implicitly by the loop completing).
+    #[test]
+    fn try_publish_qos1_returns_false_under_send_buffer_pressure() {
+        let mut v = make_pressured_variant(Qos::BestEffort);
+        let payload = vec![0xABu8; 60_000];
+        let mut saw_false = false;
+        for seq in 0..200_000u64 {
+            match v.try_publish("/p", &payload, Qos::BestEffort, seq) {
+                Ok(true) => {}
+                Ok(false) => {
+                    saw_false = true;
+                    break;
+                }
+                Err(e) => panic!("try_publish errored: {e:#}"),
+            }
+        }
+        if !saw_false && host_surfaces_udp_wouldblock() {
+            panic!("expected try_publish to return Ok(false) on QoS 1 — host can surface WouldBlock but try_publish did not");
+        }
+    }
+
+    /// QoS 2 (LatestValue): same shape as QoS 1.
+    #[test]
+    fn try_publish_qos2_returns_false_under_send_buffer_pressure() {
+        let mut v = make_pressured_variant(Qos::LatestValue);
+        let payload = vec![0xCDu8; 60_000];
+        let mut saw_false = false;
+        for seq in 0..200_000u64 {
+            match v.try_publish("/p", &payload, Qos::LatestValue, seq) {
+                Ok(true) => {}
+                Ok(false) => {
+                    saw_false = true;
+                    break;
+                }
+                Err(e) => panic!("try_publish errored: {e:#}"),
+            }
+        }
+        if !saw_false && host_surfaces_udp_wouldblock() {
+            panic!("expected try_publish to return Ok(false) on QoS 2 — host can surface WouldBlock but try_publish did not");
+        }
+    }
+
+    /// QoS 3 (ReliableUdp): TCP transport, blocking `broadcast`. With
+    /// no peers connected the broadcast is a no-op, but it must still
+    /// return `Ok(true)` — TCP receivers expect contiguous seqs and
+    /// the driver must not log `backpressure_skipped` for QoS 3/4.
+    #[test]
+    fn try_publish_qos3_never_reports_backpressure_no_peers() {
+        use crate::tcp::TcpTransport;
+        let mut cfg = dummy_config();
+        cfg.qos = Qos::ReliableUdp;
+        let mut v = HybridVariant::new("test-runner", cfg);
+        // Splice in a TCP transport with no peers. broadcast() over an
+        // empty peer set is a no-op that still returns Ok.
+        v.tcp = Some(TcpTransport::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap());
+
+        let payload = vec![0u8; 64];
+        for seq in 0..100u64 {
+            let result = v
+                .try_publish("/p", &payload, Qos::ReliableUdp, seq)
+                .expect("QoS 3 try_publish must succeed");
+            assert!(
+                result,
+                "QoS 3 must never return Ok(false) — TCP path, contiguous seqs required"
+            );
+        }
+    }
+
+    /// QoS 4 (ReliableTcp): identical contract to QoS 3 — TCP path,
+    /// always `Ok(true)`.
+    #[test]
+    fn try_publish_qos4_never_reports_backpressure_no_peers() {
+        use crate::tcp::TcpTransport;
+        let mut cfg = dummy_config();
+        cfg.qos = Qos::ReliableTcp;
+        let mut v = HybridVariant::new("test-runner", cfg);
+        v.tcp = Some(TcpTransport::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap());
+
+        let payload = vec![0u8; 64];
+        for seq in 0..100u64 {
+            let result = v
+                .try_publish("/p", &payload, Qos::ReliableTcp, seq)
+                .expect("QoS 4 try_publish must succeed");
+            assert!(
+                result,
+                "QoS 4 must never return Ok(false) — TCP receivers expect contiguous seqs"
+            );
+        }
+    }
+
+    /// Happy path: when nothing is backpressured, `try_publish`
+    /// returns `Ok(true)` on QoS 1. Uses a real loopback multicast
+    /// socket (same path the variant uses in production).
+    #[test]
+    fn try_publish_happy_path_returns_true() {
+        let mut cfg = dummy_config();
+        cfg.multicast_group = "239.0.0.1:19952".parse().unwrap();
+        let mut v = HybridVariant::new("self", cfg);
+        if v.connect().is_err() {
+            // CI without multicast: skip silently.
+            return;
+        }
+        let result = v
+            .try_publish("/p", b"x", Qos::BestEffort, 0)
+            .expect("happy-path try_publish must succeed");
+        assert!(result, "expected Ok(true) on idle transport");
         v.disconnect().ok();
     }
 }

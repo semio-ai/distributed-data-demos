@@ -143,6 +143,29 @@ impl UdpTransport {
             .with_context(|| format!("failed to send UDP datagram to {}", self.multicast_addr))
     }
 
+    /// Single non-blocking `send_to`. Returns:
+    /// - `Ok(true)`  — the datagram was accepted by the kernel.
+    /// - `Ok(false)` — the kernel send buffer was full (`WouldBlock`).
+    /// - `Err(_)`    — any other I/O error.
+    ///
+    /// Used by `HybridVariant::try_publish` for QoS 1/2 (T-impl.7): the
+    /// driver assigns the seq before calling us, and these two QoS
+    /// levels tolerate seq gaps by design (best-effort / latest-value),
+    /// so a `WouldBlock` here is recorded as `backpressure_skipped`
+    /// rather than dropped on the wire.
+    pub fn try_send_nonblocking(&self, data: &[u8]) -> Result<bool> {
+        let target = SocketAddr::V4(self.multicast_addr);
+        match self.socket.send_to(data, target) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) => Err(anyhow::anyhow!(
+                "UDP try_send to {}: {}",
+                self.multicast_addr,
+                e
+            )),
+        }
+    }
+
     /// Try to receive a datagram (non-blocking).
     /// Returns `None` if no data is available.
     pub fn try_recv(&self, buf: &mut [u8]) -> Result<Option<usize>> {
@@ -159,6 +182,19 @@ impl UdpTransport {
         // the multicast group when the socket is closed.
         drop(self.socket);
         Ok(())
+    }
+
+    /// Build a `UdpTransport` from an already-configured `UdpSocket`
+    /// plus an arbitrary unicast target. Test-only escape hatch used by
+    /// the T-impl.7 `try_publish` backpressure tests, which need a
+    /// non-multicast send path with a tiny `SO_SNDBUF` to force the
+    /// kernel into `WouldBlock`.
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(socket: UdpSocket, target: SocketAddrV4) -> Self {
+        Self {
+            socket,
+            multicast_addr: target,
+        }
     }
 }
 
