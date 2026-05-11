@@ -61,6 +61,21 @@ Logged by the writer each time a value is written during the operate phase.
 | `qos` | integer | QoS level (1-4) |
 | `bytes` | integer | Serialized size of the value in bytes |
 
+### `backpressure_skipped`
+
+Logged by the writer when the driver's per-tick value loop calls
+`Variant::try_publish` and the transport reports `Ok(false)`
+(backpressured -- not delivered, not retried within this tick). No
+matching `write` event is emitted for the skipped value, and no
+receiver will see a `receive` for it. Diagnostic counter used by
+analysis to distinguish "writer held back" from "writer sent and
+downstream dropped it".
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `path` | string | Key path that would have been written |
+| `qos` | integer | QoS level (1-4) |
+
 ### `receive`
 
 Logged by a reader each time a replicated value is received.
