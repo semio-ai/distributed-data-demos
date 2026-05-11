@@ -264,3 +264,62 @@ dimensions.
 ## Known Deviations
 
 _None yet._
+
+---
+
+## DRAFT -- E14 additions (awaiting user review, do not implement yet)
+
+A new expansion dimension is added to `[variant.common]`: `threading_modes`.
+Combined with the existing `qos` dimension, the runner emits the
+cross-product of spawns. A new scalar field `recv_buffer_kb` is also
+added.
+
+### `[variant.common] threading_modes`
+
+Accepts:
+- omitted -> defaults to `["single"]` (backwards compatible -- existing
+  configs continue to spawn single-threaded only)
+- a single string: `threading_modes = "multi"`
+- an array of strings: `threading_modes = ["single", "multi"]`
+
+Accepted values are `"single"` and `"multi"`. Anything else is a config
+error caught at parse time.
+
+### `[variant.common] recv_buffer_kb`
+
+Optional `u32`, default `4096`. Range `64..=65536` (validated at parse
+time). Forwarded to the variant via the runner-injected `--recv-buffer-kb`
+arg (see `variant-cli.md` DRAFT section).
+
+### Expansion cross-product
+
+A variant entry with `qos = [3, 4]` and
+`threading_modes = ["single", "multi"]` expands to four spawns:
+
+- `<name>-qos3-single`
+- `<name>-qos3-multi`
+- `<name>-qos4-single`
+- `<name>-qos4-multi`
+
+Naming convention: `qos` segment first, then `threading_mode` segment.
+This matches the existing `qosN` suffix convention from E9 and adds a
+new suffix after it.
+
+### Sequential execution + grace
+
+Spawns derived from one source entry continue to run sequentially in
+ascending order; the secondary sort key is `threading_mode` (alphabetical:
+`multi` before `single`). The same `inter_qos_grace_ms` grace applies
+between every consecutive pair of spawns.
+
+### Capability gating
+
+If the variant's declared `supported_threading_modes()` (see
+`variant-cli.md` DRAFT) does not include the expanded mode, the runner
+silently skips that spawn with a one-line `eprintln!` notice. The skipped
+spawn does NOT appear in the run summary.
+
+### Backward compatibility
+
+Existing configs that omit `threading_modes` continue to behave exactly
+as today: single-threaded spawns only. The new field is purely additive.

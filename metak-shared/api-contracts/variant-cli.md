@@ -66,3 +66,55 @@ The runner kills the variant if it does not exit within the per-variant
 TOML keys use `snake_case`. CLI arguments use `kebab-case` with `--` prefix.
 The runner converts `snake_case` TOML keys to `--kebab-case` CLI args
 (e.g. `tick_rate_hz` becomes `--tick-rate-hz`).
+
+---
+
+## DRAFT -- E14 additions (awaiting user review, do not implement yet)
+
+Two new runner-injected CLI args, added by T14.1 + T14.8:
+
+### `--threading-mode <single|multi>`
+
+Required. Set by the runner from the expanded `threading_modes` dimension
+in TOML config (see `toml-config-schema.md` DRAFT section). Tells the
+variant which execution model to use:
+
+- `single` -- single-threaded, fully synchronous. No tokio. Variants
+  that fundamentally rely on async runtimes (QUIC, WebRTC, Zenoh)
+  must reject this mode at `connect` time with a clear error and exit
+  non-zero before any I/O. TCP-family variants (websocket, hybrid,
+  custom-udp) must support this mode. Single-threaded mode is the
+  WASM-compatible mode -- adopting any Rust crate or pattern that
+  forces async into this mode is a violation of the WASM compilation
+  goal.
+- `multi` -- multi-threaded. Variants may spawn OS threads (typically
+  one per peer connection on the recv side) to decouple per-message
+  parse cost from the driver's poll cadence. May still avoid tokio if
+  the transport library doesn't require it; "multi" does NOT imply
+  "async". All seven variants must support this mode.
+
+Capability is per-variant and declared via the Variant trait's
+`supported_threading_modes() -> &[ThreadingMode]`. The runner consults
+this declaration (mechanism: static TOML field OR `--print-capabilities`
+probe -- T14.8 chooses) and silently skips spawns whose threading_mode
+the variant does not support.
+
+### `--recv-buffer-kb <u32>`
+
+Optional, default `4096` (4 MiB). Range `64..=65536` (64 KiB to 64 MiB).
+Sized to be safe on a Raspberry Pi 4 with 4 GB RAM under a 2-peer
+benchmark. Variants must call `setsockopt(SO_RCVBUF, recv_buffer_kb * 1024)`
+on every recv-side socket they own. Variants whose transport library
+does not expose the underlying socket (Zenoh, webrtc-rs) must document
+why and may treat this arg as advisory.
+
+### JSONL log impact
+
+The `connected` event gains a `threading_mode` field whose value is one
+of `"single"` / `"multi"`. The field is optional during the E14 rollout
+(pre-T14.8 logs may omit it) and becomes required once T14.8 lands.
+The `recv_buffer_kb` value is recorded in the same `connected` event
+as a separate field, for offline reproducibility.
+
+See also `jsonl-log-schema.md` DRAFT section (T14.1 will write that
+update).
