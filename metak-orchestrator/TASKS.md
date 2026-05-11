@@ -4033,3 +4033,329 @@ From workspace root (the worktree root):
   policy still holds; the bounded retry inside `discover()` is
   internal and not the same thing as T-coord.2's external barrier
   timeout.
+
+---
+
+## Realism sprint — pre-rerun fixes (T-impl.*)
+
+Goal: get the all-variants matrix into a state where its rows reflect
+**transport behaviour** rather than benchmark-harness limits. Filed
+2026-05-11 after diagnosing the same-machine `_183143` run. See
+`metak-shared/presentation-brief.md` §§5–6 for what each fix targets.
+
+### T-impl.1: runner — capture variant stderr per spawn
+
+**Repo**: `runner/`
+**Status**: pending.
+
+#### Background
+
+When the Zenoh `1000x100hz-qos3` spawn was investigated, bob's JSONL
+log was truncated mid-write — the variant child died/was-killed during
+`operate` and there is **no record of why** because the spawn-monitor
+discards child stderr. This blocks every "Zenoh under load" question.
+
+#### Scope
+
+1. In `runner/src/spawn.rs` (or wherever `Command::spawn` is invoked),
+   redirect the child's stderr to a per-spawn file:
+   `<log_subdir>/<effective_name>-<runner_name>-stderr.txt`.
+2. Capture must be **non-blocking** for the spawn-monitor: use
+   `Stdio::piped()` plus a dedicated thread that copies child stderr
+   to the file, OR `Stdio::from(File::create(...))` if the child's
+   stderr can go directly to disk (simpler — prefer this if
+   `inherit_stderr` isn't a requirement somewhere).
+3. The file must exist even if the spawn is killed for timeout. Use
+   line-buffered writes if the implementation supports it.
+4. **Do NOT** suppress stderr from the runner's own console — only
+   the variant child's stderr should be redirected. Operators still
+   need to see runner-side panics.
+5. Update `runner/CUSTOM.md` with a short subsection naming the file
+   convention so analysis / debugging tooling can find them.
+
+#### Tests
+
+- Unit test: spawn a stub child that writes a known string to stderr
+  and exits; assert the file is created with the expected content.
+- Integration test: spawn a child that prints to stderr and then
+  panics with a recognisable message; assert the file contains both
+  the print AND the panic message.
+
+#### Acceptance criteria
+
+- [ ] Per-spawn stderr file appears under the log subfolder.
+- [ ] Variant panic / abort messages survive to the file.
+- [ ] No deadlock on spawn-monitor when child closes stderr cleanly.
+- [ ] No deadlock when child is killed mid-write.
+- [ ] `runner/CUSTOM.md` updated with file-naming convention.
+- [ ] All existing runner tests pass.
+
+### T-impl.2: variants — bump UDP socket buffers on all UDP transports
+
+**Repo**: `variant-base/`, `variants/custom-udp/`, `variants/hybrid/`,
+`variants/quic/`, `variants/webrtc/`, `variants/zenoh/`.
+**Status**: pending.
+
+#### Background
+
+Windows default UDP recv buffer is ~64 KB. At sustained 100 K pkt/s
+kernel buffers overflow within milliseconds, producing apparent
+"loss" that is really kernel-side drop. This affects every same-host
+high-rate row in the matrix.
+
+#### Scope
+
+1. Add a small helper in `variant-base/` that bumps `SO_RCVBUF` and
+   `SO_SNDBUF` to **8 MiB** on a `socket2::Socket` (or `UdpSocket`
+   wrapped equivalently). The helper should be cross-platform; on
+   Windows the actual achieved size may be capped by the OS, so the
+   helper should query the achieved size back and log a single
+   warning line if it is below 1 MiB.
+2. Apply the helper at every UDP socket-creation site in:
+   - `variants/custom-udp/`
+   - `variants/hybrid/` (its UDP path; do NOT change the TCP path)
+   - `variants/quic/` (the underlying UDP socket quinn builds on)
+   - `variants/webrtc/` (the underlying ICE / DTLS UDP socket)
+3. For `variants/zenoh/`: Zenoh's session config has transport-layer
+   queue tuning. Set the relevant fields so the session-level
+   send/recv queues are large enough to absorb similar bursts.
+   Document the exact field path in `variants/zenoh/CUSTOM.md`. If
+   Zenoh's config-only knobs do not match the 8 MiB target,
+   document the closest equivalent.
+
+#### Tests
+
+- Unit: create a UDP socket via the helper, query `SO_RCVBUF` and
+  `SO_SNDBUF`, assert both are >= 1 MiB (a conservative floor that
+  should work on every reasonable kernel).
+- Per-variant: each variant's existing smoke / integration test
+  must still pass.
+
+#### Acceptance criteria
+
+- [ ] Helper exists in `variant-base/`; both buffer dimensions set.
+- [ ] Helper invoked at every UDP creation site in the five UDP-using
+      crates.
+- [ ] Zenoh session config updated equivalently and documented.
+- [ ] Achieved size logged when below 1 MiB.
+- [ ] All existing tests pass; new unit test passes.
+
+### T-impl.3: runner + variant-base — raise EOT timeout default + config passthrough
+
+**Repo**: `runner/`, `variant-base/`.
+**Status**: pending.
+
+#### Background
+
+The EOT phase default budget is `max(operate_secs, 5)` = 30 s at our
+current config. For hybrid TCP at 100 K writes/s this is too short:
+~3 M backlogged messages cannot drain in 30 s.
+
+#### Scope
+
+1. In `variant-base/`: change the default computation for the
+   `--eot-timeout-secs` flag from `max(operate_secs, 5)` to
+   **`max(3 * operate_secs, 30)`** (so 30 s operate -> 90 s drain).
+   Document in `variant-base/CUSTOM.md`.
+2. In `runner/`: ensure the config's per-variant `eot_timeout_secs`
+   (if present) is passed through as `--eot-timeout-secs <N>` on the
+   variant child's command line. If absent, the runner does NOT pass
+   the flag (variant uses its default from step 1).
+3. Note the optional override in
+   `metak-shared/api-contracts/toml-config-schema.md`.
+
+#### Tests
+
+- Unit in `variant-base/`: with `operate_secs = 30` and
+  `eot_timeout_secs = None`, the driver runs the EOT phase for at
+  least 90 s if peers never EOT.
+- Unit in `variant-base/`: with `eot_timeout_secs = Some(5)`, the
+  EOT phase fires `eot_timeout` after ~5 s.
+- Integration in `runner/`: a config with
+  `[variant.common].eot_timeout_secs = 7` results in the variant
+  child's command line containing `--eot-timeout-secs 7`.
+
+#### Acceptance criteria
+
+- [ ] Default raised in `variant-base/` to `max(3 * operate_secs, 30)`.
+- [ ] Runner passes the config field through as a CLI flag.
+- [ ] Config schema doc notes the field.
+- [ ] All existing tests pass; new unit + integration tests pass.
+
+### T-impl.4: variant-websocket — same-host port assignment
+
+**Repo**: `variants/websocket/`.
+**Status**: pending.
+
+#### Background
+
+On a single host both alice's and bob's websocket variants try to bind
+the same server port and one of them fails. Every `websocket-*` row in
+the same-machine run shows 0 writes / 100 % loss as a result.
+
+#### Scope
+
+1. The variant already receives `--runner <name>` from the runner.
+   Compute the runner's index in the `--peers` list (or accept a new
+   `--runner-index <N>` injected by the runner — pick whichever
+   matches the existing CLI passing pattern; extend the runner side
+   too if needed).
+2. Bind the websocket server to `base_port + runner_index`.
+3. Update the variant's peer-connect logic to compute the *peer's*
+   server port the same way and connect to
+   `peer_host:base_port + peer_index`.
+4. Document the offset convention in `variants/websocket/CUSTOM.md`.
+
+#### Tests
+
+- Unit: with `--runner alice --peers alice=127.0.0.1,bob=127.0.0.1`
+  and a base port of 19200, alice binds 19200, bob (when running
+  separately with the same args) binds 19201.
+- Smoke: two-runner same-host websocket spawn for
+  `websocket-100x100hz-qos3`, both processes produce non-zero
+  `write` and `receive` counts.
+
+#### Acceptance criteria
+
+- [ ] Variant computes its own server port from runner index.
+- [ ] Variant computes each peer's port the same way.
+- [ ] Same-host websocket spawn delivers non-zero data.
+- [ ] `variants/websocket/CUSTOM.md` updated.
+- [ ] All existing tests pass.
+
+### T-impl.5: variant-webrtc — signaling robustness investigation + fix
+
+**Repo**: `variants/webrtc/`.
+**Status**: pending — investigation first, fix second.
+
+#### Background
+
+Many webrtc spawns at higher rates produce 0 writes / 0 ms because the
+DataChannel handshake has not completed before `operate` begins.
+Spawns that do connect look fine.
+
+#### Scope (investigation phase)
+
+1. Spawn `webrtc-100x100hz-qos1` same-host with verbose logging.
+   Capture per-peer signaling timeline.
+2. Inspect: discovery / signaling channel, handshake timeouts, whether
+   the variant's `connect` phase awaits `data_channel_open`.
+3. Write a one-paragraph diagnosis to `metak-orchestrator/DECISIONS.md`
+   (next available ID).
+
+#### Scope (fix phase, only if diagnosis points to an actionable issue)
+
+4. Most likely fixes (in order): await `data_channel_open` in
+   `connect`; bump signaling timeout; properly sequence ICE candidate
+   gathering vs stabilize.
+5. Apply the fix; document in `variants/webrtc/CUSTOM.md`.
+
+#### Tests
+
+- Smoke: run `webrtc-100x100hz-qos1` same-host 3 times in a row;
+  at least 2 of 3 produce non-zero `write` AND `receive` counts.
+
+#### Acceptance criteria
+
+- [ ] Diagnosis entry in DECISIONS.md.
+- [ ] If fix applied: >= 67 % of same-host high-rate webrtc spawns
+      produce non-zero data in a 3-run smoke test.
+- [ ] If no fix possible: documented in `variants/webrtc/CUSTOM.md`
+      and rerun decision accepts "WebRTC not characterised at high
+      rates."
+- [ ] All existing tests pass.
+
+---
+
+## Realism sprint — Tier 2 (writer backpressure)
+
+### T-impl.6: variant-base — `try_write` trait method + driver respect
+
+**Repo**: `variant-base/`.
+**Status**: pending — gates T-impl.7.
+
+#### Background
+
+The matrix sweeps `vpt x tick_rate_hz` write rates regardless of what
+the receiver can sustain. At 100 K writes/sec on this hardware every
+transport's kernel buffer overflows; the resulting rows tell us about
+buffer sizing, not transport throughput.
+
+Goal: shift workload semantics from "writer always emits
+`vpt x tick_rate_hz`" to "writer emits up to `vpt x tick_rate_hz` if
+the transport reports it is not currently backpressured."
+
+#### Scope
+
+1. Add `fn try_write(&mut self, path: &str, value: &[u8], qos: Qos)
+   -> Result<bool>` to the `Variant` trait. Returns `Ok(true)` if the
+   write was accepted, `Ok(false)` if the transport is currently
+   backpressured (no error, just "not now"). Errors still propagate.
+2. Default impl: call the existing `write(...)` and return `Ok(true)`.
+3. Driver: in the operate-phase tick loop, call `try_write` instead
+   of `write`. If it returns `Ok(false)`, log a
+   `backpressure_skipped` event with path and qos, continue to the
+   next value. No retry within the same tick.
+4. Schema: add `backpressure_skipped` event to
+   `metak-shared/api-contracts/jsonl-log-schema.md`.
+5. Analysis: surface a `backpressure_skipped_count` per
+   `(variant, qos)` in the integrity report.
+
+#### Tests
+
+- Unit: stub variant whose `try_write` always returns `Ok(false)`
+  produces zero `write` events and >= 1 `backpressure_skipped` per
+  intended tick.
+- Unit: default impl behaves identically to `write`.
+- Integration: `variant-dummy` lifecycle still exits cleanly.
+
+#### Acceptance criteria
+
+- [ ] Trait method added with default impl.
+- [ ] Driver calls `try_write` and logs `backpressure_skipped`.
+- [ ] Schema doc updated.
+- [ ] Analysis exposes `backpressure_skipped_count`.
+- [ ] All existing tests pass.
+
+### T-impl.7: variants — implement `try_write` per transport
+
+**Repo**: all six variant crates.
+**Status**: pending — depends on T-impl.6.
+
+#### Per-variant scope
+
+Each transport detects backpressure differently. The override should
+be cheap and honest (never `Ok(true)` if the data would be dropped).
+
+- **Custom UDP** — non-blocking send; `WouldBlock` -> `Ok(false)`.
+- **Hybrid** — same on UDP path; on TCP path non-blocking send and
+  `WouldBlock` -> `Ok(false)`. Independent per QoS.
+- **QUIC** — `Connection::send_datagram` returns
+  `SendDatagramError::Blocked` for unreliable. Stream sends use
+  poll/try semantics.
+- **Zenoh** — configure each Publisher with
+  `congestion_control = Drop` and check write-side return; or use
+  Publisher pending depth if available. Document the chosen knob.
+- **WebRTC** — `RTCDataChannel::buffered_amount()` > 4 MiB ->
+  backpressured.
+- **WebSocket** — non-blocking TCP send; `WouldBlock` -> `Ok(false)`.
+
+#### Tests
+
+- Per-variant unit: synthesize a write loop that fills the send
+  buffer; assert `try_write` returns `Ok(false)` at some point
+  before crashing.
+- Existing tests must pass.
+
+#### Acceptance criteria
+
+- [ ] Each variant overrides `try_write`.
+- [ ] No variant returns `Ok(true)` when the kernel / library would
+      drop the data.
+- [ ] Per-variant `CUSTOM.md` documents the signal used.
+- [ ] All existing tests pass.
+
+#### Out of scope (T-impl.6 + T-impl.7)
+
+- Receiver-driven backpressure across variants.
+- Token-bucket / rate limiting on the writer side.
