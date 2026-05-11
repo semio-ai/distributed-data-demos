@@ -312,6 +312,69 @@ in `src/webrtc.rs` from 15 s to ~30 s. The variant is otherwise
 characterised as working at the rates targeted by the all-variants
 matrix.
 
+## Backpressure semantics (T-impl.7)
+
+The variant overrides `Variant::try_publish` to honour the
+backpressure-skip contract introduced by T-impl.6. The override
+behaves differently per QoS:
+
+- **QoS 1 (best-effort) and QoS 2 (latest-value)**: backpressure-aware
+  using a per-(peer, qos) in-flight byte counter. If any target
+  peer's counter is currently above `BACKPRESSURE_BYTES_THRESHOLD`
+  (defined as `4 MiB` in `src/webrtc.rs`), `try_publish` returns
+  `Ok(false)` without enqueuing anything, the driver logs a
+  `backpressure_skipped` event, and the spawn moves on to the next
+  value. The skip is symmetric across peers (skip if any one is
+  backpressured) so unreliable channels do not silently fan out to
+  only a subset of peers and create asymmetric loss.
+
+- **QoS 3 (reliable-ordered) and QoS 4 (reliable)**: never return
+  `Ok(false)`. The override delegates to `publish`, which enqueues
+  onto the per-peer send loop where the actual `dc.send().await` is
+  awaited. Backpressure for reliable QoS shows up as wall-clock
+  blocking inside the runtime's send loop, **not** as a skip --
+  returning `Ok(false)` would create a receiver-visible seq gap and
+  break the ordering / completeness guarantees the receiver relies
+  on for QoS 3/4.
+
+### Why a self-maintained counter instead of `RTCDataChannel::buffered_amount()`
+
+webrtc-rs 0.8 exposes `buffered_amount()` only as an `async` method
+on `RTCDataChannel`, gated behind a tokio mutex on the inner
+data-channel handle. Calling it from the sync `try_publish` would
+require entering the runtime (`Runtime::block_on`) on **every**
+publish tick. At our tick rates (up to 100 K msg/s in
+`max-throughput` mode) the runtime entry/exit overhead would
+dominate the very latency measurements the variant exists to
+characterise.
+
+Instead, each `try_publish` (and `publish`) increments an
+`AtomicUsize` counter under `self.inflight[(peer, qos)]` by the
+encoded-frame size before queuing an `OutboundMessage`. The send
+loop decrements the same counter by the same amount once
+`dc.send().await` returns (success or error). The counter is a
+strictly conservative proxy: it counts bytes we have committed to
+the pipeline but the SCTP layer has not yet acknowledged as sent --
+so the threshold check is more forgiving than the SCTP-level
+`buffered_amount`, never less. EOT frames bypass the counter
+(`inflight_counter = None`) because they must always be delivered.
+
+### Why the 4 MiB threshold
+
+Empirical sizing for the all-variants matrix at 100 K msg/s with
+~1 KiB payloads. 4 MiB absorbs short bursts (~40 ms of accumulated
+traffic) without unbounded growth, leaving room for the runtime
+scheduler to drain the queue. Smaller thresholds (1-2 MiB) would
+skip too aggressively during normal jitter; larger thresholds
+(>16 MiB) defer the skip past the point where the receiver-side
+latency starts becoming useless.
+
+There is a deliberate race between checking the counter and the
+subsequent increment-then-enqueue sequence: two concurrent
+`try_publish` calls could each see `counter < threshold` and both
+proceed. That's fine -- the threshold is a soft limit and a small
+overshoot is preferable to the cost of an additional fence here.
+
 ## Out of scope
 
 - STUN / TURN.

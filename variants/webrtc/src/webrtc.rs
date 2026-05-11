@@ -26,6 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -114,6 +115,24 @@ fn channel_options(qos: Qos) -> RTCDataChannelInit {
 /// if the marker drops in flight.
 const EOT_CHANNEL_QOS: Qos = Qos::ReliableTcp;
 
+/// Soft upper bound on the per-(peer, qos) outbound queue depth, in
+/// bytes, that `try_publish` consults for **unreliable** QoS levels
+/// (1 and 2) under the T-impl.7 backpressure protocol.
+///
+/// The counter approximates `RTCDataChannel::buffered_amount()`: it
+/// is incremented when a frame is enqueued for the per-peer send loop
+/// and decremented after `dc.send` completes. Querying webrtc-rs's
+/// async `buffered_amount` from `try_publish` would require entering
+/// the runtime on every publish tick, which would dominate latency
+/// measurements at our tick rates; the queued-bytes counter is a
+/// strictly larger proxy (it counts bytes we have committed to the
+/// pipeline but the SCTP layer has not yet acknowledged as sent).
+///
+/// 4 MiB absorbs short bursts (~40 ms at 100 K msg/s with 1 KiB
+/// payloads) without unbounded growth. The check is a soft limit --
+/// see the brief race with the increment-then-send sequence below.
+const BACKPRESSURE_BYTES_THRESHOLD: usize = 4 * 1024 * 1024;
+
 /// Inbound observation drained by the variant's poll methods.
 #[derive(Debug)]
 enum Inbound {
@@ -130,12 +149,28 @@ struct OutboundMessage {
     qos: u8,
     /// Already-encoded wire bytes (data or EOT frame).
     data: Bytes,
+    /// Pre-incremented "in flight" byte counter the send loop must
+    /// decrement once `dc.send` completes. `None` for EOT frames and
+    /// other paths that do not participate in `try_publish`
+    /// backpressure accounting.
+    inflight_counter: Option<Arc<AtomicUsize>>,
+    /// Number of bytes the sender added to `inflight_counter` for
+    /// this message. The send loop subtracts the same value back.
+    /// Always 0 when `inflight_counter` is `None`.
+    inflight_bytes: usize,
 }
 
 /// Per-peer DataChannel set keyed by QoS as `u8` (1..=4) since `Qos`
 /// itself doesn't implement `Hash`.
 type QosChannelMap = HashMap<u8, Arc<RTCDataChannel>>;
 type PeerChannelMap = HashMap<String, QosChannelMap>;
+
+/// Per-(peer, qos) in-flight byte counters used by `try_publish` for
+/// the T-impl.7 backpressure check. Only the unreliable QoS levels
+/// (1, 2) actually consult these; the entries are still populated for
+/// 3/4 so the schema stays uniform, but reliable publishes never read
+/// or guard on the counter (they unconditionally enqueue and await).
+type InflightMap = HashMap<(String, u8), Arc<AtomicUsize>>;
 
 /// Shutdown signal for background tasks.
 type ShutdownTx = tokio::sync::watch::Sender<bool>;
@@ -156,6 +191,10 @@ pub struct WebRtcVariant {
     /// Held alive for the lifetime of the variant so receive-side
     /// `on_message` callbacks keep working until disconnect.
     peer_connections: Vec<Arc<RTCPeerConnection>>,
+
+    /// Per-(peer, qos) in-flight byte counters consulted by
+    /// `try_publish` for the T-impl.7 backpressure protocol.
+    inflight: InflightMap,
 
     /// Pending EOTs pulled from the inbound channel, awaiting drain
     /// by `poll_peer_eots`.
@@ -183,6 +222,7 @@ impl WebRtcVariant {
             recv_rx: None,
             shutdown_tx: None,
             peer_connections: Vec::new(),
+            inflight: HashMap::new(),
             pending_eots: Vec::new(),
             pending_data: std::collections::VecDeque::new(),
         }
@@ -675,6 +715,14 @@ async fn drive_signaling(
 
 /// Background send loop: receives outbound messages and dispatches
 /// them onto the appropriate DataChannel for the target peer / QoS.
+///
+/// For each message, after the `dc.send` future resolves (whether
+/// successfully or not), decrement the per-(peer, qos) in-flight byte
+/// counter by `inflight_bytes`. This keeps the counter that
+/// `try_publish` consults in step with the actual queue depth as
+/// observed from our side, even when `send` returns an error (in
+/// which case the bytes never reach the wire but they are also no
+/// longer queued for us).
 async fn send_loop(
     mut rx: mpsc::UnboundedReceiver<OutboundMessage>,
     peer_channels: PeerChannelMap,
@@ -686,14 +734,23 @@ async fn send_loop(
                 match msg {
                     Some(m) => {
                         let Some(channels) = peer_channels.get(&m.peer) else {
+                            if let Some(c) = m.inflight_counter.as_ref() {
+                                c.fetch_sub(m.inflight_bytes, Ordering::Relaxed);
+                            }
                             continue;
                         };
                         let Some(dc) = channels.get(&m.qos) else {
+                            if let Some(c) = m.inflight_counter.as_ref() {
+                                c.fetch_sub(m.inflight_bytes, Ordering::Relaxed);
+                            }
                             continue;
                         };
                         let bytes: bytes::Bytes = m.data.clone();
                         if let Err(e) = dc.send(&bytes).await {
                             eprintln!("[webrtc] send to peer={} qos={} failed: {e}", m.peer, m.qos);
+                        }
+                        if let Some(c) = m.inflight_counter.as_ref() {
+                            c.fetch_sub(m.inflight_bytes, Ordering::Relaxed);
                         }
                     }
                     None => break,
@@ -775,6 +832,26 @@ impl Variant for WebRtcVariant {
             pcs.push(pc);
         }
 
+        // Populate the per-(peer, qos) in-flight byte counters. We
+        // create one counter for every (peer, qos) pair regardless of
+        // whether that QoS will actually use it -- `try_publish` only
+        // consults the counter for QoS 1/2, but having a uniform map
+        // keeps the send loop's accounting trivial.
+        let mut inflight: InflightMap = HashMap::new();
+        for peer_name in peer_channels.keys() {
+            for qos in [
+                Qos::BestEffort,
+                Qos::LatestValue,
+                Qos::ReliableUdp,
+                Qos::ReliableTcp,
+            ] {
+                inflight.insert(
+                    (peer_name.clone(), qos.as_int()),
+                    Arc::new(AtomicUsize::new(0)),
+                );
+            }
+        }
+
         // Spawn the send loop.
         let pc_for_send = peer_channels.clone();
         let shutdown_for_send = shutdown_rx.clone();
@@ -786,6 +863,7 @@ impl Variant for WebRtcVariant {
         self.recv_rx = Some(recv_rx);
         self.shutdown_tx = Some(shutdown_tx);
         self.peer_connections = pcs;
+        self.inflight = inflight;
         self.runtime = Some(runtime);
 
         Ok(())
@@ -797,17 +875,74 @@ impl Variant for WebRtcVariant {
             .as_ref()
             .context("not connected -- call connect() first")?;
         let bytes = encode_data(qos, seq, path, &self.runner, payload);
+        let inflight_bytes = bytes.len();
         let data = Bytes::from(bytes);
         for peer in &self.peers {
+            let counter = self
+                .inflight
+                .get(&(peer.name.clone(), qos.as_int()))
+                .cloned();
+            if let Some(c) = counter.as_ref() {
+                c.fetch_add(inflight_bytes, Ordering::Relaxed);
+            }
             send_tx
                 .send(OutboundMessage {
                     peer: peer.name.clone(),
                     qos: qos.as_int(),
                     data: data.clone(),
+                    inflight_counter: counter,
+                    inflight_bytes,
                 })
                 .map_err(|_| anyhow!("send channel closed"))?;
         }
         Ok(())
+    }
+
+    /// Non-blocking publish with backpressure detection (T-impl.7).
+    ///
+    /// For **unreliable QoS** (1 best-effort, 2 latest-value): consult
+    /// the per-(peer, qos) in-flight byte counter -- if any target
+    /// peer's pipeline already holds more than
+    /// `BACKPRESSURE_BYTES_THRESHOLD` queued bytes, return `Ok(false)`
+    /// without enqueuing anything. The driver logs a
+    /// `backpressure_skipped` event and the caller moves on; the value
+    /// is **not** delivered to any peer for this seq. The threshold
+    /// check applies symmetrically across peers (skip if any one is
+    /// backpressured) so unreliable channels do not silently fan out
+    /// to only a subset of peers and create asymmetric loss.
+    ///
+    /// For **reliable QoS** (3, 4): delegate to `publish` -- the
+    /// inbound DataChannel is ordered + reliable, and any blocking
+    /// happens inside `send_loop` (which awaits `dc.send`). Returning
+    /// `Ok(false)` for a reliable channel would silently drop a seq
+    /// that the receiver expects to see, creating a permanent gap.
+    ///
+    /// Note: there is a brief race between checking the counter and
+    /// the subsequent increment-then-enqueue sequence. That's by
+    /// design -- the threshold is a soft limit and a few extra
+    /// messages in flight when we tip over the threshold are
+    /// acceptable.
+    fn try_publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<bool> {
+        match qos {
+            Qos::BestEffort | Qos::LatestValue => {
+                // Backpressure check: if any peer's queue is already
+                // over the threshold for this QoS, skip the value.
+                for peer in &self.peers {
+                    if let Some(c) = self.inflight.get(&(peer.name.clone(), qos.as_int())) {
+                        if c.load(Ordering::Relaxed) > BACKPRESSURE_BYTES_THRESHOLD {
+                            return Ok(false);
+                        }
+                    }
+                }
+                self.publish(path, payload, qos, seq)?;
+                Ok(true)
+            }
+            Qos::ReliableUdp | Qos::ReliableTcp => {
+                // Reliable QoS: never produce a receiver-visible gap.
+                self.publish(path, payload, qos, seq)?;
+                Ok(true)
+            }
+        }
     }
 
     fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
@@ -824,6 +959,7 @@ impl Variant for WebRtcVariant {
         }
         self.send_tx.take();
         self.recv_rx.take();
+        self.inflight.clear();
 
         // Close all peer connections gracefully.
         if let Some(rt) = self.runtime.as_ref() {
@@ -853,11 +989,15 @@ impl Variant for WebRtcVariant {
         // primary QoS -- an EOT lost on an unreliable channel could
         // deadlock the wait.
         for peer in &self.peers {
+            // EOT frames bypass the T-impl.7 backpressure accounting:
+            // they are reliable, one-shot, and must not be skipped.
             send_tx
                 .send(OutboundMessage {
                     peer: peer.name.clone(),
                     qos: EOT_CHANNEL_QOS.as_int(),
                     data: data.clone(),
+                    inflight_counter: None,
+                    inflight_bytes: 0,
                 })
                 .map_err(|_| anyhow!("send channel closed"))?;
         }
@@ -941,5 +1081,202 @@ mod tests {
     fn build_rtc_config_has_no_ice_servers() {
         let cfg = build_rtc_config();
         assert!(cfg.ice_servers.is_empty());
+    }
+
+    // ---------------- T-impl.7: try_publish backpressure ----------------
+
+    /// Build a `WebRtcVariant` in a "connected-shape" state without
+    /// actually opening any PeerConnections: a real send mpsc that the
+    /// test owns the receiver of, the per-(peer, qos) in-flight
+    /// counters populated, and one `PeerDesc` in `self.peers` so
+    /// `publish` / `try_publish` know who to send to. The DataChannel
+    /// side is bypassed -- the test asserts on what `try_publish`
+    /// queues (or doesn't queue), not what the wire sees.
+    type TestHarness = (
+        WebRtcVariant,
+        mpsc::UnboundedReceiver<OutboundMessage>,
+        HashMap<(String, u8), Arc<AtomicUsize>>,
+    );
+
+    fn build_test_variant_with_peer(peer_name: &str) -> TestHarness {
+        let (send_tx, send_rx) = mpsc::unbounded_channel::<OutboundMessage>();
+        let signaling = SocketAddr::from(([127, 0, 0, 1], 0));
+        let media = SocketAddr::from(([127, 0, 0, 1], 0));
+        let peers = vec![PeerDesc {
+            name: peer_name.to_string(),
+            signaling_addr: signaling,
+            media_addr: media,
+            role: PairRole::Initiator,
+        }];
+        let mut variant = WebRtcVariant::new("self", signaling, media, peers);
+        let mut inflight: HashMap<(String, u8), Arc<AtomicUsize>> = HashMap::new();
+        for qos in [
+            Qos::BestEffort,
+            Qos::LatestValue,
+            Qos::ReliableUdp,
+            Qos::ReliableTcp,
+        ] {
+            inflight.insert(
+                (peer_name.to_string(), qos.as_int()),
+                Arc::new(AtomicUsize::new(0)),
+            );
+        }
+        variant.inflight = inflight.clone();
+        variant.send_tx = Some(send_tx);
+        (variant, send_rx, inflight)
+    }
+
+    #[test]
+    fn try_publish_qos1_returns_false_when_buffer_over_threshold() {
+        let (mut v, mut rx, inflight) = build_test_variant_with_peer("bob");
+        // Pre-load the counter to just over the threshold.
+        inflight
+            .get(&("bob".to_string(), Qos::BestEffort.as_int()))
+            .unwrap()
+            .store(BACKPRESSURE_BYTES_THRESHOLD + 1, Ordering::Relaxed);
+
+        let result = v
+            .try_publish("/p", &[0u8; 8], Qos::BestEffort, 42)
+            .expect("try_publish must not error");
+        assert!(
+            !result,
+            "QoS 1 over threshold must return Ok(false) (backpressured)"
+        );
+        // No message should have been enqueued for the send loop.
+        assert!(
+            rx.try_recv().is_err(),
+            "no OutboundMessage should be queued when try_publish returns Ok(false)"
+        );
+    }
+
+    #[test]
+    fn try_publish_qos2_returns_false_when_buffer_over_threshold() {
+        let (mut v, mut rx, inflight) = build_test_variant_with_peer("bob");
+        inflight
+            .get(&("bob".to_string(), Qos::LatestValue.as_int()))
+            .unwrap()
+            .store(BACKPRESSURE_BYTES_THRESHOLD + 1, Ordering::Relaxed);
+
+        let result = v
+            .try_publish("/p", &[0u8; 8], Qos::LatestValue, 42)
+            .expect("try_publish must not error");
+        assert!(!result, "QoS 2 over threshold must return Ok(false)");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn try_publish_qos1_returns_true_below_threshold() {
+        let (mut v, mut rx, _inflight) = build_test_variant_with_peer("bob");
+        // Counter starts at zero -- well below the threshold.
+        let result = v
+            .try_publish("/p", &[0u8; 8], Qos::BestEffort, 1)
+            .expect("try_publish must not error");
+        assert!(result, "QoS 1 below threshold must return Ok(true)");
+        // Exactly one OutboundMessage must have been queued.
+        let msg = rx
+            .try_recv()
+            .expect("a single OutboundMessage should be queued");
+        assert_eq!(msg.peer, "bob");
+        assert_eq!(msg.qos, Qos::BestEffort.as_int());
+        assert!(msg.inflight_bytes > 0);
+        assert!(rx.try_recv().is_err(), "exactly one queued message");
+    }
+
+    #[test]
+    fn try_publish_qos3_returns_true_even_when_arbitrary_counter_set() {
+        // Reliable QoS must NEVER return Ok(false) -- the receiver-
+        // visible gap would corrupt ordering / completeness.
+        let (mut v, mut rx, inflight) = build_test_variant_with_peer("bob");
+        // Pre-load the QoS-3 counter to many multiples of the threshold;
+        // this models a deeply backed-up reliable channel. try_publish
+        // must still return Ok(true) (and the caller / send loop will
+        // back-pressure us through `dc.send().await` in the send loop).
+        inflight
+            .get(&("bob".to_string(), Qos::ReliableUdp.as_int()))
+            .unwrap()
+            .store(BACKPRESSURE_BYTES_THRESHOLD * 10, Ordering::Relaxed);
+
+        let result = v
+            .try_publish("/p", &[0u8; 8], Qos::ReliableUdp, 1)
+            .expect("try_publish must not error");
+        assert!(
+            result,
+            "QoS 3 must always return Ok(true), even under pressure"
+        );
+        let msg = rx.try_recv().expect("message must be queued for QoS 3");
+        assert_eq!(msg.qos, Qos::ReliableUdp.as_int());
+    }
+
+    #[test]
+    fn try_publish_qos4_returns_true_even_when_arbitrary_counter_set() {
+        let (mut v, mut rx, inflight) = build_test_variant_with_peer("bob");
+        inflight
+            .get(&("bob".to_string(), Qos::ReliableTcp.as_int()))
+            .unwrap()
+            .store(BACKPRESSURE_BYTES_THRESHOLD * 10, Ordering::Relaxed);
+
+        let result = v
+            .try_publish("/p", &[0u8; 8], Qos::ReliableTcp, 1)
+            .expect("try_publish must not error");
+        assert!(
+            result,
+            "QoS 4 must always return Ok(true), even under pressure"
+        );
+        let msg = rx.try_recv().expect("message must be queued for QoS 4");
+        assert_eq!(msg.qos, Qos::ReliableTcp.as_int());
+    }
+
+    #[test]
+    fn try_publish_qos1_at_exact_threshold_still_sends() {
+        // Threshold check uses strict greater-than so a counter sitting
+        // exactly at the threshold should still allow a send. This
+        // documents the boundary in the contract.
+        let (mut v, mut rx, inflight) = build_test_variant_with_peer("bob");
+        inflight
+            .get(&("bob".to_string(), Qos::BestEffort.as_int()))
+            .unwrap()
+            .store(BACKPRESSURE_BYTES_THRESHOLD, Ordering::Relaxed);
+
+        let result = v
+            .try_publish("/p", &[0u8; 8], Qos::BestEffort, 1)
+            .expect("try_publish must not error");
+        assert!(result, "exactly-at-threshold should still send (strict >)");
+        let _msg = rx
+            .try_recv()
+            .expect("message must be queued at exact threshold");
+    }
+
+    #[test]
+    fn try_publish_qos1_increments_then_send_loop_decrements_counter() {
+        // Verify the accounting plumbing: queue a message, observe the
+        // counter has grown by the inflight_bytes value carried on the
+        // OutboundMessage. Simulate the send_loop's decrement and
+        // verify it returns to zero. This validates the round-trip
+        // bookkeeping that keeps the threshold check honest.
+        let (mut v, mut rx, inflight) = build_test_variant_with_peer("bob");
+        let counter = inflight
+            .get(&("bob".to_string(), Qos::BestEffort.as_int()))
+            .unwrap()
+            .clone();
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        v.try_publish("/p", &[0u8; 16], Qos::BestEffort, 1).unwrap();
+        let queued_value = counter.load(Ordering::Relaxed);
+        assert!(queued_value > 0, "counter should have been incremented");
+
+        let msg = rx.try_recv().expect("a message should be queued");
+        assert_eq!(msg.inflight_bytes, queued_value);
+        assert!(msg.inflight_counter.is_some());
+
+        // Simulate the send_loop's decrement after dc.send completes.
+        msg.inflight_counter
+            .as_ref()
+            .unwrap()
+            .fetch_sub(msg.inflight_bytes, Ordering::Relaxed);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "counter must return to zero after the send loop drains the queue"
+        );
     }
 }
