@@ -39,10 +39,21 @@ def _fmt_rate(value: float) -> str:
     return f"{value:.1f}"
 
 
-def format_integrity_table(results: list[IntegrityResult]) -> str:
+def format_integrity_table(
+    results: list[IntegrityResult],
+    *,
+    late_tail_groups: set[tuple[str, str]] | None = None,
+) -> str:
     """Format the integrity report as a CLI table.
 
     Groups results by (variant, run) and shows one row per writer->receiver pair.
+
+    ``late_tail_groups`` (T11.5): set of ``(variant, run)`` keys for
+    which the corresponding ``PerformanceResult.late_receives_tail_pct``
+    was > 0. Rows in those groups are annotated with
+    ``[late_tail_present]`` so the integrity reader sees the same
+    outlier signal that the performance table shows. ``None`` means
+    no late-tail information available (legacy callers).
     """
     if not results:
         return "Integrity Report\n(no data)\n"
@@ -113,6 +124,13 @@ def format_integrity_table(results: list[IntegrityResult]) -> str:
         )
         if errors:
             row += "  [FAIL: " + ", ".join(errors) + "]"
+        # T11.5: flag rows whose (variant, run) carries a non-zero
+        # late_receives_tail_pct from the performance side. This is
+        # a notice, not an error -- it just calls out the latency-tail
+        # outlier so the reader doesn't have to cross-reference the
+        # performance table to see it.
+        if late_tail_groups is not None and (r.variant, r.run) in late_tail_groups:
+            row += "  [late_tail_present]"
         lines.append(row)
 
     lines.append("")
@@ -164,6 +182,7 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     w_jitter = 12
     w_loss = 9
     w_late = 9
+    w_tail = 11
 
     header = (
         _pad("Variant", w_variant)
@@ -180,6 +199,7 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
         + _rpad("Jitter p95", w_jitter)
         + _rpad("Loss%", w_loss)
         + _rpad("Late", w_late)
+        + _rpad("LateTail%", w_tail)
     )
     lines.append(header)
     lines.append(sep)
@@ -194,6 +214,16 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
             delivery_pct = 100.0 * r.receives_per_sec / r.writes_per_sec
         else:
             delivery_pct = 0.0
+        # T11.5 late-tail rendering: ``<count> (<pct>%)`` so a glance
+        # at the column shows both the absolute outlier count and its
+        # share of receives. When count is zero, render a plain ``0``
+        # so the column doesn't clutter for well-behaved groups.
+        if r.late_receives_tail_count == 0:
+            tail_str = "0"
+        else:
+            tail_str = (
+                f"{r.late_receives_tail_count:,} ({r.late_receives_tail_pct:.2f}%)"
+            )
         row = (
             _pad(r.variant, w_variant)
             + _pad(r.run, w_run)
@@ -209,6 +239,7 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
             + _rpad(_fmt_ms(r.jitter_p95_ms), w_jitter)
             + _rpad(_fmt_pct(r.loss_pct), w_loss)
             + _rpad(late_str, w_late)
+            + _rpad(tail_str, w_tail)
         )
         lines.append(row)
 

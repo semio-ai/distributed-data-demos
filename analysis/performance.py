@@ -100,6 +100,16 @@ class PerformanceResult:
     # for any writer in this group (legacy logs without EOT) -- the
     # tables render this as ``-``.
     late_receives: int | None = None
+    # T11.5 late-receive-TAIL metric: count and percentage of delivery
+    # records whose latency exceeds 10x the group's p99 latency. This
+    # is distinct from ``late_receives`` (which is the EOT-window
+    # boundary metric from E12). The tail metric surfaces extreme
+    # outliers within the delivery distribution itself. ``late_count``
+    # is the absolute count; ``late_pct`` is 100 * late_count /
+    # total_receives. Both are 0.0 when there are no deliveries (no
+    # outliers to find).
+    late_receives_tail_count: int = 0
+    late_receives_tail_pct: float = 0.0
     # Downsampled per-message latency vector for distribution-shape
     # plots (latency CDF). Capped at ``LATENCY_SAMPLE_CAP``; see the
     # module docstring for the sampling strategy. Empty when the group
@@ -290,6 +300,40 @@ def _latency_samples(deliveries: pl.DataFrame) -> list[float]:
     stride = (n + LATENCY_SAMPLE_CAP - 1) // LATENCY_SAMPLE_CAP
     sampled = col.gather_every(stride)
     return [float(v) for v in sampled.to_list()]
+
+
+def _late_tail_stats(deliveries: pl.DataFrame, p99_ms: float) -> tuple[int, float]:
+    """T11.5 late-receive-tail count + percentage.
+
+    Definition: a delivery whose ``latency_ms`` exceeds ``10 * p99``
+    (where ``p99`` is this group's 99th-percentile latency) is part of
+    the late tail. Returns ``(count, percentage_of_total_receives)``.
+
+    Clock-correction is already applied to ``latency_ms`` upstream
+    (see ``correlate._attach_offsets``), so the threshold operates on
+    the same corrected values as the percentiles. Groups whose p99 is
+    zero (e.g. degenerate single-delivery groups, or groups where every
+    latency is zero) define the threshold as zero too -- which means
+    *any* non-zero latency would be flagged. The unit test for hand-
+    computed parity uses a non-degenerate group where ``p99 = 10`` ms,
+    so the practical contract is unambiguous; the zero-p99 edge case
+    only occurs in synthetic or pathological inputs.
+
+    Returns ``(0, 0.0)`` when there are no deliveries.
+    """
+    if deliveries.is_empty() or "latency_ms" not in deliveries.columns:
+        return 0, 0.0
+
+    threshold = p99_ms * 10.0
+    counts = deliveries.select(
+        pl.col("latency_ms").is_not_null().sum().alias("total"),
+        (pl.col("latency_ms") > threshold).sum().alias("late"),
+    ).row(0)
+    total = int(counts[0] or 0)
+    late = int(counts[1] or 0)
+    if total == 0:
+        return 0, 0.0
+    return late, 100.0 * late / total
 
 
 def _latency_stats(deliveries: pl.DataFrame) -> tuple[float, float, float, float]:
@@ -594,6 +638,7 @@ def performance_for_group(
     resources = _resource_metrics(group, variant, run)
     has_uncorrected_latency = _any_uncorrected(deliveries)
     late_receives = _late_receives_count(group, windows)
+    late_tail_count, late_tail_pct = _late_tail_stats(deliveries, p99)
 
     return PerformanceResult(
         variant=variant,
@@ -612,5 +657,7 @@ def performance_for_group(
         resources=resources,
         has_uncorrected_latency=has_uncorrected_latency,
         late_receives=late_receives,
+        late_receives_tail_count=late_tail_count,
+        late_receives_tail_pct=late_tail_pct,
         latency_samples_ms=latency_samples,
     )

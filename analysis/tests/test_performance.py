@@ -14,6 +14,89 @@ def _perf(events: list[dict], variant: str = "test-variant", run: str = "run01")
     return performance_for_group(lazy, deliveries, variant, run)
 
 
+class TestLateTailStats:
+    """T11.5: late-receive-tail metric (latencies > 10 * p99)."""
+
+    def test_hand_computed_example(self) -> None:
+        """Spec example: p99=10ms, latencies [1,5,99,150,200] -> 2 / 40%.
+
+        Hand-computation: threshold = 10 * 10 = 100 ms. Latencies 150
+        and 200 ms both exceed the threshold; 99 is below. Count = 2,
+        percentage = 2 / 5 = 40.0%.
+
+        We feed the latencies via synthetic receive timestamps so the
+        full pipeline (correlate + performance) processes them; the
+        p99 of [1,5,99,150,200] is ~199.04 with linear interpolation,
+        so we pass the desired p99 directly to ``_late_tail_stats``
+        to keep the test focused on the threshold + percentage math.
+        """
+        from performance import _late_tail_stats
+
+        # Build a delivery DataFrame with the given latencies.
+        import polars as pl
+
+        deliveries = pl.DataFrame(
+            {"latency_ms": [1.0, 5.0, 99.0, 150.0, 200.0]},
+        )
+        count, pct = _late_tail_stats(deliveries, p99_ms=10.0)
+        assert count == 2
+        assert pct == 40.0
+
+    def test_no_outliers(self) -> None:
+        """All latencies under the threshold yield zero late-tail."""
+        from performance import _late_tail_stats
+
+        import polars as pl
+
+        deliveries = pl.DataFrame(
+            {"latency_ms": [1.0, 2.0, 3.0, 4.0, 5.0]},
+        )
+        count, pct = _late_tail_stats(deliveries, p99_ms=10.0)
+        assert count == 0
+        assert pct == 0.0
+
+    def test_empty_deliveries(self) -> None:
+        """Empty input returns (0, 0.0) without crashing."""
+        from performance import _late_tail_stats
+
+        import polars as pl
+
+        empty = pl.DataFrame({"latency_ms": []}, schema={"latency_ms": pl.Float64})
+        count, pct = _late_tail_stats(empty, p99_ms=5.0)
+        assert count == 0
+        assert pct == 0.0
+
+    def test_attached_to_performance_result(self) -> None:
+        """The metric is exposed on PerformanceResult."""
+        events = [
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000),
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=1001,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=1002,
+            ),
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000),
+        ]
+        r = _perf(events)
+        # The fields exist with sane defaults.
+        assert r.late_receives_tail_count == 0
+        assert r.late_receives_tail_pct == 0.0
+
+
 class TestPercentile:
     def test_empty(self) -> None:
         assert _percentile([], 50) == 0.0

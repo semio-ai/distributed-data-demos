@@ -452,9 +452,11 @@ class TestOperateWindowScoping:
         out = format_performance_table([r])
         # The Late column header is present.
         assert "Late" in out
-        # And the row has a "-" for the late count (followed by a
-        # newline or end of string).
-        assert " -\n" in out or out.rstrip().endswith(" -")
+        # And the row has a "-" for the late count (T11.5 adds a
+        # LateTail% column after Late so the dash is no longer at
+        # end-of-row; just check the literal cell value appears with
+        # a leading space.)
+        assert " -          " in out or " -\n" in out
 
     def test_late_receives_table_count_with_eot(self) -> None:
         events = _baseline_two_runner_events(

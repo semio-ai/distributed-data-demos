@@ -257,7 +257,20 @@ def main(argv: list[str] | None = None) -> int:
 
         # Step 3: summary tables.
         if do_summary:
-            print(format_integrity_table(integrity_results))
+            # T11.5: pass the (variant, run) keys of groups with a
+            # non-zero late-tail percentage so the integrity rows can
+            # carry a ``[late_tail_present]`` notice alongside the
+            # performance-table column.
+            late_tail_groups: set[tuple[str, str]] = {
+                (p.variant, p.run)
+                for p in performance_results
+                if p.late_receives_tail_pct > 0
+            }
+            print(
+                format_integrity_table(
+                    integrity_results, late_tail_groups=late_tail_groups
+                )
+            )
             print(format_performance_table(performance_results))
 
         # Step 4: diagrams.
