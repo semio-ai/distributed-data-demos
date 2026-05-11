@@ -677,3 +677,142 @@ N>2 runners would need a per-peer media-port stride or a Muxed UDP
 setup. Variant errors clearly when violated. A future N-peer
 extension is a separate epic if/when N-peer benchmarks become a
 priority — not on the current backlog.
+
+---
+
+## E14: Threading-Mode Dimension and Receive-Centric Analysis
+
+**Repos**: `variant-base/`, `variants/websocket/`, `variants/custom-udp/`,
+`variants/hybrid/`, `variants/quic/`, `variants/webrtc/`, `variants/zenoh/`,
+`runner/`, `analysis/`, plus contract updates in `metak-shared/`.
+
+**Goal**: Add a `threading_mode` dimension to the benchmark matrix so each
+variant can be measured under both single-threaded (sync, no tokio) and
+multi-threaded (per-peer reader thread) execution models. Lift the
+receive side from "a column in the metrics table" to "the headline metric
+the benchmark optimises for", on the grounds that writers ship at requested
+rate almost always but receivers are the actual sync bottleneck.
+
+This epic exists because:
+
+1. **WASM compilation target.** The team plans to compile some variant
+   crates to WASM (browser and/or WASI). Browser-WASM does not support
+   multi-threaded tokio runtimes; WASI is restricted. The team has
+   real production scenarios that must adhere to strictly single-threaded
+   operation, alongside other scenarios where multi-threading is allowed.
+   The benchmark must characterise both.
+2. **T-impl.10 acceptance partial.** The 2026-05-11 diagnostic on
+   `configs/two-runner-websocket-qos4.toml` showed that a single-threaded
+   WebSocket variant cannot drain at 100 K msg/s symmetric on this
+   hardware: the per-message WS frame-parse cost caps receive
+   throughput regardless of driver-side drain budget. The fix is to
+   move the parse off the driver thread — and we should do this in a
+   way that is generalisable across variants and observable to operators
+   who want to compare the two regimes.
+3. **Project framing.** Per `overview.md`: the goal is "keep multiple
+   peers in sync under huge change diffs with lowest latency possible."
+   The metric that decides whether peers are in sync is **receive
+   throughput**, not write throughput. The analysis tool's headline
+   number should reflect that.
+
+### Scope
+
+#### Variant-side (T14.1-T14.7)
+
+- **T14.1** — `variant-base` infrastructure for threading-mode dimension.
+  New `ThreadingMode { Single, Multi }` type, new `--threading-mode`
+  injected CLI arg, new `Variant::supported_threading_modes()` trait
+  method (default `&[Single]`), no-op `start_reader_threads` /
+  `stop_reader_threads` hooks. New `--recv-buffer-kb` injected CLI arg
+  (default 4096, range 64-65536). Driver passes the chosen mode to
+  the variant via `Variant::connect`. No transport changes here.
+- **T14.2** — `variants/websocket` implements `Multi`: per-peer reader
+  thread per WS connection, decoded frames pushed into a bounded
+  `mpsc::Sender<ReceivedUpdate>`. `poll_receive` becomes a fast
+  channel `try_recv`. `SO_RCVBUF` set from `--recv-buffer-kb`.
+  Capability declared `[Single, Multi]`. Closes the immediate T-impl.10
+  follow-up.
+- **T14.3** — `variants/custom-udp` implements `Multi`: per-socket recv
+  thread for both UDP and TCP paths. `SO_RCVBUF` configurable.
+  Capability `[Single, Multi]`.
+- **T14.4** — `variants/hybrid` implements `Multi`: per-peer TCP reader
+  thread, single recv thread for the UDP multicast socket.
+  Capability `[Single, Multi]`. May discover Hybrid is already
+  partly multi-threaded -- audit and align before extending.
+- **T14.5** — `variants/quic` declares capability `[Multi]` only. No
+  code change beyond the declaration and a `CUSTOM.md` note explaining
+  why (quinn is fundamentally async; "single-threaded QUIC" would be
+  misleading to claim).
+- **T14.6** — `variants/webrtc` declares capability `[Multi]` only.
+  Same shape as T14.5.
+- **T14.7** — `variants/zenoh` declares capability `[Multi]` only.
+  Same shape as T14.5.
+
+#### Runner + config (T14.8)
+
+- **T14.8** — runner + TOML schema add `threading_modes` expansion.
+  Schema change: `[variant.common] threading_modes = ["single", "multi"]`
+  (default `["single"]` for backwards compatibility -- existing configs
+  continue to spawn single-threaded). Runner expands the cross-product
+  with `qos`: a variant entry with `qos = [3, 4]` and
+  `threading_modes = ["single", "multi"]` becomes four spawns
+  (`<name>-qos3-single`, `<name>-qos3-multi`, `<name>-qos4-single`,
+  `<name>-qos4-multi`). The runner consults each variant's declared
+  `supported_threading_modes()` (via a sidecar `--probe` invocation or
+  static declaration in TOML -- decide in the task) and silently skips
+  unsupported modes with a stderr notice. Spawn naming and per-spawn
+  log filenames preserve the new suffix.
+
+#### Analysis (T11.5 -- filed under E11, can start in parallel)
+
+- **T11.5** — Promote receive throughput to the headline metric.
+  Summary tables lead with receive throughput per
+  `(writer, receiver, variant, qos, threading_mode)`. Write throughput
+  becomes the "requested rate" context column. Add a late-receive tail
+  metric (receives whose `receive_ts - write_ts` exceeds 10x the 99th
+  percentile of that group). All metric definitions stay
+  backwards-compatible -- only the ordering and emphasis change.
+  Threading-mode column appears in tables once T14.8 logs include it;
+  before that the column is constant. Listed under E11 so it can start
+  before T14.x lands.
+
+### Out of scope
+
+- N>2-peer benchmarks (orthogonal). WebRTC's known 1-peer limit from
+  T3g.2 still stands.
+- Replacing tokio with another async runtime for the async-only
+  variants.
+- WASM compilation itself. The team owns that separately. This epic
+  only ensures the variants that need to compile to WASM have a
+  single-threaded mode that is sync, not async-single-threaded.
+- New transport variants. Existing five plus dummy are enough to
+  characterise the threading-mode dimension.
+- Changes to EOT (E12), clock-sync (E8), or runner-runner coordination
+  (E2 + E9).
+
+### Dependencies
+
+- E1 (Variant trait + protocol driver): touched.
+- E2 (runner): touched at T14.8.
+- E3a/b/d/e/f/g (the six active variants): each touched at exactly
+  one task.
+- E9 (`--peers` injection): touched lightly to add `--threading-mode`
+  and `--recv-buffer-kb` to the injected-arg list.
+- E11 (analysis): T11.5 lives here.
+
+### Acceptance
+
+- A two-runner config that lists `threading_modes = ["single", "multi"]`
+  for the websocket variant runs both modes back-to-back, produces
+  per-mode JSONL logs, and the analysis tool reports receive throughput
+  for each mode separately.
+- WebSocket multi-threaded mode sustains the previously-failing
+  `websocket-1000x100hz-qos4` symmetric flood with delivery >= 99%
+  on the same machine as the 2026-05-11 incident.
+- Single-threaded WebSocket on the same workload completes the spawn
+  without `WSAECONNRESET` (it may show <100% delivery -- that is a
+  legitimate measured result, not a failure).
+- QUIC, WebRTC, Zenoh continue to function exactly as before; their
+  capability declaration is the only change.
+- Analysis summary tables lead with receive throughput; existing
+  metrics still computed and visible.

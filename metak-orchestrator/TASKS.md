@@ -4565,3 +4565,525 @@ Commits: `e9457eb`, `a397450`, `73e89af`.
 - Re-running hybrid's high-rate fixtures as a baseline (separate measurement task).
 
 ---
+
+## E14: Threading-Mode Dimension and Receive-Centric Analysis
+
+See `EPICS.md` E14 for the full epic description, motivation (WASM
+compilation target + T-impl.10 residual failure), and acceptance gates.
+
+**Contract dependency.** T14.1 and T14.8 require updates to
+`metak-shared/api-contracts/variant-cli.md` and
+`metak-shared/api-contracts/toml-config-schema.md`. Draft proposals
+appended to those files under "DRAFT -- E14 additions". User review
+required before any worker is spawned against the new contract.
+
+**Spawn ordering**:
+- T14.1 lands first (foundational; defines the trait surface).
+- T11.5 may start IN PARALLEL with T14.1 (analysis pivot does not
+  depend on the threading-mode dimension; it only benefits from it
+  once data flows).
+- T14.2 - T14.7 (variant implementations) can spawn in parallel
+  after T14.1 lands and the contracts are agreed.
+- T14.8 (runner + config expansion) needs T14.1's
+  `supported_threading_modes()` API to exist before it can probe
+  variants. Spawn after T14.1 but in parallel with T14.2 - T14.7.
+
+### T14.1: variant-base -- threading-mode infrastructure + recv-buffer arg
+
+**Repo**: `variant-base/`.
+**Status**: pending. Foundational; gates T14.2 - T14.8.
+
+#### Background
+
+E14 introduces a `threading_mode` dimension so each variant can be
+measured under both single-threaded sync (no tokio, WASM-friendly) and
+multi-threaded (per-peer reader thread) execution. The dimension is
+declared per-variant via a new trait method; the driver passes the
+chosen mode to `Variant::connect`; each variant decides what the mode
+means inside its own implementation. A new `--recv-buffer-kb` injected
+arg lets every variant size its OS-level recv buffer uniformly.
+
+#### Scope
+
+1. **New type** in `variant-base/src/variant_trait.rs` (or wherever the
+   trait lives -- worker to locate):
+   ```rust
+   #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+   pub enum ThreadingMode { Single, Multi }
+   ```
+   Implement `FromStr` (accept `"single"` / `"multi"`, case-insensitive)
+   and `Display` (lowercase). Serde tags as `"single"` / `"multi"`.
+
+2. **Trait extensions** in `Variant`:
+   ```rust
+   fn supported_threading_modes(&self) -> &'static [ThreadingMode] {
+       &[ThreadingMode::Single]
+   }
+   ```
+   Default: single only. Variants that need it (websocket, custom-udp,
+   hybrid) override with `&[Single, Multi]`. Async-only variants (quic,
+   webrtc, zenoh) override with `&[Multi]`. Order does not matter;
+   runner does declared-set membership checks.
+
+   ```rust
+   fn start_reader_threads(&mut self, mode: ThreadingMode) -> Result<()> {
+       Ok(()) // default: no-op for Single mode; Multi-supporting variants override
+   }
+   fn stop_reader_threads(&mut self) -> Result<()> { Ok(()) }
+   ```
+   The driver calls `start_reader_threads(mode)` immediately AFTER
+   `connect` returns successfully, and `stop_reader_threads` during
+   the `disconnect` path (BEFORE calling `disconnect` itself so the
+   reader threads can drain pending receives cleanly). If the variant
+   does not override, both are silent no-ops.
+
+3. **Driver passes mode to connect**: extend `Variant::connect` signature
+   to accept `threading_mode: ThreadingMode` as an additional arg.
+   Variants that don't care can ignore it. Variants that branch on
+   mode (websocket, custom-udp, hybrid) use it to decide whether to
+   spawn reader threads.
+
+   This is a breaking change to the trait. Existing variant implementations
+   must be updated -- but for variants that don't yet support Multi mode
+   the change is just adding an unused arg. T14.2 - T14.7 will update
+   each variant; for now T14.1 ships the trait change PLUS a default
+   implementation that the existing variant code compiles against.
+   Concretely: the trait signature changes, every variant gets the
+   new arg added to its `impl Variant`, but only `VariantDummy` is
+   updated in this task; the other six variants need updating in
+   T14.2 - T14.7. Use `cargo check --workspace` to find the touch
+   points. If trait-default-impls let us avoid touching all variants
+   in this task, prefer that route.
+
+4. **CLI args** in `variant-base/src/common_cli.rs` (or equivalent):
+   - `--threading-mode <single|multi>` -- required (runner-injected).
+   - `--recv-buffer-kb <u32>` -- optional, default `4096`, range
+     `64..=65536` (64 KiB to 64 MiB). 64 KiB is below the Windows
+     default but harmless; 64 MiB is generous on a Raspberry Pi 4.
+     Tighten or loosen as the worker discovers what variants need.
+
+5. **Driver plumbing**: parse the new args, pass `ThreadingMode` to
+   `Variant::connect`, call `start_reader_threads(mode)` after connect
+   returns, call `stop_reader_threads` before disconnect. The
+   `recv_buffer_kb` value is passed via `CommonCliArgs` and variants
+   read it from there -- no new trait method needed.
+
+6. **JSONL schema**: add a `threading_mode` field to the existing
+   `connected` event so every log file records which mode the spawn
+   ran in. Optional now; promoted to required once T14.8 lands.
+   Schema doc update in `metak-shared/api-contracts/jsonl-log-schema.md`
+   appendix (worker writes the change, orchestrator reviews).
+
+7. **VariantDummy update**: dummy has no real I/O so it trivially
+   supports both modes. Declare `[Single, Multi]` capabilities. Both
+   modes do the same thing internally (in-process data board); the
+   point is to exercise the new infrastructure end-to-end.
+
+#### Tests (in `variant-base/src/`)
+
+1. Unit: `ThreadingMode` parse/display roundtrip.
+2. Unit: default `supported_threading_modes()` returns `[Single]`.
+3. Unit: default `start_reader_threads` / `stop_reader_threads` are
+   no-ops returning `Ok(())`.
+4. Integration: `VariantDummy` runs end-to-end in both modes; both
+   produce the expected `connected` / `phase` / `eot_sent` / `write` /
+   `receive` event sequence; the `connected` event carries the
+   correct `threading_mode` field.
+5. Integration: protocol-driver test asserts `start_reader_threads`
+   and `stop_reader_threads` are called in the right order relative
+   to `connect` / `disconnect`.
+
+#### Validation (MANDATORY)
+
+From workspace root:
+- `cargo build --release -p variant-base` clean.
+- `cargo test --release -p variant-base` all-green.
+- `cargo test --release --workspace` all-green -- this is where any
+  variant whose `connect` signature broke would surface. **If a
+  variant fails to compile, that is a known T14.2-T14.7 follow-up:
+  the worker should add the new arg to each affected variant's
+  `connect` signature as the minimal change to keep the workspace
+  compiling, but should NOT implement Multi mode for those variants
+  in this task.**
+- `cargo clippy --release --workspace --all-targets -- -D warnings` clean.
+- `cargo fmt --check` clean.
+
+#### Acceptance criteria
+
+- [ ] `ThreadingMode` type + parse/display + serde.
+- [ ] `supported_threading_modes` trait method with default.
+- [ ] `start_reader_threads` / `stop_reader_threads` trait methods with
+  default no-op.
+- [ ] `Variant::connect` accepts `ThreadingMode`.
+- [ ] `--threading-mode` and `--recv-buffer-kb` CLI args.
+- [ ] Driver calls reader-thread hooks around connect/disconnect.
+- [ ] `VariantDummy` declares `[Single, Multi]` capabilities and works
+  end-to-end in both modes.
+- [ ] `metak-shared/api-contracts/jsonl-log-schema.md` documents the new
+  `threading_mode` field on `connected`.
+- [ ] `metak-shared/api-contracts/variant-cli.md` documents the new
+  injected args.
+- [ ] All existing workspace tests pass after the worker's minimal
+  signature updates to other variants.
+- [ ] `variant-base/CUSTOM.md` "Threading-mode dimension (T14.1)"
+  subsection added.
+
+#### Out of scope
+
+- Actually implementing `Multi` mode for any variant other than
+  `VariantDummy`. Each variant gets its own task (T14.2 - T14.7).
+- Runner config-expansion (T14.8).
+- Analysis-side changes (T11.5).
+- Touching the EOT phase, clock-sync, or runner-runner coordination.
+
+---
+
+### T14.2: variants/websocket -- implement Multi threading mode
+
+**Repo**: `variants/websocket/`.
+**Status**: pending. Depends on T14.1.
+**Closes**: the T-impl.10 residual failure on
+`configs/two-runner-websocket-qos4.toml`.
+
+#### Scope
+
+- Declare `supported_threading_modes() = &[Single, Multi]`.
+- In `connect(threading_mode)`, when `mode == Multi`: spawn one OS
+  thread per peer WS connection. Each thread does blocking
+  `WebSocket::read_message` in a loop, parses the binary header, and
+  sends `ReceivedUpdate` over a bounded `mpsc::Sender<ReceivedUpdate>`.
+- `poll_receive` for `Multi` mode: try-recv on the shared `Receiver`.
+  For `Single` mode: existing behaviour (inline read + parse).
+- `stop_reader_threads`: signal threads to exit (close the mpsc on the
+  send side, set an `AtomicBool`), join them with a short timeout.
+- Apply `SO_RCVBUF = recv_buffer_kb * 1024` on the underlying TCP socket
+  immediately after the WS handshake completes. Same for both modes.
+- Channel bound: `4 * values_per_tick * peer_count` slots (over-provision
+  to absorb bursts; bounded so a stuck consumer doesn't OOM).
+- Update `variants/websocket/CUSTOM.md`: new "Threading modes (T14.2)"
+  section explaining when each mode is chosen, the reader-thread
+  ownership model, and the channel-bounding rationale. Remove the
+  "Backpressure semantics (T-impl.7)" / "Cross-reference: T-impl.10"
+  sections OR mark them historical -- the new `Multi` mode supersedes
+  the T-impl.7 "default is intentional" conclusion for high-rate
+  symmetric workloads while leaving the rationale correct for
+  `Single` mode.
+
+#### Tests
+
+- Unit: threading-mode capability declaration.
+- Unit: reader-thread lifecycle (`start_reader_threads` creates
+  threads; `stop_reader_threads` joins them).
+- Integration (existing two-runner regression): run the existing
+  fixture in both modes; assert non-zero writes and receives in both.
+- Integration (new): a two-runner localhost fixture analogous to
+  `configs/two-runner-websocket-qos4.toml` but trimmed to the single
+  `1000x100hz` spawn (or, ideally, use the existing fixture);
+  `threading_modes = ["single", "multi"]`. Assert Multi mode delivers
+  >= 99 % at 100 K msg/s symmetric. Single mode may show <100 %
+  delivery -- record what it actually delivers without asserting a
+  threshold (this is a measurement, not a gate).
+
+#### Validation (MANDATORY)
+
+- `cargo test --release -p variant-websocket` all-green.
+- `cargo test --release -p variant-websocket -- --ignored two_runner_regression` all-green in both modes.
+- End-to-end localhost repro of `configs/two-runner-websocket-qos4.toml`
+  first spawn in Multi mode completes with delivery >= 99 % on both
+  sides. Single mode completes (may be <100 %; record actual).
+- Clippy + fmt clean.
+
+#### Acceptance criteria
+
+- [ ] Variant declares `[Single, Multi]`.
+- [ ] Multi mode uses per-peer reader threads + bounded mpsc.
+- [ ] `SO_RCVBUF` configured from `--recv-buffer-kb` in both modes.
+- [ ] Existing single-mode behaviour unchanged in `Single`.
+- [ ] Two-runner regression test passes in both modes.
+- [ ] End-to-end repro at 100 K msg/s symmetric in Multi mode:
+  delivery >= 99 % on both sides.
+- [ ] CUSTOM.md updated; obsolete T-impl.7 / T-impl.10 sections marked
+  historical or removed.
+
+#### Out of scope
+
+- TLS / wss://, subprotocols, extensions.
+- Changing the publish path or the binary header format.
+- Tuning the channel bound beyond the formula above.
+
+---
+
+### T14.3: variants/custom-udp -- implement Multi threading mode
+
+**Repo**: `variants/custom-udp/`.
+**Status**: pending. Depends on T14.1.
+
+#### Scope
+
+- Declare `[Single, Multi]`.
+- Multi mode: one recv thread for the UDP multicast socket; one recv
+  thread per active TCP connection (QoS 4 path). Each thread parses
+  the binary header and pushes to a shared bounded mpsc.
+- Apply `SO_RCVBUF` from `--recv-buffer-kb` to both UDP and TCP sockets.
+- Update `variants/custom-udp/CUSTOM.md` with the threading-mode
+  documentation.
+- Tests: same shape as T14.2 (capability declaration, reader-thread
+  lifecycle, two-runner regression in both modes).
+
+#### Acceptance criteria
+
+- [ ] Multi mode implemented per scope.
+- [ ] Single-mode behaviour unchanged.
+- [ ] All existing tests pass in both modes.
+- [ ] CUSTOM.md updated.
+
+---
+
+### T14.4: variants/hybrid -- audit + implement Multi threading mode
+
+**Repo**: `variants/hybrid/`.
+**Status**: pending. Depends on T14.1.
+
+#### Scope
+
+- **Audit step (do this first)**: read the current Hybrid implementation
+  and determine what threading model it already uses for the TCP path
+  and the UDP multicast path. STATUS.md L30 hints Hybrid handles
+  high-rate qos4 today; if it already uses a reader thread, T14.4
+  reduces to wiring up the `ThreadingMode` API on top of existing
+  behaviour. Report findings in STATUS.md before implementing.
+- Declare `[Single, Multi]`.
+- Multi mode: per-peer TCP reader thread + single UDP multicast recv
+  thread, pushing to a shared bounded mpsc.
+- Single mode: pure inline blocking I/O on the driver thread (may
+  require disabling existing reader threads -- the audit will reveal
+  if this is a code change or already the case).
+- Apply `SO_RCVBUF` from `--recv-buffer-kb`.
+- Update CUSTOM.md.
+- Tests: capability declaration + reader-thread lifecycle + two-runner
+  regression in both modes.
+
+#### Acceptance criteria
+
+- [ ] Audit findings posted to STATUS.md.
+- [ ] Both modes implemented per scope.
+- [ ] Existing Hybrid tests pass in Multi mode.
+- [ ] Single mode passes a less-demanding fixture (worker picks; e.g.
+  `hybrid-10x100hz-qos4`). High-rate symmetric is allowed to be
+  lossy in Single mode -- record actual delivery without asserting.
+- [ ] CUSTOM.md updated.
+
+---
+
+### T14.5: variants/quic -- declare Multi-only capability
+
+**Repo**: `variants/quic/`.
+**Status**: pending. Depends on T14.1.
+
+#### Scope
+
+- Override `supported_threading_modes()` to return `&[Multi]`.
+- `connect(ThreadingMode::Single)` returns a clear error before any I/O.
+- `connect(ThreadingMode::Multi)` is the existing behaviour -- no code
+  change.
+- Apply `SO_RCVBUF` from `--recv-buffer-kb` to the underlying UDP
+  socket(s) if quinn exposes a way to do this; otherwise document
+  why not.
+- Update `variants/quic/CUSTOM.md` with a "Threading modes" section
+  explaining: quinn is fundamentally async; a sync single-threaded
+  QUIC would be a significant rewrite that does not match the
+  benchmark's purpose. We declare Multi only.
+- Tests: unit assertion that `connect(Single)` errors cleanly.
+
+#### Acceptance criteria
+
+- [ ] Capability declared `[Multi]`.
+- [ ] `connect(Single)` errors before I/O.
+- [ ] `--recv-buffer-kb` plumbed if possible.
+- [ ] CUSTOM.md updated.
+- [ ] All existing tests pass.
+
+---
+
+### T14.6: variants/webrtc -- declare Multi-only capability
+
+**Repo**: `variants/webrtc/`.
+**Status**: pending. Depends on T14.1.
+
+Identical shape to T14.5. Webrtc-rs is fundamentally async + has its
+own task pool. Declare `[Multi]` only; `connect(Single)` errors.
+
+#### Acceptance criteria
+
+- [ ] Capability declared `[Multi]`.
+- [ ] `connect(Single)` errors before I/O.
+- [ ] CUSTOM.md updated.
+- [ ] All existing tests pass.
+
+---
+
+### T14.7: variants/zenoh -- declare Multi-only capability
+
+**Repo**: `variants/zenoh/`.
+**Status**: pending. Depends on T14.1.
+
+Identical shape to T14.5 / T14.6. Zenoh has internal threads we cannot
+disable from the client; declaring Single would be dishonest.
+
+#### Acceptance criteria
+
+- [ ] Capability declared `[Multi]`.
+- [ ] `connect(Single)` errors before I/O.
+- [ ] CUSTOM.md updated.
+- [ ] All existing tests pass.
+
+---
+
+### T14.8: runner + TOML schema -- threading_modes expansion
+
+**Repo**: `runner/`. Contract impact: `metak-shared/api-contracts/toml-config-schema.md`.
+**Status**: pending. Depends on T14.1 (needs `supported_threading_modes`
+to exist). Can spawn in parallel with T14.2-T14.7.
+
+#### Scope
+
+- TOML schema: `[variant.common]` accepts `threading_modes` as either
+  a string (`"single"` or `"multi"`) or a list of strings. Default
+  when absent: `["single"]` (backwards-compatible with existing configs).
+- Runner expansion: cross-product over `qos` and `threading_modes`.
+  A variant entry with `qos = [3, 4]` and
+  `threading_modes = ["single", "multi"]` expands to four spawns:
+  `<name>-qos3-single`, `<name>-qos3-multi`, `<name>-qos4-single`,
+  `<name>-qos4-multi`. Naming convention: `qos` segment first, then
+  `threading_mode` segment.
+- Capability gating: how the runner learns each variant's
+  `supported_threading_modes`. Two options for the worker to choose
+  between:
+  - **Static declaration in TOML**: each variant entry declares
+    `supported_modes = ["single", "multi"]` and the runner validates
+    against that. Simple, no runtime dependency.
+  - **Probe via variant binary**: runner invokes
+    `<binary> --print-capabilities` once at startup, parses JSON output.
+    More accurate (single source of truth in the variant code) but
+    adds a per-variant startup cost.
+  Worker picks one and documents the choice in the completion report
+  and in CUSTOM.md.
+- Unsupported-mode handling: if a config requests a mode the variant
+  doesn't support, skip the spawn with an `eprintln!` notice
+  `[runner:<name>] skipping <effective_name>: variant does not support threading_mode=<mode>`.
+  Do not fail the run. The spawn does not appear in the summary table.
+- The injected `--threading-mode` arg passes the chosen mode to the
+  child variant. The `--recv-buffer-kb` arg is also injected (default
+  4096 if absent from TOML; configurable per-spawn via
+  `[variant.common] recv_buffer_kb = 8192`).
+- JSONL filename convention extends to include the threading_mode
+  suffix: `<effective_name>-<runner>-<run>.jsonl`.
+
+#### Tests
+
+- Unit: TOML expansion for the four-spawn cross-product case.
+- Unit: TOML expansion with `threading_modes` absent defaults to `["single"]`.
+- Unit: unsupported-mode skip emits the eprintln and does not appear
+  in the summary.
+- Integration: a fixture config with both modes runs end-to-end through
+  the dummy variant.
+
+#### Acceptance criteria
+
+- [ ] TOML schema accepts `threading_modes`.
+- [ ] Cross-product expansion works.
+- [ ] Backwards-compat: existing configs default to `["single"]` and
+  run unchanged.
+- [ ] Unsupported-mode skip prints the notice and continues.
+- [ ] `--recv-buffer-kb` injected with default 4096.
+- [ ] Contract update in `metak-shared/api-contracts/toml-config-schema.md`.
+- [ ] Tests pass.
+
+#### Out of scope
+
+- Backwards-compat shims for the existing `qos`-only fixtures (they
+  default to `["single"]`, which IS backwards-compat).
+- Re-running every existing fixture in Multi mode. New end-to-end
+  validation belongs in E7.
+
+---
+
+### T11.5: analysis -- promote receive throughput to headline metric
+
+**Repo**: `analysis/`.
+**Status**: pending. **Can start IN PARALLEL with T14.1** (does not
+depend on threading-mode dimension; only benefits from it once data
+flows).
+
+#### Background
+
+Project goal per `metak-shared/overview.md`: "keep multiple peers in
+sync under huge change diffs with lowest latency possible". The metric
+that decides "in sync" is **receive throughput**, not write throughput.
+Writers ship at requested rate almost always; receivers are the actual
+sync bottleneck. The current analysis tool reports both throughputs as
+peers in the summary table without highlighting which one matters.
+
+#### Scope
+
+- **Summary tables**: receive throughput leads the table. Per
+  `(writer, receiver, variant, qos, threading_mode)` grouping:
+  - Column 1: receive throughput (msg/s) -- **headline**
+  - Column 2: write throughput (msg/s) -- "requested rate" context
+  - Column 3: delivery percentage (receive / write)
+  - Existing latency / jitter / loss columns follow
+  - `threading_mode` is a new grouping dimension; when not present in
+    logs (pre-T14.8 data), default to `"single"` and the column is
+    constant for that dataset.
+- **New metric: late-receive tail count**. For each
+  `(writer, receiver, qos, variant)` group, count receives whose
+  `receive_ts - write_ts` (clock-corrected per E8) exceeds 10x the
+  99th-percentile latency of that group. Report as a count and a
+  percentage of total receives. Add to the integrity report.
+- Existing CLI tables continue to compute and print everything they
+  print today; this task only changes ORDER and EMPHASIS. No metric
+  is removed.
+- Diagrams (E5/E6) are out of scope for this task; their reordering
+  is a follow-up.
+- Update `metak-shared/ANALYSIS.md` to document the new ordering and
+  the late-receive-tail metric.
+
+#### Tests
+
+- Unit: existing test datasets continue to produce the same numeric
+  values; only output ordering changes. Snapshot tests if they exist
+  can be updated.
+- Unit: synthetic dataset with known write/receive counts produces the
+  expected receive-headline column order.
+- Unit: late-receive-tail computation matches a hand-computed example.
+
+#### Validation
+
+- Run the analysis tool against the existing
+  `logs/same-machine-all-variants-01-20260511_104934/` dataset and
+  produce the new summary tables. Verify no value changed numerically
+  (only column order). Save the new output for comparison.
+- Run against any logs from this session
+  (`logs/websocket-all-20260511_*` / `logs/websocket-first-only-*`) to
+  verify the tool handles configs that aborted mid-run.
+
+#### Acceptance criteria
+
+- [ ] Receive throughput leads the summary table.
+- [ ] Write throughput becomes the "requested rate" column.
+- [ ] Late-receive-tail metric computed and reported.
+- [ ] `threading_mode` column added; defaults to `"single"` for
+  pre-T14.8 data.
+- [ ] All existing metrics still computed.
+- [ ] Pre-existing test datasets produce numerically-identical output
+  (modulo ordering).
+- [ ] `metak-shared/ANALYSIS.md` updated.
+
+#### Out of scope
+
+- Diagram reordering (separate E5/E6 task).
+- New plot types beyond what E5/E6 already define.
+- Adding columns for any metric not already computed.
+- Re-baselining historical results.
+
+---
