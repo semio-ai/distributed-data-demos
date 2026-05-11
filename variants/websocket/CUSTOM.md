@@ -246,6 +246,40 @@ After implementation:
   has the expected `connected` / `phase` / `eot_sent` / `eot_received`
   events and that delivery is ≥ 99% over the operate window.
 
+## Backpressure semantics (T-impl.7)
+
+T-impl.7 added `Variant::try_publish` so transports that can cheaply
+detect backpressure can return `Ok(false)` and let the driver log a
+`backpressure_skipped` event instead of fire-and-forget. **The
+WebSocket variant intentionally does NOT override `try_publish`** --
+the trait's default implementation (delegate to `publish`, return
+`Ok(true)`) is exactly what we want.
+
+Rationale:
+
+- The variant supports **only reliable QoS** (3 and 4); QoS 1 and 2
+  are rejected outright at `publish` and at `connect` time. There is
+  no unreliable code path that could benefit from a skip.
+- For reliable QoS, returning `Ok(false)` would create a
+  receiver-visible seq gap that breaks the ordering / completeness
+  guarantees we make for QoS 3/4 (the driver assigns and consumes
+  `seq` *before* calling `try_publish`, so any `Ok(false)` is a hole
+  the receiver will observe). The correct semantics for a backed-up
+  reliable transport are "block the writer", which `tungstenite::send`
+  already does because the underlying TCP socket stays in blocking
+  mode (see `connect` -> `set_write_timeout(None)` in
+  `src/websocket.rs`).
+- Genuine connection failure (half-broken TCP, peer dropped) is
+  reported via the existing `Err(...)` return path in `publish`, not
+  via `Ok(false)`. The two concerns -- backpressure vs. failure --
+  are kept distinct.
+
+If a future requirement adds half-broken-connection detection or
+explicit refusal semantics, that would naturally fit as an
+`Err(...)` from `try_publish` rather than `Ok(false)`. See
+`metak-orchestrator/TASKS.md` T-impl.7 and
+`variant-base/src/variant_trait.rs` for the contract.
+
 ## Out of scope
 
 - TLS / `wss://`.

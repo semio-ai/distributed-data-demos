@@ -715,4 +715,36 @@ mod tests {
         assert!(names.contains("alice"));
         assert!(names.contains("bob"));
     }
+
+    /// T-impl.7: the WebSocket variant intentionally keeps the trait
+    /// default `try_publish` impl -- delegate to `publish`, return
+    /// `Ok(true)`. The variant only supports reliable QoS (3, 4), and
+    /// reliable QoS must never return `Ok(false)` (that would create a
+    /// receiver-visible seq gap). This test pins the contract: a
+    /// happy-path `try_publish` at QoS 3 / QoS 4 with zero peers
+    /// returns `Ok(true)`. See `CUSTOM.md` "Backpressure semantics
+    /// (T-impl.7)" for the rationale.
+    #[test]
+    fn try_publish_qos3_returns_true_in_happy_path() {
+        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableUdp));
+        let ok = v
+            .try_publish("/p", &[0u8; 8], Qos::ReliableUdp, 1)
+            .expect("try_publish must not error");
+        assert!(
+            ok,
+            "QoS 3 try_publish must return Ok(true) -- reliable QoS does not honour backpressure-skip"
+        );
+    }
+
+    #[test]
+    fn try_publish_qos4_returns_true_in_happy_path() {
+        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableTcp));
+        let ok = v
+            .try_publish("/p", &[0u8; 8], Qos::ReliableTcp, 1)
+            .expect("try_publish must not error");
+        assert!(
+            ok,
+            "QoS 4 try_publish must return Ok(true) -- reliable QoS does not honour backpressure-skip"
+        );
+    }
 }
