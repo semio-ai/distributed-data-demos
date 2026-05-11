@@ -37,6 +37,8 @@ Logged once when the variant has established connections to all peers.
 |-------|------|-------------|
 | `launch_ts` | string (RFC 3339) | The `--launch-ts` value from the runner |
 | `elapsed_ms` | float | `connected_ts - launch_ts` in milliseconds |
+| `threading_mode` | string (optional during E14 rollout, required once T14.8 lands) | The threading execution model the variant ran under for this spawn: `"single"` or `"multi"`. Matches the `--threading-mode` injected arg. See `variant-cli.md` "E14 additions". Variant-base logs this field unconditionally once T14.1 lands; logs produced by binaries that pre-date T14.1 will omit it. |
+| `recv_buffer_kb` | integer (optional during E14 rollout, required once T14.8 lands) | The OS-level recv buffer size in kibibytes the variant was asked to apply (range `64..=65536`, default `4096`). Variants apply `setsockopt(SO_RCVBUF, recv_buffer_kb * 1024)` on every recv-side socket they own; async-only variants whose transport library hides the socket treat the arg as advisory but still record it for offline reproducibility. |
 
 ### `phase`
 
