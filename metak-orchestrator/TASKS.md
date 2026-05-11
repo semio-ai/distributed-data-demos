@@ -5008,6 +5008,74 @@ to exist). Can spawn in parallel with T14.2-T14.7.
 
 ---
 
+### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (DEFERRED)
+
+**Repo**: `variants/zenoh/`, plus a small runner-side sidecar-spawn
+mechanism.
+**Status**: deferred. Filed as a skeleton; not part of the E14 sprint.
+Spawn only after E14 (T14.1 - T14.8) lands and the team confirms a
+real WASM use case for Zenoh.
+
+#### Background
+
+Zenoh's crate is internally multi-threaded, so T14.7 declares the
+variant `[Multi]` only. However, Zenoh's architecture naturally
+supports an out-of-process router (`zenohd`). A thin single-threaded
+RPC client talking to a sidecar router process gives Zenoh a
+genuinely single-threaded, sync, WASM-compatible client surface
+without lying about what runs where.
+
+This is the path the team identified as the production topology for
+Zenoh in WASM scenarios.
+
+#### Scope (high level -- worker fills in detail when scheduled)
+
+- Update `variants/zenoh` capability to `[Single, Multi]`. Existing
+  Multi mode unchanged from T14.7.
+- New Single mode: variant spawns a `zenohd` sidecar process at
+  `connect` time (or runner manages the sidecar lifecycle -- see
+  below), then opens a single-threaded RPC client connection to it.
+  Publish/poll_receive go through the RPC client. No tokio in the
+  variant process itself.
+- Sidecar lifecycle management: open question whether the variant
+  owns the sidecar (simpler, but spawn/teardown per variant) or the
+  runner owns it (sharable across variants, but more contract surface).
+  T14.9 decides; my default expectation is variant-owned for the
+  first cut and runner-promoted-if-needed later.
+- RPC protocol: the obvious candidate is Zenoh's own admin/control
+  surface, exposed via `zenohd`'s REST/WS admin API or a custom
+  Zenoh subscription. Worker picks one and documents the choice.
+- Analysis: optionally report router resource usage separately from
+  variant resource usage. Out of scope for first cut.
+
+#### Contract impact
+
+If the runner owns sidecar lifecycle, a new contract for sidecar
+declaration in TOML would be needed. If the variant owns it, no
+contract change. Default: variant-owned, no contract change.
+
+#### Acceptance criteria (rough)
+
+- [ ] Zenoh variant declares `[Single, Multi]`.
+- [ ] Single mode spawns and tears down a `zenohd` sidecar cleanly.
+- [ ] Variant binary itself contains no tokio in Single mode (verified
+  by `cargo tree -e features` or similar).
+- [ ] Two-runner localhost regression passes in Single mode at a
+  modest workload (worker picks; not high-rate symmetric for the
+  first cut).
+- [ ] CUSTOM.md documents the sidecar topology and the RPC choice.
+- [ ] EPICS.md "Future work" subsection on E14 promoted to a
+  retrospective note pointing here.
+
+#### Out of scope
+
+- Same as T14.7's out-of-scope plus the sidecar-spawn mechanism
+  generalisation across other variants. If a future variant benefits
+  from a sidecar (e.g. a Aeron driver process) that's a separate
+  effort.
+
+---
+
 ### T11.5: analysis -- promote receive throughput to headline metric
 
 **Repo**: `analysis/`.

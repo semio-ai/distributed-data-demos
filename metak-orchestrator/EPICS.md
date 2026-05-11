@@ -816,3 +816,31 @@ This epic exists because:
   capability declaration is the only change.
 - Analysis summary tables lead with receive throughput; existing
   metrics still computed and visible.
+
+### Future work (deferred -- NOT part of E14)
+
+#### Zenoh single-threaded client via router-RPC
+
+Although the Zenoh crate is internally multi-threaded, Zenoh's
+architecture naturally supports an out-of-process router. A future
+variant configuration could launch a separate `zenohd` process as a
+sidecar and have the variant client (a thin RPC client over Zenoh's
+admin/control surface or a custom RPC channel) operate strictly
+single-threaded, with the router process absorbing all concurrency.
+
+This is the WASM-friendly path for Zenoh: the WASM binary contains
+only the single-threaded RPC client; the multi-threaded router runs
+natively beside it. Real production scenarios in the team's target
+deployments would use exactly this topology.
+
+Filed as **T14.9** in `TASKS.md` (skeleton; not scheduled). When
+implemented, Zenoh's capability declaration becomes `[Single, Multi]`
+and the existing Multi-only declaration from T14.7 is updated. T14.9
+also requires a small runner change to optionally spawn a sidecar
+process per variant (the router) and tear it down after the spawn --
+that mechanism would be reusable for any future variant that benefits
+from a sidecar.
+
+Out of scope for E14: the router-spawning mechanism, the RPC protocol
+between client and router, and any analysis-side changes to report
+router resource usage separately from variant resource usage.
