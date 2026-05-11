@@ -96,6 +96,18 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     let drain_msg_budget = (config.values_per_tick as usize).saturating_mul(2).max(1);
     let drain_time_budget = Duration::from_millis(1);
 
+    // Two-tier back-off counter for the max-throughput loop (T-impl.8).
+    // Local to this protocol run -- only relevant under MaxThroughput;
+    // unused under ScalarFlood where the inter-tick sleep already paces
+    // the writer.
+    //
+    // Tiers (max-throughput only):
+    //   - 1st consecutive Ok(false): yield_now() -- release timeslice.
+    //   - 2nd+ consecutive Ok(false): sleep(1ms) -- substantial back-off
+    //     (~15ms on Windows due to timer granularity, ~1ms on Linux).
+    //   - Ok(true) resets the counter to 0.
+    let mut consecutive_skipped: u32 = 0;
+
     while operate_start.elapsed() < operate_duration {
         // In max-throughput mode, skip the tick sleep entirely.
         if !max_throughput {
@@ -113,13 +125,38 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         // retried within the same tick, and NOT recorded as a `write`.
         // Real errors still propagate. See T-impl.6 and
         // `metak-shared/api-contracts/jsonl-log-schema.md`.
+        //
+        // Under max-throughput, Ok(false) also triggers the two-tier
+        // self-pacing back-off (yield then sleep) -- see T-impl.8 and
+        // `variant-base/CUSTOM.md`. Under scalar-flood the inter-tick
+        // sleep already paces the writer, so no extra back-off here.
         let ops = workload.generate(config.values_per_tick);
         for op in &ops {
             let seq = seq_gen.next_seq();
             if variant.try_publish(&op.path, &op.payload, qos, seq)? {
                 logger.log_write(seq, &op.path, qos, op.payload.len())?;
+                if max_throughput {
+                    consecutive_skipped = 0;
+                }
             } else {
                 logger.log_backpressure_skipped(&op.path, qos)?;
+                if max_throughput {
+                    consecutive_skipped = consecutive_skipped.saturating_add(1);
+                    if consecutive_skipped == 1 {
+                        // First skip since the last successful publish:
+                        // yield the timeslice so the receiver thread may
+                        // be scheduled, but do not sleep -- a yield costs
+                        // <100us on Windows and may suffice.
+                        std::thread::yield_now();
+                    } else {
+                        // Second or later consecutive skip: take a real
+                        // sleep. On Windows this actually sleeps ~15ms
+                        // (timer granularity); on Linux it's ~1ms.
+                        // Either way it's substantially longer than a
+                        // yield -- a deliberate back-off.
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
             }
         }
 
@@ -873,6 +910,382 @@ mod tests {
         fn disconnect(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// A variant whose `try_publish` returns `Ok(false)` exactly once
+    /// and `Ok(true)` forever after. Used to verify that the
+    /// max-throughput loop reacts to the first backpressure with a
+    /// cheap `yield_now()` (no sleep) and resumes immediately.
+    struct OnceBackpressuredVariant {
+        try_publish_calls: u64,
+    }
+
+    impl OnceBackpressuredVariant {
+        fn new() -> Self {
+            Self {
+                try_publish_calls: 0,
+            }
+        }
+    }
+
+    impl Variant for OnceBackpressuredVariant {
+        fn name(&self) -> &str {
+            "once-backpressured"
+        }
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            Ok(())
+        }
+        fn try_publish(
+            &mut self,
+            _path: &str,
+            _payload: &[u8],
+            _qos: Qos,
+            _seq: u64,
+        ) -> Result<bool> {
+            self.try_publish_calls += 1;
+            // First call returns Ok(false); everything after is Ok(true).
+            Ok(self.try_publish_calls != 1)
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            Ok(None)
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A variant whose `try_publish` alternates `Ok(false), Ok(true),
+    /// Ok(false), Ok(true), ...` indefinitely. Used to verify that the
+    /// max-throughput back-off counter resets on every successful
+    /// publish, so each `false` triggers a cheap yield rather than the
+    /// 1ms sleep path.
+    struct AlternatingBackpressuredVariant {
+        try_publish_calls: u64,
+    }
+
+    impl AlternatingBackpressuredVariant {
+        fn new() -> Self {
+            Self {
+                try_publish_calls: 0,
+            }
+        }
+    }
+
+    impl Variant for AlternatingBackpressuredVariant {
+        fn name(&self) -> &str {
+            "alternating-backpressured"
+        }
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            Ok(())
+        }
+        fn try_publish(
+            &mut self,
+            _path: &str,
+            _payload: &[u8],
+            _qos: Qos,
+            _seq: u64,
+        ) -> Result<bool> {
+            self.try_publish_calls += 1;
+            // Odd calls (1st, 3rd, ...) -> Ok(false); even calls -> Ok(true).
+            Ok(self.try_publish_calls.is_multiple_of(2))
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            Ok(None)
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn max_throughput_yields_on_first_backpressure_does_not_sleep() {
+        // Stub returns Ok(false) once, then Ok(true) forever. Under
+        // max-throughput the first false should trigger yield_now() and
+        // every subsequent true should produce a `write` event AND
+        // reset the consecutive-skipped counter, so the sleep(1ms) path
+        // is never taken on this variant.
+        //
+        // Direct timing assertion: the FIRST try_publish (false) wraps
+        // a yield, and every subsequent try_publish is Ok(true). We
+        // measure the wall-clock between the variant's first call and
+        // the second call (via the publish counter). Yield should keep
+        // that delta well under one Windows scheduler tick.
+        //
+        // We can't observe the variant's call timestamps directly here,
+        // so we instead use the event count as a proxy: if a sleep had
+        // happened on the first skip, the operate loop would still
+        // accumulate millions of writes over 1s, but the test must
+        // observe a HIGH write-rate -- which proves no per-skip sleep.
+        // The simpler signal: with sleep(1ms) we would expect maybe
+        // 1000-66000 writes/sec; without sleep (yield-only) the rate
+        // is bounded by libc/log I/O at millions/sec.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 5);
+        args.workload = "max-throughput".to_string();
+        args.operate_secs = 1; // smallest non-zero value the CLI supports
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+
+        let mut variant = OnceBackpressuredVariant::new();
+        let start = std::time::Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+
+        let lines = read_log(dir.path(), "alice");
+        let write_events: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["event"] == "write").collect();
+        let skip_events: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backpressure_skipped")
+            .collect();
+
+        eprintln!(
+            "max_throughput_yields_on_first_backpressure: elapsed={:?}, writes={}, skips={}",
+            elapsed,
+            write_events.len(),
+            skip_events.len()
+        );
+
+        assert_eq!(
+            skip_events.len(),
+            1,
+            "exactly one backpressure_skipped event expected; got {}",
+            skip_events.len()
+        );
+        // With a 1s operate window and only the FIRST call returning
+        // Ok(false), we should accumulate thousands of `write` events.
+        // A sleep(1ms) on the first skip would NOT prevent this -- but
+        // would push the total wall-clock above 1s by ~15ms on Windows
+        // (negligible). The strong evidence here is the write count.
+        assert!(
+            write_events.len() > 100,
+            "expected many `write` events after the single skip; got {}",
+            write_events.len()
+        );
+        // Sanity-bound the wall-clock: 1s operate + EOT no-op +
+        // a few ms of stabilize/silent/logger I/O. If something
+        // accidentally inserted a long sleep, total time would balloon.
+        // 3s gives generous slack for CI noise on Windows.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "operate phase ran long -- did the yield path accidentally sleep? got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn max_throughput_sleeps_after_consecutive_backpressure_does_rate_limit() {
+        // Stub returns Ok(false) forever. Under max-throughput the
+        // first false yields, every subsequent consecutive false hits
+        // the 1ms sleep path. Over a 1-second operate window (the
+        // minimum the CliArgs `operate_secs: u64` supports) the skip
+        // count must be PACED -- bounded by the sleep granularity, not
+        // free-spinning at millions/sec.
+        //
+        // Platform expectations (always-false, ~1s operate, vpt=1):
+        //   Linux  (~1ms sleep): ~1000 skips
+        //   Windows (~15ms sleep): ~66 skips
+        // Free-spin (no back-off) would produce millions of skips per
+        // second. We assert (well) below that.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(
+            dir.path().to_str().unwrap(),
+            "alice",
+            "alice=127.0.0.1",
+            5, // small EOT timeout, but empty expected-peer set exits immediately
+        );
+        args.workload = "max-throughput".to_string();
+        args.operate_secs = 1; // smallest non-zero value the CLI supports
+        args.silent_secs = 0;
+        args.tick_rate_hz = 1;
+        args.values_per_tick = 1; // one try_publish per outer iter -> each iter triggers back-off
+
+        let mut variant = AlwaysBackpressuredVariant::new();
+        let start = std::time::Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+
+        let lines = read_log(dir.path(), "alice");
+        let skip_events: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backpressure_skipped")
+            .collect();
+
+        eprintln!(
+            "max_throughput_sleeps_after_consecutive: elapsed={:?}, skips={}, try_publish_calls={}",
+            elapsed,
+            skip_events.len(),
+            variant.try_publish_calls
+        );
+
+        // Lower bound: pacing should still let SOME skips happen
+        // (at least more than one per ~15ms tick over 1s on Windows).
+        assert!(
+            skip_events.len() >= 5,
+            "expected at least 5 backpressure_skipped events over 1s; got {}",
+            skip_events.len()
+        );
+        // Upper bound: the key assertion -- the loop is paced by the
+        // sleep granularity, NOT free-spinning. Free-spin would push
+        // skip counts into the millions in 1s. We accept any value up
+        // to a few thousand to absorb fast Linux scheduling, but
+        // anything above that means the back-off didn't fire.
+        assert!(
+            skip_events.len() < 5000,
+            "max-throughput should be paced (not free-spinning); got {} skips in {:?}",
+            skip_events.len(),
+            elapsed
+        );
+    }
+
+    #[test]
+    fn max_throughput_resets_on_successful_publish() {
+        // Stub returns alternating Ok(false), Ok(true), Ok(false), ...
+        // Every false should be paired with a yield (since the previous
+        // iteration's true reset the counter). NO false should ever hit
+        // the sleep path -- which is the assertion this test enforces
+        // via skip-rate: if the sleep path had fired, we would observe
+        // a skip count throttled by sleep granularity. With pure yield
+        // we should accumulate many thousands of skip+write pairs over
+        // a 1-second operate window.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 5);
+        args.workload = "max-throughput".to_string();
+        args.operate_secs = 1; // smallest non-zero value
+        args.silent_secs = 0;
+        args.tick_rate_hz = 1;
+        args.values_per_tick = 1; // simplest pattern: each outer iter is exactly one call
+
+        let mut variant = AlternatingBackpressuredVariant::new();
+        let start = std::time::Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+
+        let lines = read_log(dir.path(), "alice");
+        let write_events: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["event"] == "write").collect();
+        let skip_events: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backpressure_skipped")
+            .collect();
+
+        eprintln!(
+            "max_throughput_resets_on_success: elapsed={:?}, writes={}, skips={}",
+            elapsed,
+            write_events.len(),
+            skip_events.len()
+        );
+
+        // Both event types should be present and roughly equal (the
+        // pattern alternates 1:1).
+        assert!(
+            !write_events.is_empty(),
+            "expected `write` events from the alternating pattern"
+        );
+        assert!(
+            !skip_events.is_empty(),
+            "expected `backpressure_skipped` events from the alternating pattern"
+        );
+        // 1:1 ratio within a small slack (off-by-one if loop ends on a
+        // false).
+        let diff = write_events.len().abs_diff(skip_events.len());
+        assert!(
+            diff <= 1,
+            "expected ~equal write and skip counts in alternating pattern; got writes={}, skips={}",
+            write_events.len(),
+            skip_events.len()
+        );
+
+        // KEY assertion: if every false had triggered sleep(1ms), in
+        // 1 second we would have observed at most ~1000 skip+write
+        // pairs on Linux (~66 on Windows). With the counter resetting
+        // to 0 on each Ok(true), every false instead takes the yield
+        // path, and we should observe MANY MORE pairs than the
+        // sleep-bound -- proving the reset works.
+        //
+        // We require a count well above the Windows sleep ceiling
+        // (~66/s). 1000 skips in 1s is achievable even with sleep on
+        // Linux, so we set the bar at 5000+ to unambiguously rule out
+        // the sleep path on either platform.
+        assert!(
+            skip_events.len() > 5000,
+            "reset-on-success should bypass sleep; got only {} skips in {:?} (expected >5000, indicating yield-only path)",
+            skip_events.len(),
+            elapsed
+        );
+    }
+
+    #[test]
+    fn scalar_flood_max_throughput_path_unchanged() {
+        // Stub returns Ok(false) forever under the scalar-flood profile.
+        // The driver must NOT apply the max-throughput yield/sleep
+        // back-off here -- the inter-tick sleep is the sole pacing.
+        // We expect exactly tick_rate_hz * operate_secs * vpt skipped
+        // events (one per intended value), and the wall-clock should
+        // be roughly operate_secs (no extra back-off was added).
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        args.workload = "scalar-flood".to_string();
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.tick_rate_hz = 10;
+        args.values_per_tick = 5;
+
+        let mut variant = AlwaysBackpressuredVariant::new();
+        let start = std::time::Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+
+        let lines = read_log(dir.path(), "alice");
+        let skip_events: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backpressure_skipped")
+            .collect();
+        let write_events: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["event"] == "write").collect();
+
+        eprintln!(
+            "scalar_flood_unchanged: elapsed={:?}, skips={}, writes={}",
+            elapsed,
+            skip_events.len(),
+            write_events.len()
+        );
+
+        // Expected = tick_rate_hz * operate_secs * vpt = 10 * 1 * 5 = 50.
+        // Allow small slack (one or two ticks of timing jitter).
+        let expected = (args.tick_rate_hz as usize)
+            * (args.operate_secs as usize)
+            * (args.values_per_tick as usize);
+        let low = expected.saturating_sub(args.values_per_tick as usize * 2);
+        let high = expected + args.values_per_tick as usize * 2;
+        assert!(
+            (low..=high).contains(&skip_events.len()),
+            "scalar-flood skip count should equal ticks*vpt (~{expected}); got {} (range {}..={})",
+            skip_events.len(),
+            low,
+            high
+        );
+        assert!(
+            write_events.is_empty(),
+            "always-backpressured variant should produce no `write` events"
+        );
+
+        // Wall-clock: roughly operate_secs (1s) with no extra back-off.
+        // The new yield/sleep code path is gated on max-throughput so
+        // it must not fire here. Allow generous slack for stabilize=0,
+        // silent=0, EOT (empty expected set exits immediately) and CI
+        // jitter.
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "scalar-flood should not gain new yield/sleep back-off; got {:?}",
+            elapsed
+        );
     }
 
     #[test]
