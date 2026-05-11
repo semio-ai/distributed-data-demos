@@ -71,6 +71,14 @@ receiver will see a `receive` for it. Diagnostic counter used by
 analysis to distinguish "writer held back" from "writer sent and
 downstream dropped it".
 
+Under the `max-throughput` workload profile (T-impl.8), emitting this
+event ALSO triggers the driver's two-tier self-pacing back-off:
+`std::thread::yield_now()` on the first consecutive skip since the
+last successful publish, then `std::thread::sleep(Duration::from_millis(1))`
+on the second and later consecutive skips. The counter resets on every
+`Ok(true)`. Under `scalar-flood` the inter-tick sleep is the sole
+pacing and no extra back-off is applied.
+
 | Field | Type | Description |
 |-------|------|-------------|
 | `path` | string | Key path that would have been written |

@@ -152,3 +152,57 @@ finds in `CliArgs::extra` via `cli::parse_peer_names_from_extra`) minus
 the runner's own name. If the wait expires with peers still missing,
 the driver logs a single `eot_timeout` event with the missing names —
 the spawn does NOT abort.
+
+### Self-pacing in max-throughput (T-impl.8)
+
+The operate-phase loop runs differently for the two workload profiles:
+
+- **`scalar-flood`**: an explicit `tick_interval` sleep paces the writer
+  to `tick_rate_hz`. When `try_publish` returns `Ok(false)` the driver
+  emits a `backpressure_skipped` event and moves on -- the inter-tick
+  sleep is the sole back-off.
+- **`max-throughput`**: the inter-tick sleep is removed so each
+  transport's headline rate is measured. To keep the writer from
+  spinning on `Ok(false)` and starving the receiver, the operate loop
+  applies a two-tier back-off using a local `consecutive_skipped: u32`
+  counter:
+  1. **First consecutive `Ok(false)`**: log `backpressure_skipped`, then
+     `std::thread::yield_now()`. No sleep -- the yield releases the
+     timeslice (cost <100 us on Windows) and the receiver thread may
+     run immediately. If it drains the queue, the very next
+     `try_publish` returns `Ok(true)` and the counter resets to zero.
+  2. **Second or later consecutive `Ok(false)`**: log
+     `backpressure_skipped`, then
+     `std::thread::sleep(Duration::from_millis(1))`. The sleep already
+     releases the timeslice -- no additional yield.
+  3. **`Ok(true)`** resets `consecutive_skipped = 0`, so the next
+     transient `Ok(false)` returns to the yield path.
+
+**Why yield first, then sleep?** A yield is essentially free; if the
+receiver only needs to run for a few microseconds to drain one message,
+yield is plenty and we get back to publishing immediately. A sleep is
+much more expensive (especially on Windows). The first-skip yield is
+the optimistic case ("the receiver was just briefly preempted, give it
+a chance"); the second-skip sleep is the pessimistic case ("the queue
+is genuinely full, give it a real interval to drain").
+
+**Windows timer-granularity caveat.**
+`std::thread::sleep(Duration::from_millis(1))` does not sleep for 1 ms
+on Windows -- it sleeps for approximately one system tick, which is
+~15.6 ms by default (or ~10 ms with `timeBeginPeriod(1)`, or ~1 ms only
+if some other process has bumped the timer resolution). On Linux it's
+~1 ms. **This is a feature, not a bug**: the longer sleep gives the
+receiver substantial drain time on Windows, which is exactly the
+back-off pressure we want under sustained backpressure. The
+consequence is that under a saturated transport, the max-throughput
+write-rate trace becomes sawtooth-shaped (long sleep, burst of
+publishes, repeat); the *aggregate* throughput converges to the
+sustainable rate of the transport. We deliberately do NOT call
+`timeBeginPeriod(1)` -- it would affect the whole process and is a
+documented thread-scheduling hazard.
+
+**Scalar-flood is unchanged.** The new yield/sleep is gated on
+`max_throughput == true`; under `scalar-flood` the back-off counter
+is never touched and the existing inter-tick sleep is the sole pacing
+mechanism. See `driver::run_protocol` and the
+`scalar_flood_max_throughput_path_unchanged` unit test for the guard.
