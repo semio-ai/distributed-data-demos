@@ -62,3 +62,33 @@ side-by-side under identical conditions.
 2. Add diagram generation (E5) and time-series charts (E6).
 3. Run end-to-end validation across two LAN machines (E7).
 4. Unblock Aeron variant on Linux (E3c).
+
+## Cross-cutting goals (added 2026-05-11, awaiting user review)
+
+### WASM compilation target
+
+Some variant crates are planned to compile to WASM for downstream
+use in the team's production scenarios. WASM environments — particularly
+browser-WASM — do not support full multi-threaded async runtimes like
+tokio. As a result:
+
+- **Single-threaded synchronous variant operation is a first-class
+  requirement**, not a fallback.
+- Variant infrastructure in `variant-base` defaults to sync-capable
+  abstractions; async runtimes (tokio) are opt-in for variants that
+  fundamentally need them (QUIC, WebRTC, Zenoh).
+- TCP-family variants (websocket, hybrid TCP, custom-udp TCP) must
+  support both modes.
+
+This goal is the driving motivation for epic E14 (Threading-Mode
+Dimension and Receive-Centric Analysis).
+
+### Receive throughput as the headline metric
+
+The project's stated goal is "keep multiple peers in sync under huge
+change diffs with lowest latency possible." The metric that decides
+"in sync" is **receive throughput**, not write throughput. Writers
+ship at requested rate almost always; receivers face buffer pressure,
+parse cost, and application-level work, and are the actual sync
+bottleneck. The analysis tool's headline number reflects this; see
+T11.5.
