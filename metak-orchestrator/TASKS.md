@@ -4359,3 +4359,139 @@ be cheap and honest (never `Ok(true)` if the data would be dropped).
 
 - Receiver-driven backpressure across variants.
 - Token-bucket / rate limiting on the writer side.
+
+### T-impl.8: variant-base — self-pacing for max-throughput (yield then sleep fallback)
+
+**Repo**: `variant-base/`.
+**Status**: pending.
+**Depends on**: T-impl.6 (try_publish trait), T-impl.7 (per-variant overrides). Both landed.
+
+#### Background
+
+The `max-throughput` workload profile runs the operate phase **without
+any tick-rate sleep** so each transport's headline rate is measured.
+Without pacing the writer drowns the receiver and the spawn either
+hits `eot_timeout` or shows ~99 % loss. T-impl.7 added per-variant
+`try_publish` returning `Ok(false)` when the local transport is
+backpressured, but the driver currently just logs
+`backpressure_skipped` and continues to the next value — there is no
+back-off, so the next `try_publish` is almost certainly `Ok(false)`
+too, and the loop burns CPU without giving the receiver any chance
+to drain.
+
+For **`scalar-flood`** this is fine: the explicit tick-rate sleep
+already paces the writer. For **`max-throughput`** we want the
+writer to back off briefly on `Ok(false)` so the receiver can
+catch up.
+
+#### Scope (max-throughput only — do NOT change `scalar-flood`)
+
+In `variant-base/src/driver.rs`, identify the operate-phase loop
+that runs when `workload_profile = MaxThroughput`. The current
+behaviour after the T-impl.6 changes is:
+
+```
+loop {
+    if elapsed >= operate_secs { break; }
+    let seq = next_seq();
+    let path = next_path();
+    let payload = next_payload();
+    match variant.try_publish(path, payload, qos, seq)? {
+        true  => logger.log_write(...);
+        false => logger.log_backpressure_skipped(path, qos);
+    }
+}
+```
+
+Change the `false` branch to introduce a two-tier back-off:
+
+1. **First `Ok(false)` since the last `Ok(true)`**: log
+   `backpressure_skipped` AND call `std::thread::yield_now()`. Don't
+   sleep. The yield costs less than 100 µs on Windows but releases the
+   timeslice so the receiver thread can be scheduled.
+2. **Second consecutive `Ok(false)`** (the immediately next iteration
+   also returned `Ok(false)`): log `backpressure_skipped` AND call
+   `std::thread::sleep(Duration::from_millis(1))`. On Windows this
+   actually sleeps ~15 ms by default (timer resolution); on Linux it's
+   ~1 ms. Either way it's a substantially longer back-off than the
+   yield gave us.
+3. **Third and subsequent consecutive `Ok(false)`**: same as #2 (just
+   `sleep(1ms)`). No further escalation.
+4. **`Ok(true)` resets the consecutive-counter to 0**, so the very
+   next `Ok(false)` after any successful write goes back to yield.
+
+The consecutive-counter is a `u32` (or `usize`) local to the operate
+loop; no need for thread-safety. Reset on the first successful publish.
+
+Do NOT change the behaviour when `Ok(false)` happens under
+`scalar-flood` — that path keeps the current "log and continue"
+behaviour because the inter-tick sleep already provides pacing.
+
+#### Tests (in `variant-base/src/driver.rs::tests`)
+
+1. **Yield path**: a stub variant whose `try_publish` returns
+   `Ok(false)` only on the first call, then `Ok(true)`. With
+   `MaxThroughput` profile and `operate_secs = 0.1` (or whatever's
+   the minimum the test scaffolding supports), assert that
+   exactly one `backpressure_skipped` event is logged, multiple
+   `write` events follow, AND `std::thread::sleep` was NOT called
+   on that path. (You can avoid mocking sleep by checking the
+   wall-clock: if the test takes < 5 ms it can't have called
+   sleep(1ms); if it takes > 10 ms, it did.) Be tolerant of
+   scheduler noise — use generous bounds.
+2. **Sleep fallback path**: a stub variant whose `try_publish`
+   always returns `Ok(false)`. After ~50 ms wall-clock, the
+   `backpressure_skipped` count should be in the low tens, NOT in
+   the thousands — because the sleep is rate-limiting. (At
+   1 ms sleep, ~50 events. At Windows' 15 ms granularity, ~3.) Use
+   bounds like "more than 5, less than 200" to absorb both
+   scenarios.
+3. **Reset behaviour**: a stub variant whose `try_publish` returns
+   the pattern `[false, true, false, true, false, true, ...]`.
+   Each `false` should be paired with a yield (not a sleep), so
+   the test should complete much faster than if every `false` had
+   triggered a sleep. Same wall-clock bounding.
+4. **`scalar-flood` is unchanged**: a stub variant with always-false
+   `try_publish` under `ScalarFlood` profile must behave as today
+   (one `backpressure_skipped` per tick × vpt; no yield/sleep added
+   beyond the existing inter-tick sleep).
+
+#### Validation (MANDATORY)
+
+From workspace root:
+- `cargo build --release -p variant-base` clean.
+- `cargo test --release -p variant-base` all-green (existing 58+2 plus
+  the new 4 tests).
+- `cargo test --release --workspace` all-green (variants still pass —
+  they don't override the driver loop, so nothing should regress).
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  zero warnings.
+- `cargo fmt --check` clean.
+
+#### Docs
+
+- `variant-base/CUSTOM.md`: new "Self-pacing in max-throughput
+  (T-impl.8)" subsection documenting the two-tier back-off, why
+  yield-first / sleep-fallback, and the Windows timer-granularity
+  caveat (~15 ms actual sleep when asking for 1 ms).
+- `metak-shared/api-contracts/jsonl-log-schema.md`: no schema change
+  needed (the `backpressure_skipped` event is unchanged); add a
+  sentence noting that under `max-throughput` these events are now
+  *also* a pacing signal, not just a drop count.
+
+#### Acceptance criteria
+
+- [ ] Driver's `max-throughput` operate loop has the two-tier back-off.
+- [ ] Counter resets on `Ok(true)`.
+- [ ] `scalar-flood` operate loop is unchanged.
+- [ ] All four new unit tests pass.
+- [ ] All existing tests pass (no regressions in variants).
+- [ ] `variant-base/CUSTOM.md` documents the back-off + Windows caveat.
+- [ ] Schema doc gets the one-sentence note.
+
+#### Out of scope
+
+- Changing the back-off duration adaptively (e.g. exponential).
+- Receiver-driven explicit backpressure signal across the wire.
+- Token-bucket rate limiting (still out of scope).
+- Adjusting Windows timer resolution via `timeBeginPeriod`.
