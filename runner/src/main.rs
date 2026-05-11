@@ -640,8 +640,27 @@ fn run(cli: &Cli) -> Result<()> {
             timeout_secs
         );
 
-        let outcome =
-            spawn::spawn_and_monitor(&variant.binary, &args, Duration::from_secs(timeout_secs))?;
+        // Per-spawn stderr capture. The child's stderr is redirected to
+        // `<log_subdir>/<effective_name>-<runner_name>-stderr.txt` so a
+        // post-mortem can see panic / abort / OS-error messages even when
+        // the JSONL log was truncated mid-write. The directory is the same
+        // one the variant's JSONL log goes into: `log_dir_resolved` when
+        // the variant declared its own `log_dir`, otherwise the run-level
+        // `run_log_dir`. The file is truncated on every spawn so a
+        // `--resume` re-spawn cleanly overwrites the previous attempt.
+        let stderr_dir: PathBuf = log_dir_resolved
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| run_log_dir.clone());
+        let stderr_capture =
+            spawn::stderr_capture_path(&stderr_dir, &job.effective_name, &cli.name);
+
+        let outcome = spawn::spawn_and_monitor(
+            &variant.binary,
+            &args,
+            Duration::from_secs(timeout_secs),
+            Some(&stderr_capture),
+        )?;
 
         let status = outcome.status_str();
         let exit_code = outcome.exit_code();

@@ -16,6 +16,10 @@ path = "tests/helpers/sleeper.rs"
 name = "arg-echo"
 path = "tests/helpers/arg_echo.rs"
 
+[[bin]]
+name = "stderr-writer"
+path = "tests/helpers/stderr_writer.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
