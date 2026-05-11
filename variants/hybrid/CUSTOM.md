@@ -208,9 +208,13 @@ send pressure, `publish` retries on `WouldBlock` with a bounded
 wall-clock budget (~1 ms via `std::thread::yield_now()` between
 attempts). If the budget is exhausted while still hitting `WouldBlock`,
 the send returns an error so the caller surfaces back-pressure rather
-than silently dropping data. We also bump `SO_SNDBUF` (~4 MB) at socket
-creation to reduce how often the retry actually triggers under high
-multicast rates on Windows.
+than silently dropping data. The UDP socket is also tuned via
+`variant_base::tune_udp_buffers` at creation time to bump both
+`SO_RCVBUF` and `SO_SNDBUF` to 8 MiB (T-impl.2) — the previous 4 MiB
+send-only bump was insufficient because the receive path also clipped
+at Windows-default ~64 KB buffers during 100 K pkt/s same-host runs.
+The TCP path is untouched: TCP back-pressure is the protocol-level
+signal we deliberately measure.
 
 ### Testing
 

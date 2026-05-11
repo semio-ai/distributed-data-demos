@@ -138,6 +138,43 @@ TX and RX in parallel, and combines that with a per-key
 `Publisher` cache so the route resolution cost is paid once per
 distinct key and not once per put.
 
+### Transport queue tuning (T-impl.2)
+
+Zenoh does **not** expose a raw `SO_RCVBUF` / `SO_SNDBUF` knob on its
+UDP transport links (the per-link `so_rcvbuf` / `so_sndbuf` options
+documented in `DEFAULT_CONFIG.json5` only apply to TCP / TLS / QUIC
+links). The closest equivalent — and what the other UDP-using variants
+spend their 8 MiB allocation on — is the **transport-level priority
+queue depth** that sits immediately above the socket. We raise every
+priority queue to its schema maximum:
+
+```
+transport/link/tx/queue/size/control            16
+transport/link/tx/queue/size/real_time          16
+transport/link/tx/queue/size/interactive_high   16
+transport/link/tx/queue/size/interactive_low    16
+transport/link/tx/queue/size/data_high          16
+transport/link/tx/queue/size/data               16
+transport/link/tx/queue/size/data_low           16
+transport/link/tx/queue/size/background         16
+transport/link/rx/buffer_size                   8388608   (8 MiB)
+```
+
+The TX queues default to `2` batches per priority and are constrained
+to the inclusive range `[1, 16]` by Zenoh itself (a value of 17+ causes
+`zenoh::open` to error during config validation). With the default
+`batch_size = 65535` bytes, 16 batches = ~1 MiB per priority queue, so
+the per-link aggregate across the 8 priorities is ~8 MiB — matching the
+8 MiB target the other variants set on `SO_*BUF` directly.
+
+The RX-side `buffer_size` raises the per-link receive buffer from the
+default 65 535 bytes to 8 MiB so the RX path absorbs the same bursts
+the TX side now buffers.
+
+Both edits live in `build_zenoh_config` (`src/zenoh.rs`); they are
+applied to every session the variant opens, regardless of mode
+(peer / client / router) or listen-endpoint configuration.
+
 ### Message encoding
 
 The variant needs to transmit: `writer` (runner name), `seq`, `path`, `qos`,

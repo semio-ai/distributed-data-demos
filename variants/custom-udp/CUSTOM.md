@@ -184,6 +184,18 @@ Treat reads of `total_len > max_buffer_size` the same way (drop peer): a
 peer that asks us to allocate more than `--buffer-size` bytes is buggy
 or hostile, and silent truncation is worse than dropping the stream.
 
+### UDP buffer tuning (T-impl.2)
+
+Every UDP socket the variant creates (today: the multicast socket in
+`setup_udp`) must be passed through `variant_base::tune_udp_buffers`
+immediately after `Socket::new`. The helper bumps `SO_RCVBUF` and
+`SO_SNDBUF` to 8 MiB, logs a single warning if the achieved size falls
+below 1 MiB, and then returns. The rationale is to absorb 100 K pkt/s
+bursts on the same-host fixtures that would otherwise overrun the
+Windows-default ~64 KB kernel buffer within milliseconds and produce
+spurious "loss" rows. Do NOT skip the call on Linux: the helper is
+no-op-safe when the kernel grants the full request.
+
 ### MTU handling
 
 Standard Ethernet MTU = 1500 bytes. UDP payload limit = ~1472 bytes.

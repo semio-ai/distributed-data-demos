@@ -117,7 +117,13 @@ Quinn is async (tokio). The `Variant` trait is sync. Strategy:
    and the list of `(peer_name, peer_host, peer_port)` tuples per the
    "Port derivation" section above.
 2. Generate a self-signed certificate using `rcgen`.
-3. Create a Quinn endpoint bound to `0.0.0.0:my_bind_port` with the cert.
+3. Bind a `std::net::UdpSocket` on `0.0.0.0:my_bind_port` ourselves,
+   pass it through `variant_base::tune_udp_buffers_std` to bump
+   `SO_RCVBUF` / `SO_SNDBUF` to 8 MiB (T-impl.2), then hand the tuned
+   socket to `quinn::Endpoint::new(EndpointConfig::default(), Some(server_config), socket, quinn::default_runtime()?)`.
+   `Endpoint::server(addr)` would have bound the socket internally and
+   left it on Windows' ~64 KB defaults, dropping packets at 100 K pkt/s
+   same-host loads. Set the client config on the endpoint afterwards.
 4. Connect to each peer (QUIC client handshake).
 5. Accept incoming connections from peers (QUIC server).
 6. For each peer connection, spawn background send/receive tasks.

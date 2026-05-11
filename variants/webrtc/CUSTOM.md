@@ -146,6 +146,33 @@ report `open`. After that, the PeerConnection is the only channel.
 - Bind ICE on `0.0.0.0:my_media_listen` so candidates use the OS's
   default interfaces. The peer host comes from `--peers`.
 
+### UDP buffer tuning — known gap (T-impl.2)
+
+T-impl.2 bumps `SO_RCVBUF` / `SO_SNDBUF` to 8 MiB at every UDP socket
+creation site across the other UDP-using variants
+(custom-udp, hybrid, quic) via `variant_base::tune_udp_buffers`. **The
+webrtc variant cannot apply this tuning today** because webrtc-rs
+0.8.0 does not expose its ICE/DTLS UDP socket externally:
+
+- `SettingEngine` (the public configuration surface) has no
+  `set_udp_send_buffer_size` / `set_udp_recv_buffer_size` knob.
+- `UDPNetwork::Ephemeral(EphemeralUDP)` (what we use, pinned to a
+  single host port via `EphemeralUDP::new(media_port, media_port)`)
+  binds its own `tokio::net::UdpSocket` internally during ICE
+  gathering. Variant code never sees the socket.
+- `UDPNetwork::Muxed(Arc<dyn UDPMux>)` takes an opaque mux trait
+  object, not a `UdpSocket`. Building a custom `UDPMux` that owns a
+  pre-tuned socket is theoretically possible but requires
+  reimplementing webrtc-rs's internal multiplexing — far outside the
+  scope of T-impl.2's "bump SO_*BUF" deliverable.
+
+Decision: skip the helper invocation in this variant and document the
+gap here. The expected fallout is that the webrtc same-host rows at
+100 K pkt/s will continue to show higher loss than custom-udp / quic
+until upstream webrtc-rs gains a buffer-size knob (or a
+`UDPNetwork::PreboundSocket(UdpSocket)` constructor). Track the
+upstream gap if T-impl.2's analysis flags this as load-bearing.
+
 ### connect
 
 1. Parse CLI, derive ports.
@@ -260,6 +287,30 @@ After implementation:
   logs show `connected`, the EOT phase, and delivery ≥ 95% on
   reliable channels. Unreliable channels at high rate may show some
   loss — record what you measure.
+
+## Signaling robustness characterisation (T-impl.5)
+
+T-impl.5 asked for an investigation into whether the WebRTC variant
+was the cause of "0 writes / 0 ms" rows seen in earlier matrix runs.
+The diagnosis is recorded in full in
+`metak-orchestrator/DECISIONS.md` as **D10: T-impl.5 — WebRTC
+signaling fragility, investigation and disposition**.
+
+**Outcome**: No fix required. The `connect` phase already awaits
+`data_channel_open` on every expected peer with a 15-second cap
+(`CONNECT_TIMEOUT`), the signaling exchange has its own 10-second cap
+(`SIGNALING_CONNECT_TIMEOUT`), and three back-to-back same-host
+`webrtc-100x100hz-qos1` smoke runs all produced non-zero writes AND
+non-zero receives on both runners (3 of 3, well above the 2-of-3
+acceptance bar). The historical "0 writes" rows for webrtc in matrix
+runs were almost certainly the upstream coordination hang described
+in DECISIONS D9 (resolved by T-coord.1b), not a webrtc-side bug.
+
+If a future run does surface webrtc-only 0-write rows independent of
+other variants, the first knob to try is bumping `CONNECT_TIMEOUT`
+in `src/webrtc.rs` from 15 s to ~30 s. The variant is otherwise
+characterised as working at the rates targeted by the all-variants
+matrix.
 
 ## Out of scope
 
