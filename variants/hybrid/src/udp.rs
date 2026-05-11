@@ -14,18 +14,17 @@
 /// dominant failure mode for UDP send: the NIC drains slower than user-space
 /// pushes packets in. We absorb this transient pressure with a tight retry
 /// loop (`yield_now` plus a short wall-clock budget) so the variant doesn't
-/// drop messages on the floor at the kernel boundary. We also bump
-/// `SO_SNDBUF` to reduce how often the retry actually triggers.
+/// drop messages on the floor at the kernel boundary. We also bump both
+/// `SO_RCVBUF` and `SO_SNDBUF` to 8 MiB via
+/// [`variant_base::tune_udp_buffers`] to absorb 100 K pkt/s bursts that
+/// the ~64 KB Windows-default UDP buffers would otherwise drop kernel-side
+/// (T-impl.2).
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-
-/// Target send buffer size (bytes). Larger than the OS default to reduce
-/// `WouldBlock` frequency at high multicast rates.
-const UDP_SEND_BUF_BYTES: usize = 4 * 1024 * 1024;
 
 /// Wall-clock budget per `send` call when retrying on `WouldBlock`.
 /// Chosen to be small enough not to stall the publish loop noticeably while
@@ -97,10 +96,10 @@ impl UdpTransport {
             .set_reuse_address(true)
             .context("failed to set SO_REUSEADDR")?;
 
-        // Bump SO_SNDBUF to reduce how often `send` hits WouldBlock under
-        // high-throughput multicast (especially on Windows). Best-effort;
-        // ignore failure (the kernel may cap it lower than requested).
-        let _ = socket.set_send_buffer_size(UDP_SEND_BUF_BYTES);
+        // T-impl.2: bump SO_RCVBUF / SO_SNDBUF to 8 MiB via the shared
+        // helper. Replaces the earlier 4 MiB send-only bump — the
+        // receive path also needs the buffer headroom on Windows.
+        variant_base::tune_udp_buffers(&socket).context("tune UDP buffers")?;
 
         // Bind to the multicast port on the specified address.
         let bind = SocketAddrV4::new(bind_addr, multicast_addr.port());

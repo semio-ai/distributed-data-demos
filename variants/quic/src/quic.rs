@@ -469,9 +469,27 @@ impl Variant for QuicVariant {
         let client_config = build_client_config().context("failed to build client config")?;
 
         // Create the endpoint inside the runtime.
+        //
+        // T-impl.2: bind the underlying `std::net::UdpSocket` ourselves so
+        // we can tune `SO_RCVBUF` / `SO_SNDBUF` to 8 MiB before quinn wraps
+        // it. `quinn::Endpoint::server(addr)` would bind internally and
+        // leave the socket on Windows' ~64 KB defaults, which loses
+        // packets at our 100 K pkt/s same-host fixtures. We use
+        // `Endpoint::new` with `default_runtime()` (TokioRuntime via the
+        // `runtime-tokio` feature, which is on by default for quinn 0.11).
         let endpoint = runtime.block_on(async {
-            let mut endpoint = quinn::Endpoint::server(server_config, bind_addr)
-                .context("failed to bind QUIC endpoint")?;
+            let std_socket =
+                std::net::UdpSocket::bind(bind_addr).context("failed to bind QUIC UDP socket")?;
+            variant_base::tune_udp_buffers_std(&std_socket).context("tune QUIC UDP buffers")?;
+            let quinn_runtime = quinn::default_runtime()
+                .ok_or_else(|| anyhow::anyhow!("no quinn runtime available"))?;
+            let mut endpoint = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(server_config),
+                std_socket,
+                quinn_runtime,
+            )
+            .context("failed to bind QUIC endpoint")?;
             endpoint.set_default_client_config(client_config);
             Ok::<quinn::Endpoint, anyhow::Error>(endpoint)
         })?;

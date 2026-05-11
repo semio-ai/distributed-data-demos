@@ -193,6 +193,11 @@ impl UdpVariant {
             .set_reuse_address(true)
             .context("failed to set SO_REUSEADDR")?;
         socket.set_nonblocking(true)?;
+        // T-impl.2: bump SO_RCVBUF / SO_SNDBUF to 8 MiB so the high-rate
+        // same-host fixtures don't get clipped by ~64 KB Windows kernel
+        // defaults. The helper logs a single warning if the OS caps the
+        // achieved size below 1 MiB and continues regardless.
+        variant_base::tune_udp_buffers(&socket).context("tune UDP buffers")?;
 
         // Bind to the multicast port on all interfaces.
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, multicast_addr.port());
