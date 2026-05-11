@@ -267,9 +267,10 @@ _None yet._
 
 ---
 
-## DRAFT -- E14 additions (awaiting user review, do not implement yet)
+## E14 additions: threading_modes expansion + recv_buffer_kb
 
-A new expansion dimension is added to `[variant.common]`: `threading_modes`.
+Approved 2026-05-12. A new expansion dimension is added to
+`[variant.common]`: `threading_modes`.
 Combined with the existing `qos` dimension, the runner emits the
 cross-product of spawns. A new scalar field `recv_buffer_kb` is also
 added.

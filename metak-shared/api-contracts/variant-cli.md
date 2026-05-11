@@ -69,9 +69,9 @@ The runner converts `snake_case` TOML keys to `--kebab-case` CLI args
 
 ---
 
-## DRAFT -- E14 additions (awaiting user review, do not implement yet)
+## E14 additions: threading mode and recv buffer
 
-Two new runner-injected CLI args, added by T14.1 + T14.8:
+Two new runner-injected CLI args, added by T14.1 + T14.8 (approved 2026-05-12):
 
 ### `--threading-mode <single|multi>`
 

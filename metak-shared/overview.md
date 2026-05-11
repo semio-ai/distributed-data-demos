@@ -63,7 +63,9 @@ side-by-side under identical conditions.
 3. Run end-to-end validation across two LAN machines (E7).
 4. Unblock Aeron variant on Linux (E3c).
 
-## Cross-cutting goals (added 2026-05-11, awaiting user review)
+## Cross-cutting goals
+
+_Added 2026-05-11, approved 2026-05-12._
 
 ### WASM compilation target
 
