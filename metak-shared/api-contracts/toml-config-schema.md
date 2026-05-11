@@ -50,6 +50,7 @@ timeout_secs = <integer>                # optional, overrides default_timeout_se
   values_per_tick = <integer | array>   # writes per tick — array form expands; see "Array Expansion"
   qos = <integer | array | omitted>     # QoS level(s) — see "QoS Expansion"
   log_dir = "<path>"                    # directory for JSONL output
+  eot_timeout_secs = <integer>          # optional override of the EOT-phase drain budget (default: max(3 * operate_secs, 30))
 
   # Variant-specific options — only this implementation uses these.
   # When `template` is set, missing keys are taken from the template's specific.
@@ -92,6 +93,7 @@ converts `snake_case` keys to `--kebab-case` args.
 | `values_per_tick` | yes | integer OR array of integers | Values written per tick. Array form expands the entry into one spawn per listed value (deduplicated, sorted ascending). See "Array Expansion" below. |
 | `qos` | no | integer OR array of integers (1-4) | If omitted, the runner expands the entry into 4 spawn invocations (qos 1, 2, 3, 4). If an array (e.g. `qos = [1, 3]`), the runner expands into one spawn per listed level. If an integer, behaves as before — one spawn at that level. See "QoS Expansion" below. |
 | `log_dir` | yes | string | JSONL output directory. **MUST be `"./logs"`** for every config and every test/validation fixture. Per-run isolation is provided by the auto-created session subfolder `<log_dir>/<run-name>-<launch-ts>/`; tests and ad-hoc validations MUST NOT introduce sibling `logs-<tag>/` roots at the repo level. Anything a task wants to "break out" goes inside the session subfolder, not next to `logs/`. |
+| `eot_timeout_secs` | no | integer | Override in seconds for the variant's EOT (end-of-test) drain budget. When omitted, the variant computes its own default as `max(3 * operate_secs, 30)` (see `variant-base/src/driver.rs::default_eot_timeout_secs`). Useful for short-`operate_secs` smoke tests that still need a generous drain window, or for hybrid TCP variants under very high write rates where the default is not enough. |
 
 ### `[variant.specific]`
 
