@@ -364,6 +364,142 @@ class TestGenerateComparisonPlot:
         assert r.latency_p95_ms - r.latency_p50_ms >= 0
         assert r.latency_p99_ms - r.latency_p95_ms >= 0
 
+    def test_log_throughput_off_keeps_linear_yscale(self, tmp_path: Path) -> None:
+        """Default (``log_throughput=False``) keeps throughput on linear scale."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=50.0),
+            _make_result("zenoh-10x100hz-qos1", writes_per_sec=480.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes, "expected at least one throughput axis"
+        for ax in tp_axes:
+            assert ax.get_yscale() == "linear", (
+                f"throughput axis should be linear by default, got {ax.get_yscale()}"
+            )
+        for f in captured:
+            original_close(f)
+
+    def test_log_throughput_on_sets_log_yscale_on_throughput_axes_only(
+        self, tmp_path: Path
+    ) -> None:
+        """``log_throughput=True`` switches throughput panels to log; latency stays log."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        # Four QoS rows -> four throughput axes and four latency axes.
+        results = []
+        for q in (1, 2, 3, 4):
+            results.append(
+                _make_result(
+                    f"custom-udp-10x100hz-qos{q}",
+                    writes_per_sec=50.0 * q,
+                )
+            )
+            results.append(
+                _make_result(
+                    f"zenoh-10x100hz-qos{q}",
+                    writes_per_sec=480.0 * q,
+                )
+            )
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(
+                results, tmp_path, log_throughput=True
+            )
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        lat_axes = [
+            ax for ax in fig.axes if "latency" in (ax.get_ylabel() or "").lower()
+        ]
+        assert len(tp_axes) == 4, f"expected 4 throughput axes, got {len(tp_axes)}"
+        assert len(lat_axes) == 4, f"expected 4 latency axes, got {len(lat_axes)}"
+        for ax in tp_axes:
+            assert ax.get_yscale() == "log", (
+                f"throughput axis should be log with log_throughput=True, "
+                f"got {ax.get_yscale()}"
+            )
+        for ax in lat_axes:
+            assert ax.get_yscale() == "log", (
+                f"latency axis should remain log, got {ax.get_yscale()}"
+            )
+        for f in captured:
+            original_close(f)
+
+    def test_log_throughput_zero_writes_skipped_not_clamped(
+        self, tmp_path: Path
+    ) -> None:
+        """A 0-writes spawn renders as NaN under log scale, not a tiny visible bar."""
+        import math
+
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=0.0),
+            _make_result("zenoh-10x100hz-qos1", writes_per_sec=480.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(
+                results, tmp_path, log_throughput=True
+            )
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes, "expected a throughput axis"
+        heights = [b.get_height() for b in tp_axes[0].patches]
+        assert any(math.isnan(h) for h in heights), (
+            f"expected zero-writes bar to be NaN (skipped), got {heights}"
+        )
+        assert any(math.isfinite(h) and h > 0 for h in heights), (
+            f"expected the non-zero bar to render finite, got {heights}"
+        )
+
+        for f in captured:
+            original_close(f)
+
     def test_nonpositive_p95_renders_as_nan_bar(self, tmp_path: Path) -> None:
         """A percentile <= 0 (clock-noise artifact) is dropped to NaN.
 
