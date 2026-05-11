@@ -530,6 +530,141 @@ class TestGenerateComparisonPlot:
         for f in captured:
             original_close(f)
 
+    def test_target_lines_drawn_at_unique_workload_rates(self, tmp_path: Path) -> None:
+        """One horizontal line per unique ``vpt * hz`` target rate.
+
+        Three synthesized workloads at 10x100hz, 100x100hz, 1000x100hz
+        produce targets {1_000, 10_000, 100_000}. The throughput
+        subplot should carry exactly those three axhline objects --
+        same set on every QoS row, but here we only have one row so
+        we inspect that single throughput axis.
+        """
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=900.0),
+            _make_result("custom-udp-100x100hz-qos1", writes_per_sec=9_500.0),
+            _make_result("custom-udp-1000x100hz-qos1", writes_per_sec=95_000.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes, "expected at least one throughput axis"
+        ax_tp = tp_axes[0]
+        # axhline objects are constant-y Line2Ds with both ydata points
+        # equal. Collect their y values and check the unique set.
+        target_ys: set[float] = set()
+        for line in ax_tp.lines:
+            ydata = line.get_ydata()
+            if len(ydata) >= 2 and ydata[0] == ydata[-1]:
+                target_ys.add(float(ydata[0]))
+        assert target_ys == {1_000.0, 10_000.0, 100_000.0}, (
+            f"expected three unique target y values, got {target_ys}"
+        )
+        for f in captured:
+            original_close(f)
+
+    def test_target_lines_skip_max_workload(self, tmp_path: Path) -> None:
+        """The ``max`` workload has no fixed target -> no axhline drawn."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        # Only a max-workload result. No target rate should be derived.
+        results = [
+            _make_result("custom-udp-max-qos1", writes_per_sec=400_000.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes, "expected at least one throughput axis"
+        ax_tp = tp_axes[0]
+        horizontal_ys = [
+            float(line.get_ydata()[0])
+            for line in ax_tp.lines
+            if len(line.get_ydata()) >= 2
+            and line.get_ydata()[0] == line.get_ydata()[-1]
+        ]
+        assert horizontal_ys == [], (
+            f"expected no target lines for a max-only panel, got {horizontal_ys}"
+        )
+        for f in captured:
+            original_close(f)
+
+    def test_target_line_labels_use_si_suffix(self, tmp_path: Path) -> None:
+        """Labels for 1 K / 10 K / 100 K targets use SI suffixes."""
+        import re
+
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=900.0),
+            _make_result("custom-udp-100x100hz-qos1", writes_per_sec=9_500.0),
+            _make_result("custom-udp-1000x100hz-qos1", writes_per_sec=95_000.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes
+        ax_tp = tp_axes[0]
+        si_pattern = re.compile(r"^\d+(\.\d+)?\s*[KMG]/s$")
+        # Pull all text artists on the axis with content matching the
+        # SI suffix pattern; group by the integer y position so the
+        # assertion does not depend on the order matplotlib stored
+        # them in.
+        si_label_ys: set[float] = set()
+        for txt in ax_tp.texts:
+            if si_pattern.match(txt.get_text() or ""):
+                si_label_ys.add(float(txt.get_position()[1]))
+        assert {1_000.0, 10_000.0, 100_000.0}.issubset(si_label_ys), (
+            f"expected SI labels at 1 K / 10 K / 100 K targets, got {si_label_ys}"
+        )
+        for f in captured:
+            original_close(f)
+
     def test_nonpositive_p95_renders_as_nan_bar(self, tmp_path: Path) -> None:
         """A percentile <= 0 (clock-noise artifact) is dropped to NaN.
 

@@ -98,6 +98,52 @@ _MAX_WORKLOAD_RANK: int = 10**12
 _LATENCY_EPSILON_MS: float = 1e-5
 
 
+def _format_target_rate_label(target: float) -> str:
+    """Format an aggregate write-rate target as a short SI string.
+
+    Used to label horizontal target lines on the throughput subplots
+    of the comparison chart. The intended write rate of a workload is
+    ``vpt * tick_rate_hz``; for the standard workload grid these values
+    are clean powers of 10 (1 K/s, 10 K/s, 100 K/s, 1 M/s) and the
+    formatter produces correspondingly clean labels. For odd values
+    that fall between SI decades the function rounds the mantissa to
+    one decimal place and falls back to the next-smaller SI suffix.
+
+    Examples
+    --------
+    >>> _format_target_rate_label(1_000)
+    '1 K/s'
+    >>> _format_target_rate_label(10_000)
+    '10 K/s'
+    >>> _format_target_rate_label(100_000)
+    '100 K/s'
+    >>> _format_target_rate_label(1_000_000)
+    '1 M/s'
+    >>> _format_target_rate_label(50)
+    '50/s'
+    """
+    abs_target = abs(target)
+    if abs_target >= 1_000_000_000:
+        scaled = target / 1_000_000_000
+        suffix = "G/s"
+    elif abs_target >= 1_000_000:
+        scaled = target / 1_000_000
+        suffix = "M/s"
+    elif abs_target >= 1_000:
+        scaled = target / 1_000
+        suffix = "K/s"
+    else:
+        # Sub-thousand targets keep their absolute value with no SI
+        # prefix. Integers render without a trailing ".0".
+        if float(target).is_integer():
+            return f"{int(target)}/s"
+        return f"{target:g}/s"
+    # Clean integer mantissa (e.g. 1, 10, 100) -> drop the decimal.
+    if float(scaled).is_integer():
+        return f"{int(scaled)} {suffix}"
+    return f"{scaled:g} {suffix}"
+
+
 def _split_variant_name(name: str) -> tuple[str, str, int | None]:
     """Split a variant name into ``(transport, workload, qos)``.
 
@@ -294,6 +340,23 @@ def generate_comparison_plot(
         qos_values_seen, key=lambda q: (q is None, q if q is not None else -1)
     )
 
+    # Compute the set of unique aggregate write-rate targets present in
+    # the input. A workload named ``<vpt>x<hz>hz`` has an intended write
+    # rate of ``vpt * hz``; the ``max`` workload has no fixed target and
+    # is excluded. Drawing one horizontal reference line per unique
+    # target lets the reader see at a glance whether each bar reached
+    # its intended rate. Targets are independent of QoS, so the same
+    # set of lines is drawn on every throughput subplot.
+    target_rates: set[int] = set()
+    for _, workload, _ in parsed.keys():
+        if workload == "max":
+            continue
+        m = _WORKLOAD_VPS_HZ_RE.match(workload)
+        if m is None:
+            continue
+        target_rates.add(int(m.group(1)) * int(m.group(2)))
+    target_rate_order: list[int] = sorted(target_rates)
+
     # Build per-family palettes keyed by (transport, workload).
     palettes: dict[str, dict[str, tuple[float, float, float, float]]] = {}
     for t in transport_order:
@@ -451,6 +514,35 @@ def generate_comparison_plot(
         else:
             ax_tp.yaxis.grid(True, linestyle="--", alpha=0.5)
         ax_tp.set_axisbelow(True)
+
+        # Draw horizontal target-rate reference lines. One line per
+        # unique ``vpt * hz`` target observed across all workloads in
+        # the input (``max`` excluded). The bars use the default
+        # ``zorder=2``; lines at ``zorder=1`` therefore sit behind
+        # them. A short SI label at the right edge of the plot, just
+        # above the line, identifies each target. On the log-scale
+        # chart the standard 1 K / 10 K / 100 K / 1 M targets land on
+        # clean log decades so the labels sit at natural gridlines.
+        right_x = ax_tp.get_xlim()[1]
+        for target in target_rate_order:
+            ax_tp.axhline(
+                y=target,
+                color="grey",
+                linestyle="--",
+                linewidth=0.8,
+                alpha=0.6,
+                zorder=1,
+            )
+            ax_tp.text(
+                x=right_x,
+                y=target,
+                s=_format_target_rate_label(target),
+                ha="right",
+                va="bottom",
+                fontsize=8,
+                color="grey",
+                alpha=0.8,
+            )
 
         # Latency axis cosmetics. Log scale exposes both reliable sub-ms
         # and lossy tens-of-ms regimes simultaneously.
