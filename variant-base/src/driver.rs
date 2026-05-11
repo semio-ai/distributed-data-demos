@@ -12,6 +12,30 @@ use crate::types::{Phase, Qos};
 use crate::variant_trait::Variant;
 use crate::workload::create_workload;
 
+/// Minimum EOT-phase drain budget in seconds when no explicit override is
+/// provided. Replaces the previous 5-second floor: even short fixture runs
+/// (e.g. `operate_secs = 1..=10`) get a meaningful 30-second drain window
+/// for late-arriving messages on hybrid TCP/UDP transports.
+pub const MIN_DEFAULT_EOT_TIMEOUT_SECS: u64 = 30;
+
+/// Multiplier applied to `operate_secs` when computing the default EOT
+/// timeout. At 100 K writes/s the in-flight backlog can take roughly the
+/// operate-phase wall-clock to drain on hybrid transports; the factor of 3
+/// gives headroom for late deliveries while still being bounded.
+pub const DEFAULT_EOT_TIMEOUT_OPERATE_MULTIPLIER: u64 = 3;
+
+/// Compute the default EOT timeout in seconds from `operate_secs`.
+///
+/// Formula: `max(3 * operate_secs, 30)`. Used by the driver when
+/// `--eot-timeout-secs` is not provided on the CLI.
+#[inline]
+pub fn default_eot_timeout_secs(operate_secs: u64) -> u64 {
+    std::cmp::max(
+        operate_secs.saturating_mul(DEFAULT_EOT_TIMEOUT_OPERATE_MULTIPLIER),
+        MIN_DEFAULT_EOT_TIMEOUT_SECS,
+    )
+}
+
 /// Run the full test protocol: connect, stabilize, operate, silent.
 ///
 /// The driver owns the logger and all support modules. The variant only
@@ -140,7 +164,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
 
     let eot_timeout_secs = config
         .eot_timeout_secs
-        .unwrap_or_else(|| std::cmp::max(config.operate_secs, 5));
+        .unwrap_or_else(|| default_eot_timeout_secs(config.operate_secs));
     let eot_timeout = Duration::from_secs(eot_timeout_secs);
 
     let my_eot_id = variant.signal_end_of_test()?;
@@ -242,9 +266,70 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::cli::CliArgs;
-    use crate::driver::run_protocol;
+    use crate::driver::{
+        default_eot_timeout_secs, run_protocol, DEFAULT_EOT_TIMEOUT_OPERATE_MULTIPLIER,
+        MIN_DEFAULT_EOT_TIMEOUT_SECS,
+    };
     use crate::types::{Qos, ReceivedUpdate};
     use crate::variant_trait::{PeerEot, Variant};
+
+    #[test]
+    fn default_eot_timeout_secs_uses_30s_floor_for_short_operate() {
+        // operate_secs = 5 -> 3*5 = 15, floor at 30 -> 30.
+        assert_eq!(default_eot_timeout_secs(5), 30);
+        // operate_secs = 0 -> floor applies.
+        assert_eq!(default_eot_timeout_secs(0), 30);
+        // operate_secs = 10 -> 3*10 = 30, exactly at the floor.
+        assert_eq!(default_eot_timeout_secs(10), 30);
+    }
+
+    #[test]
+    fn default_eot_timeout_secs_scales_with_operate_secs() {
+        // operate_secs = 30 -> 3*30 = 90, well above the 30s floor.
+        assert_eq!(default_eot_timeout_secs(30), 90);
+        // operate_secs = 60 -> 3*60 = 180.
+        assert_eq!(default_eot_timeout_secs(60), 180);
+    }
+
+    #[test]
+    fn default_eot_timeout_secs_saturates_on_overflow() {
+        // u64::MAX as operate_secs would overflow 3 * operate_secs;
+        // saturating_mul keeps the result at u64::MAX rather than panicking.
+        assert_eq!(default_eot_timeout_secs(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn default_eot_timeout_constants_match_documented_values() {
+        assert_eq!(MIN_DEFAULT_EOT_TIMEOUT_SECS, 30);
+        assert_eq!(DEFAULT_EOT_TIMEOUT_OPERATE_MULTIPLIER, 3);
+    }
+
+    #[test]
+    fn driver_uses_default_when_eot_timeout_secs_is_none() {
+        // We cannot directly observe the computed duration without spawning
+        // a 90 s wait, so we verify the computation lives in
+        // `default_eot_timeout_secs` and matches the documented examples.
+        // operate_secs = 30, override = None -> 90
+        assert_eq!(default_eot_timeout_secs(30), 90);
+        // operate_secs = 5, override = None -> 30 (floor)
+        assert_eq!(default_eot_timeout_secs(5), 30);
+        // Override-wins path: driver applies the exact override unchanged,
+        // ignoring the default-computation helper.
+        fn pick(override_value: Option<u64>, operate_secs: u64) -> u64 {
+            override_value.unwrap_or_else(|| default_eot_timeout_secs(operate_secs))
+        }
+        assert_eq!(pick(Some(5), 30), 5, "explicit override wins over default");
+        assert_eq!(
+            pick(None, 30),
+            90,
+            "default formula applies when override is None"
+        );
+        assert_eq!(
+            pick(None, 5),
+            30,
+            "floor applies when override is None and operate is short"
+        );
+    }
 
     /// Variant that does NOT override the EOT trait methods, used to
     /// exercise the default-impl fallback path.

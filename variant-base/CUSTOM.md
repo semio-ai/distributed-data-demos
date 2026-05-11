@@ -117,8 +117,28 @@ generic `impl Variant`) and the parsed CLI config, then runs:
 2. Stabilize phase (sleep)
 3. Operate phase (tick loop with workload)
 4. EOT phase (signal end-of-test, wait for peer EOTs, bounded by
-   `--eot-timeout-secs` which defaults to `max(operate_secs, 5)`)
+   `--eot-timeout-secs` which defaults to `max(3 * operate_secs, 30)`
+   - see `driver::default_eot_timeout_secs`)
 5. Silent phase (drain + flush)
+
+### EOT default-timeout rationale (T-impl.3)
+
+The default formula is `max(3 * operate_secs, 30)`:
+
+- **`3 * operate_secs`**: at 100 K writes/s on hybrid TCP transports the
+  in-flight backlog at end-of-operate can take roughly the operate-phase
+  wall-clock to drain. A factor of three gives headroom for late
+  deliveries from peers that fell behind without permitting an unbounded
+  hang.
+- **30-second floor**: replaces the previous 5-second floor. Short-operate
+  fixture runs (e.g. `operate_secs = 1..=10`) still need a meaningful
+  drain budget - five seconds was empirically too aggressive for
+  cross-machine TCP variants where socket teardown alone can take a few
+  seconds. The 30-second floor matches the default per-barrier coordination
+  budget the runner uses on the other side of the spawn.
+- The formula has a single source of truth at `driver::default_eot_timeout_secs`.
+  The CLI struct docstring (`cli::CliArgs::eot_timeout_secs`) and the runner
+  contract docs reference this helper rather than re-encoding the formula.
 
 The driver owns the logger and calls it directly. Variants never touch
 the logger — they only do transport work through the trait methods.

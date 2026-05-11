@@ -31,7 +31,9 @@ pub struct CliArgs {
 
     /// Maximum duration in seconds the EOT phase will wait for peer EOTs
     /// before giving up and logging an `eot_timeout` event. When unset,
-    /// the driver computes the default at runtime as `max(operate_secs, 5)`.
+    /// the driver computes the default at runtime as
+    /// `max(3 * operate_secs, 30)` (see
+    /// `driver::default_eot_timeout_secs`).
     #[arg(long)]
     pub eot_timeout_secs: Option<u64>,
 
