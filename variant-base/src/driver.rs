@@ -36,6 +36,60 @@ pub fn default_eot_timeout_secs(operate_secs: u64) -> u64 {
     )
 }
 
+/// Minimum operate-phase drain wallclock budget. Applies to both
+/// workload profiles -- the budget is never allowed below this floor.
+pub const MIN_OPERATE_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(1);
+
+/// Safety margin subtracted from `next_tick - now` to leave room for the
+/// next publish phase. Only used in the scalar-flood path.
+pub const OPERATE_DRAIN_SAFETY_MARGIN: Duration = Duration::from_millis(1);
+
+/// Flat wallclock cap for the max-throughput operate-phase drain loop.
+/// There is no tick boundary in max-throughput, but the drain still must
+/// not be unbounded -- the publisher needs to run again. Empirically
+/// tuned to absorb a substantial fraction of the recv buffer without
+/// starving the publish path.
+pub const MAX_THROUGHPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(5);
+
+/// Compute the wallclock drain budget for one operate-phase iteration
+/// (T-impl.10).
+///
+/// - **max-throughput**: returns a flat `MAX_THROUGHPUT_DRAIN_TIME_BUDGET`
+///   (5 ms). No tick boundary to respect, but the drain must remain
+///   bounded.
+/// - **scalar-flood**: returns `(next_tick - now) - OPERATE_DRAIN_SAFETY_MARGIN`,
+///   floored at `MIN_OPERATE_DRAIN_TIME_BUDGET` (1 ms). If we are already
+///   behind on the publish phase (`next_tick - now <= safety_margin`),
+///   falls back to the 1 ms floor so we don't compound the lateness.
+///
+/// Motivation: a hardcoded 1 ms drain cap is too tight when per-message
+/// receive cost is high (e.g. websocket frame parsing). The recv buffer
+/// then grows monotonically each tick at high symmetric rates until one
+/// side's TCP window collapses -- see the 2026-05-11 diagnostic incident
+/// referenced in `variant-base/CUSTOM.md`.
+#[inline]
+pub fn compute_operate_drain_time_budget(
+    max_throughput: bool,
+    next_tick: Instant,
+    now: Instant,
+) -> Duration {
+    if max_throughput {
+        MAX_THROUGHPUT_DRAIN_TIME_BUDGET
+    } else if next_tick <= now {
+        MIN_OPERATE_DRAIN_TIME_BUDGET
+    } else {
+        let remaining = next_tick - now;
+        if remaining <= OPERATE_DRAIN_SAFETY_MARGIN {
+            MIN_OPERATE_DRAIN_TIME_BUDGET
+        } else {
+            std::cmp::max(
+                remaining - OPERATE_DRAIN_SAFETY_MARGIN,
+                MIN_OPERATE_DRAIN_TIME_BUDGET,
+            )
+        }
+    }
+}
+
 /// Run the full test protocol: connect, stabilize, operate, silent.
 ///
 /// The driver owns the logger and all support modules. The variant only
@@ -86,15 +140,26 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // budget and a wallclock budget. Without this, an unbounded
     // `while let Some(update) = variant.poll_receive()? { ... }` starves
     // `publish` whenever a peer publishes faster than the local variant
-    // drains. See T-fairness.1.
+    // drains. See T-fairness.1 (original bound) and T-impl.10 (the
+    // tick-aware widening below).
     //
-    // Defaults: drain at most `2 * values_per_tick` messages (so a fair
-    // drain still keeps up with a peer publishing at our rate), and at
-    // most 1ms of wallclock per outer iteration. Whichever trips first
-    // breaks out and lets the next publish tick run; remaining queued
-    // messages stay in the variant's internal buffer.
-    let drain_msg_budget = (config.values_per_tick as usize).saturating_mul(2).max(1);
-    let drain_time_budget = Duration::from_millis(1);
+    // Message-count budget (operate phase): `4 * values_per_tick`, floor
+    // at 1. The doubled cap (was `2 *`) costs nothing when the buffer is
+    // small -- the `Ok(None)` early-exit fires immediately -- and gives
+    // breathing room at high symmetric rates where transports with
+    // expensive per-message receive cost otherwise build up backlog.
+    //
+    // Wallclock budget (operate phase): computed per-iteration inside the
+    // loop below. See `compute_operate_drain_time_budget` for the
+    // tick-aware formula motivated by the 2026-05-11 websocket-1000x100hz
+    // diagnostic incident.
+    //
+    // The EOT-phase drain (further below) retains the pre-T-impl.10
+    // budgets (2 * vpt, 1 ms wallclock) -- the failure mode the new
+    // formula addresses only manifests during operate-phase pacing.
+    let drain_msg_budget = (config.values_per_tick as usize).saturating_mul(4).max(1);
+    let eot_drain_msg_budget = (config.values_per_tick as usize).saturating_mul(2).max(1);
+    let eot_drain_time_budget = Duration::from_millis(1);
 
     // Two-tier back-off counter for the max-throughput loop (T-impl.8).
     // Local to this protocol run -- only relevant under MaxThroughput;
@@ -163,6 +228,15 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         // Drain received updates, bounded by both a message-count and a
         // wallclock budget. Whichever trips first ends this drain pass;
         // any remaining queued messages drain on subsequent iterations.
+        //
+        // The wallclock budget is recomputed each iteration (T-impl.10).
+        // - scalar-flood: scales with the time-to-next-tick so we
+        //   actually use the slack between bursts; floored at 1 ms when
+        //   the publish phase already overran the tick.
+        // - max-throughput: flat 5 ms -- no tick boundary, but the drain
+        //   must not become unbounded.
+        let drain_time_budget =
+            compute_operate_drain_time_budget(max_throughput, next_tick, Instant::now());
         let drain_start = Instant::now();
         let mut drained = 0usize;
         while drained < drain_msg_budget {
@@ -238,9 +312,12 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         // Overall EOT semantics are unchanged: the outer loop keeps
         // iterating until every expected peer is seen or the timeout
         // expires, so total time spent draining can still exceed 1ms.
+        //
+        // EOT uses the pre-T-impl.10 budgets (2 * vpt, 1 ms wallclock)
+        // deliberately -- the tick-aware widening is operate-only.
         let drain_start = Instant::now();
         let mut drained = 0usize;
-        while drained < drain_msg_budget {
+        while drained < eot_drain_msg_budget {
             match variant.poll_receive()? {
                 Some(update) => {
                     logger.log_receive(
@@ -251,7 +328,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
                         update.payload.len(),
                     )?;
                     drained += 1;
-                    if drain_start.elapsed() >= drain_time_budget {
+                    if drain_start.elapsed() >= eot_drain_time_budget {
                         break;
                     }
                 }
@@ -1324,6 +1401,311 @@ mod tests {
             variant.publish_calls as usize,
             write_events.len(),
             "publish() call count should match `write` event count"
+        );
+    }
+
+    // ----- T-impl.10: operate-loop drain budget tests -----
+
+    /// Variant whose `poll_receive` always returns `Some` (unbounded
+    /// inbound) and records each call's timestamp segmented by drain
+    /// phase. A new drain phase begins on every `try_publish` (or
+    /// `publish` fallthrough) call. Lets a test measure the wall-clock
+    /// duration of each drain phase independently.
+    struct InstrumentedReceiveVariant {
+        // Per drain phase: vector of `Instant`s when `poll_receive` was
+        // called during that phase. A new entry is appended on every
+        // call to `try_publish` (or its fallback `publish`).
+        drain_phases: Vec<Vec<std::time::Instant>>,
+    }
+
+    impl InstrumentedReceiveVariant {
+        fn new() -> Self {
+            Self {
+                drain_phases: vec![Vec::new()],
+            }
+        }
+
+        fn begin_drain_phase(&mut self) {
+            // Only start a fresh phase if the current one already has
+            // entries; otherwise the test setup (back-to-back publishes
+            // without an intervening receive) would create a flurry of
+            // empty phases and break per-phase counting.
+            if self.drain_phases.last().is_some_and(|p| !p.is_empty()) {
+                self.drain_phases.push(Vec::new());
+            }
+        }
+    }
+
+    impl Variant for InstrumentedReceiveVariant {
+        fn name(&self) -> &str {
+            "instrumented-receive"
+        }
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            self.begin_drain_phase();
+            Ok(())
+        }
+        fn try_publish(
+            &mut self,
+            _path: &str,
+            _payload: &[u8],
+            _qos: Qos,
+            _seq: u64,
+        ) -> Result<bool> {
+            // Always accept. The trait default would fall through to
+            // `publish` but we override to also record the phase boundary
+            // on the success path without bumping `publish` counters.
+            self.begin_drain_phase();
+            Ok(true)
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            self.drain_phases
+                .last_mut()
+                .expect("at least one phase exists")
+                .push(std::time::Instant::now());
+            Ok(Some(ReceivedUpdate {
+                writer: "peer".to_string(),
+                seq: 0,
+                path: "/firehose".to_string(),
+                qos: Qos::BestEffort,
+                payload: vec![0u8; 8],
+            }))
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scalar_flood_drain_msg_budget_is_four_x_vpt() {
+        // Scenario: low tick rate (100 Hz -> 10 ms tick) and small
+        // `values_per_tick` (10). The publish phase finishes fast, so
+        // most of the tick is available for the drain. With the
+        // pre-T-impl.10 1 ms wallclock cap the drain would terminate
+        // well below the message budget; with the new tick-aware
+        // formula the message budget (`4 * vpt = 40`) is the operative
+        // limit.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        args.workload = "scalar-flood".to_string();
+        args.tick_rate_hz = 100;
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 10;
+
+        let mut variant = InstrumentedReceiveVariant::new();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        // Inspect drain phases that occurred AFTER a publish. The
+        // very first phase (index 0) is the pre-first-publish window
+        // which may be empty; meaningful phases are non-empty.
+        let nonempty_phases: Vec<&Vec<std::time::Instant>> = variant
+            .drain_phases
+            .iter()
+            .filter(|p| !p.is_empty())
+            .collect();
+        eprintln!(
+            "scalar_flood_drain_msg_budget: phases={}, vpt={}",
+            nonempty_phases.len(),
+            args.values_per_tick
+        );
+        assert!(
+            nonempty_phases.len() >= 10,
+            "expected many drain phases over a 1s operate at 100 Hz; got {}",
+            nonempty_phases.len()
+        );
+
+        // Each drain phase must be capped at `4 * vpt = 40` receives.
+        let budget = (args.values_per_tick as usize) * 4;
+        for (idx, phase) in nonempty_phases.iter().enumerate() {
+            assert!(
+                phase.len() <= budget,
+                "drain phase {idx} exceeded msg budget: got {} receives, budget {}",
+                phase.len(),
+                budget,
+            );
+        }
+
+        // The TYPICAL drain phase should hit the message budget --
+        // the wallclock cap is now slack-aware (and at 100 Hz / vpt=10
+        // there is several ms of slack each tick). Allow some phases to
+        // come in short (jitter, scheduler) but require that the median
+        // phase saturates the message budget.
+        let mut lens: Vec<usize> = nonempty_phases.iter().map(|p| p.len()).collect();
+        lens.sort_unstable();
+        let median = lens[lens.len() / 2];
+        assert_eq!(
+            median, budget,
+            "median drain-phase size should saturate `4 * vpt = {budget}` (the message budget is operative); got {median}. Full distribution: {lens:?}",
+        );
+    }
+
+    #[test]
+    fn scalar_flood_drain_does_not_overrun_tick() {
+        // Tight tick: 1000 Hz -> 1 ms tick. Publishing 1000 values per
+        // tick will saturate (or overrun) the tick. The drain budget
+        // formula must NOT add measurable overrun on top of whatever
+        // overrun publishing already incurs. We assert the total
+        // operate-phase wall-clock stays within `operate_secs + 50 ms`
+        // over a 1-second run.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        args.workload = "scalar-flood".to_string();
+        args.tick_rate_hz = 1000;
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 1000;
+
+        let mut variant = InstrumentedReceiveVariant::new();
+        let start = std::time::Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+        eprintln!("scalar_flood_drain_does_not_overrun_tick: elapsed={elapsed:?}");
+
+        // The driver entered the protocol BEFORE the operate phase
+        // (connect, stabilize) and exits AFTER (eot, silent). With
+        // stabilize=0, silent=0, and a single-runner empty expected-peer
+        // EOT, those overheads are minimal. The dominant wall-clock is
+        // the operate phase itself plus per-iteration drain overhead.
+        // 1 s operate + 50 ms slack absorbs scheduler jitter, log I/O,
+        // and the floor-at-1ms fallback when the publish phase overran
+        // the tick. Anything beyond that means the drain compounded the
+        // lateness, which is exactly what the formula must prevent.
+        assert!(
+            elapsed < Duration::from_millis(1000 + 50),
+            "operate phase should not slip more than 50 ms beyond operate_secs; got {elapsed:?}",
+        );
+    }
+
+    #[test]
+    fn max_throughput_drain_bounded_to_five_ms() {
+        // Stub variant with unbounded inbound + max-throughput profile.
+        // Each drain phase must be bounded by ~5 ms (the
+        // MAX_THROUGHPUT_DRAIN_TIME_BUDGET). Without bounding, the
+        // first drain phase would never exit and the test would hang
+        // forever. We use a tolerant ceiling (<25 ms) to absorb
+        // Windows scheduler jitter and the cost of logging each
+        // receive event to disk.
+        //
+        // `values_per_tick=1_000_000` makes the message budget
+        // effectively unreachable (4 million per phase) so the
+        // wallclock cap is the operative limit.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        args.workload = "max-throughput".to_string();
+        args.tick_rate_hz = 1; // ignored under max-throughput
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 1_000_000;
+
+        let mut variant = InstrumentedReceiveVariant::new();
+        let start = std::time::Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+
+        let nonempty_phases: Vec<&Vec<std::time::Instant>> = variant
+            .drain_phases
+            .iter()
+            .filter(|p| p.len() >= 2)
+            .collect();
+        eprintln!(
+            "max_throughput_drain_bounded: elapsed={elapsed:?}, phases_with_2plus={}",
+            nonempty_phases.len()
+        );
+        assert!(
+            !nonempty_phases.is_empty(),
+            "expected at least one drain phase with >=2 receives over 1s max-throughput",
+        );
+
+        // Per-phase wall-clock: from first to last receive in the phase.
+        // 25 ms tolerance for Windows scheduler / log I/O noise on the
+        // 5 ms target.
+        for (idx, phase) in nonempty_phases.iter().enumerate() {
+            let phase_dur = *phase.last().unwrap() - *phase.first().unwrap();
+            assert!(
+                phase_dur < Duration::from_millis(25),
+                "max-throughput drain phase {idx} too long: {phase_dur:?} (cap is 5ms; tolerance 25ms)",
+            );
+        }
+    }
+
+    /// Variant whose `poll_receive` always returns `Ok(None)` (empty
+    /// queue) and counts every call so the test can verify the early-
+    /// exit fired regardless of the wallclock budget.
+    struct EmptyReceiveCountingVariant {
+        poll_receive_calls: u64,
+    }
+
+    impl EmptyReceiveCountingVariant {
+        fn new() -> Self {
+            Self {
+                poll_receive_calls: 0,
+            }
+        }
+    }
+
+    impl Variant for EmptyReceiveCountingVariant {
+        fn name(&self) -> &str {
+            "empty-receive-counting"
+        }
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            Ok(())
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            self.poll_receive_calls += 1;
+            Ok(None)
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn empty_queue_drain_still_early_exits() {
+        // The drain inner loop's `None => break` arm must fire
+        // immediately when the queue is empty, regardless of how
+        // generous the wallclock budget is. We assert that over a 1 s
+        // operate window at 100 Hz the tick cadence is preserved
+        // (~100 outer iterations -> ~100 `poll_receive` calls in the
+        // operate phase, plus a few from the EOT/silent paths) and
+        // that the operate phase completes in roughly `operate_secs`.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        args.workload = "scalar-flood".to_string();
+        args.tick_rate_hz = 100;
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+
+        let mut variant = EmptyReceiveCountingVariant::new();
+        let start = std::time::Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+        eprintln!(
+            "empty_queue_drain_still_early_exits: elapsed={elapsed:?}, poll_receive_calls={}",
+            variant.poll_receive_calls
+        );
+
+        // Wall-clock: ~1 s of operate (+ EOT immediate exit + 0 silent).
+        // 250 ms slack absorbs scheduler jitter on CI.
+        assert!(
+            elapsed < Duration::from_millis(1250),
+            "empty-queue drain should not add measurable overhead; got {elapsed:?}",
+        );
+        // Each outer iteration does exactly ONE `poll_receive` (because
+        // the very first call returns None and breaks). At 100 Hz over
+        // 1 s that's ~100 calls; the EOT phase exits immediately (empty
+        // expected set) so it contributes none. Bound loosely to absorb
+        // jitter.
+        assert!(
+            variant.poll_receive_calls >= 50 && variant.poll_receive_calls <= 500,
+            "expected ~100 poll_receive calls (1s at 100Hz, one per iter); got {}",
+            variant.poll_receive_calls,
         );
     }
 }
