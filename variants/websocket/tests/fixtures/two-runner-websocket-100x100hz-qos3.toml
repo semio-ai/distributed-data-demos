@@ -1,0 +1,35 @@
+# T-impl.4 regression fixture: two-runner-on-localhost websocket spawn at
+# the exact (vpt, hz, qos) shape called out in the task acceptance criteria.
+#
+# The single websocket entry pins QoS to 3 (reliable-ordered) so the
+# runner produces exactly one spawn (no Cartesian expansion across QoS
+# levels). Phases are kept short so the regression test completes well
+# under the per-fixture timeout.
+#
+# Same-host port derivation (see variants/websocket/src/pairing.rs):
+#   runner_stride = 1, qos_stride = 10
+#   alice qos=3 listens at 19960 + 0 + 20 = 19980
+#   bob   qos=3 listens at 19960 + 1 + 20 = 19981
+# If these collide, one runner fails to bind. The regression test below
+# verifies that both runners produce non-zero writes and receives.
+
+run = "websocket-tImpl4-100x100hz-qos3"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "websocket-100x100hz-qos3"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 3
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 3
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960
