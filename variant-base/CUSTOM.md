@@ -206,3 +206,46 @@ documented thread-scheduling hazard.
 is never touched and the existing inter-tick sleep is the sole pacing
 mechanism. See `driver::run_protocol` and the
 `scalar_flood_max_throughput_path_unchanged` unit test for the guard.
+
+### Operate-loop drain budgets (T-impl.10)
+
+The operate-phase per-iteration receive drain is bounded by two budgets:
+a message-count cap and a wallclock cap. The wallclock cap is now
+computed per-iteration by `compute_operate_drain_time_budget`:
+
+- **`scalar-flood`**:
+  `drain_time_budget = max(1ms, (next_tick - now) - 1ms safety margin)`.
+  If we have already overrun the tick (`next_tick - now <= 1ms`), the
+  formula falls back to the 1 ms floor so the drain does not compound
+  the lateness. In practice this means the drain phase fills the slack
+  between the publish burst and the next tick boundary.
+- **`max-throughput`**: a flat `Duration::from_millis(5)`. There is no
+  tick boundary to respect, but the drain still must not be unbounded
+  -- the publisher needs to run again. Five milliseconds is empirically
+  long enough to drain a substantial fraction of the recv buffer
+  without starving the publish path.
+
+The message-count cap was simultaneously bumped from `2 * values_per_tick`
+to `4 * values_per_tick` (floor at 1). The doubled cap costs nothing
+when buffers are small (the `Ok(None)` early-exit fires immediately)
+and absorbs momentary bursts at high symmetric rates.
+
+The EOT-phase drain retains the pre-T-impl.10 budgets (2 * vpt,
+1 ms wallclock) -- the failure mode the new formula addresses only
+manifests during operate-phase pacing.
+
+**Why this change exists.** A two-runner `websocket-1000x100hz`
+run (100 K msg/s symmetric) deadlocked ~130 ms into the operate
+phase on 2026-05-11. The 1 ms drain wallclock was too tight for
+transports with expensive per-message receive cost (websocket frame
+parse + client-mask XOR): the recv buffer grew monotonically each
+tick at 6:1 publish-vs-receive ratio until one side's TCP window
+collapsed (`WSAECONNRESET`). Transports with cheap framing (hybrid
+TCP) drained in time today but sat close to the cliff. The fix is
+architectural -- in the driver, not in any one variant -- because
+the symptom is general to high-rate symmetric workloads. See
+`driver::compute_operate_drain_time_budget` and the four T-impl.10
+unit tests (`scalar_flood_drain_msg_budget_is_four_x_vpt`,
+`scalar_flood_drain_does_not_overrun_tick`,
+`max_throughput_drain_bounded_to_five_ms`,
+`empty_queue_drain_still_early_exits`).
