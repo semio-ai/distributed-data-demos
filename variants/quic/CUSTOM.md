@@ -151,3 +151,53 @@ This is a benchmark tool, not production — don't over-engineer TLS.
   Synthesize the new CLI shape: `--peers self=127.0.0.1`, `--runner self`,
   `--base-port <free port>`, `--qos 1` (or whichever level the test
   exercises).
+
+### Backpressure semantics (T-impl.7)
+
+`Variant::try_publish` is implemented honestly on the QoS 1/2 datagram path
+and falls through to the default `publish` for the QoS 3/4 reliable path.
+
+- **QoS 1 / QoS 2 (best-effort / latest-value, datagrams)**: the variant's
+  main thread bypasses the send_loop channel and calls
+  `quinn::Connection::send_datagram` directly. Before each send it inspects
+  every established connection's `datagram_send_buffer_space()` and, if
+  *no* connection currently has room for the encoded message, returns
+  `Ok(false)` so the driver logs a `backpressure_skipped` event. A
+  receiver-visible seq gap is acceptable here per the QoS contract.
+
+  **Why polling buffer space rather than matching on a `Blocked` error
+  variant**: quinn 0.11's `Connection::send_datagram` always forwards to
+  `proto::Datagrams::send(data, drop=true)`, which makes the
+  `proto::SendDatagramError::Blocked` discriminant `unreachable!()` inside
+  the wrapper. The error variants actually surfaced are `UnsupportedByPeer`,
+  `Disabled`, `TooLarge`, and `ConnectionLost`. With `drop=true`, a full
+  outgoing-datagram queue causes quinn to silently evict the oldest queued
+  datagram to make room for the new one — which would inflate our delivery
+  rate metric and hide real backpressure. Polling `datagram_send_buffer_space`
+  and refusing to send when it is below the message length is therefore the
+  honest signal. (Quinn does offer `send_datagram_wait` for the blocking
+  variant, which we deliberately do *not* use for QoS 1/2 because blocking
+  would introduce unbounded latency without producing the gap the driver's
+  `backpressure_skipped` event is designed to count.)
+
+  The exact quinn error variant we match for "connection went away mid-burst"
+  is `quinn::SendDatagramError::ConnectionLost(_)`; we ignore it on a single
+  connection and let the rest of the fan-out continue. Other hard errors
+  propagate as `anyhow::Error` to the driver.
+
+- **QoS 3 / QoS 4 (reliable streams)**: `try_publish` delegates to
+  `publish`, which enqueues an `OutboundMessage::reliable=true` onto the
+  send_loop's unbounded mpsc channel. The send_loop opens a fresh
+  unidirectional QUIC stream per message and awaits
+  `SendStream::write_all`. QUIC streams flow-control inside quinn (the
+  `write_all` future stalls until peer-side credit is available), so
+  backpressure is absorbed at the stream layer rather than producing a
+  seq gap. `try_publish` therefore always returns `Ok(true)` on the
+  reliable path.
+
+The unit test `test_try_publish_qos1_reports_backpressure_under_burst`
+verifies the QoS 1 path by spinning up a loopback Quinn pair and bursting
+~1 KiB datagrams from one variant; without ever yielding back to the
+runtime, the outgoing datagram buffer fills and `try_publish` flips to
+`Ok(false)` within seconds. `test_try_publish_qos3_and_qos4_never_backpressure`
+verifies the reliable path returns `Ok(true)` across hundreds of bursts.

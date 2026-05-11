@@ -17,6 +17,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
+# `bytes::Bytes` for the QoS 1/2 try_publish path (T-impl.7): quinn's
+# `Connection::send_datagram` takes a `bytes::Bytes`, so we need a
+# direct dependency to construct it from our `Vec<u8>` encode buffer.
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3"
