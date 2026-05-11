@@ -127,6 +127,47 @@ When a variant exceeds its timeout:
 3. Send SIGKILL if still alive
 4. Record status as "timeout" in the done barrier
 
+### Failure diagnostics on non-success spawn (T-impl.9)
+
+After the status line `'<name>' finished: status=<failed|timeout>, exit_code=<n>`,
+the runner prints a post-mortem block to its own stderr so an operator can
+diagnose without scavenging the logs directory. Layout:
+
+```
+[runner:<name>] stderr capture: <abs path>
+[runner:<name>] jsonl log:      <abs path>           # only when file exists
+[runner:<name>] ---- stderr tail (last 20 lines) ----
+<up to 20 lines of the capture, sourced from the last <= 64 KiB of the file>
+[runner:<name>] ---- end stderr tail ----
+```
+
+If the capture file is empty (the common Windows TerminateProcess case
+where the child was killed before flushing anything) the bracketed
+tail block is replaced by:
+
+```
+[runner:<name>] (stderr capture is empty -- child likely killed before writing any output)
+```
+
+Successful and skipped (resume mode) spawns stay silent. The existing
+status line is preserved verbatim -- the block ADDS context, never
+replaces output.
+
+Implementation lives in `print_failure_diagnostics` in `main.rs`, layered
+over two helpers in `spawn.rs`:
+
+- `spawn::jsonl_log_path` -- builds `<log_subdir>/<effective_name>-<runner_name>-<run>.jsonl`
+  per `metak-shared/api-contracts/jsonl-log-schema.md`.
+- `spawn::tail_stderr_file` -- bounded read of the last 20 lines / 64 KiB
+  of the capture file. Returns `Ok(None)` only for a missing file (skip
+  silently), `Ok(Some(""))` for an empty file (triggers the notice line),
+  `Ok(Some(content))` otherwise.
+
+Motivating incident: `configs/two-runner-websocket-qos4.toml` on bob hit
+the 60s timeout, was TerminateProcess'd before flushing stderr, and the
+runner's only output was the lone status line. With T-impl.9 the same
+run now points the operator at the capture file + JSONL log inline.
+
 ### Per-spawn stderr capture
 
 Every variant child's stderr is redirected to a per-spawn file so panic /
