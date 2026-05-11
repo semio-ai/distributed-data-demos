@@ -446,6 +446,24 @@ impl ZenohVariant {
 
 /// Build a Zenoh `Config` from the parsed args. Pure helper so the runtime
 /// initialisation in `connect` stays linear.
+///
+/// **T-impl.2**: Zenoh doesn't expose a raw `SO_RCVBUF` / `SO_SNDBUF`
+/// knob on its UDP transport links, so we tune the **transport-level**
+/// queues that sit immediately above the socket instead. The plain-UDP
+/// variants bump `SO_*BUF` to 8 MiB so that at 100 K pkt/s sustained
+/// the kernel queue does not overflow within milliseconds. The Zenoh
+/// equivalent is to raise each transport-link priority queue's batch
+/// count to its maximum (16) — with the default `batch_size = 65535`
+/// bytes that gives ~1 MiB of TX-side queue depth per QoS priority,
+/// and with 8 priority queues the per-link aggregate is ~8 MiB which
+/// matches the 8 MiB target the other variants use. We also raise the
+/// receive-side per-link buffer (`transport/link/rx/buffer_size`) from
+/// its default 65 535 bytes to 8 MiB so the RX path can absorb the
+/// same bursts. Field paths chosen against Zenoh 1.9's
+/// `DEFAULT_CONFIG.json5` schema; the upper limit of 16 on
+/// `transport/link/tx/queue/size/*` is enforced by Zenoh itself and
+/// values outside `[1, 16]` cause `zenoh::open` to error. See
+/// `variants/zenoh/CUSTOM.md` for the full rationale.
 fn build_zenoh_config(args: &ZenohArgs) -> Result<zenoh::Config> {
     let mut config = zenoh::Config::default();
 
@@ -462,6 +480,43 @@ fn build_zenoh_config(args: &ZenohArgs) -> Result<zenoh::Config> {
             .insert_json5("listen/endpoints", &format!("[\"{}\"]", listen))
             .map_err(zenoh_err)?;
     }
+
+    // Raise each priority queue's batch count to the schema maximum (16),
+    // giving ~16 * 65535 = ~1 MiB of TX buffering per priority, and
+    // ~8 MiB across the 8 priorities — i.e. the 8 MiB target T-impl.2
+    // mandates for every UDP-using variant. `insert_json5` parses the
+    // value as JSON5; an integer literal works directly.
+    config
+        .insert_json5("transport/link/tx/queue/size/control", "16")
+        .map_err(zenoh_err)?;
+    config
+        .insert_json5("transport/link/tx/queue/size/real_time", "16")
+        .map_err(zenoh_err)?;
+    config
+        .insert_json5("transport/link/tx/queue/size/interactive_high", "16")
+        .map_err(zenoh_err)?;
+    config
+        .insert_json5("transport/link/tx/queue/size/interactive_low", "16")
+        .map_err(zenoh_err)?;
+    config
+        .insert_json5("transport/link/tx/queue/size/data_high", "16")
+        .map_err(zenoh_err)?;
+    config
+        .insert_json5("transport/link/tx/queue/size/data", "16")
+        .map_err(zenoh_err)?;
+    config
+        .insert_json5("transport/link/tx/queue/size/data_low", "16")
+        .map_err(zenoh_err)?;
+    config
+        .insert_json5("transport/link/tx/queue/size/background", "16")
+        .map_err(zenoh_err)?;
+
+    // RX-side per-link buffer: bump from the default 65 535 bytes to
+    // 8 MiB so a burst of receives doesn't get clipped before zenoh's
+    // own routing layer can pull it off the link.
+    config
+        .insert_json5("transport/link/rx/buffer_size", "8388608")
+        .map_err(zenoh_err)?;
 
     Ok(config)
 }
