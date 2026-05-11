@@ -397,3 +397,165 @@ class TestIntegrityQoS4:
         r = results[0]
         assert r.completeness_error
         assert r.unresolved_gaps is None  # gap checking not applicable
+
+
+class TestIntegrityBackpressureSkipped:
+    """T-impl.6: per-writer ``backpressure_skipped`` counter on integrity rows."""
+
+    def test_skipped_count_surfaced_on_writer_row(self) -> None:
+        # alice writes 2 values, then the driver reports 3 skipped
+        # values (transport backpressured). bob receives both writes.
+        # Expected: one integrity row alice -> bob with
+        # backpressure_skipped_count == 3.
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=100,
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                seq=2,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=101,
+            ),
+            make_event(
+                "backpressure_skipped",
+                runner="alice",
+                path="/k",
+                qos=1,
+                offset_ms=102,
+            ),
+            make_event(
+                "backpressure_skipped",
+                runner="alice",
+                path="/k",
+                qos=1,
+                offset_ms=103,
+            ),
+            make_event(
+                "backpressure_skipped",
+                runner="alice",
+                path="/k",
+                qos=1,
+                offset_ms=104,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=110,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=2,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=111,
+            ),
+        ]
+        results = _verify(events)
+        assert len(results) == 1
+        r = results[0]
+        assert r.writer == "alice"
+        assert r.receiver == "bob"
+        assert r.write_count == 2
+        assert r.receive_count == 2
+        assert r.backpressure_skipped_count == 3
+
+    def test_no_skipped_events_yields_zero(self) -> None:
+        # No `backpressure_skipped` events in the log -- the count
+        # must default to 0 rather than missing or None. This is the
+        # legacy-log compatibility case (pre-T-impl.6).
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=100,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=110,
+            ),
+        ]
+        results = _verify(events)
+        r = results[0]
+        assert r.backpressure_skipped_count == 0
+
+    def test_skipped_count_replicated_per_receiver(self) -> None:
+        # alice writes to bob and carol; the skip count is per-writer
+        # so the same number must appear on both rows.
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=100,
+            ),
+            make_event(
+                "backpressure_skipped",
+                runner="alice",
+                path="/k",
+                qos=1,
+                offset_ms=101,
+            ),
+            make_event(
+                "backpressure_skipped",
+                runner="alice",
+                path="/k",
+                qos=1,
+                offset_ms=102,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=110,
+            ),
+            make_event(
+                "receive",
+                runner="carol",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=111,
+            ),
+        ]
+        results = _verify(events)
+        assert len(results) == 2
+        for r in results:
+            assert r.writer == "alice"
+            assert r.backpressure_skipped_count == 2

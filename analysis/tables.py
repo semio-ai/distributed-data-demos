@@ -49,7 +49,9 @@ def format_integrity_table(results: list[IntegrityResult]) -> str:
 
     lines: list[str] = []
     lines.append("Integrity Report")
-    sep = "-" * 126
+    # Wider table to accommodate the ``BP-skip`` column added in
+    # T-impl.6 (per-writer count of ``backpressure_skipped`` events).
+    sep = "-" * 138
     lines.append(sep)
 
     # Column widths
@@ -63,6 +65,7 @@ def format_integrity_table(results: list[IntegrityResult]) -> str:
     w_ooo = 14
     w_dupes = 7
     w_gaps = 16
+    w_bpskip = 12
 
     header = (
         _pad("Variant", w_variant)
@@ -75,6 +78,7 @@ def format_integrity_table(results: list[IntegrityResult]) -> str:
         + _rpad("Out-of-order", w_ooo)
         + _rpad("Dupes", w_dupes)
         + _rpad("Unresolved gaps", w_gaps)
+        + _rpad("BP-skip", w_bpskip)
     )
     lines.append(header)
     lines.append(sep)
@@ -105,6 +109,7 @@ def format_integrity_table(results: list[IntegrityResult]) -> str:
             + _rpad(str(r.out_of_order), w_ooo)
             + _rpad(str(r.duplicates), w_dupes)
             + _rpad(gaps_str, w_gaps)
+            + _rpad(f"{r.backpressure_skipped_count:,}", w_bpskip)
         )
         if errors:
             row += "  [FAIL: " + ", ".join(errors) + "]"

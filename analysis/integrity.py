@@ -15,7 +15,16 @@ import polars as pl
 
 @dataclass
 class IntegrityResult:
-    """Integrity check result for one (variant, run, writer -> receiver) pair."""
+    """Integrity check result for one (variant, run, writer -> receiver) pair.
+
+    ``backpressure_skipped_count`` is the number of times the writer's
+    driver tick skipped a value because ``Variant::try_publish`` reported
+    backpressure (per ``metak-shared/api-contracts/jsonl-log-schema.md``
+    -- T-impl.6). Aggregated per ``(variant, run, writer)`` -- the same
+    writer's count is replicated onto every (writer -> receiver) row in
+    the report. Defaults to 0 when no ``backpressure_skipped`` events
+    are present (e.g. legacy logs from before T-impl.6 / T-impl.7).
+    """
 
     variant: str
     run: str
@@ -28,6 +37,7 @@ class IntegrityResult:
     out_of_order: int
     duplicates: int
     unresolved_gaps: int | None  # None when gap checking does not apply
+    backpressure_skipped_count: int
     completeness_error: bool
     ordering_error: bool
     duplicate_error: bool
@@ -41,6 +51,29 @@ def _count_writes_per_writer(group: pl.LazyFrame) -> pl.DataFrame:
         .filter(pl.col("seq").is_not_null() & pl.col("path").is_not_null())
         .group_by(["variant", "run", "runner"])
         .agg(pl.len().alias("write_count"))
+        .rename({"runner": "writer"})
+        .with_columns(
+            pl.col("variant").cast(pl.Utf8),
+            pl.col("run").cast(pl.Utf8),
+            pl.col("writer").cast(pl.Utf8),
+        )
+        .collect()
+    )
+
+
+def _count_backpressure_skipped_per_writer(group: pl.LazyFrame) -> pl.DataFrame:
+    """Count ``backpressure_skipped`` events per (variant, run, writer).
+
+    The writer of a ``backpressure_skipped`` event is the ``runner``
+    field on the line (the driver emits the event from the writer's
+    side). Returns one row per writer that produced at least one skip
+    event. Joiners must fill missing rows with ``0``. See
+    ``metak-shared/api-contracts/jsonl-log-schema.md`` (T-impl.6).
+    """
+    return (
+        group.filter(pl.col("event") == "backpressure_skipped")
+        .group_by(["variant", "run", "runner"])
+        .agg(pl.len().cast(pl.UInt32).alias("backpressure_skipped_count"))
         .rename({"runner": "writer"})
         .with_columns(
             pl.col("variant").cast(pl.Utf8),
@@ -240,6 +273,7 @@ def integrity_for_group(
     is the materialized delivery-records DataFrame for that group.
     """
     write_counts = _count_writes_per_writer(group)
+    skip_counts = _count_backpressure_skipped_per_writer(group)
     pair_stats = _check_per_pair(deliveries)
     gaps = _gap_counts(group)
 
@@ -267,6 +301,16 @@ def integrity_for_group(
         on=["variant", "run", "writer"],
         how="left",
     )
+    if not skip_counts.is_empty():
+        joined = joined.join(
+            skip_counts,
+            on=["variant", "run", "writer"],
+            how="left",
+        )
+    else:
+        joined = joined.with_columns(
+            pl.lit(0).cast(pl.UInt32).alias("backpressure_skipped_count")
+        )
     if not gaps.is_empty():
         joined = joined.join(
             gaps,
@@ -282,6 +326,7 @@ def integrity_for_group(
         pl.col("write_count").fill_null(0),
         pl.col("out_of_order").fill_null(0),
         pl.col("duplicates").fill_null(0),
+        pl.col("backpressure_skipped_count").fill_null(0),
     ).sort(["variant", "run", "writer", "receiver"])
 
     results: list[IntegrityResult] = []
@@ -291,6 +336,7 @@ def integrity_for_group(
         receive_count = int(row["receive_count"])
         out_of_order = int(row["out_of_order"])
         duplicates = int(row["duplicates"])
+        backpressure_skipped_count = int(row["backpressure_skipped_count"])
 
         delivery_pct = (receive_count / write_count * 100.0) if write_count > 0 else 0.0
 
@@ -330,6 +376,7 @@ def integrity_for_group(
                 out_of_order=out_of_order,
                 duplicates=duplicates,
                 unresolved_gaps=unresolved_gaps,
+                backpressure_skipped_count=backpressure_skipped_count,
                 completeness_error=completeness_error,
                 ordering_error=ordering_error,
                 duplicate_error=duplicate_error,

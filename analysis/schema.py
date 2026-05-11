@@ -64,6 +64,7 @@ KNOWN_EVENTS: frozenset[str] = frozenset(
         "connected",
         "phase",
         "write",
+        "backpressure_skipped",
         "receive",
         "gap_detected",
         "gap_filled",
