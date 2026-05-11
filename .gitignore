@@ -30,3 +30,5 @@ target
 *.pkl
 *.pyc
 __pycache__/
+/.claude/worktrees
+/runner/logs

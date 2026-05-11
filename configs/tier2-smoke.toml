@@ -1,0 +1,23 @@
+run = "tier2-smoke"
+runners = ["alice", "bob"]
+default_timeout_secs = 90
+
+[[variant]]
+name = "custom-udp-burst"
+binary = "target/release/variant-custom-udp.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 5
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19501"
+  buffer_size = 65536
+  tcp_base_port = 19800
+  peers = "127.0.0.1:19800"
