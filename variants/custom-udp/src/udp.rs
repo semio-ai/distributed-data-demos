@@ -238,11 +238,25 @@ impl UdpVariant {
         self.tcp_listener = Some(listener);
 
         // Connect to peers (excluding self — already filtered in main).
+        //
+        // T-impl.7: outbound TCP streams stay in blocking mode so
+        // `write_all` truly blocks under kernel back-pressure. The
+        // receive path uses `tcp_in_streams` (separate sockets accepted
+        // from the listener), which retain non-blocking semantics for
+        // polled reads — see `recv_tcp`. Mixing blocking writes with
+        // non-blocking reads on different sockets avoids the
+        // `FIONBIO`-is-socket-wide trap (see hybrid CUSTOM.md "Truly-
+        // blocking writes, polled reads via SO_RCVTIMEO" for the same
+        // pattern on hybrid).
         for peer_addr in &self.config.tcp_peers {
             match TcpStream::connect(peer_addr) {
                 Ok(stream) => {
                     let _ = stream.set_nodelay(true);
-                    stream.set_nonblocking(true)?;
+                    // Explicit blocking — `TcpStream::connect` already
+                    // returns a blocking socket by default but we set
+                    // it again so the back-pressure contract doesn't
+                    // depend on upstream defaults.
+                    stream.set_nonblocking(false)?;
                     self.tcp_out_streams.push(stream);
                 }
                 Err(e) => {
@@ -488,6 +502,96 @@ impl UdpVariant {
         Ok(())
     }
 
+    /// Shared publish implementation used by both `publish` and `try_publish`.
+    ///
+    /// When `block_on_wouldblock` is `true`, UDP sends spin on
+    /// `WouldBlock` with `yield_now()` until the kernel accepts the
+    /// datagram (preserving the original blocking-style `publish`
+    /// behaviour). When `false`, a single `send_to` attempt is made and
+    /// `WouldBlock` returns `Ok(false)` so the caller can log a
+    /// `backpressure_skipped` event.
+    ///
+    /// TCP (QoS 4) is always blocking — see `try_publish` for the
+    /// rationale: gapping a TCP stream would corrupt the per-peer
+    /// receiver state, and TCP's own send buffer already provides
+    /// natural pacing.
+    fn publish_encoded(
+        &mut self,
+        encoded: &[u8],
+        qos: Qos,
+        seq: u64,
+        block_on_wouldblock: bool,
+    ) -> Result<bool> {
+        match qos {
+            Qos::BestEffort | Qos::LatestValue => {
+                let socket = self
+                    .udp_socket
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("UDP socket not connected"))?;
+                let target: SocketAddr = SocketAddr::V4(self.config.multicast_group);
+                loop {
+                    match socket.send_to(encoded, target) {
+                        Ok(_) => return Ok(true),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            if block_on_wouldblock {
+                                std::thread::yield_now();
+                                continue;
+                            } else {
+                                return Ok(false);
+                            }
+                        }
+                        Err(e) => return Err(e).context("UDP send failed"),
+                    }
+                }
+            }
+            Qos::ReliableUdp => {
+                // QoS 3: NACK protocol requires contiguous seqs, so we
+                // never report backpressure here — gapping the stream
+                // would force receivers to NACK for a seq we already
+                // dropped. Spin on WouldBlock; the kernel buffer is the
+                // pacing mechanism.
+                let socket = self
+                    .udp_socket
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("UDP socket not connected"))?;
+                let target: SocketAddr = SocketAddr::V4(self.config.multicast_group);
+                loop {
+                    match socket.send_to(encoded, target) {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        Err(e) => return Err(e).context("UDP send failed"),
+                    }
+                }
+
+                // Buffer for retransmit. Limit buffer to last 10000 messages.
+                self.send_buffer.insert(seq, encoded.to_vec());
+                if self.send_buffer.len() > 10000 && seq > 10000 {
+                    let cutoff = seq - 10000;
+                    self.send_buffer.retain(|&k, _| k > cutoff);
+                }
+                Ok(true)
+            }
+            Qos::ReliableTcp => {
+                // QoS 4: blocking TCP write. Strictly contiguous seqs;
+                // never report backpressure (the kernel send buffer
+                // fills and `write_all` blocks until it drains).
+                let mut failed_indices = Vec::new();
+                for (i, stream) in self.tcp_out_streams.iter_mut().enumerate() {
+                    if stream.write_all(encoded).is_err() {
+                        failed_indices.push(i);
+                    }
+                }
+                for &i in failed_indices.iter().rev() {
+                    self.tcp_out_streams.remove(i);
+                }
+                Ok(true)
+            }
+        }
+    }
+
     /// Handle a received NACK: retransmit the requested message if we have it buffered.
     fn handle_nack(&self, data: &[u8]) -> Result<()> {
         let (writer, missing_seq) = protocol::decode_nack(data)?;
@@ -527,75 +631,31 @@ impl Variant for UdpVariant {
 
     fn publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<()> {
         let encoded = protocol::encode(qos, seq, path, &self.config.runner, payload)?;
-
-        match qos {
-            Qos::BestEffort | Qos::LatestValue => {
-                // Send via multicast UDP.
-                let socket = self
-                    .udp_socket
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("UDP socket not connected"))?;
-                let target: SocketAddr = SocketAddr::V4(self.config.multicast_group);
-                loop {
-                    match socket.send_to(&encoded, target) {
-                        Ok(_) => break,
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            std::thread::yield_now();
-                            continue;
-                        }
-                        Err(e) => return Err(e).context("UDP send failed"),
-                    }
-                }
-            }
-            Qos::ReliableUdp => {
-                // Send via multicast UDP and buffer for NACK retransmit.
-                let socket = self
-                    .udp_socket
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("UDP socket not connected"))?;
-                let target: SocketAddr = SocketAddr::V4(self.config.multicast_group);
-                loop {
-                    match socket.send_to(&encoded, target) {
-                        Ok(_) => break,
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            std::thread::yield_now();
-                            continue;
-                        }
-                        Err(e) => return Err(e).context("UDP send failed"),
-                    }
-                }
-
-                // Buffer for retransmit. Limit buffer to last 10000 messages.
-                self.send_buffer.insert(seq, encoded);
-                if self.send_buffer.len() > 10000 {
-                    // Remove oldest entries. Since seq is monotonically increasing,
-                    // remove anything below seq - 10000.
-                    if seq > 10000 {
-                        let cutoff = seq - 10000;
-                        self.send_buffer.retain(|&k, _| k > cutoff);
-                    }
-                }
-            }
-            Qos::ReliableTcp => {
-                // Send via TCP to all connected peers.
-                let mut failed_indices = Vec::new();
-                for (i, stream) in self.tcp_out_streams.iter_mut().enumerate() {
-                    if stream.write_all(&encoded).is_err() {
-                        failed_indices.push(i);
-                    }
-                }
-                // Remove failed streams (in reverse to preserve indices).
-                for &i in failed_indices.iter().rev() {
-                    self.tcp_out_streams.remove(i);
-                }
-                if self.tcp_out_streams.is_empty() && !self.config.tcp_peers.is_empty() {
-                    // All TCP peers disconnected but we had peers configured.
-                    // Fall through silently; the runner will detect missing data.
-                }
-            }
-        }
-
+        self.publish_encoded(&encoded, qos, seq, /* block_on_wouldblock */ true)?;
         Ok(())
+    }
+
+    /// T-impl.7: honest backpressure for the driver.
+    ///
+    /// QoS 1/2 use a single non-blocking `send_to`. If the kernel returns
+    /// `WouldBlock`, we return `Ok(false)` so the driver logs
+    /// `backpressure_skipped` instead of `write`, and the seq gap that
+    /// results is tolerated by the receiver (best-effort / latest-value
+    /// both already tolerate loss).
+    ///
+    /// QoS 3 / QoS 4 MUST NOT gap the seq stream — the NACK protocol
+    /// (QoS 3) needs contiguous seqs to know what to ask for, and the
+    /// TCP receiver (QoS 4) expects strictly ordered framed messages.
+    /// For those QoS levels we keep the blocking-retry behaviour from
+    /// `publish` and always report `Ok(true)`; the kernel send buffer is
+    /// the natural pacing mechanism.
+    ///
+    /// See `variants/custom-udp/CUSTOM.md` "Backpressure semantics
+    /// (T-impl.7)".
+    fn try_publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<bool> {
+        let encoded = protocol::encode(qos, seq, path, &self.config.runner, payload)?;
+        let block = matches!(qos, Qos::ReliableUdp | Qos::ReliableTcp);
+        self.publish_encoded(&encoded, qos, seq, block)
     }
 
     fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
@@ -955,5 +1015,212 @@ mod tests {
             FrameReadResult::DropPeer(_) => {}
             other => panic!("expected DropPeer, got {:?}", other),
         }
+    }
+
+    // ---- T-impl.7: try_publish backpressure semantics ----
+
+    /// Build a `UdpVariant` whose UDP socket is a *real* non-blocking
+    /// socket bound to an ephemeral port (not a multicast group) with a
+    /// tiny `SO_SNDBUF`. The intent is to drive `send_to` into
+    /// `WouldBlock` quickly without depending on the OS-wide multicast
+    /// configuration. The configured `multicast_group` doubles as the
+    /// send target — sending to a non-listening unicast addr exercises
+    /// the same syscall path while staying inside loopback.
+    fn make_variant_with_tiny_sndbuf(qos: Qos) -> Result<UdpVariant> {
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+            .context("create test socket")?;
+        socket.set_reuse_address(true).ok();
+        socket.set_nonblocking(true)?;
+        // Tiny send buffer so the kernel can fill quickly. The kernel
+        // typically clamps the floor (Windows ~1 KB), but anything well
+        // below the per-packet rate-times-MTU drains slowly enough that
+        // a busy loop is guaranteed to hit `WouldBlock`.
+        let _ = socket.set_send_buffer_size(1024);
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        socket.bind(&SockAddr::from(bind_addr))?;
+
+        // Pick a discard target: an arbitrary loopback port nobody is
+        // listening on. The kernel still buffers the datagram inside
+        // SO_SNDBUF before its NIC layer can drop it, so we get
+        // realistic WouldBlock once the buffer fills.
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1);
+
+        let mut cfg = default_config(qos);
+        cfg.multicast_group = target;
+        let mut v = UdpVariant::new(cfg);
+        v.udp_socket = Some(socket.into());
+        Ok(v)
+    }
+
+    /// Detect whether the host kernel actually surfaces `WouldBlock`
+    /// when an undersized SO_SNDBUF is hammered. Some platforms (most
+    /// notably Windows on a few NIC configurations) silently drop the
+    /// datagram at a layer below the syscall return, so `send_to`
+    /// never reports `WouldBlock`. When that happens we can't validate
+    /// the `Ok(false)` path with a real socket — fall back to a probe.
+    fn host_surfaces_udp_wouldblock() -> bool {
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+        let Ok(socket) = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) else {
+            return false;
+        };
+        if socket.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let _ = socket.set_send_buffer_size(1024);
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        if socket.bind(&SockAddr::from(bind_addr)).is_err() {
+            return false;
+        }
+        let target = SockAddr::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
+        let payload = vec![0u8; 60_000];
+        for _ in 0..200_000 {
+            match socket.send_to(&payload, &target) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    /// QoS 1 (BestEffort): `try_publish` must return `Ok(false)` at
+    /// some point when the UDP send buffer fills, NOT block and NOT
+    /// fall through to `publish`.
+    ///
+    /// Some host configurations never surface `WouldBlock` on
+    /// loopback UDP (the kernel drops at a deeper layer). We probe
+    /// first and only assert the `Ok(false)` outcome when the probe
+    /// confirms the host can produce it; otherwise we settle for
+    /// "every `try_publish` call returns `Ok(true)` and never errors",
+    /// which still proves we never panicked, never blocked
+    /// indefinitely, and never returned `Err`.
+    #[test]
+    fn try_publish_qos1_returns_false_under_send_buffer_pressure() {
+        let mut v = make_variant_with_tiny_sndbuf(Qos::BestEffort)
+            .expect("must construct a non-blocking test variant");
+
+        // Near-MTU-max payloads so a 1 KB send buffer can only hold
+        // one datagram — every subsequent send hits WouldBlock until
+        // the kernel drains.
+        let payload = vec![0xABu8; 60_000];
+        let mut saw_false = false;
+        for seq in 0..200_000u64 {
+            match v.try_publish("/p", &payload, Qos::BestEffort, seq) {
+                Ok(true) => {}
+                Ok(false) => {
+                    saw_false = true;
+                    break;
+                }
+                Err(e) => panic!("try_publish errored: {e:#}"),
+            }
+        }
+
+        if !saw_false && host_surfaces_udp_wouldblock() {
+            panic!("expected try_publish to return Ok(false) on QoS 1 — host can surface WouldBlock but try_publish did not");
+        }
+    }
+
+    /// QoS 2 (LatestValue): same behaviour as QoS 1 — gap-tolerant by
+    /// design, so `try_publish` reports backpressure honestly.
+    #[test]
+    fn try_publish_qos2_returns_false_under_send_buffer_pressure() {
+        let mut v = make_variant_with_tiny_sndbuf(Qos::LatestValue)
+            .expect("must construct a non-blocking test variant");
+
+        let payload = vec![0xCDu8; 60_000];
+        let mut saw_false = false;
+        for seq in 0..200_000u64 {
+            match v.try_publish("/p", &payload, Qos::LatestValue, seq) {
+                Ok(true) => {}
+                Ok(false) => {
+                    saw_false = true;
+                    break;
+                }
+                Err(e) => panic!("try_publish errored: {e:#}"),
+            }
+        }
+
+        if !saw_false && host_surfaces_udp_wouldblock() {
+            panic!("expected try_publish to return Ok(false) on QoS 2 — host can surface WouldBlock but try_publish did not");
+        }
+    }
+
+    /// QoS 3 (ReliableUdp): MUST NOT gap the seq stream. Under the
+    /// same buffer pressure that triggers `Ok(false)` for QoS 1/2,
+    /// QoS 3 must keep returning `Ok(true)` (blocking on WouldBlock
+    /// internally) so the NACK protocol stays sound. We bound the
+    /// inner blocking loop indirectly by giving the kernel time to
+    /// drain between iterations (yield_now in the impl); the test
+    /// itself just needs to confirm we never see `Ok(false)`.
+    #[test]
+    fn try_publish_qos3_never_reports_backpressure() {
+        let mut v = make_variant_with_tiny_sndbuf(Qos::ReliableUdp)
+            .expect("must construct a non-blocking test variant");
+
+        let payload = vec![0xEFu8; 64];
+        // Modest iteration count: enough to hit at least one transient
+        // WouldBlock at SO_SNDBUF=2KB, but few enough that the kernel-
+        // drain spin in `publish_encoded` keeps the test fast.
+        for seq in 0..500u64 {
+            let result = v
+                .try_publish("/p", &payload, Qos::ReliableUdp, seq)
+                .expect("QoS 3 try_publish should succeed");
+            assert!(
+                result,
+                "QoS 3 must never return Ok(false) (would create a NACK-fatal seq gap)"
+            );
+        }
+    }
+
+    /// QoS 4 (ReliableTcp): identical "always Ok(true)" contract.
+    /// We don't have peers in this minimal fixture, so the TCP write
+    /// path is a no-op — but the no-peers case is exactly the same
+    /// codepath production hits when all peers have been dropped due
+    /// to write errors, and the driver must still see `Ok(true)` so
+    /// it doesn't emit `backpressure_skipped` for a transport that
+    /// fundamentally can't gap.
+    #[test]
+    fn try_publish_qos4_never_reports_backpressure_no_peers() {
+        let mut v = UdpVariant::new(default_config(Qos::ReliableTcp));
+        // No `connect()` call: tcp_out_streams stays empty, which is
+        // the "all peers dropped" steady-state. We just need to assert
+        // the return contract here.
+        let payload = b"hello";
+        for seq in 0..50u64 {
+            let result = v
+                .try_publish("/p", payload, Qos::ReliableTcp, seq)
+                .expect("QoS 4 try_publish should succeed");
+            assert!(
+                result,
+                "QoS 4 must never return Ok(false) — TCP receivers expect contiguous seqs"
+            );
+        }
+    }
+
+    /// Happy path: when nothing is backpressured, `try_publish`
+    /// returns `Ok(true)` on QoS 1. Uses a real loopback multicast
+    /// socket (same path the variant uses in production) so this
+    /// exercises the full `setup_udp` -> `try_publish` flow.
+    #[test]
+    fn try_publish_happy_path_returns_true() {
+        // Ephemeral multicast group/port so we don't collide with the
+        // other tests in this module that bind 239.0.0.1:9000.
+        let mut cfg = default_config(Qos::BestEffort);
+        cfg.multicast_group = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 19940);
+        let mut v = UdpVariant::new(cfg);
+        if v.connect().is_err() {
+            // CI without multicast: skip silently. This is the same
+            // pattern used by `connect_and_disconnect` above.
+            return;
+        }
+
+        let payload = b"x";
+        // A single send at low rate must always be accepted.
+        let result = v
+            .try_publish("/p", payload, Qos::BestEffort, 0)
+            .expect("happy-path try_publish must succeed");
+        assert!(result, "expected Ok(true) on idle transport");
+        v.disconnect().ok();
     }
 }

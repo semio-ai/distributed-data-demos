@@ -204,6 +204,49 @@ For messages larger than 1472 bytes, implement application-layer fragmentation:
 - Reassemble at receiver.
 - For the `scalar-flood` workload (8-byte payloads), fragmentation will never trigger.
 
+### Backpressure semantics (T-impl.7)
+
+Custom-udp overrides `Variant::try_publish` (see `src/udp.rs`,
+`impl Variant for UdpVariant::try_publish` -> `publish_encoded`) so the
+driver gets honest backpressure signalling instead of always seeing
+`Ok(true)`. The driver assigns and consumes a seq number BEFORE calling
+`try_publish`, so any `Ok(false)` return creates a receiver-visible gap
+in the seq stream. This is fine for some QoS levels and catastrophic
+for others:
+
+- **QoS 1 (BestEffort)** — non-blocking `UdpSocket::send_to`.
+  `WouldBlock` -> `Ok(false)`. The driver logs `backpressure_skipped`;
+  the receiver tolerates loss by definition. (No retry, no kernel-buffer
+  spin: a backed-up sender skips the value and moves on.)
+- **QoS 2 (LatestValue)** — same as QoS 1. Even if the receiver only
+  ever cares about the newest seq, gapping is still fine because the
+  stale-discard logic on the receiver runs against the highest seen
+  seq.
+- **QoS 3 (ReliableUdp / NACK)** — blocking `send_to` with `yield_now`
+  on `WouldBlock`. ALWAYS `Ok(true)`. Rationale: the receiver's gap
+  detector would NACK for any seq we drop, and the writer's send-buffer
+  no longer contains the payload (we never produced it), so the
+  retransmit would fail and stall the spawn. The kernel send buffer is
+  the natural pacing mechanism; `publish_encoded`'s spin-on-WouldBlock
+  is the same loop pre-T-impl.7 used in `publish`.
+- **QoS 4 (ReliableTcp)** — blocking `write_all`. ALWAYS `Ok(true)`.
+  TCP receivers expect strictly contiguous framed messages; a gap would
+  corrupt the per-peer reader state. Outbound TCP streams are kept in
+  **blocking mode** (`set_nonblocking(false)` in `setup_tcp`) — only
+  the inbound `tcp_in_streams` are non-blocking for polled reads, so
+  there is no `FIONBIO`-is-socket-wide aliasing between the read and
+  write paths. The kernel send-buffer fill makes `write_all` block,
+  which is exactly the back-pressure signal we want to measure.
+
+Where it lives:
+
+- `src/udp.rs::UdpVariant::publish_encoded` — shared core, parameterised
+  by `block_on_wouldblock`.
+- `src/udp.rs::Variant::try_publish` — picks `block_on_wouldblock`
+  per QoS.
+- `src/udp.rs::Variant::publish` — keeps the legacy "always block"
+  semantics by passing `block_on_wouldblock = true`.
+
 ### Testing
 
 - Unit tests for message serialization/deserialization.
