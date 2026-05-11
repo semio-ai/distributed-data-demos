@@ -253,10 +253,16 @@ def generate_comparison_plot(
 
     Returns
     -------
-    Path to the generated ``comparison.png``.
+    Path to the generated ``comparison.png`` (or ``comparison-log.png``
+    when ``log_throughput=True``, so the log-scale variant does not
+    overwrite the linear-scale output in the same ``--output`` dir).
     """
+    # Filename suffix differs by throughput scale so both flavours can
+    # coexist in the same output directory.
+    out_filename = "comparison-log.png" if log_throughput else "comparison.png"
+
     if not results:
-        return _empty_plot(output_dir)
+        return _empty_plot(output_dir, filename=out_filename)
 
     # Parse variant names and group results by (transport, workload, qos).
     # Keep only the first entry per key (typical input has one
@@ -269,7 +275,7 @@ def generate_comparison_plot(
         parsed.setdefault(key, r)
 
     if not parsed:
-        return _empty_plot(output_dir)
+        return _empty_plot(output_dir, filename=out_filename)
 
     # Collect distinct transports and workloads in deterministic order.
     transports_seen = {t for t, _, _ in parsed.keys()}
@@ -303,7 +309,7 @@ def generate_comparison_plot(
     n_qos_groups = len(qos_order)
 
     if n_bars == 0 or n_qos_groups == 0:
-        return _empty_plot(output_dir)
+        return _empty_plot(output_dir, filename=out_filename)
 
     # Bar width / x-positions. Each row plots the same set of
     # (transport, workload) bars for a single QoS, so the x-axis carries
@@ -491,7 +497,7 @@ def generate_comparison_plot(
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / "comparison.png"
+    out_path = output_dir / out_filename
     # ``bbox_inches="tight"`` would clip the carefully reserved bottom
     # band, so save at the figure size we computed.
     fig.savefig(str(out_path), dpi=150)

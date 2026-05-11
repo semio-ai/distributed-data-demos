@@ -456,6 +456,36 @@ class TestGenerateComparisonPlot:
         for f in captured:
             original_close(f)
 
+    def test_log_throughput_filename_suffix(self, tmp_path: Path) -> None:
+        """``log_throughput`` toggles the output filename so both flavours coexist.
+
+        Without the suffix the log-scale run would overwrite the linear-scale
+        ``comparison.png`` in the same ``--output`` dir. The returned ``Path``
+        must reflect the filename actually written, since the CLI prints it.
+        """
+        from plots import generate_comparison_plot
+
+        results = [
+            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=50.0),
+            _make_result("zenoh-10x100hz-qos1", writes_per_sec=480.0),
+        ]
+
+        linear_out = generate_comparison_plot(
+            results, tmp_path / "out", log_throughput=False
+        )
+        assert linear_out.name == "comparison.png"
+        assert linear_out.exists()
+
+        log_out = generate_comparison_plot(
+            results, tmp_path / "out", log_throughput=True
+        )
+        assert log_out.name == "comparison-log.png"
+        assert log_out.exists()
+
+        # Both files coexist in the same directory.
+        assert linear_out.parent == log_out.parent
+        assert linear_out.exists()
+
     def test_log_throughput_zero_writes_skipped_not_clamped(
         self, tmp_path: Path
     ) -> None:
