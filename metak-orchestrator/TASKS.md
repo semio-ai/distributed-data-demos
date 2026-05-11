@@ -4495,3 +4495,73 @@ From workspace root:
 - Receiver-driven explicit backpressure signal across the wire.
 - Token-bucket rate limiting (still out of scope).
 - Adjusting Windows timer resolution via `timeBeginPeriod`.
+
+### T-impl.9: runner -- surface diagnostics on spawn failure -- done
+
+**Repo**: `runner/`.
+**Status**: done 2026-05-11. All acceptance criteria met.
+
+#### Background
+
+Triggered by a real diagnostic session on `configs/two-runner-websocket-qos4.toml`. A websocket variant on bob hit the 60 s runner timeout, was TerminateProcess'd, and produced an empty stderr file plus a JSONL log truncated mid-record. The runner's only output was a single `'<name>' finished: status=timeout, exit_code=-1` line with no pointer to where to look.
+
+#### Implementation
+
+On non-success spawn outcome (`failed` or `timeout`), the runner now prints, immediately after the existing status line:
+1. Absolute path to the per-spawn stderr capture file.
+2. Absolute path to the variant's JSONL log file (skipped silently if file missing).
+3. A `---- stderr tail (last 20 lines) ----` block reading the last 20 lines (capped at last 64 KiB from EOF), or an `(stderr capture is empty -- child likely killed before writing any output)` notice if the file is empty.
+
+Helpers `tail_stderr_file` and `jsonl_log_path` live in `runner/src/spawn.rs`. Call site in `runner/src/main.rs` via `print_failure_diagnostics` right after the existing status line. `success` and `skipped` spawns stay silent (unchanged behaviour).
+
+#### Acceptance criteria
+
+- [x] On `failed` or `timeout` spawn, runner stderr includes capture file path, JSONL log path (if present), and either tail or empty-capture notice.
+- [x] Tail capped at 20 lines and bounded by ~64 KiB from EOF.
+- [x] `success` / `skipped` outcomes preserve silent behaviour.
+- [x] 4 new integration tests + 8 new unit tests pass.
+- [x] `cargo test --release -p runner` all-green.
+- [x] `cargo clippy --release -p runner --all-targets -- -D warnings` clean.
+- [x] `cargo fmt -p runner -- --check` clean.
+- [x] End-to-end smoke on `configs/two-runner-websocket-qos4.toml` shows the new diagnostic block in both runners' terminals.
+
+Commits: `d614a43`, `c8c1808`, `d501ec9`, `f5587b7`, `a101fd3`.
+
+### T-impl.10: variant-base -- adaptive receive-drain in operate loop -- code done, fixture acceptance partial
+
+**Repo**: `variant-base/`.
+**Status**: code done 2026-05-11 (committed). Fixture acceptance partial -- end-to-end repro still fails. Follow-up T-impl.11 (websocket-specific) needed; direction pending user pick.
+
+#### Background
+
+A two-runner `configs/two-runner-websocket-qos4.toml` run at `tick_rate_hz=100, values_per_tick=1000` (100 K msg/s symmetric) deadlocked ~130 ms into the operate phase. alice: 6126 writes / 1139 receives, then `WSAECONNRESET` -> exit 1. bob: 6823 writes / 1075 receives, then runner-timeout TerminateProcess. The driver's per-tick drain budget (`1 ms` wallclock, `2 * values_per_tick` messages) was hypothesised as the bottleneck.
+
+#### Implementation
+
+In `variant-base/src/driver.rs`:
+- New `compute_operate_drain_time_budget()` helper. scalar-flood: `max(1ms, (next_tick - now) - 1ms safety margin)`. max-throughput: flat 5 ms.
+- `drain_msg_budget` bumped from `2 * vpt` to `4 * vpt`, floor at 1.
+- EOT-phase drain unchanged.
+- Four new unit tests in `driver::tests`; T-impl.8 tests untouched and still pass.
+- `variant-base/CUSTOM.md` "Operate-loop drain budgets (T-impl.10)" subsection added documenting the change and the 2026-05-11 incident that motivated it.
+
+#### Acceptance criteria
+
+- [x] Drain budget logic updated.
+- [x] All four new unit tests pass.
+- [x] Existing variant-base tests pass unchanged.
+- [x] `cargo test --release --workspace` all-green; no integrity-gate regression in any variant test suite.
+- [x] `variant-base/CUSTOM.md` documents the new behaviour.
+- [x] No changes to `metak-shared/api-contracts/`.
+- [ ] End-to-end `websocket-1000x100hz` two-runner repro completes successfully. **FAILED**: same `WSAECONNRESET` failure mode recurs. Post-fix: alice 6211w / 1049r, bob 7291w / 1334r (bob's receives +24% vs pre-fix; ratio unchanged at ~5.5:1). Driver fix helped marginally but the dominant bottleneck is per-message WS frame-parse cost, not driver drain budget. See `metak-orchestrator/STATUS.md` worker completion report for full repro logs. The driver change stays landed -- it is a real (though dose-limited) robustness improvement and has no regressions. T-impl.11 will address the websocket-specific cap.
+
+Commits: `e9457eb`, `a397450`, `73e89af`.
+
+#### Out of scope
+
+- Interleaving `try_publish` and `poll_receive` within a tick.
+- Per-variant tuning of drain budgets.
+- Investigating Zenoh T10.2 timeouts under the same hypothesis (stays in its own task).
+- Re-running hybrid's high-rate fixtures as a baseline (separate measurement task).
+
+---
