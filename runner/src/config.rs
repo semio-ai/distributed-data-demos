@@ -1458,4 +1458,316 @@ name = "v"
         }
         assert!(count > 0, "expected at least one config in {configs_dir:?}");
     }
+
+    // -----------------------------------------------------------------
+    // T14.8: threading_modes + recv_buffer_kb + supported_modes parsing.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn threading_modes_omitted_defaults_to_single() {
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+"#,
+        );
+        let spec = cfg.variant[0].threading_modes_spec().unwrap();
+        assert_eq!(spec, ThreadingModesSpec::Default);
+        assert_eq!(spec.modes(), vec![ThreadingMode::Single]);
+    }
+
+    #[test]
+    fn threading_modes_scalar_string() {
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+  threading_modes = "multi"
+"#,
+        );
+        let spec = cfg.variant[0].threading_modes_spec().unwrap();
+        assert_eq!(spec, ThreadingModesSpec::Single(ThreadingMode::Multi));
+        assert_eq!(spec.modes(), vec![ThreadingMode::Multi]);
+    }
+
+    #[test]
+    fn threading_modes_array_dedup_and_sort() {
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+  threading_modes = ["single", "multi", "single"]
+"#,
+        );
+        let modes = cfg.variant[0].threading_modes_spec().unwrap().modes();
+        // Canonical order: multi before single (alphabetical).
+        assert_eq!(modes, vec![ThreadingMode::Multi, ThreadingMode::Single]);
+    }
+
+    #[test]
+    fn threading_modes_rejects_unknown_value() {
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+  threading_modes = "async"
+"#;
+        let mut cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid threading_mode 'async'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn threading_modes_rejects_empty_array() {
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+  threading_modes = []
+"#;
+        let mut cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("threading_modes array must be non-empty"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn recv_buffer_kb_default_when_absent() {
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+"#,
+        );
+        assert_eq!(
+            cfg.variant[0].recv_buffer_kb().unwrap(),
+            DEFAULT_RECV_BUFFER_KB
+        );
+    }
+
+    #[test]
+    fn recv_buffer_kb_accepts_boundaries() {
+        for value in [RECV_BUFFER_KB_MIN, RECV_BUFFER_KB_MAX] {
+            let toml_str = format!(
+                r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+  recv_buffer_kb = {value}
+"#
+            );
+            let mut cfg: BenchConfig = toml::from_str(&toml_str).unwrap();
+            cfg.resolve_templates().unwrap();
+            cfg.validate().unwrap();
+            assert_eq!(cfg.variant[0].recv_buffer_kb().unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn recv_buffer_kb_rejects_below_min() {
+        let below = RECV_BUFFER_KB_MIN - 1;
+        let toml_str = format!(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+  recv_buffer_kb = {below}
+"#
+        );
+        let mut cfg: BenchConfig = toml::from_str(&toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("recv_buffer_kb 63 is out of range"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn recv_buffer_kb_rejects_above_max() {
+        let above = RECV_BUFFER_KB_MAX + 1;
+        let toml_str = format!(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+  recv_buffer_kb = {above}
+"#
+        );
+        let mut cfg: BenchConfig = toml::from_str(&toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("recv_buffer_kb 65537 is out of range"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn supported_modes_absent_resolves_to_none() {
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+"#,
+        );
+        assert!(cfg.variant[0].supported_modes_resolved().unwrap().is_none());
+    }
+
+    #[test]
+    fn supported_modes_parses_list() {
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+supported_modes = ["single", "multi"]
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+"#,
+        );
+        let modes = cfg.variant[0].supported_modes_resolved().unwrap().unwrap();
+        assert_eq!(modes, vec![ThreadingMode::Multi, ThreadingMode::Single]);
+    }
+
+    #[test]
+    fn supported_modes_rejects_unknown_entry() {
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+supported_modes = ["single", "weird"]
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+"#;
+        let mut cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid threading_mode 'weird'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn supported_modes_rejects_empty_list() {
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+supported_modes = []
+  [variant.common]
+  tick_rate_hz = 1
+  values_per_tick = 1
+"#;
+        let mut cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty supported_modes list"),
+            "unexpected error: {msg}"
+        );
+    }
 }
