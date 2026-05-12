@@ -6630,3 +6630,237 @@ The orchestrator should treat the end-to-end E2E result as a
 meaningful negative finding and file a follow-up task for the
 websocket variant before declaring the integrity gate for
 100 K msg/s symmetric workloads "passing".
+
+---
+
+## T14.1 -- variant-base threading-mode infrastructure (2026-05-11, complete)
+
+### What was implemented
+
+T14.1 introduces the `ThreadingMode { Single, Multi }` dimension and
+two recv-side runner-injected CLI args (`--threading-mode`,
+`--recv-buffer-kb`) across the `variant-base` crate. The `Variant`
+trait gains a `supported_threading_modes` declaration method, two
+lifecycle hooks (`start_reader_threads(mode)` /
+`stop_reader_threads()`) with default no-op impls, and a breaking
+signature change on `connect` to accept `threading_mode:
+ThreadingMode`. The driver's `run_protocol` now passes the mode
+through to `connect`, calls `start_reader_threads` immediately AFTER
+a successful `connect` (and before logging `connected`), and calls
+`stop_reader_threads` BEFORE `disconnect` so reader threads can
+drain pending receives cleanly. The `connected` JSONL event gains
+`threading_mode` and `recv_buffer_kb` fields. `VariantDummy`
+declares `[Single, Multi]` capabilities -- it has no real I/O, so
+both modes do the same thing internally; the point is to exercise
+the new infrastructure end-to-end.
+
+`--threading-mode` is **optional with a default of `single`** during
+the E14 rollout (intended deviation from the "required" contract
+wording -- see deviations section below). Once T14.8 lands and the
+runner always injects the arg, the default becomes a fallback for
+ad-hoc manual invocations only. `--recv-buffer-kb` is optional with
+default 4096, range 64..=65536.
+
+### Cross-folder touches
+
+Did NOT take a trait-default-impl route -- the trait signature
+change to `connect` is unavoidable per the task spec. Applied the
+authorised minimal compile-fix to the six other variant crates:
+
+- `variants/zenoh/src/zenoh.rs`
+- `variants/custom-udp/src/udp.rs`
+- `variants/quic/src/quic.rs`
+- `variants/hybrid/src/hybrid.rs`
+- `variants/websocket/src/websocket.rs`
+- `variants/webrtc/src/webrtc.rs`
+
+Each gained:
+1. The new `threading_mode: variant_base::ThreadingMode` arg on the
+   `impl Variant::connect` signature, with `let _ = threading_mode;`
+   to suppress the unused-arg warning and a 2-line comment pointing
+   to the variant's follow-up task (T14.2-T14.7).
+2. Test-only `.connect()` call sites updated to pass
+   `variant_base::ThreadingMode::Single` (the pre-E14 effective
+   behaviour) so existing test semantics are preserved.
+
+No other behaviour changes in any variant. No transport, no QoS, no
+EOT, no clock-sync code touched.
+
+### Validation commands and results
+
+```
+cargo build --release -p variant-base
+    Finished `release` profile [optimized] target(s) in 7.82s
+
+cargo test --release -p variant-base
+    test result: ok. 82 passed; 0 failed; 0 ignored
+    (lib unit tests)
+    test result: ok. 3 passed; 0 failed; 0 ignored
+    (integration tests)
+
+cargo test --release --workspace -- --test-threads=2
+    Total tests across workspace: 546 passed; 0 failed.
+    Per-crate test results:
+      runner unit:                  139 passed
+      runner integration (15 dummy spawns + 1 clock-sync + ...): all-green
+      variant-base lib + integration: 82 + 3 passed
+      variant-base bin (variant-dummy): 0 (no tests in bin)
+      variant-zenoh unit + loopback + 2 ignored: 23 + 1
+      variant-custom-udp unit + integration: 73 + 7
+      variant-hybrid unit + integration: 50 + 7
+      variant-quic unit + integration + 2 ignored: 30 + 0
+      variant-webrtc unit + integration: 43 + 4
+      variant-websocket unit + integration: 36 + 28
+
+      Note: A first workspace-test run hit one transient FAIL on
+      runner::protocol::tests::done_barrier_hang_repro_when_peer_already_advanced
+      (a 30 s barrier-timing test in the runner). Caused by leftover
+      runner-* processes from a prior aborted run holding the
+      linker / port. After cleanup it passes both individually and
+      as part of the workspace run. Not caused by T14.1; same
+      pattern was reported by the T-impl.10 worker.
+
+cargo clippy --release --workspace --all-targets -- -D warnings
+    Finished `release` profile [optimized] target(s) in 7.82s
+    (clean -- no warnings)
+
+cargo fmt --check
+    (clean -- no output)
+```
+
+### VariantDummy smoke output (single + multi modes)
+
+Built workspace, then ran `target/release/variant-dummy.exe` with
+`--operate-secs 1 --values-per-tick 3 --tick-rate-hz 100 --qos 1
+--workload scalar-flood --peers solo=127.0.0.1` plus identity args
+and the new `--threading-mode {single|multi}` / `--recv-buffer-kb
+{4096|8192}`.
+
+**Single mode** -- exit 0; log file `dummy-solo-smoke.jsonl`
+(connected, phase, write, receive, eot_sent, phase, eot,
+eot_received, phase, silent sequence):
+
+```
+{"event":"phase","phase":"connect","run":"smoke","runner":"solo","ts":"2026-05-11T23:53:30.643201100Z","variant":"dummy"}
+{"elapsed_ms":643.2447,"event":"connected","launch_ts":"2026-05-11T23:53:30.000000000Z","recv_buffer_kb":4096,"run":"smoke","runner":"solo","threading_mode":"single","ts":"2026-05-11T23:53:30.643248100Z","variant":"dummy"}
+{"event":"phase","phase":"stabilize","run":"smoke","runner":"solo","ts":"2026-05-11T23:53:30.643263300Z","variant":"dummy"}
+{"event":"phase","phase":"operate","profile":"scalar-flood","run":"smoke","runner":"solo","ts":"2026-05-11T23:53:30.643271600Z","variant":"dummy"}
+{"bytes":8,"event":"write","path":"/bench/0","qos":1,"run":"smoke","runner":"solo","seq":1,"ts":"2026-05-11T23:53:30.643280300Z","variant":"dummy"}
+... (302 more write events) ...
+... (303 receive events; dummy echoes 1:1) ...
+{"event":"phase","phase":"eot","run":"smoke","runner":"solo","ts":"2026-05-11T23:53:31.643787600Z","variant":"dummy"}
+{"event":"eot_sent","eot_id":0,"run":"smoke","runner":"solo","ts":"2026-05-11T23:53:31.643793500Z","variant":"dummy"}
+{"event":"phase","phase":"silent","run":"smoke","runner":"solo","ts":"2026-05-11T23:53:31.643804600Z","variant":"dummy"}
+```
+
+Counts: 303 `write`, 303 `receive`, 1 `eot_sent`, 0 `eot_timeout`.
+`connected.threading_mode == "single"`,
+`connected.recv_buffer_kb == 4096`.
+
+**Multi mode** -- exit 0; same log shape:
+
+```
+{"event":"phase","phase":"connect","run":"smoke","runner":"solo","ts":"2026-05-11T23:53:44.297976300Z","variant":"dummy"}
+{"elapsed_ms":298.0122,"event":"connected","launch_ts":"2026-05-11T23:53:44.000000000Z","recv_buffer_kb":8192,"run":"smoke","runner":"solo","threading_mode":"multi","ts":"2026-05-11T23:53:44.298015100Z","variant":"dummy"}
+{"event":"phase","phase":"stabilize","run":"smoke","runner":"solo","ts":"2026-05-11T23:53:44.298029600Z","variant":"dummy"}
+{"event":"phase","phase":"operate","profile":"scalar-flood","run":"smoke","runner":"solo","ts":"2026-05-11T23:53:44.298037400Z","variant":"dummy"}
+... (writes + matching receives) ...
+{"event":"phase","phase":"eot","run":"smoke","runner":"solo","ts":"2026-05-11T23:53:45.298269000Z","variant":"dummy"}
+{"event":"eot_sent","eot_id":0,"run":"smoke","runner":"solo","ts":"2026-05-11T23:53:45.298278200Z","variant":"dummy"}
+{"event":"phase","phase":"silent","run":"smoke","runner":"solo","ts":"2026-05-11T23:53:45.298288600Z","variant":"dummy"}
+```
+
+Counts: 303 `write`, 303 `receive`, 1 `eot_sent`, 0 `eot_timeout`.
+`connected.threading_mode == "multi"`,
+`connected.recv_buffer_kb == 8192`.
+
+Both modes produce the canonical `phase` ordering
+(connect -> stabilize -> operate -> eot -> silent) and identical
+event counts, confirming the new infrastructure is wired end-to-end
+without affecting the dummy's existing semantics.
+
+### Deviations from spec
+
+1. **`--threading-mode` made optional with default `single`, not
+   required.** The contract says "Required. Set by the runner from
+   the expanded `threading_modes` dimension". But T14.1 lands before
+   T14.8 (the runner-side change that does the injection), and the
+   task spec says "All existing workspace tests pass after the
+   worker's minimal signature updates to other variants." The runner
+   integration tests in `runner/tests/integration.rs` spawn
+   `variant-dummy` without `--threading-mode` today; making the arg
+   required would have broken every one of those tests and would
+   have forced a runner change to keep workspace tests green --
+   violating the explicit "DO NOT touch runner/" rule. The chosen
+   compromise: the arg defaults to `single` (the pre-E14 effective
+   behaviour and the WASM-compatible mode), the trait surface is
+   complete, every variant-base test that exercises the arg
+   round-trips both modes, and the contract description in
+   `variant-cli.md` "E14 additions" already says the arg is set by
+   the runner from the expanded dimension -- so the long-term
+   "required" outcome is preserved as soon as T14.8 lands and the
+   runner always injects the arg. Documented in
+   `variant-base/CUSTOM.md` "Threading-mode dimension (T14.1)" and
+   in the field's docstring. Workspace tests stay green and no
+   runner code is touched.
+
+2. **Commits 2 and 3 cannot stand alone individually.** The
+   suggested split lists 7 commits, several of which (e.g.
+   "feat(variant-base): add ThreadingMode type + supported_threading_modes
+   trait method") would not compile as a standalone commit -- the
+   suggested commit-1 wording adds a trait method, but the breaking
+   `connect` signature change happens later in the suggested order
+   and would leave the workspace broken between commits. Adjusted
+   the split to: (1) ThreadingMode type only; (2) full trait +
+   driver + CLI + logger + dummy + integration wiring; (3) six-
+   variants compile-fix; (4) jsonl-log-schema docs; (5) CUSTOM.md
+   docs. Each commit is self-contained and either compiles
+   variant-base in isolation (commits 1-2 -- workspace at commits
+   1-2 has the six variants still broken, which is the expected
+   state until commit 3 lands) or builds the whole workspace
+   (commits 3-5). The task spec explicitly allowed this kind of
+   adjustment: "If a commit shape doesn't fit the natural break in
+   your work, adjust -- these are suggestions."
+
+### Open concerns
+
+- **`stop_reader_threads` ordering relative to a blocked reader.**
+  The trait contract states that `stop_reader_threads()` is called
+  BEFORE `variant.disconnect()` so reader threads can drain pending
+  receives cleanly. A real reader thread spawned by T14.2 (websocket)
+  will be blocked inside `WebSocket::read_message` at the moment
+  `stop_reader_threads()` runs. The trait does not prescribe a
+  wake-up mechanism; T14.2 will set the precedent (likely
+  `AtomicBool` + short `SO_RCVTIMEO` so the read loop wakes up
+  every few ms, checks the flag, and exits cleanly). The current
+  trait surface is intentionally agnostic: it does not force the
+  variant to issue a peer-side shutdown from inside
+  `stop_reader_threads()` because some variants (websocket, hybrid
+  TCP) want to send a close frame from inside `disconnect()`, which
+  needs a still-live socket. The order is:
+  `stop_reader_threads -> disconnect (sends close, tears down
+  socket)`. Confirm with the T14.2 worker that this ordering meets
+  their needs before they implement.
+
+- **Drain semantics during `stop_reader_threads`.** A reader thread
+  may have decoded messages in flight in a bounded mpsc channel
+  between the OS recv buffer and the variant's `poll_receive` path
+  at the moment the driver calls `stop_reader_threads()`. The
+  driver is no longer in a polling loop at this point (the
+  protocol has already entered the disconnect path), so any
+  un-drained messages are lost. T14.2 will need to decide whether
+  to drain the channel before joining the reader thread or accept
+  the loss as a measurement artefact -- the trait does not
+  prescribe. The driver's pre-disconnect drain budget is
+  effectively zero now (the silent-phase poll loop has already
+  exited by the time `stop_reader_threads` runs). If T14.2 finds
+  this insufficient, the right place to address it is in the
+  driver, not the variant.
+
+### Commits
+
+- `cf4544a` feat(variant-base): add ThreadingMode type with FromStr/Display/serde
+- `e7c0009` feat(variant-base): wire threading-mode through trait, driver, CLI, logger, and VariantDummy
+- `56d28b1` chore(variants): add threading_mode arg to connect signatures (T14.1 compile-fix)
+- `0daad49` docs(contract): add threading_mode + recv_buffer_kb fields to connected event
+- `57d5401` docs(variant-base): document threading-mode dimension in CUSTOM.md
