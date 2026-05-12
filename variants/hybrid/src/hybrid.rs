@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use variant_base::types::{Qos, ReceivedUpdate};
+use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::{PeerEot, Variant};
 
 use crate::protocol::{self, Frame};
@@ -175,6 +175,16 @@ impl HybridVariant {
 impl Variant for HybridVariant {
     fn name(&self) -> &str {
         "hybrid"
+    }
+
+    /// Hybrid supports both `Single` and `Multi`. See T14.4 in
+    /// `metak-orchestrator/TASKS.md` and CUSTOM.md "Threading modes
+    /// (T14.4)". In `Single` mode `poll_receive` is the existing
+    /// inline UDP + TCP probe. In `Multi` mode the variant spawns one
+    /// UDP recv thread plus one per-peer TCP reader thread and the
+    /// driver thread only drains the resulting bounded mpsc.
+    fn supported_threading_modes(&self) -> &'static [ThreadingMode] {
+        &[ThreadingMode::Single, ThreadingMode::Multi]
     }
 
     fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
