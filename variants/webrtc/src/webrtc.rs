@@ -51,7 +51,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
-use variant_base::types::{Qos, ReceivedUpdate};
+use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::variant_trait::{PeerEot, Variant};
 
 use crate::pairing::{PairRole, PeerDesc};
@@ -766,11 +766,28 @@ impl Variant for WebRtcVariant {
         "webrtc"
     }
 
-    fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
-        // T14.1 compile-fix only -- the trait signature gained the
-        // threading-mode argument. Real Multi-only capability
-        // declaration + Single-mode rejection is filed under T14.6.
-        let _ = threading_mode;
+    fn supported_threading_modes(&self) -> &'static [ThreadingMode] {
+        // T14.6: webrtc-rs is fundamentally async and brings its own
+        // task pool (DTLS handshake, SCTP timers, ICE state machine,
+        // per-DataChannel on_message callbacks). A sync single-threaded
+        // WebRTC client would be a major rewrite of the upstream crate
+        // and defeats the point of benchmarking the off-the-shelf
+        // stack. We declare Multi only; `connect(Single)` errors
+        // before any I/O. See `variants/webrtc/CUSTOM.md` "Threading
+        // modes (T14.6)".
+        &[ThreadingMode::Multi]
+    }
+
+    fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()> {
+        // T14.6: reject Single mode BEFORE any I/O. Capability is
+        // declared via `supported_threading_modes()`; this is the
+        // belt-and-braces guard for the case the runner asks anyway.
+        if threading_mode == ThreadingMode::Single {
+            anyhow::bail!(
+                "variant-webrtc does not support single-threaded mode \
+                 (webrtc-rs requires async + task pool); spawn with --threading-mode multi"
+            );
+        }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_io()
@@ -1070,6 +1087,46 @@ mod tests {
             assert_eq!(label_to_qos(label), Some(qos));
         }
         assert_eq!(label_to_qos("unknown"), None);
+    }
+
+    /// T14.6: WebRTC declares Multi-only support. webrtc-rs brings its
+    /// own task pool; Single mode is not honourable.
+    #[test]
+    fn test_supported_threading_modes_is_multi_only() {
+        let signaling = SocketAddr::from(([127, 0, 0, 1], 0));
+        let media = SocketAddr::from(([127, 0, 0, 1], 0));
+        let v = WebRtcVariant::new("self", signaling, media, vec![]);
+        let modes = v.supported_threading_modes();
+        assert_eq!(modes, &[ThreadingMode::Multi]);
+    }
+
+    /// T14.6: `connect(Single)` must error BEFORE any I/O. The guard
+    /// must short-circuit before the variant builds its tokio runtime
+    /// or opens any sockets. We assert both the Err outcome and that
+    /// no runtime / channels / peer connections were stashed on
+    /// `self`, which is the structural sign that no I/O happened.
+    #[test]
+    fn test_connect_single_mode_errors_before_io() {
+        let signaling = SocketAddr::from(([127, 0, 0, 1], 0));
+        let media = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut v = WebRtcVariant::new("self", signaling, media, vec![]);
+        let err = v
+            .connect(ThreadingMode::Single)
+            .expect_err("connect(Single) must error for variant-webrtc");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not support single-threaded mode"),
+            "error message should explain Single is unsupported, got: {msg}",
+        );
+        assert!(
+            msg.contains("--threading-mode multi"),
+            "error message should point at the multi flag, got: {msg}",
+        );
+        assert!(v.runtime.is_none());
+        assert!(v.send_tx.is_none());
+        assert!(v.recv_rx.is_none());
+        assert!(v.shutdown_tx.is_none());
+        assert!(v.peer_connections.is_empty());
     }
 
     #[test]

@@ -42,6 +42,13 @@ fn binary_loopback_exits_successfully() {
             "self",
             "--run",
             "loopback01",
+            // T14.6: WebRTC requires Multi mode. Place this BEFORE
+            // `--peers` because `--peers` is an unrecognised arg
+            // (runner-injected) that triggers clap's trailing-var-arg
+            // collection; later recognised args would otherwise land
+            // in `extra` instead of being parsed.
+            "--threading-mode",
+            "multi",
             "--peers",
             "self=127.0.0.1",
             "--",

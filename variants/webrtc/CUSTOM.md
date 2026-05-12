@@ -385,3 +385,54 @@ overshoot is preferable to the cost of an additional fence here.
 - Re-negotiation after the initial offer/answer.
 - Recovery after a PeerConnection drop mid-spawn — log clearly and let
   the spawn fail. Cross-spawn isolation is the runner's responsibility.
+
+## Threading modes (T14.6)
+
+The WebRTC variant declares `supported_threading_modes() -> &[Multi]`. It
+does not support `ThreadingMode::Single` and `connect(Single)` returns
+an `Err` before any socket or task setup. The runner consults this
+declaration (per T14.8) and silently skips any
+`<name>-qos<n>-single` spawn the matrix expansion would otherwise
+produce.
+
+### Why no Single mode
+
+webrtc-rs is fundamentally async and brings its own task pool. Every
+PeerConnection internally spawns tasks for the DTLS handshake, the
+SCTP timers (heartbeat, retransmit, congestion control), the ICE
+state machine, and one per DataChannel for the user `on_message`
+callback. There is no synchronous configuration surface on
+`webrtc::api::APIBuilder` or `RTCPeerConnection` to disable any of
+this -- the crate's entire I/O loop assumes a running tokio runtime
+and freely uses `tokio::spawn`, `tokio::time::timeout`, and async
+locks throughout.
+
+Even a tokio-current-thread runtime would only collapse the worker
+pool down -- the runtime itself is still very much present, which is
+precisely the dependency the E14 single-threaded mode exists to
+remove for WASM-friendly deployments. Browser-WASM does not allow a
+multi-threaded tokio at all; WASI restricts threading. A real
+single-threaded WebRTC client in those environments uses the
+browser's native `RTCPeerConnection` JS API directly, not webrtc-rs
+compiled to WASM -- which is the right architecture but well outside
+this benchmark's scope (E3g exists to measure the off-the-shelf
+webrtc-rs stack on a LAN, not to reimplement it).
+
+Downstream consumers that need WebRTC DataChannels in WASM would
+either (a) use the browser's native `RTCPeerConnection` (no
+benchmark required) or (b) wait for a sans-IO Rust WebRTC crate to
+mature. Neither is on the project's current backlog.
+
+### `--recv-buffer-kb`
+
+webrtc-rs does not expose the underlying UDP socket(s) it allocates
+through `EphemeralUDP::new(...)` for ICE/DTLS/SCTP transport. There
+is no public hook on `SettingEngine` or `RTCPeerConnection` to set
+`SO_RCVBUF` on those sockets, and reaching into webrtc-rs internals
+to grab the `Arc<UdpSocket>` from its ICE agent is out of contract.
+The `--recv-buffer-kb` injected arg is therefore **advisory** for
+this variant: the value is recorded in the `connected` JSONL event
+(driver-side, per the contract) but the variant cannot honour
+per-spawn overrides. Operators tuning kernel buffers for WebRTC need
+to use OS-level sysctl knobs (`net.core.rmem_max` on Linux, the
+analogous Windows registry keys) outside the benchmark.
