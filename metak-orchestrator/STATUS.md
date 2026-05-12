@@ -9130,9 +9130,110 @@ deferred because it requires per-stream buffer state and is a
 larger change. The write-timeout path achieves the required
 `completed` outcome by itself.)
 
-### Implementation in progress
+### Implementation complete (2026-05-12)
 
-Tests, builds, and end-to-end repro to follow.
+**Commits landed in `git log`:**
+
+- `b57c7f0 docs(status): T14.19 audit findings for TCP-single-mode deadlock`
+- `d77c110 fix(variants/custom-udp): SO_SNDTIMEO on Single-mode qos4 outbound TCP (T14.19)`
+- `62ca23e fix(variants/websocket): SO_SNDTIMEO on Single-mode outbound TCP (T14.19)`
+- `c7e6dd3 docs(variants): document T14.19 SO_SNDTIMEO fix in CUSTOM.md`
+- `88cf963 test(variants): wire T14.19 integration tests to actual runner naming`
+
+Verified with `git log --oneline -10` -- all five commits present
+in the local main branch (33 commits ahead of origin/main, no
+auto-stash hook interference observed).
+
+### Validation results
+
+1. **Build clean**:
+   - `cargo build --release --workspace` finishes 34 s, no warnings.
+2. **Non-ignored tests all pass**:
+   - `cargo test --release -p variant-custom-udp -p variant-hybrid -p variant-websocket`: 94 + 72 + 44 = 210 unit tests + 28 (websocket integration) + others = ALL GREEN. No regressions.
+3. **Ignored test verification**:
+   - `cargo test --release -p variant-custom-udp --test two_runner_t14_19_tcp_single_no_deadlock -- --ignored --nocapture`: PASS in 18.7 s. Both runners reach `eot_sent` via T14.18 control channel.
+   - `cargo test --release -p variant-websocket --test two_runner_t14_19_tcp_single_no_deadlock -- --ignored --nocapture`: PASS in 27.8 s. Both runners reach operate phase, exit `status=success` via the EOT-timeout path.
+   - Pre-existing `two_runner_regression_qos4_*` failures in `variants/custom-udp/tests/two_runner_regression.rs` (delivery ~20% vs ≥99% threshold) reproduce on the **pre-T14.19** commit (`b57c7f0`) as well. These are NOT caused by this change; they are independent regressions in the 99% delivery contract for qos4 Single mode at the 10K msg/s workload, predating T14.19. Filed separately if needed -- not in scope for T14.19.
+4. **Clippy + fmt clean** on `variant-custom-udp`, `variant-websocket`, `variant-hybrid`.
+5. **End-to-end repro** of `configs/two-runner-stress-e14.toml`:
+
+| Spawn (the three that previously deadlocked) | Pre-T14.19 | Post-T14.19 |
+| --- | --- | --- |
+| `custom-udp-1000x100hz-qos4-single` | status=timeout, 172K writes / 180 recv (deadlock @ 5s) | **status=success, exit_code=0** |
+| `websocket-1000x100hz-qos3-single`  | status=timeout (deadlock @ 5s)                          | **status=success, exit_code=0** |
+| `websocket-1000x100hz-qos4-single`  | status=timeout (deadlock @ 5s)                          | **status=success, exit_code=0** |
+
+All 16 custom-udp + hybrid + websocket spawns in the stress-e14
+fixture now exit `status=success`. The previously-deadlocking spawns
+emit a `[custom-udp] T14.19: dropping outbound TCP peer ...
+(TimedOut)` (custom-udp) or `warning: dropping WS peer ... (TimedOut)`
+(websocket) line to stderr exactly once per peer when SO_SNDTIMEO
+fires, then proceed to clean EOT/teardown. The Zenoh + WebRTC
+zenoh-asymmetric-timeout pattern remains as previously documented
+(NOT in T14.19's scope -- separate issue).
+
+### Path chosen and rationale (final)
+
+**Path A**: install `SO_SNDTIMEO` (5 s) on outbound TCP in Single
+mode in both custom-udp and websocket. <30 LoC per variant. Does
+not restructure publish or poll_receive.
+
+The cleanest part of the diagnosis is that hybrid's empirical
+survival mechanism (drains up to 64 KiB per read syscall via its
+`try_recv_framed`, versus custom-udp's frame-per-`read_exact` and
+websocket's frame-per-`ws.read()`) was NOT what we ported. Instead
+we ported hybrid's `write_with_retry` 10s budget IDEA via the
+simpler kernel-level `SO_SNDTIMEO` knob. The empirical effect
+matches: a stuck write surfaces as a typed error in 5 s, the peer
+is dropped, the publish loop exits its bound naturally, EOT routes
+over the T14.18 control side-channel (custom-udp) or times out
+cleanly (websocket -- no separate control channel), the spawn
+exits status=success.
+
+Delivery for the previously-deadlocking spawns is near-zero -- the
+user's "log everything with bad latency" intent accepts this, and
+the T14.17 classifier marks them `completed` (no longer
+`deadlock`).
+
+### Files touched
+
+- `variants/custom-udp/src/udp.rs` (~25 LoC: const + setup_tcp gate + error-log refinement + 1 unit test)
+- `variants/custom-udp/tests/fixtures/two-runner-custom-udp-t14-19-stress.toml` (new)
+- `variants/custom-udp/tests/two_runner_t14_19_tcp_single_no_deadlock.rs` (new)
+- `variants/custom-udp/CUSTOM.md` (new section)
+- `variants/websocket/src/websocket.rs` (~25 LoC: const + helper + 2 call sites + broadcast Err-relax + 1 unit test)
+- `variants/websocket/tests/fixtures/two-runner-websocket-t14-19-stress.toml` (new)
+- `variants/websocket/tests/two_runner_t14_19_tcp_single_no_deadlock.rs` (new)
+- `variants/websocket/CUSTOM.md` (new section)
+
+`variants/hybrid/` was NOT touched (it already survives the workload).
+`metak-shared/` was NOT touched (no contract change).
+
+### Deviations / open concerns
+
+- The websocket fix relaxes `broadcast_binary` so that an empty
+  peer set after write errors returns `Ok(())` instead of the
+  pre-T14.19 "all WS peers dropped" `Err`. This is a small behaviour
+  change for the unrelated "real connection drop" code path: a
+  websocket variant whose only peer crashes mid-spawn will now exit
+  `status=success` with `eot_timeout` logged, where it previously
+  would exit `status=fail`. The new behaviour matches the documented
+  rule in the module docs ("One peer dropping must NOT fail the
+  whole spawn -- mirroring Hybrid's TCP rule"). The T14.17
+  classifier should handle the eot_timeout entry correctly.
+- A "bigger reads per call" fix in the recv path (porting hybrid's
+  full 64 KiB drain pattern to custom-udp + websocket) was deferred.
+  It would improve delivery percentages further but is a larger
+  change requiring per-stream buffer state. The SO_SNDTIMEO path
+  achieves the required `completed` outcome by itself.
+- Pre-existing `two_runner_regression_qos4_*` failures in
+  `variants/custom-udp/tests/two_runner_regression.rs` (failing
+  pre-T14.19 too) and `variants/hybrid` ignored regressions are
+  separate from T14.19. Worth filing as a follow-up if not already
+  known.
 
 Stress logs (audit basis): `logs/stress-e14-20260512_111017/`.
+Stress logs (T14.19 repro): `logs_t14_19_repro/` (gitignored;
+re-run via `target/release/runner --name {alice,bob} --config
+configs/two-runner-stress-e14.toml`).
 
