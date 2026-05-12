@@ -543,3 +543,106 @@ not just QoS-pair boundaries.
 Full spec: `metak-shared/api-contracts/toml-config-schema.md` "Variant
 Templates" and "Array Expansion" sections. Worker brief:
 `metak-orchestrator/TASKS.md` T-config.2.
+
+### Threading-mode dimension (T14.8)
+
+E14 adds a fourth expansion dimension on top of qos / tick_rate_hz /
+values_per_tick: `threading_modes`. The runner cross-products it with
+the existing dimensions and injects `--threading-mode <mode>` plus
+`--recv-buffer-kb <N>` into every spawned variant. Full spec lives in
+`metak-shared/api-contracts/toml-config-schema.md` ("E14 additions")
+and `variant-cli.md` ("E14 additions: threading mode and recv buffer").
+Code paths to mind when revisiting:
+
+- `config.rs`: `ThreadingMode` enum (string-only -- the runner does
+  NOT depend on `variant-base`), `ThreadingModesSpec` (mirrors the
+  `QosSpec` / `PositiveSpec` shape), `recv_buffer_kb()` accessor with
+  parse-time range validation (`64..=65536`), and the new
+  `[[variant]] supported_modes` field via `supported_modes_resolved()`.
+- `spawn_job.rs`: cross-product expansion now four-deep
+  (`tick_rate_hz` -> `values_per_tick` -> `qos` -> `threading_mode`).
+  Naming suffix `-<mode>` appears AFTER `-qos<N>` only when more than
+  one mode was requested. Sort order matches the contract: alphabetical,
+  so `multi` comes before `single`.
+- `cli_args.rs`: emits `--threading-mode <mode>` and
+  `--recv-buffer-kb <N>` unconditionally on every spawn (the
+  rollout-window default in `variant-base`'s clap is `single` /
+  4096, but from T14.8 onward the runner does not rely on those
+  defaults).
+- `main.rs::expand_and_gate_jobs`: applies capability gating before
+  resume-inventory and Phase 2 so the skip set / barrier ids / log
+  filenames are all aligned on the post-gating job list.
+
+#### Capability mechanism: Option A (static TOML declaration)
+
+T14.8 picks **Option A** over Option B (`--print-capabilities`
+runtime probe). Reasoning:
+
+- **Simpler.** No per-binary startup probe; no JSON-shape contract
+  for the probe response; no caching of probe results in the runner.
+  The runner stays unaware of how variants implement threading;
+  it just reads a list of strings from the config.
+- **Faster.** No process spawn per variant binary at startup. On
+  multi-host benchmarks that is N variants times one extra fork
+  each per runner -- not catastrophic, but wasteful.
+- **No new variant-side surface.** Option B would have required
+  T14.1's variant-base + every T14.5/T14.6/T14.7 worker to emit the
+  probe response, expanding the in-flight work-stream just to wire
+  up gating. Option A's per-entry TOML declaration is a config-side
+  responsibility -- the orchestrator can add it to each
+  `[[variant]]` block independently.
+
+The only trade-off: declarations CAN drift from the variant's actual
+trait impl. Treated as an acceptable risk because (a) variants that
+declare `supported_modes` wrongly will fail at `connect` time with a
+clear error and the existing T-impl.9 failure-diagnostics block will
+print the stderr capture inline, and (b) the trait-level
+`supported_threading_modes()` is the single source of truth on the
+variant side -- declarations in the TOML are an advisory layer the
+runner consults, NOT the contract a variant must honour.
+
+#### Permissive default for entries without `supported_modes`
+
+When a `[[variant]]` entry omits `supported_modes`, the runner treats
+EVERY requested threading mode as supported and emits a single
+stderr note per source entry (not per spawn):
+
+```
+[runner:<name>] note: variant '<name>' has no supported_modes declared;
+                     treating every requested threading_mode as supported
+```
+
+Reasoning: T14.8 lands ahead of every T14.2-T14.7 variant
+capability declaration. A strict default (e.g. "supports only
+single") would force the orchestrator to land every variant's
+declaration before any T14.8 run could exercise its Multi mode --
+serialising work that is supposed to run in parallel. The permissive
+default keeps T14.8 forward-compatible.
+
+If a variant lies and the requested mode causes `connect` to fail,
+the existing failure-diagnostics block surfaces the stderr capture
+in the runner's terminal. The operator sees the failure immediately
+and can either fix the variant's trait impl or pin the variant's
+`supported_modes` in the config.
+
+#### Capability-gating skip notice
+
+When the variant DOES declare `supported_modes` and the config
+requests a mode that is not in the list, the runner skips the spawn
+with a single stderr line and excludes it from the run summary:
+
+```
+[runner:<name>] skipping <effective_name>: variant does not support threading_mode=<mode>
+```
+
+Skipped spawns:
+- Do not appear in the run summary table.
+- Do not block on ready/done barriers.
+- Do not produce a JSONL log file.
+- Do not count as failures (the run still exits 0 if every executed
+  spawn succeeded).
+
+The exact line shape above is part of the T14.8 contract; the
+`integration.rs` test
+`threading_modes_capability_gating_skips_unsupported_with_notice`
+pins it.
