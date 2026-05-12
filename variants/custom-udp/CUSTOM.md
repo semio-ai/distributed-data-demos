@@ -184,7 +184,7 @@ Treat reads of `total_len > max_buffer_size` the same way (drop peer): a
 peer that asks us to allocate more than `--buffer-size` bytes is buggy
 or hostile, and silent truncation is worse than dropping the stream.
 
-### Threading modes (T14.3)
+### Threading modes (T14.3 + T14.16)
 
 Custom-UDP declares `[Single, Multi]` via
 `Variant::supported_threading_modes`. Both modes share `connect` /
@@ -197,7 +197,7 @@ Custom-UDP declares `[Single, Multi]` via
   `recv_from` and (at QoS 4) the inbound TCP streams via lazy accept +
   short-deadline framed reads, all on the driver thread.
 
-**Multi mode** (T14.3 addition).
+**Multi mode** (T14.3 addition; T14.16 channel split).
 
 - `start_reader_threads(Multi)` spawns one OS thread per recv-side
   socket:
@@ -211,24 +211,62 @@ Custom-UDP declares `[Single, Multi]` via
     s timeout) and then moved into per-peer reader threads; the
     listener is dropped afterwards. The same `SO_RCVTIMEO = 50 ms`
     pattern is used.
-- Each reader thread parses the binary header inline and pushes either
-  a `Data(Message)`, an `Eot(EotFrame)`, a `Nack(Vec<u8>)`, or a
-  `TcpPeerDropped` signal into a shared bounded `sync_channel`.
-- Channel bound: `4 * values_per_tick * (peer_count + 1)` floored at
-  `MULTI_CHANNEL_FLOOR` (16). The `+1` accounts for the UDP reader
-  alongside the per-TCP-peer readers.
-- Under sustained back-pressure (channel full), reader threads warn
-  once and drop the frame; QoS 1/2 tolerate the loss by definition and
-  QoS 3 NACK / QoS 4 framing semantics observed on the driver thread
-  are unchanged because the dropped item simply never lands in
-  `pending`.
-- `poll_receive` becomes a fast `try_recv` drain (`drain_multi_channel`)
-  that applies each item against the same state the Single-mode path
-  uses (`process_received_message`, `record_peer_eot`, `handle_nack`).
-- `stop_reader_threads` sets an `AtomicBool` flag, drops the receiver,
-  and joins each reader thread with a 2 s deadline per thread. Wedged
-  threads are logged once and abandoned -- preferred over deadlocking
-  the disconnect path.
+
+**Two-channel architecture (T14.16).**
+
+Pre-T14.16 the variant used a single bounded `sync_channel` for every
+`ReaderItem` variant (`Data`, `Eot`, `Nack`, `TcpPeerDropped`). The
+all-variants 100 K msg/s qos2 smoke surfaced an asymmetric same-host
+timeout: one runner saturated its bounded reader channel under
+sustained load and the saturated `try_send` dropped not only Data
+frames but the peer's `Eot` marker, forcing the peer's driver to wait
+the full `eot_timeout` and exit with `status=timeout`. T14.16 splits
+the reader-thread mpsc into two channels so EOT can never be dropped:
+
+- **Data channel** (`data_tx` / `data_rx`): bounded
+  `mpsc::sync_channel` carrying `ReaderDataItem::Data(Message)` only.
+  Bound: `4 * values_per_tick * (peer_count + 1)` floored at
+  `MULTI_CHANNEL_FLOOR` (16). Drop-on-full is acceptable here -- UDP
+  is best-effort by definition, and QoS 3/4 protocols on the driver
+  thread are unchanged because the dropped item simply never lands in
+  `pending`. Reader threads use `try_send`; on `TrySendError::Full`
+  the warning line is
+  `[custom-udp] multi: data channel full -- dropping Data frame (receiver saturated)`
+  (renamed from the pre-T14.16 wording so operators can be sure that
+  EOT was NOT lost when this line appears).
+- **Lifecycle channel** (`lifecycle_tx` / `lifecycle_rx`): unbounded
+  `std::sync::mpsc::channel` carrying `ReaderLifecycleItem::Eot`,
+  `Nack`, and `TcpPeerDropped`. Unbounded is safe because lifecycle
+  items are infrequent (O(peers) per spawn for `Eot`; O(peers) total
+  for `TcpPeerDropped`; O(gaps) for `Nack` -- only fired by the
+  receiver's gap detector, which is rare on same-host fixtures).
+  Reader threads use the blocking-by-API `Sender::send`, which on an
+  unbounded channel never actually blocks: the only failure mode is
+  receiver-dropped (driver tearing down), at which point the reader
+  thread exits.
+
+**NACK disposition (T14.16).** Worker folded `Nack` into the lifecycle
+channel rather than introducing a third sibling. Rationale: NACKs are
+rare (only emitted by the receiver's gap detector), losing them is
+catastrophic for QoS-3 reliability (the receiver would never get the
+retransmit), and one extra `std::sync::mpsc` channel keeps both the
+wiring and the drain path straightforward. The drain order on the
+driver thread is then "all lifecycle items first, regardless of
+flavour, then bounded data drain" -- which keeps the priority
+guarantee uniform across `Eot`, `Nack`, and `TcpPeerDropped`.
+
+- `poll_receive` -> `drain_multi_channel` drains
+  `lifecycle_rx.try_recv()` FIRST in an unconditional loop (lifecycle
+  items are rare, drain to empty), then drains `data_rx.try_recv()`
+  bounded by "first staged update". This keeps the
+  one-update-per-`poll_receive`-call shape used by Single mode while
+  guaranteeing EOT / NACK / PeerDropped observations are never starved
+  by a saturated data channel.
+- `stop_reader_threads` sets an `AtomicBool` flag, drops BOTH
+  receivers (closes the channels so reader threads observe
+  `Disconnected`), and joins each reader thread with a 2 s deadline
+  per thread. Wedged threads are logged once and abandoned -- preferred
+  over deadlocking the disconnect path.
 
 **`SO_RCVBUF`** (both modes).
 
