@@ -1321,27 +1321,37 @@ name = "v"
 
     #[test]
     fn two_runner_all_variants_expands_to_expected_spawn_list() {
-        // Locks in the post-rewrite spawn list for the headline config: every
-        // (variant family, vpt, hz, qos) combo from the original config is
-        // present, and no extras have crept in. Five families
-        // (custom-udp, hybrid, quic, zenoh, webrtc) emit the full 4-qos
-        // expansion (32 spawns each = 160), while websocket is restricted to
-        // qos [3, 4] (16 spawns), for a total of 176.
+        // Locks in the post-E14 spawn list for the headline config: every
+        // (variant family, vpt, hz, qos, threading_mode) combo expected from
+        // the config is present, and no extras have crept in. Math (post-E14
+        // threading_modes = ["single", "multi"] on every template):
+        //   - custom-udp / hybrid: 8 entries x 4 qos x 2 modes  = 64 each
+        //   - quic / zenoh / webrtc: 8 x 4 x 1 (Multi-only, gated by
+        //     supported_modes = ["multi"] per [[variant]])         = 32 each
+        //   - websocket: 8 x 2 (qos [3, 4]) x 2 modes            = 32
+        //   Total: 64 + 64 + 32 + 32 + 32 + 32                   = 256
+        //
+        // The runner's `expand_and_gate_jobs` is exercised here (not the raw
+        // `spawn_job::expand_variant`) so this test also covers T14.8
+        // capability gating against the per-[[variant]] supported_modes
+        // declarations.
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .join("configs/two-runner-all-variants.toml");
         let (config, _) = BenchConfig::from_file(&path).unwrap();
 
-        let mut spawn_names: Vec<String> = Vec::new();
-        for (idx, v) in config.variant.iter().enumerate() {
-            for job in crate::spawn_job::expand_variant(idx, v).unwrap() {
-                spawn_names.push(job.effective_name);
-            }
-        }
+        let mut notes: Vec<String> = Vec::new();
+        let gated =
+            crate::expand_and_gate_jobs(&config, "test", |l| notes.push(l.to_string())).unwrap();
+        let spawn_names: Vec<String> = gated.into_iter().map(|(_, j)| j.effective_name).collect();
 
         let mut expected: Vec<String> = Vec::new();
-        let full_qos_families = ["custom-udp", "hybrid", "quic", "zenoh", "webrtc"];
+        // Families that emit both threading modes (custom-udp / hybrid).
+        let both_modes_families = ["custom-udp", "hybrid"];
+        // Families that emit only -multi (gated by per-variant
+        // supported_modes = ["multi"]).
+        let multi_only_families = ["quic", "zenoh", "webrtc"];
         let vpt_hz_pairs: &[(u32, u32)] = &[
             (1000, 100),
             (1000, 10),
@@ -1351,25 +1361,57 @@ name = "v"
             (10, 100),
             (10, 1000),
         ];
-        for fam in &full_qos_families {
+        for fam in &both_modes_families {
             for (vpt, hz) in vpt_hz_pairs {
                 for qos in 1..=4 {
-                    expected.push(format!("{fam}-{vpt}x{hz}hz-qos{qos}"));
+                    for mode in ["multi", "single"] {
+                        expected.push(format!("{fam}-{vpt}x{hz}hz-qos{qos}-{mode}"));
+                    }
                 }
             }
             for qos in 1..=4 {
-                expected.push(format!("{fam}-max-qos{qos}"));
+                for mode in ["multi", "single"] {
+                    expected.push(format!("{fam}-max-qos{qos}-{mode}"));
+                }
             }
         }
-        // websocket family: qos restricted to [3, 4].
+        for fam in &multi_only_families {
+            for (vpt, hz) in vpt_hz_pairs {
+                for qos in 1..=4 {
+                    for mode in ["multi", "single"] {
+                        expected.push(format!("{fam}-{vpt}x{hz}hz-qos{qos}-{mode}"));
+                    }
+                }
+            }
+            for qos in 1..=4 {
+                for mode in ["multi", "single"] {
+                    expected.push(format!("{fam}-max-qos{qos}-{mode}"));
+                }
+            }
+        }
+        // websocket family: qos restricted to [3, 4], both modes.
         for (vpt, hz) in vpt_hz_pairs {
             for qos in [3, 4] {
-                expected.push(format!("websocket-{vpt}x{hz}hz-qos{qos}"));
+                for mode in ["multi", "single"] {
+                    expected.push(format!("websocket-{vpt}x{hz}hz-qos{qos}-{mode}"));
+                }
             }
         }
         for qos in [3, 4] {
-            expected.push(format!("websocket-max-qos{qos}"));
+            for mode in ["multi", "single"] {
+                expected.push(format!("websocket-max-qos{qos}-{mode}"));
+            }
         }
+
+        // Apply the same supported_modes = ["multi"] gating used by the
+        // runner: drop every "-single" expectation for the async-only
+        // families so the expected set matches the gated actual.
+        expected.retain(|name| {
+            let async_only = multi_only_families
+                .iter()
+                .any(|fam| name.starts_with(&format!("{fam}-")));
+            !(async_only && name.ends_with("-single"))
+        });
 
         let mut sorted_actual = spawn_names.clone();
         sorted_actual.sort();
@@ -1384,8 +1426,9 @@ name = "v"
         );
         assert_eq!(
             spawn_names.len(),
-            176,
-            "expected 5 families x 32 + websocket 16 = 176 spawns"
+            256,
+            "expected (custom-udp + hybrid) 64 each + (quic + zenoh + webrtc) 32 each + \
+             websocket 32 = 256 spawns"
         );
     }
 
