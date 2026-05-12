@@ -5190,6 +5190,165 @@ by E14; a pre-existing flakiness surfaced by parallel worker execution.
 
 ---
 
+### T14.13: variants/quic -- investigate ordering failures at qos4 reliable streams
+
+**Repo**: `variants/quic/`.
+**Status**: pending, filed 2026-05-12 by orchestrator after E14 smoke.
+
+#### Background
+
+The 2026-05-12 E14 smoke (`configs/two-runner-smoke-e14.toml`) ran QUIC
+at 100 vpt x 100 Hz x qos 4 (reliable). The T11.5 integrity report
+flagged both directions with `[FAIL: ordering]`:
+
+```
+quic-100x100hz-multi  alice->bob  qos 4  100,100 / 100,100  100.00%  41911 out-of-order
+quic-100x100hz-multi  bob->alice  qos 4  100,100 / 100,100  100.00%  41471 out-of-order
+```
+
+100% delivery (no loss) but ~42K out-of-order messages out of ~100K
+total per direction. That's a strong signal that the QUIC variant is
+emitting messages on parallel reliable streams without per-stream
+ordering downstream, or that the multi-stream interleave isn't being
+preserved in receive order.
+
+QoS 4 is supposed to be "reliable, ordered". If the variant uses one
+QUIC reliable stream end-to-end the kernel guarantees ordering; if it
+uses multiple parallel streams, ordering is per-stream only.
+
+#### Scope
+
+- Read `variants/quic/src/quic.rs` to determine the qos 4 stream
+  strategy.
+- If qos 4 uses multiple streams: either consolidate to one stream
+  per writer for true ordering, or accept per-stream ordering and
+  document the analysis-tool ordering check as not-applicable to
+  QUIC qos 4.
+- Update CUSTOM.md with the chosen semantics.
+
+#### Acceptance criteria
+
+- [ ] Root cause documented.
+- [ ] Either ordering is enforced or the integrity-check semantics
+  for QUIC qos 4 are adjusted with rationale.
+- [ ] T11.5 integrity report no longer flags `[FAIL: ordering]` for
+  QUIC qos 4 (or the gate is intentional and documented).
+
+#### Out of scope
+
+- QUIC qos 1-3 ordering. Different code paths; revisit if needed.
+
+---
+
+### T14.14: runner -- diagnose same-host coordination glitch on later spawns
+
+**Repo**: `runner/`.
+**Status**: pending, filed 2026-05-12 by orchestrator after E14 smoke.
+
+#### Background
+
+The 2026-05-12 E14 smoke (`configs/two-runner-smoke-e14.toml`) hit an
+asymmetric coordination glitch at the 8th of 9 spawns
+(`zenoh-100x100hz-multi`):
+
+- alice: stuck on `ready` barrier for zenoh-multi, timed out after 120s,
+  exited EX_TEMPFAIL (75).
+- bob: completed clock_sync (with unusually-high `rtt_ms=59.327` vs
+  ~0.3 ms for prior spawns), ran the variant to success
+  (`status=success, exit_code=0`), then timed out on the `done` barrier
+  waiting for alice, exited EX_TEMPFAIL.
+
+The 7 spawns before this all completed cleanly on both sides with
+sub-millisecond clock_sync RTTs. The webrtc spawn (9th) never ran
+because both runners aborted. The 59 ms RTT on bob's side suggests
+serious scheduler / network-stack contention at the moment of the
+zenoh-multi ready barrier — likely from prior spawns' lingering
+TIME_WAIT sockets or zenoh's startup work.
+
+The runner-runner discovery protocol seems to allow one side to
+proceed past `ready` while the other side never sees the confirmation.
+
+#### Scope
+
+- Reproduce (likely flaky; may need multiple smoke runs).
+- Determine whether the ready-barrier protocol drops UDP messages
+  under same-host port pressure, or whether one side cleans up too
+  quickly between spawns, or whether a clock_sync stall masks a
+  protocol bug.
+- Either harden the protocol (e.g. acknowledgement retries) or
+  document a same-host limitation.
+
+#### Acceptance criteria
+
+- [ ] Root cause identified.
+- [ ] Either a fix lands or a clear "known limitation" entry is added
+      to `metak-shared/api-contracts/runner-coordination.md`.
+
+#### Out of scope
+
+- Cross-machine coordination. This bug is same-host specific.
+
+---
+
+### T14.15: variants/hybrid -- characterise Single-mode catastrophic latency at 10K msg/s
+
+**Repo**: `variants/hybrid/` (research / analysis only; may produce no
+code change).
+**Status**: pending, filed 2026-05-12 by orchestrator after E14 smoke.
+
+#### Background
+
+The 2026-05-12 E14 smoke ran hybrid in Single mode at 100 vpt x 100 Hz
+x qos 4 (10K msg/s symmetric, qos 4 = TCP path). Result:
+
+```
+hybrid-100x100hz-single  multi  19,996 receives/s  99.95%  p50 1.11ms p99 9.61ms  Loss 0.05%
+hybrid-100x100hz-single  single    499.8 receives/s   3.46%  p50 8765.1ms p99 40643.6ms  Loss 96.54%
+```
+
+Receive throughput cratered from 20K msg/s to 500 msg/s. p50 latency
+8.7 seconds, p99 latency 40 seconds. CPU pegged at 100%. This matches
+T14.4 worker's smoke finding (3.90 / 3.99 % delivery) and is far more
+catastrophic than websocket Single (which dropped throughput to ~13K
+but kept 100% delivery and millisecond latency).
+
+The behaviour is consistent with hybrid's inline single-threaded TCP
+read loop being unable to keep up with the publisher even at 10K
+msg/s on the same machine. The user's stated intent
+("log all the messages being received with a very bad latency")
+applies here: we ARE logging everything, the latency just balloons
+to ~40 s on the tail.
+
+#### Scope
+
+This task is primarily INVESTIGATIVE. Questions to answer:
+- Is the 40-s tail latency consistent across runs, or is it
+  pathologically variable?
+- At what tick_rate_hz x vpt does hybrid Single transition from
+  "low latency" to "buffer-accumulation regime"?
+- Is the binding bottleneck the inline TCP read in `poll_receive`,
+  or the inline UDP path, or the blocking TCP write back-pressuring
+  the publisher?
+- Should hybrid be reworked to log-from-reader in Single mode too
+  (effectively making Single mode a single-thread-with-callback
+  model rather than fully inline)? Or do we accept that Single mode
+  is for low-rate workloads only and document the threshold?
+
+#### Acceptance criteria
+
+- [ ] Investigation report appended to
+      `metak-orchestrator/STATUS.md` documenting the answers.
+- [ ] Decision: rework, document threshold, or leave as-is.
+- [ ] If rework: separate implementation task filed.
+
+#### Out of scope
+
+- WebSocket Single mode (different ceiling, file separately if needed).
+- Custom UDP Single mode (its smoke result was effectively identical
+  to Multi at 10K msg/s, so it isn't motivated yet).
+
+---
+
 ### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (DEFERRED)
 
 **Repo**: `variants/zenoh/`, plus a small runner-side sidecar-spawn

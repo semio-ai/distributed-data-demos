@@ -7916,3 +7916,336 @@ the receive cost off the driver thread.
    but did not resolve it. Recommend the orchestrator pick this
    up as a follow-up; the new T14.4 fixture covers the same TCP
    path correctness and confirms the variant is healthy.
+
+---
+
+## T14.10 -- websocket log-from-reader (COMPLETE, 2026-05-12)
+
+### What I implemented
+
+Moved the Multi-mode JSONL `receive` write off the driver thread and
+onto the per-peer reader thread, lifting the high-rate delivery cliff
+that T14.2's drop-on-full design imposed.
+
+1. **`variant-base/src/logger.rs`**: added a `LoggerHandle` type --
+   a `Clone`-able `Arc<Mutex<Logger>>` wrapper that exposes
+   `log_receive` from any thread. The original owned `Logger` API is
+   untouched.
+2. **`variant-base/src/variant_trait.rs`**: added a
+   `Variant::attach_logger(logger: LoggerHandle)` trait method with
+   a default no-op. Variants whose reader threads write events
+   directly opt in by overriding it.
+3. **`variant-base/src/driver.rs`**: the driver now wraps its
+   `Logger` in a `LoggerHandle`, calls
+   `variant.attach_logger(handle.clone())` between `connect` and
+   `start_reader_threads`, and routes its own event emission through
+   a thin `LoggerProxy` so existing call sites (`logger.log_phase`,
+   `logger.log_write`, ...) are unchanged.
+4. **`variants/websocket/src/websocket.rs`**: the variant stores
+   an `Option<LoggerHandle>`, overrides `attach_logger`, and clones
+   the handle into each spawned reader thread.
+   `reader_thread_main` now calls `logger.log_receive(...)` directly
+   on every decoded `Frame::Data` and forgets the frame -- no mpsc
+   push. The `ReaderItem` enum lost its `Data` variant; the channel
+   is now lifecycle-only (`Eot`, `PeerDropped`) with a fixed
+   `LIFECYCLE_CHANNEL_CAPACITY = 256`. `poll_peers_once_multi`
+   drains lifecycle items and always returns `None`.
+5. **Tests**: added three unit tests covering attach-logger,
+   lifecycle-only mpsc behaviour, and PeerDropped processing.
+   Updated the existing reader-thread spawn-and-join test to
+   attach a tmpdir-scoped logger. Updated the high-rate ignored
+   test's docstring to record the T14.2 -> T14.10 progression.
+6. **`variants/websocket/CUSTOM.md`**: rewrote the "Threading
+   modes" section as "(T14.2 + T14.10)" with a new "T14.10 data
+   flow" subsection and a "Bounded-channel rationale
+   (lifecycle-only, post-T14.10)" replacement. The old
+   drop-on-full / 4-vpt-bounded-channel paragraphs were retired.
+
+### Logger thread-safety choice
+
+`Arc<Mutex<Logger>>` wrapped in a `LoggerHandle` newtype. Rationale:
+the existing `Logger` writes to a `BufWriter<File>` and is not
+internally thread-safe. The lock is held for the duration of one
+`serde_json::to_writer` + `\n` write per event -- microseconds in
+the common case -- so contention is minimal. The newtype keeps the
+public API narrow: only `log_receive` is exposed cross-thread today,
+which constrains future cross-thread callers from sneaking in
+driver-only events. The driver's existing single-owner mutable
+access is preserved via a `LoggerProxy` that re-locks per event.
+
+### Validation results
+
+All pre-task validation gates pass on Windows 11 + rustc 1.94.1:
+
+- `cargo build --release -p variant-websocket`: clean.
+- `cargo test --release -p variant-websocket`: 43 unit + 28
+  integration tests pass.
+- `cargo test --release -p variant-websocket -- --ignored`: all 3
+  ignored tests pass, including:
+  - `two_runner_websocket_1000x100hz_multi_high_rate` --
+    alice<-bob delivery 1555999/1556000 = 100.00%, bob<-alice
+    1544000/1544000 = 100.00%. Pre-T14.10 this test was failing
+    at ~28% under the same workload.
+  - `two_runner_websocket_both_modes_qos3_smoke` -- both Single
+    and Multi pass at the low-rate fixture.
+  - `two_runner_websocket_same_host_qos3_no_port_collision` --
+    passes.
+- `cargo clippy --release -p variant-websocket --all-targets --
+  -D warnings`: clean.
+- `cargo fmt -p variant-websocket -- --check`: clean.
+- `cargo clippy --release -p variant-base --all-targets --
+  -D warnings`: clean.
+- `cargo test --release --workspace --no-fail-fast`: **594 passed,
+  1 failed, 13 ignored**. The 1 failure is
+  `runner::config::tests::two_runner_all_variants_expands_to_expected_spawn_list`
+  -- a pre-existing spawn-name expansion mismatch in
+  `runner/src/config.rs` (every spawn now has both `-single` and
+  `-multi` suffixes from E14's `threading_modes` plumbing, but the
+  test's expected set still lists single-suffix names). I verified
+  with `git stash` that this fails identically on `main` without my
+  changes. It is unrelated to T14.10.
+
+### End-to-end repro
+
+Ran two-runner localhost against
+`configs/two-runner-websocket-qos4-multi-1000x100hz.toml` (alice in
+background, bob in foreground):
+
+```
+================ ALICE STDOUT ================
+Benchmark run: websocket-tImpl14_2-e2e-1000x100hz-multi
+Variant                  Runner   Status    Exit
+websocket-1000x100hz     alice    success   0
+websocket-1000x100hz     bob      success   0
+
+================ BOB STDOUT ================
+Benchmark run: websocket-tImpl14_2-e2e-1000x100hz-multi
+Variant                  Runner   Status    Exit
+websocket-1000x100hz     alice    success   0
+websocket-1000x100hz     bob      success   0
+```
+
+Both reached `eot_sent` and `eot_received` cleanly. Per-side
+write/receive counts within the writer's operate window:
+
+```
+alice writes in operate window: 1539000
+bob writes in operate window:   1572000
+alice received from bob (in bob window):   1571999/1572000 = 99.9999%
+bob received from alice (in alice window): 1538999/1539000 = 99.9999%
+```
+
+**Delivery >= 99% confirmed on both sides** -- 99.9999% in each
+direction, equivalent to one missed frame per ~1.5 M (likely the
+last in-flight frame after `eot_sent` exited the operate window).
+
+### Deviations
+
+None. The implementation followed the task spec exactly:
+
+- LoggerHandle is `Arc<Mutex<Logger>>` per task spec recommendation.
+- Reader thread logs via the handle and forgets the frame; no mpsc
+  push for Data.
+- mpsc is lifecycle-only (`Eot` + `PeerDropped`); fixed bound 256
+  (within the suggested ~256 slot range).
+- Driver's `poll_receive` continues to be called from operate-loop
+  and EOT-loop; it harvests lifecycle items only in Multi mode. No
+  driver changes were required (verified: driver only consumes
+  `Some(update)` and `None`; Multi mode returns `None` indefinitely
+  and the driver's only side effect for non-`Some` is to break the
+  drain inner loop, which is fine).
+- Single mode behaviour unchanged: driver still calls inline
+  `poll_receive` on the variant which still returns `Some(update)`
+  decoded inline; driver then logs as before.
+
+### Open concerns
+
+- **New throughput cliff**. T14.10 moves the bottleneck from the
+  bounded-channel drop point to the `Arc<Mutex<Logger>>`
+  contention point. At 100 K msg/s symmetric (the workload that
+  motivated T14.10) the cliff is not visible in the JSONL counts
+  -- both sides hit 99.9999%. The new ceiling is some combination
+  of:
+  1. Mutex contention between N reader threads + driver writers.
+  2. `serde_json::to_writer` + `BufWriter<File>` serialization cost.
+  3. Underlying file syscall throughput when the BufWriter spills.
+  I did not push beyond 100 K msg/s in this validation; the next
+  workload up would be `max-throughput` or a vpt=10000 fixture.
+  Recommend a follow-up T14.12 to characterise the new cliff if
+  the analysis tool starts comparing transports above this rate.
+- **Driver `poll_receive` in Multi mode is now structurally a
+  lifecycle-drain call rather than a data-drain call.** This is a
+  contract shift that other variants (custom-udp, hybrid) may
+  benefit from adopting, but T14.10 deliberately scoped to
+  websocket only. The task entry explicitly defers the
+  generalisation as T14.11 if motivated.
+- **Logger interleaving**. With N+1 writers (N reader threads +
+  the driver) into the same JSONL file, line ordering is no
+  longer strictly per-spawn monotonic across event types. The
+  analysis tool keys on `(variant, run, writer, seq, path)` so
+  this does not break downstream metrics, but anyone reading the
+  raw JSONL manually should be aware that a `write` and a
+  `receive` from the same wall-clock instant may appear in either
+  order. Documented in `variants/websocket/CUSTOM.md` "Ordering
+  and observability under T14.10".
+
+---
+
+## all-variants config fix + test refresh (COMPLETE, 2026-05-11)
+
+### What I did
+
+Unblocked `cargo test --release --workspace` by fixing two issues with
+the headline `configs/two-runner-all-variants.toml` config and the
+test that locks its expansion.
+
+1. **`configs/two-runner-all-variants.toml`** -- moved
+   `supported_modes` from every `[[variant_template]]` block to each
+   async-only `[[variant]]` entry. Specifically: removed it from all
+   six templates (custom-udp-base, hybrid-base, quic-base, zenoh-base,
+   webrtc-base, websocket-base) and added
+   `supported_modes = ["multi"]` to the 24 entries backed by
+   quic-base / zenoh-base / webrtc-base (8 entries x 3 templates).
+   TCP-family entries (custom-udp, hybrid, websocket) omit the field
+   entirely and inherit the runner's permissive default (every
+   requested mode is supported), which matches their actual
+   capability. Header comment and "Structure" paragraph updated to
+   document the new layout. Commit `dc0f662`.
+
+2. **`runner/src/config.rs::two_runner_all_variants_expands_to_expected_spawn_list`**
+   -- rewritten to mirror the post-E14 expansion math (256 spawns
+   instead of 176) and to exercise the T14.8 capability gating
+   end-to-end. The test now calls `crate::expand_and_gate_jobs`
+   (instead of the raw `spawn_job::expand_variant`) so the per-variant
+   `supported_modes` gating is verified by the same code path the
+   runner uses at startup. The expected-set builder mirrors the
+   gating: it drops every `-single` expectation for the three
+   async-only families before the comparison. Commit `430651d`.
+
+### Decisions
+
+- **TCP-family templates**: removed `supported_modes` rather than
+  leaving the documentation form (`["single", "multi"]`). Rationale:
+  the runner falls back to a permissive default when the field is
+  absent (treats every requested mode as supported and emits a
+  one-time stderr note per variant entry); the explicit form had no
+  runtime effect, so removing it keeps the config minimal and
+  consistent with the policy of only declaring `supported_modes`
+  where it actually gates spawns. The one-time stderr note is
+  expected for TCP-family entries in this config -- documented in
+  the header.
+
+- **Template inheritance for `supported_modes`**: NOT implemented.
+  The orchestrator's task brief offered this as an option but
+  explicitly required orchestrator approval before pursuing it. The
+  config-side fix is the agreed scope and works correctly today.
+
+### `expand_variant` vs `expand_and_gate_jobs`
+
+The orchestrator suspected `expand_variant` itself might gate Single
+for async-only at `[[variant]]` level. It does NOT. The capability
+gating lives one layer up in `runner/src/main.rs::expand_and_gate_jobs`,
+which calls `expand_variant` per source entry and then filters each
+job against `variant.supported_modes_resolved()`. The previous test
+called `expand_variant` directly, which is why it produced 352 (every
+mode expanded) once `threading_modes = ["single", "multi"]` was added
+to every template. Switching the test to `expand_and_gate_jobs` was
+the right fix and also tightens coverage (the unit suite did not
+previously exercise the gating path end-to-end against a real config).
+
+### Validation
+
+- `cargo test --release -p runner two_runner_all_variants_expands_to_expected_spawn_list`
+  -- PASS (256 spawns, exact name set matches).
+- `cargo test --release -p runner config::tests::all_repo_configs_parse`
+  -- PASS (every config in `configs/` parses cleanly).
+- `cargo test --release --workspace --no-fail-fast` -- all targeted
+  tests pass. One flake observed:
+  `runner::protocol::tests::done_barrier_hang_repro_when_peer_already_advanced`
+  failed during the full-workspace run but passes in isolation.
+  Unrelated to this task (network-coordination test). The previously
+  flagged `quic::tests::test_try_publish_qos1_reports_backpressure_under_burst`
+  did not flake this run.
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  -- clean.
+- `cargo fmt --check` -- clean.
+- Smoke test: `target/release/runner.exe --name alice --config configs/two-runner-all-variants.toml`
+  emits `[runner:alice] config loaded: run=all-variants-01, 48 variant(s), 2 runner(s), hash=6555fc8d6db5`
+  and proceeds to `starting discovery...` -- config parses without
+  error.
+
+### Summary
+
+Two small, surgical commits unblock the workspace test suite and
+correct the runtime behaviour of the headline benchmark config. The
+test now exercises the T14.8 gating path end-to-end so future
+regressions in either the config's `supported_modes` declarations or
+the gating logic in `expand_and_gate_jobs` will surface here.
+
+---
+
+## 2026-05-12 — E14 smoke (orchestrator): real cross-variant data + 3 follow-ups filed
+
+Ran `configs/two-runner-smoke-e14.toml` end-to-end on localhost: 6
+variants × qos 4 × both modes where supported (9 expected spawns
+after `supported_modes` gating skipped quic/zenoh/webrtc Single). 7
+spawns completed cleanly on both runners; the 8th
+(`zenoh-100x100hz-multi`) hit a runner-runner coordination glitch
+(filed as T14.14) and the 9th (`webrtc-100x100hz-multi`) never ran.
+
+### Cross-variant performance at 10K msg/s qos 4 symmetric (T11.5 output)
+
+```
+Variant                Thread   Receives/s  Delivery  Lat p50    Lat p99      Loss%
+custom-udp-multi       multi    19,980      99.95%    3.19 ms    10.63 ms     0.05%
+custom-udp-single      single   19,996      99.95%    1.11 ms    9.61 ms      0.05%
+hybrid-multi           multi    20,015      100%      1.13 ms    10.22 ms     0%
+hybrid-single          single      499.8     3.46%    8765 ms    40,644 ms    96.54%
+quic-multi (ordering!) multi    17,961      99.90%    5.99 ms    984.5 ms     0.10%
+websocket-multi        multi    20,015      100%      0.029 ms   0.203 ms     0%
+websocket-single       single   13,471      100%      1.04 ms    9.32 ms      0%
+zenoh-multi            multi    10,009      100%      0.350 ms   0.711 ms     0%
+```
+
+### Validation of T11.5 pipeline
+
+Receive throughput is now the headline column; write throughput moves
+to "Writes/s(req)" context; `threading_mode` is a real grouping
+dimension; `[late_tail_present]` annotation surfaces on websocket-multi
+(358 / 200K = 0.18%) and zenoh-multi (139 / 100K = 0.14%); QUIC
+ordering failures surface as `[FAIL: ordering]` integrity flag with
+41 K out-of-order out of 100 K per direction. The pivot delivers real
+analytical value -- a single glance now ranks variants by "did peers
+stay in sync".
+
+### Follow-ups filed (skeleton tasks in TASKS.md)
+
+- **T14.13** (quic): 41 K out-of-order messages per direction at qos 4
+  reliable. Likely multi-stream interleave; needs design decision
+  (consolidate to one reliable stream, or adjust integrity-check
+  semantics).
+- **T14.14** (runner): asymmetric coordination glitch at later spawns
+  on same-host. alice stuck on `ready` while bob completed full
+  spawn and stuck on `done`. clock_sync RTT on bob's side spiked to
+  59 ms (vs ~0.3 ms baseline) suggesting scheduler/socket pressure
+  from prior spawns' TIME_WAIT.
+- **T14.15** (hybrid): Single mode at 10K msg/s qos 4 cratered to
+  3.46 % delivery, p99 latency 40 seconds. The user's "log
+  everything with bad latency" intent IS satisfied (we're recording
+  all the late receives), but the threshold at which Single mode
+  becomes unusable on hybrid is much lower than expected. Worth
+  investigating the threshold curve.
+
+### Key win
+
+The E14 plumbing works end-to-end: TCP-family variants ran both modes,
+async-only variants ran Multi only via per-variant `supported_modes`
+gating with the expected stderr notice ("skipping
+quic-100x100hz-single: variant does not support
+threading_mode=single"). The orchestrator's per-variant
+`supported_modes` config decision was correct: zero failed spawns from
+capability mismatches.
+
+Commit: `663cd4a` smoke config; smoke logs at
+`logs/smoke-e14-20260512_040533/` preserved for inspection.
+
