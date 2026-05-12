@@ -1,0 +1,142 @@
+# E14 high-rate stress smoke. Exercises the original user-reported
+# failure cases from `logs/all-variants-01-20260512_093124/` at the
+# 1000 vpt x 100 Hz workload (100K msg/s symmetric) across all QoS
+# levels and both threading modes where supported.
+#
+# Pre-T14.16/T14.18: this pattern produced eot_lost on UDP Single,
+# deadlock on TCP qos4 Single, asymmetric timeouts on Multi qos2-3.
+# With the integrated fixes, every spawn should classify `completed`
+# per T14.17 (delivery percentage will still be catastrophic on UDP
+# Single -- that is the honest measurement of the kernel-overflow
+# cliff, not a failure).
+#
+# Total spawns: 32 (custom-udp 8 + hybrid 8 + websocket 4 + quic 4 +
+# zenoh 4 + webrtc 4). At 8s operate per spawn ~~ 8 min wall-time.
+#
+# Run from the repo root:
+#   target/release/runner --name alice --config configs/two-runner-stress-e14.toml
+#   target/release/runner --name bob   --config configs/two-runner-stress-e14.toml
+
+run = "stress-e14"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+# ─── Custom UDP ──────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "custom-udp-base"
+binary = "target/release/variant-custom-udp.exe"
+  [variant_template.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  stabilize_secs = 2
+  operate_secs = 8
+  silent_secs = 2
+  workload = "scalar-flood"
+  log_dir = "./logs"
+  threading_modes = ["single", "multi"]
+  [variant_template.specific]
+  multicast_group = "239.0.0.1:19501"
+  buffer_size = 65536
+  tcp_base_port = 19800
+  control_base_port = 19590
+
+[[variant]]
+template = "custom-udp-base"
+name = "custom-udp-1000x100hz"
+
+# ─── Hybrid UDP/TCP ──────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "hybrid-base"
+binary = "target/release/variant-hybrid.exe"
+  [variant_template.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  stabilize_secs = 2
+  operate_secs = 8
+  silent_secs = 2
+  workload = "scalar-flood"
+  log_dir = "./logs"
+  threading_modes = ["single", "multi"]
+  [variant_template.specific]
+  multicast_group = "239.0.0.1:19503"
+  tcp_base_port = 19900
+  control_base_port = 19595
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-1000x100hz"
+
+# ─── WebSocket (qos 3+4 only) ────────────────────────────────────────────────
+
+[[variant]]
+name = "websocket-1000x100hz"
+binary = "target/release/variant-websocket.exe"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  stabilize_secs = 2
+  operate_secs = 8
+  silent_secs = 2
+  workload = "scalar-flood"
+  qos = [3, 4]
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+  [variant.specific]
+  ws_base_port = 19960
+
+# ─── QUIC (Multi only) ───────────────────────────────────────────────────────
+
+[[variant]]
+name = "quic-1000x100hz"
+supported_modes = ["multi"]
+binary = "target/release/variant-quic.exe"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  stabilize_secs = 2
+  operate_secs = 8
+  silent_secs = 2
+  workload = "scalar-flood"
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+  [variant.specific]
+  base_port = 19930
+
+# ─── Zenoh (Multi only) ──────────────────────────────────────────────────────
+
+[[variant]]
+name = "zenoh-1000x100hz"
+supported_modes = ["multi"]
+binary = "target/release/variant-zenoh.exe"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  stabilize_secs = 2
+  operate_secs = 8
+  silent_secs = 2
+  workload = "scalar-flood"
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+  [variant.specific]
+  zenoh_mode = "peer"
+
+# ─── WebRTC (Multi only, qos 1-2 unreliable mode is fine here) ───────────────
+
+[[variant]]
+name = "webrtc-1000x100hz"
+supported_modes = ["multi"]
+binary = "target/release/variant-webrtc.exe"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  stabilize_secs = 2
+  operate_secs = 8
+  silent_secs = 2
+  workload = "scalar-flood"
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+  [variant.specific]
+  signaling_base_port = 19980
+  media_base_port = 20000
