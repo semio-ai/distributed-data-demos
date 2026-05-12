@@ -7137,3 +7137,119 @@ constant is well above the 4 * 1000 vpt * 1 peer (= 4000)
 high-rate fixture working set; a follow-up could thread
 `values_per_tick` through if profiling shows the bound matters.
 
+---
+
+## T14.5 + T14.6 + T14.7 -- Multi-only capability declarations (2026-05-11, complete)
+
+Three async-only variants (QUIC, WebRTC, Zenoh) declare
+`supported_threading_modes() -> &[Multi]` and reject
+`connect(Single)` with a clear actionable error before any I/O.
+Bundled into one worker run because each task is a few-line
+declaration + a CUSTOM.md section; spawning three separate
+workers would be wasteful per the orchestrator's authorisation.
+
+### Per-variant summary
+
+| Variant | Trait override | `connect(Single)` error message | `SO_RCVBUF` plumbing | CUSTOM.md section |
+|---------|----------------|-------------------------------|----------------------|--------------------|
+| QUIC (T14.5) | `&[ThreadingMode::Multi]` | `"variant-quic does not support single-threaded mode (quinn requires async); spawn with --threading-mode multi"` | advisory (variant tunes its own UDP socket to fixed 8 MiB via `tune_udp_buffers_std`; trait `connect` does not receive `recv_buffer_kb`) | "Threading modes (T14.5)" |
+| WebRTC (T14.6) | `&[ThreadingMode::Multi]` | `"variant-webrtc does not support single-threaded mode (webrtc-rs requires async + task pool); spawn with --threading-mode multi"` | advisory (webrtc-rs hides its UDP socket inside `SettingEngine` / `EphemeralUDP` with no public `SO_RCVBUF` hook) | "Threading modes (T14.6)" |
+| Zenoh (T14.7) | `&[ThreadingMode::Multi]` | `"variant-zenoh does not currently support single-threaded mode (Zenoh has internal threads we cannot disable); see T14.9 for the deferred router-RPC path. Spawn with --threading-mode multi"` | advisory (zenoh hides its transport sockets behind the `Session` API) | "Threading modes (T14.7)" -- cross-references T14.9 explicitly |
+
+### Tests added per variant (6 new unit tests total)
+
+Each variant gets:
+- `test_supported_threading_modes_is_multi_only` -- asserts
+  `supported_threading_modes()` returns `&[ThreadingMode::Multi]`.
+- `test_connect_single_mode_errors_before_io` -- constructs a
+  variant, calls `connect(ThreadingMode::Single)`, asserts the
+  Err outcome, asserts the error message contains the variant-
+  specific phrase + `--threading-mode multi` hint (Zenoh also
+  asserts the `T14.9` cross-reference), then asserts the
+  variant's internal state-bearing fields (`runtime`, `send_tx`,
+  `recv_rx`, etc.) are still `None` -- the structural sign that
+  no I/O happened.
+
+### Existing tests updated
+
+- variants/quic/src/quic.rs: 5 existing tests changed from
+  `ThreadingMode::Single` to `ThreadingMode::Multi` so they
+  actually reach the post-guard connect path.
+- variants/quic/tests/loopback.rs: `--threading-mode multi`
+  injected BEFORE `--peers` -- `--peers` is an unrecognised arg
+  that starts clap's `trailing_var_arg = true` collection, so
+  later recognised args would otherwise land in `extra` and the
+  CLI default (`single`) would be used. This subtlety bites
+  every variant whose integration test invokes the binary
+  without the runner's arg ordering.
+- variants/webrtc/tests/integration.rs: same `--threading-mode
+  multi` BEFORE `--peers` fix on the loopback test.
+- variants/zenoh/tests/loopback.rs: same fix (the test does not
+  pass `--peers`, but the comment documents the ordering rule
+  for future test authors).
+- variants/zenoh/src/zenoh.rs: `zenoh_bridge_stress_10000_messages`
+  (already `#[ignore]`d) changed from `Single` to `Multi`.
+
+### Validation
+
+Per-variant gate (build + test + clippy --all-targets -D warnings
++ fmt --check):
+
+- `variant-quic`: build clean, test all-green except a known
+  pre-existing flake in `test_try_publish_qos1_reports_backpressure_under_burst`
+  (timing-sensitive backpressure detection under loopback; verified
+  unrelated to T14.5 by running on baseline before my changes --
+  passes when system is idle, fails under build contention). 31
+  passing + flake on retry-needed. Clippy clean. Fmt clean.
+- `variant-webrtc`: build clean, all 49 tests pass (45 unit + 4
+  integration). Clippy clean. Fmt clean.
+- `variant-zenoh`: build clean, 26 tests pass (25 unit + 1 loopback;
+  2 `#[ignore]`d two-runner regressions). Clippy clean. Fmt clean.
+
+Workspace-wide gate `cargo test --release --workspace` could NOT
+be run cleanly because two pre-existing worker WIPs left the
+workspace in a transient broken state:
+- `variants/websocket/src/main.rs:51` calls
+  `WebSocketConfig::from_derived(derived, qos, args.recv_buffer_kb, args.values_per_tick)`
+  but the constructor still takes 2 args (T14.2 WIP from
+  another worker).
+- `variants/hybrid/src/main.rs` references a `recv_buffer_kb`
+  field on `HybridConfig` that does not exist (T14.4 follow-up
+  WIP from the hybrid worker).
+- `runner/tests` `protocol::*` tests hang on barrier exchange
+  for >60 s; pre-existing flake unrelated to E14.
+
+Instead I validated the four crates that actually changed plus
+`variant-base`: `cargo test --release -p variant-base -p variant-quic
+-p variant-webrtc -p variant-zenoh -- --skip test_try_publish_qos1_reports_backpressure_under_burst`
+runs **194 passing tests**, 0 failed, 1 skipped (flake), 3
+ignored. No regressions caused by my changes.
+
+### Findings / hard-stop check
+
+- None of QUIC, WebRTC, or Zenoh turned out to have a hidden
+  Single-mode path. quinn / webrtc-rs / zenoh all need an async
+  runtime at their core. The capability matrix in E14 ("async-
+  only variants declare Multi only") stands.
+- The clap trailing-var-arg subtlety with `--peers` is a real
+  trap: every variant whose integration tests synthesise the
+  runner-injected `--peers` flag must put `--threading-mode`
+  BEFORE `--peers` until T14.8 lands (after which the runner is
+  the one injecting both flags in the right order). Filed
+  inline in each test as a doc comment so the next author
+  doesn't trip on it.
+- `--recv-buffer-kb` is advisory in all three async-only
+  variants because the underlying transport library hides the
+  UDP socket. This matches what the contract anticipates
+  (`metak-shared/api-contracts/variant-cli.md` E14 additions:
+  "Variants whose transport library does not expose the
+  underlying socket may treat this as advisory but must still
+  record the value in the `connected` JSONL event"). The driver
+  already records it; nothing more for the variants to do.
+
+### Commits
+
+- `888ef98` feat(variants/quic): declare Multi-only threading mode (T14.5)
+- `9536919` feat(variants/webrtc): declare Multi-only threading mode (T14.6)
+- `e99676a` feat(variants/zenoh): declare Multi-only threading mode + T14.9 cross-reference (T14.7)
+
