@@ -37,3 +37,5 @@ binary = "target/release/variant-custom-udp.exe"
   multicast_group = "239.0.0.1:19544"
   buffer_size = 65536
   tcp_base_port = 19800
+  # T14.18: control TCP for EOT side-channel.
+  control_base_port = 20180

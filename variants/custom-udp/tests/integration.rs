@@ -52,6 +52,12 @@ fn run_custom_udp_variant(multicast_group: &str, tcp_base_port: &str, qos: u8, r
     let binary = env!("CARGO_BIN_EXE_variant-custom-udp");
     let tmp = tempfile::tempdir().unwrap();
     let qos_str = qos.to_string();
+    // T14.18: distinct --control-base-port per fixture so concurrent
+    // single-runner tests don't collide on the control listen port.
+    let control_base_port = format!(
+        "{}",
+        tcp_base_port.parse::<u16>().unwrap().saturating_add(200)
+    );
 
     let mut child = std::process::Command::new(binary)
         .args([
@@ -89,6 +95,8 @@ fn run_custom_udp_variant(multicast_group: &str, tcp_base_port: &str, qos: u8, r
             "65536",
             "--tcp-base-port",
             tcp_base_port,
+            "--control-base-port",
+            &control_base_port,
         ])
         .spawn()
         .expect("failed to spawn variant-custom-udp");
@@ -162,6 +170,8 @@ fn runner_not_in_peers_fails() {
             "65536",
             "--tcp-base-port",
             "19844",
+            "--control-base-port",
+            "20044",
         ])
         .output()
         .expect("failed to run variant-custom-udp");
