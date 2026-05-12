@@ -318,6 +318,13 @@ fn run(cli: &Cli) -> Result<()> {
                 path.display()
             );
         }
+        for path in &local.deleted_partial {
+            eprintln!(
+                "[runner:{}] resume: deleted partial log (crashed mid-spawn, no EOT marker) {}",
+                cli.name,
+                path.display()
+            );
+        }
         eprintln!(
             "[runner:{}] resume: local manifest has {} complete job(s)",
             cli.name,
