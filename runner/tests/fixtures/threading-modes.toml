@@ -1,0 +1,21 @@
+run = "tmod"
+runners = ["local"]
+default_timeout_secs = 30
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+supported_modes = ["single", "multi"]
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 0
+  operate_secs = 1
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  threading_modes = ["single", "multi"]
+  log_dir = "./test-logs-threading-modes"
+
+  [variant.specific]

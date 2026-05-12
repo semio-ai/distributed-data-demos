@@ -1,0 +1,23 @@
+run = "tmodg"
+runners = ["local"]
+default_timeout_secs = 30
+
+# Variant declares only "single" support. The runner must skip the
+# "multi" spawn with a stderr notice and NOT include it in the summary.
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+supported_modes = ["single"]
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 0
+  operate_secs = 1
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  threading_modes = ["single", "multi"]
+  log_dir = "./test-logs-threading-modes-gated"
+
+  [variant.specific]

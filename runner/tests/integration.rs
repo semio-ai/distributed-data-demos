@@ -622,6 +622,191 @@ fn template_and_array_expansion_produces_cartesian_product_log_files() {
     let _ = std::fs::remove_dir_all(&log_dir);
 }
 
+// -------------------------------------------------------------------
+// T14.8: threading_modes expansion end-to-end via variant-dummy.
+// VariantDummy declares both Single and Multi (variant-base T14.1), so a
+// single-runner config that requests both modes must produce 2 successful
+// spawns, 2 JSONL log files (suffixed `-single` / `-multi`), and both
+// `connected` events must record the matching `threading_mode` field.
+// -------------------------------------------------------------------
+
+#[test]
+fn threading_modes_expansion_runs_both_spawns_through_variant_dummy() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-logs-threading-modes");
+    let _ = std::fs::remove_dir_all(&log_dir);
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg("tests/fixtures/threading-modes.toml")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}");
+    eprintln!("--- stderr ---\n{stderr}");
+
+    assert!(
+        output.status.success(),
+        "runner should exit 0, got {:?}\nstderr: {stderr}",
+        output.status.code()
+    );
+
+    // Both spawn names must appear in the summary.
+    for needle in ["dummy-multi", "dummy-single"] {
+        assert!(
+            stdout.contains(needle),
+            "summary should contain {needle}, got:\n{stdout}"
+        );
+    }
+
+    // One timestamped log subfolder; one JSONL file per spawn.
+    assert!(log_dir.exists(), "log dir should exist");
+    let subdirs: Vec<_> = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert_eq!(subdirs.len(), 1, "expected exactly one timestamped subfolder");
+
+    let jsonl_files: Vec<String> = std::fs::read_dir(subdirs[0].path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        jsonl_files.len(),
+        2,
+        "expected exactly 2 JSONL files (one per mode), got {jsonl_files:?}"
+    );
+    assert!(
+        jsonl_files.iter().any(|f| f.contains("dummy-multi")),
+        "expected a dummy-multi log file, got {jsonl_files:?}"
+    );
+    assert!(
+        jsonl_files.iter().any(|f| f.contains("dummy-single")),
+        "expected a dummy-single log file, got {jsonl_files:?}"
+    );
+
+    // Each log's connected event must record the matching threading_mode.
+    for file in &jsonl_files {
+        let expected_mode = if file.contains("dummy-multi") {
+            "multi"
+        } else {
+            "single"
+        };
+        let contents = std::fs::read_to_string(subdirs[0].path().join(file)).unwrap();
+        let connected_line = contents
+            .lines()
+            .find(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|v| v.get("event").map(|e| e == "connected"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or_else(|| panic!("no `connected` event in {file}"));
+        let parsed: serde_json::Value = serde_json::from_str(connected_line).unwrap();
+        assert_eq!(
+            parsed.get("threading_mode").and_then(|v| v.as_str()),
+            Some(expected_mode),
+            "{file}: connected event threading_mode mismatch"
+        );
+        // recv_buffer_kb must also be present (default 4096 since the
+        // fixture does not override).
+        assert_eq!(
+            parsed.get("recv_buffer_kb").and_then(|v| v.as_u64()),
+            Some(4096),
+            "{file}: connected event recv_buffer_kb mismatch"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
+
+#[test]
+fn threading_modes_capability_gating_skips_unsupported_with_notice() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-logs-threading-modes-gated");
+    let _ = std::fs::remove_dir_all(&log_dir);
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg("tests/fixtures/threading-modes-gated.toml")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}");
+    eprintln!("--- stderr ---\n{stderr}");
+
+    assert!(
+        output.status.success(),
+        "runner should exit 0 (gated spawns are not failures), got {:?}\nstderr: {stderr}",
+        output.status.code()
+    );
+
+    // Stderr must carry the exact contract notice for the skipped multi spawn.
+    assert!(
+        stderr.contains(
+            "skipping dummy-multi: variant does not support threading_mode=multi"
+        ),
+        "stderr must carry the capability-gating skip notice, got:\n{stderr}"
+    );
+
+    // Summary must contain the single-mode spawn but NOT the multi-mode spawn.
+    assert!(
+        stdout.contains("dummy-single"),
+        "summary should contain dummy-single, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("dummy-multi"),
+        "summary must NOT contain dummy-multi (skipped), got:\n{stdout}"
+    );
+
+    // Only one JSONL file (the single-mode spawn) should have been produced.
+    assert!(log_dir.exists(), "log dir should exist");
+    let subdirs: Vec<_> = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert_eq!(subdirs.len(), 1, "expected exactly one timestamped subfolder");
+    let jsonl_files: Vec<String> = std::fs::read_dir(subdirs[0].path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        jsonl_files.len(),
+        1,
+        "expected exactly 1 JSONL file (gated multi spawn excluded), got {jsonl_files:?}"
+    );
+    assert!(
+        jsonl_files[0].contains("dummy-single"),
+        "expected dummy-single log file, got {jsonl_files:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
+
 /// Single-runner end-to-end resume: first run produces non-empty JSONL files;
 /// second run with `--resume` skips both spawns; third run with one file
 /// truncated re-runs only that one spawn.
