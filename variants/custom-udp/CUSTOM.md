@@ -184,6 +184,81 @@ Treat reads of `total_len > max_buffer_size` the same way (drop peer): a
 peer that asks us to allocate more than `--buffer-size` bytes is buggy
 or hostile, and silent truncation is worse than dropping the stream.
 
+### Threading modes (T14.3)
+
+Custom-UDP declares `[Single, Multi]` via
+`Variant::supported_threading_modes`. Both modes share `connect` /
+`disconnect`; the difference is on the receive side.
+
+**Single mode** (default; pre-E14 behaviour).
+
+- `start_reader_threads` / `stop_reader_threads` are no-ops.
+- `poll_receive` reads the UDP multicast socket via non-blocking
+  `recv_from` and (at QoS 4) the inbound TCP streams via lazy accept +
+  short-deadline framed reads, all on the driver thread.
+
+**Multi mode** (T14.3 addition).
+
+- `start_reader_threads(Multi)` spawns one OS thread per recv-side
+  socket:
+  - one UDP reader thread driving a *clone* of the multicast socket
+    (`UdpSocket::try_clone` so the variant keeps a non-blocking handle
+    for `publish`), switched to blocking with `SO_RCVTIMEO = 50 ms` so
+    it can periodically wake to observe the shutdown flag.
+  - at QoS 4: one thread per accepted inbound TCP peer. Inbound
+    streams are *pre-accepted* synchronously during
+    `start_reader_threads` (up to `tcp_peers.len()` of them, with a 30
+    s timeout) and then moved into per-peer reader threads; the
+    listener is dropped afterwards. The same `SO_RCVTIMEO = 50 ms`
+    pattern is used.
+- Each reader thread parses the binary header inline and pushes either
+  a `Data(Message)`, an `Eot(EotFrame)`, a `Nack(Vec<u8>)`, or a
+  `TcpPeerDropped` signal into a shared bounded `sync_channel`.
+- Channel bound: `4 * values_per_tick * (peer_count + 1)` floored at
+  `MULTI_CHANNEL_FLOOR` (16). The `+1` accounts for the UDP reader
+  alongside the per-TCP-peer readers.
+- Under sustained back-pressure (channel full), reader threads warn
+  once and drop the frame; QoS 1/2 tolerate the loss by definition and
+  QoS 3 NACK / QoS 4 framing semantics observed on the driver thread
+  are unchanged because the dropped item simply never lands in
+  `pending`.
+- `poll_receive` becomes a fast `try_recv` drain (`drain_multi_channel`)
+  that applies each item against the same state the Single-mode path
+  uses (`process_received_message`, `record_peer_eot`, `handle_nack`).
+- `stop_reader_threads` sets an `AtomicBool` flag, drops the receiver,
+  and joins each reader thread with a 2 s deadline per thread. Wedged
+  threads are logged once and abandoned -- preferred over deadlocking
+  the disconnect path.
+
+**`SO_RCVBUF`** (both modes).
+
+Honoured per `metak-shared/api-contracts/variant-cli.md` "E14
+additions: `--recv-buffer-kb`":
+
+- **UDP**: applied via `apply_recv_buffer_kb_udp` *as an upward floor
+  only*. The pre-existing `tune_udp_buffers` helper requests 8 MiB
+  for high-rate same-host fixtures; honouring a smaller
+  `--recv-buffer-kb` value (default 4 MiB) would silently regress
+  those tests, so the helper only upsizes the buffer above the
+  current achieved value. The Multi-mode UDP clone re-applies
+  `recv_buffer_kb * 1024` on the cloned descriptor unconditionally
+  because socket options aren't always inherited via `dup`.
+- **TCP**: applied unconditionally on every TCP socket the variant
+  owns -- outbound `tcp_out_streams` from `setup_tcp`, lazily-accepted
+  inbound streams in Single mode (`recv_tcp`), and synchronously-
+  accepted inbound streams in Multi mode
+  (`multi_accept_tcp_peers`). Kernel-default TCP SO_RCVBUF on Windows
+  is much smaller than 4 MiB so this is an honest upsize.
+
+**Out of scope for T14.3.**
+
+- Auto-tuning the channel bound at runtime based on observed
+  backpressure.
+- Off-thread NACK retransmission. NACK handling stays on the driver
+  thread (where `send_buffer` lives); only the parse / dedup step
+  moves to readers.
+- Per-thread CPU affinity. The OS scheduler decides.
+
 ### UDP buffer tuning (T-impl.2)
 
 Every UDP socket the variant creates (today: the multicast socket in
