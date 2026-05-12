@@ -362,8 +362,26 @@ impl EotDedup {
     }
 }
 
+/// Maximum payload size accepted on a reliable stream frame (length
+/// prefix value). 64 MiB is well above any realistic per-message size
+/// the variant emits today; the cap is a defensive guard against a
+/// malformed peer claiming a giant frame length.
+const RELIABLE_FRAME_MAX_BYTES: u32 = 64 * 1024 * 1024;
+
 /// Handle a single incoming QUIC connection: read datagrams and streams,
 /// forward decoded messages to recv_tx.
+///
+/// **Reliable-stream ordering (T14.13)**: each accepted unidirectional
+/// QUIC stream is treated as a long-lived ordered frame channel for the
+/// qos3/qos4 path. The read loop pulls length-delimited frames one at a
+/// time *in a single task*. Quinn guarantees per-stream byte order, so
+/// dispatching frames sequentially from a single reader preserves the
+/// writer's send order all the way through to the variant's inbound
+/// mpsc. The previous design opened a fresh stream per message and
+/// spawned a tokio task per stream that read_to_end-ed and pushed into
+/// the mpsc; even though each per-stream task was ordered, the
+/// cross-task race on the mpsc-send destroyed end-to-end order at
+/// ~42 K messages/spawn under the E14 smoke (T14.13 audit).
 async fn handle_connection(
     connection: quinn::Connection,
     recv_tx: mpsc::UnboundedSender<Inbound>,
@@ -394,28 +412,22 @@ async fn handle_connection(
         }
     });
 
-    // Spawn a task for reading uni streams.
+    // Spawn a task for accepting reliable uni streams. Per peer-pair
+    // we expect ONE long-lived reliable stream (T14.13), but accept any
+    // additional streams the peer opens too -- each gets its own
+    // ordered reader task. We do NOT spawn a fresh task per *frame*;
+    // each accepted stream runs a single read loop that pulls
+    // length-delimited frames and dispatches them in order so the
+    // variant's inbound mpsc preserves per-stream order.
     let stream_task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 result = connection.accept_uni() => {
                     match result {
-                        Ok(mut recv_stream) => {
+                        Ok(recv_stream) => {
                             let tx = recv_tx_stream.clone();
                             let dedup = dedup_stream.clone();
-                            tokio::spawn(async move {
-                                // Each uni-stream carries exactly one
-                                // frame (data or EOT). `read_to_end`
-                                // returns once the writer calls
-                                // `finish` and the stream is fully
-                                // drained -- that is also the
-                                // stream-end-as-EOT signal for the
-                                // reliable path: if the trailing frame
-                                // decodes to an Eot, we surface it.
-                                if let Ok(buf) = recv_stream.read_to_end(64 * 1024).await {
-                                    dispatch_decoded(&buf, &tx, &dedup).await;
-                                }
-                            });
+                            tokio::spawn(read_reliable_stream(recv_stream, tx, dedup));
                         }
                         Err(_) => break,
                     }
@@ -427,6 +439,55 @@ async fn handle_connection(
 
     let _ = dgram_task.await;
     let _ = stream_task.await;
+}
+
+/// Read length-delimited frames from a single reliable (uni) QUIC
+/// stream, dispatching each in order through the inbound pipeline.
+///
+/// Wire format on the stream:
+///   repeated: [u32 BE length][length bytes of frame payload]
+///
+/// The stream ends when the peer calls `finish()`; that surfaces as
+/// `Ok(None)` from `read` on the next length-prefix attempt (or
+/// `FinishedEarly(0)` from `read_exact`). EOT frames are sent on this
+/// same stream as the final length-delimited frame before `finish`.
+async fn read_reliable_stream(
+    mut recv_stream: quinn::RecvStream,
+    tx: mpsc::UnboundedSender<Inbound>,
+    dedup: Arc<EotDedup>,
+) {
+    loop {
+        let mut len_buf = [0u8; 4];
+        match recv_stream.read_exact(&mut len_buf).await {
+            Ok(()) => {}
+            Err(quinn::ReadExactError::FinishedEarly(0)) => {
+                // Clean end-of-stream right at a frame boundary --
+                // peer called `finish()`. No data lost.
+                return;
+            }
+            Err(_) => {
+                // Reset / connection error / partial frame. Drop the
+                // stream; the connection-level error path will surface
+                // separately.
+                return;
+            }
+        }
+        let frame_len = u32::from_be_bytes(len_buf);
+        if frame_len == 0 {
+            // Zero-length frame is malformed (every frame carries at
+            // least a tag byte). Stop reading defensively.
+            return;
+        }
+        if frame_len > RELIABLE_FRAME_MAX_BYTES {
+            // Defensive cap. Stop reading; the peer is misbehaving.
+            return;
+        }
+        let mut frame = vec![0u8; frame_len as usize];
+        if recv_stream.read_exact(&mut frame).await.is_err() {
+            return;
+        }
+        dispatch_decoded(&frame, &tx, &dedup).await;
+    }
 }
 
 /// Decode a single inbound buffer (datagram or finished uni-stream) and
@@ -649,11 +710,12 @@ impl Variant for QuicVariant {
     ///   honest backpressure signal: a receiver-visible seq gap is
     ///   acceptable for QoS 1/2.
     /// - **QoS 3 / QoS 4 (reliable streams)**: fall through to
-    ///   `publish` and return `Ok(true)`. Reliable streams flow-control
-    ///   inside quinn (`SendStream::write_all` awaits credit); the
-    ///   per-message `tokio::spawn` in `send_loop` means a seq gap is
-    ///   not introduced by the variant and the driver should not
-    ///   observe `backpressure_skipped` on the reliable path.
+    ///   `publish` and return `Ok(true)`. Reliable writes are
+    ///   serialised onto a **single long-lived unidirectional stream
+    ///   per connection** (T14.13) by the send_loop; quinn's per-stream
+    ///   flow control absorbs backpressure inside the `write_all` await
+    ///   without producing a seq gap. The send_loop is fed via the
+    ///   unbounded mpsc, so `publish` itself returns immediately.
     ///
     /// Note: quinn 0.11's `Connection::send_datagram` *cannot* return
     /// `SendDatagramError::Blocked` -- the wrapper forces `drop=true`
@@ -852,28 +914,49 @@ impl QuicVariant {
 }
 
 /// Background send loop: reads from the channel and sends over QUIC connections.
+///
+/// **Reliable-stream strategy (T14.13)**: opens ONE long-lived
+/// unidirectional QUIC stream per connection on first reliable use and
+/// writes length-delimited frames onto it serially (one `await` per
+/// frame, in channel order). QUIC guarantees per-stream ordering, so
+/// the receiver's single-task reader (`read_reliable_stream`) surfaces
+/// frames in exactly the order the send_loop pushed them. The previous
+/// strategy opened a fresh uni-stream per message and `tokio::spawn`-ed
+/// the write, which produced cross-stream interleaving on the network
+/// and ~42 K out-of-order receives per direction in the E14 smoke (see
+/// the T14.13 audit in STATUS.md).
+///
+/// If a per-connection reliable stream errors mid-spawn (peer dropped,
+/// flow-control reset, etc.) we drop the handle and lazily re-open on
+/// the next reliable send to that connection. EOT is the final
+/// length-delimited frame on the same stream; the stream is then
+/// `finish()`-ed on shutdown so the receiver sees a clean
+/// end-of-stream at a frame boundary.
 async fn send_loop(
     mut rx: mpsc::UnboundedReceiver<OutboundMessage>,
     connections: Vec<quinn::Connection>,
     mut shutdown_rx: ShutdownRx,
 ) {
+    // Per-connection reliable send-stream slots, parallel to
+    // `connections`. Lazily opened on first reliable use; reset to
+    // `None` on send error so the next reliable message re-opens.
+    let mut reliable_streams: Vec<Option<quinn::SendStream>> =
+        (0..connections.len()).map(|_| None).collect();
+
     loop {
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
                     Some(outbound) => {
                         for attempt in 0..outbound.retries.max(1) {
-                            for conn in &connections {
+                            for (idx, conn) in connections.iter().enumerate() {
                                 if outbound.reliable {
-                                    // Send via unidirectional stream.
-                                    if let Ok(mut send_stream) = conn.open_uni().await {
-                                        let data = outbound.data.clone();
-                                        tokio::spawn(async move {
-                                            if send_stream.write_all(&data).await.is_ok() {
-                                                let _ = send_stream.finish();
-                                            }
-                                        });
-                                    }
+                                    send_reliable_frame(
+                                        conn,
+                                        &mut reliable_streams[idx],
+                                        &outbound.data,
+                                    )
+                                    .await;
                                 } else {
                                     // Send via datagram (fire-and-forget).
                                     let _ = conn.send_datagram(outbound.data.clone().into());
@@ -891,6 +974,48 @@ async fn send_loop(
             }
             _ = shutdown_rx.changed() => break,
         }
+    }
+
+    // Cleanly finish every still-open reliable stream so the peer's
+    // read loop sees a frame-aligned end-of-stream. Errors during
+    // shutdown are ignored.
+    for slot in reliable_streams.iter_mut() {
+        if let Some(stream) = slot.as_mut() {
+            let _ = stream.finish();
+        }
+    }
+}
+
+/// Write one length-delimited frame onto the per-connection long-lived
+/// reliable stream, opening the stream lazily on first use. On error
+/// the stream slot is cleared so the next reliable message to this
+/// connection re-opens a fresh stream (best-effort; QUIC's underlying
+/// connection error will already surface on the receive side too).
+async fn send_reliable_frame(
+    conn: &quinn::Connection,
+    slot: &mut Option<quinn::SendStream>,
+    frame: &[u8],
+) {
+    // Open a fresh stream if we don't have one yet (first reliable
+    // send to this connection, or a prior send tore down the stream).
+    if slot.is_none() {
+        match conn.open_uni().await {
+            Ok(stream) => *slot = Some(stream),
+            Err(_) => return,
+        }
+    }
+    let Some(stream) = slot.as_mut() else {
+        return;
+    };
+    // Length-prefix framing: [u32 BE length][frame bytes]. The receiver
+    // peels this back in `read_reliable_stream`.
+    let len_prefix = (frame.len() as u32).to_be_bytes();
+    if stream.write_all(&len_prefix).await.is_err() {
+        *slot = None;
+        return;
+    }
+    if stream.write_all(frame).await.is_err() {
+        *slot = None;
     }
 }
 
@@ -1089,10 +1214,13 @@ mod tests {
     }
 
     /// Stream-close-with-trailer harness: write a data frame and then
-    /// an EOT frame on a uni-stream and `finish`; reader observes the
-    /// data first, then the EOT. Validates the per-frame stream
-    /// pattern (each `open_uni` carries one frame and ends in
-    /// `finish`).
+    /// an EOT frame on a SINGLE long-lived uni-stream, length-delimited,
+    /// then `finish`. The reader (`read_reliable_stream` via
+    /// `handle_connection`) observes the data first, then the EOT, in
+    /// the exact order they were written. Validates the T14.13
+    /// long-lived stream + length-delimited frame strategy: a single
+    /// task on the receive side preserves per-stream order through to
+    /// the inbound channel.
     #[tokio::test]
     async fn test_stream_close_with_trailer() {
         // Spin up a loopback Quinn endpoint pair.
@@ -1135,13 +1263,16 @@ mod tests {
         let data_frame = encode_data("alice", "/p", Qos::ReliableTcp, 1, &[10, 20, 30]);
         let eot_frame = encode_eot("alice", 99);
 
-        let mut s1 = conn.open_uni().await.unwrap();
-        s1.write_all(&data_frame).await.unwrap();
-        s1.finish().unwrap();
-
-        let mut s2 = conn.open_uni().await.unwrap();
-        s2.write_all(&eot_frame).await.unwrap();
-        s2.finish().unwrap();
+        // Single long-lived uni-stream carries both frames, each
+        // preceded by a u32 BE length prefix (T14.13 wire format).
+        let mut s = conn.open_uni().await.unwrap();
+        let data_len = (data_frame.len() as u32).to_be_bytes();
+        s.write_all(&data_len).await.unwrap();
+        s.write_all(&data_frame).await.unwrap();
+        let eot_len = (eot_frame.len() as u32).to_be_bytes();
+        s.write_all(&eot_len).await.unwrap();
+        s.write_all(&eot_frame).await.unwrap();
+        s.finish().unwrap();
 
         // Allow the streams to flush.
         let mut observed_data = false;
@@ -1241,11 +1372,16 @@ mod tests {
     /// queued datagram (quinn 0.11's `send_datagram` uses drop=true
     /// internally and never returns Blocked).
     ///
-    /// The test sends ~1 KiB datagrams in a tight loop on the variant's
-    /// main thread without ever yielding to the runtime, so the
-    /// outgoing buffer fills up and the variant's `try_publish` flips
-    /// to `Ok(false)`. Bounded by a 5-second deadline so the test
-    /// cannot hang if quinn changes its internal buffer size.
+    /// **B is disconnected before the burst** so A's outgoing
+    /// datagram buffer accumulates without the receiver draining; the
+    /// connection remains "established" from A's side (quinn marks
+    /// it as lost only after its idle-timeout, which is several
+    /// seconds long), so A keeps queueing datagrams until the
+    /// 1 MiB-ish quinn outgoing buffer is full. This makes the test
+    /// deterministic regardless of how fast the receiver normally
+    /// drains -- which became relevant after T14.13 made the reliable
+    /// path much cheaper and freed up runtime capacity for the
+    /// datagram drain on loopback.
     #[test]
     fn test_try_publish_qos1_reports_backpressure_under_burst() {
         // Pick two free ports on loopback for the pair.
@@ -1285,13 +1421,17 @@ mod tests {
             "variant A never established an outbound connection to B"
         );
 
+        // Tear down B so its receive side stops draining datagrams.
+        // From A's perspective the underlying quinn connection is
+        // still established for several seconds (until quinn's
+        // idle-timeout expires). Within our 5-second test window the
+        // outgoing datagram buffer therefore fills with no consumer,
+        // and `datagram_send_buffer_space()` reliably hits zero.
+        variant_b.disconnect().expect("disconnect b");
+
         // Sustain-burst ~1 KiB datagrams from A. The quinn-proto
-        // default datagram_send_buffer_size is 1 MiB
-        // (datagram_receive_buffer_size = 1 MiB on the receiver side,
-        // and the send buffer is configured separately but defaults
-        // around the same order). With ~1 KiB payloads we typically
-        // saturate in a few hundred sends before the tokio worker
-        // catches up.
+        // default datagram_send_buffer_size is 1 MiB. With B not
+        // draining, ~1000 1 KiB sends saturate the buffer.
         let payload = vec![0xABu8; 1024];
         let mut got_backpressure = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1314,7 +1454,6 @@ mod tests {
         );
 
         variant_a.disconnect().expect("disconnect a");
-        variant_b.disconnect().expect("disconnect b");
     }
 
     /// For QoS 3/4 (reliable streams) `try_publish` MUST always return
@@ -1358,6 +1497,106 @@ mod tests {
                 );
             }
         }
+
+        variant_a.disconnect().expect("disconnect a");
+        variant_b.disconnect().expect("disconnect b");
+    }
+
+    /// T14.13 unit regression: a burst of qos4 publishes from A to B
+    /// arrives at B in strict ascending seq order via
+    /// `poll_receive`. The reliable-stream strategy must be one
+    /// long-lived uni-stream per connection so QUIC's per-stream
+    /// ordering invariant carries the writer's send order all the way
+    /// through to the variant's inbound channel.
+    ///
+    /// This is the small-rate sibling of the
+    /// `tests/two_runner_t14_13_qos4_ordering.rs` end-to-end check;
+    /// here we drive the variant directly without subprocesses.
+    #[test]
+    fn test_qos4_in_order_receive_loopback() {
+        let port_a = pick_free_udp_port();
+        let port_b = pick_free_udp_port();
+        let addr_a: SocketAddr = format!("127.0.0.1:{}", port_a).parse().unwrap();
+        let addr_b: SocketAddr = format!("127.0.0.1:{}", port_b).parse().unwrap();
+
+        let mut variant_a = QuicVariant::new("a", addr_a, vec![addr_b]);
+        let mut variant_b = QuicVariant::new("b", addr_b, vec![addr_a]);
+        variant_b
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect b");
+        std::thread::sleep(Duration::from_millis(200));
+        variant_a
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect a");
+
+        // Wait for A's outbound connection to be established (otherwise
+        // publish() enqueues into a send_loop with zero connections and
+        // nothing is sent).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while variant_a.connections.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !variant_a.connections.is_empty(),
+            "variant A never established an outbound connection to B"
+        );
+
+        // Burst 2000 qos4 messages with increasing seq. The payload is
+        // small so the burst completes quickly; the test isn't about
+        // throughput, it's about *ordering*.
+        const N: u64 = 2000;
+        let payload = vec![0xCDu8; 64];
+        for seq in 0..N {
+            variant_a
+                .publish("/bench/0", &payload, Qos::ReliableTcp, seq)
+                .expect("publish qos4");
+        }
+
+        // Drain B's inbound channel until we have N receives or the
+        // deadline elapses. Using poll_receive matches the driver's
+        // real path so this asserts the end-to-end variant behaviour.
+        let mut received: Vec<u64> = Vec::with_capacity(N as usize);
+        let drain_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while received.len() < N as usize && std::time::Instant::now() < drain_deadline {
+            match variant_b.poll_receive() {
+                Ok(Some(update)) => {
+                    assert_eq!(update.writer, "a");
+                    assert_eq!(update.qos, Qos::ReliableTcp);
+                    received.push(update.seq);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => panic!("poll_receive errored: {e}"),
+            }
+        }
+
+        assert_eq!(
+            received.len(),
+            N as usize,
+            "expected {N} receives, got {}; first/last: {:?}/{:?}",
+            received.len(),
+            received.first(),
+            received.last(),
+        );
+
+        // The actual ordering assertion: with the one-stream-per-
+        // connection reliable strategy, B's poll_receive must return
+        // seqs in strict ascending order. Pre-T14.13 this fired
+        // because send_loop opened a fresh stream per message AND
+        // tokio::spawn-ed the write, so cross-stream interleaves
+        // produced out-of-order receives.
+        let mut out_of_order = 0usize;
+        for win in received.windows(2) {
+            if win[1] <= win[0] {
+                out_of_order += 1;
+            }
+        }
+        assert_eq!(
+            out_of_order,
+            0,
+            "qos4 receives must be strictly ascending; got {out_of_order} out-of-order events. \
+             First 20 seqs: {:?}",
+            &received[..received.len().min(20)],
+        );
 
         variant_a.disconnect().expect("disconnect a");
         variant_b.disconnect().expect("disconnect b");
