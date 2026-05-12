@@ -66,7 +66,8 @@ removed.
 ```toml
 [variant.specific]
 multicast_group = "239.0.0.1:19500"
-tcp_base_port   = 19900
+tcp_base_port     = 19900
+control_base_port = 20100  # T14.18
 ```
 
 Variant-specific CLI args:
@@ -75,6 +76,10 @@ Variant-specific CLI args:
   Same value used by all runners; no runner or QoS stride applied.
 - `--tcp-base-port <u16>` — required. Base port that per-runner / per-qos
   TCP ports are derived from.
+- `--control-base-port <u16>` — **required (T14.18)**. Base port for the
+  per-peer-pair TCP control side-channel that carries EOT frames
+  independently of the data path. See "Control side-channel (T14.18)"
+  below for the derivation formula and rationale.
 
 The variant also reads (from the standard runner-injected args, see
 `metak-shared/api-contracts/variant-cli.md`):
@@ -253,6 +258,94 @@ Where it lives:
 - `src/hybrid.rs::Variant::try_publish` — dispatches by QoS.
 - `src/hybrid.rs::Variant::publish` — unchanged; keeps the
   spin-on-WouldBlock UDP send and the blocking TCP broadcast.
+
+### Control side-channel (T14.18)
+
+Hybrid establishes a **per-peer-pair TCP control connection** at
+`connect()` time, separate from the data path (UDP multicast for
+qos1-2 and TCP per-pair for qos3-4). EOT markers are routed
+exclusively over this control connection regardless of QoS. Source:
+T14.18, after the all-variants 100K msg/s repro
+(`logs/all-variants-01-20260512_093124/`) showed `eot_lost` on
+Single mode under symmetric UDP saturation — the kernel UDP recv
+buffer fills faster than userspace can drain, and the EOT datagram is
+dropped at the kernel level. A separate TCP socket is the only way
+to make EOT robust to data-path saturation in Single mode (we can't
+just say "use Multi" because Single is a first-class WASM
+requirement).
+
+**Port derivation** (matches `derive_control_endpoints` in
+`src/main.rs`):
+
+```
+runner_stride = 1
+my_control_listen = control_base_port + runner_index * runner_stride
+                                              # NO QoS stride.
+```
+
+One control port per (runner, variant binary). The TOML field
+`control_base_port` is required.
+
+**Pairing** (same convention as Hybrid TCP / QUIC / WebSocket): the
+lower-sorted-name peer in a pair is the **server** (accepts on its
+derived port). The higher-sorted peer is the **client** (dials the
+server's port). Both sides set `TCP_NODELAY` immediately. Bounded
+retry on `ConnectionRefused` (30 s budget) so the two runners can
+race past the ready barrier without one's connect failing before the
+other's listener is bound.
+
+**Wire format** (length-prefixed binary, see
+`src/controltcp.rs`):
+
+```
+[u32 BE length] [tag: u8] [tag-specific payload]
+```
+
+Tags:
+- `0x01` — EOT marker. Payload is the existing `protocol::encode_eot`
+  bytes (same `(writer, eot_id)` shape used on the pre-T14.18 data
+  path).
+- `0x02` — `bye` marker. No payload follows. Sent during
+  `disconnect()` so the peer's read side gets a clean EOF.
+
+Frames are capped at 4 KiB (`MAX_CONTROL_FRAME_BYTES`).
+
+**Threading**:
+
+- **Multi mode**: one dedicated OS reader thread per control
+  connection (`src/controltcp.rs::spawn_control_reader`). The thread
+  reads length-prefixed frames in a blocking loop with
+  `MULTI_MODE_READ_TIMEOUT = 200 ms` and pushes decoded EOT markers
+  onto the existing T14.16 `lifecycle_tx` channel as
+  `HubLifecycleMessage::Eot { writer, eot_id }`. The data path is
+  unchanged.
+- **Single mode**: control socket is BLOCKING with a short
+  `SO_RCVTIMEO` (`SINGLE_MODE_READ_TIMEOUT = 1 ms`). The variant's
+  `poll_receive` polls each control peer inline via
+  `ControlPeer::try_recv_frame` before draining the data path. The
+  inline poll budget is microseconds per tick; no additional threads
+  are spawned. **Worker chose non-blocking polling over a dedicated
+  Single-mode control thread** because the per-tick cost is
+  negligible and the WASM-compatibility story is cleaner (data path
+  remains strictly single-threaded; the only auxiliary fd is the
+  control socket polled inline).
+
+**Lifecycle teardown** (in `disconnect`):
+
+1. Send a `bye` frame on every surviving control peer.
+2. `shutdown(Write)` the local write side so the peer's read sees
+   EOF after draining in-flight frames.
+3. Drain the read side until peer closes or `--eot-timeout-secs`
+   elapses (default 5 s, configurable via TOML). Any EOT frame that
+   arrives during the drain (typically a last EOT racing our own
+   `bye`) is applied. Single mode only — Multi mode already stopped
+   the control reader threads in `stop_reader_threads`.
+4. Drop the stream.
+
+**Removed**: pre-T14.18 EOT-over-multicast (qos1-2) and EOT-on-data-
+TCP (qos3-4) paths. `protocol::encode_eot_framed` is retained for
+tests only; `protocol::encode_eot` is still used as the inner payload
+of the control EOT frame.
 
 ### Threading modes (T14.4 + T14.16)
 
