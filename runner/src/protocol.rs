@@ -965,11 +965,10 @@ impl Coordinator {
                 if Instant::now() >= overall_deadline {
                     break;
                 }
-                let peer_index =
-                    match self.runners_order.iter().position(|r| r == &peer) {
-                        Some(i) => i,
-                        None => continue,
-                    };
+                let peer_index = match self.runners_order.iter().position(|r| r == &peer) {
+                    Some(i) => i,
+                    None => continue,
+                };
                 let peer_tcp_port = match self
                     .base_port
                     .checked_add(RESUME_MANIFEST_TCP_OFFSET)
@@ -1048,10 +1047,8 @@ impl Coordinator {
 
             // 4. Deadline reached?
             if Instant::now() >= overall_deadline {
-                let mut missing: Vec<String> = accept_pending
-                    .into_iter()
-                    .chain(connect_pending)
-                    .collect();
+                let mut missing: Vec<String> =
+                    accept_pending.into_iter().chain(connect_pending).collect();
                 missing.sort();
                 missing.dedup();
                 return Err(BarrierTimeoutError {
@@ -1251,9 +1248,8 @@ fn exchange_with_peer_via_accept(
     // 1. Read peer's manifest first.
     let peer_bytes = read_manifest_frame(&mut stream)
         .map_err(|e| anyhow!("resume_manifest accept: read frame failed: {}", e))?;
-    let peer_msg = Message::from_bytes(&peer_bytes).ok_or_else(|| {
-        anyhow!("resume_manifest accept: peer frame is not a valid Message")
-    })?;
+    let peer_msg = Message::from_bytes(&peer_bytes)
+        .ok_or_else(|| anyhow!("resume_manifest accept: peer frame is not a valid Message"))?;
     let (peer_name, peer_jobs) = match peer_msg {
         Message::ResumeManifest {
             name,
@@ -1330,9 +1326,8 @@ fn exchange_with_peer_via_connect(
     // 2. Read peer's manifest back.
     let peer_bytes = read_manifest_frame(&mut stream)
         .map_err(|e| anyhow!("resume_manifest connect: read frame failed: {}", e))?;
-    let peer_msg = Message::from_bytes(&peer_bytes).ok_or_else(|| {
-        anyhow!("resume_manifest connect: peer frame is not a valid Message")
-    })?;
+    let peer_msg = Message::from_bytes(&peer_bytes)
+        .ok_or_else(|| anyhow!("resume_manifest connect: peer frame is not a valid Message"))?;
     match peer_msg {
         Message::ResumeManifest {
             name,
@@ -1823,6 +1818,202 @@ mod tests {
             .unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all.get("local"), Some(&local_manifest));
+    }
+
+    /// T14.24 regression: a manifest much larger than the old UDP recv
+    /// buffer (`MAX_MSG_SIZE = 4096`) must survive the new TCP per-pair
+    /// exchange. Synthesises ~8 KB of `complete_jobs` strings per peer
+    /// so the serialised payload comfortably exceeds 4 KB in each
+    /// direction. With the pre-T14.24 UDP path this would silently fail
+    /// to parse on the receiver and the barrier would time out at 120 s.
+    #[test]
+    fn large_manifest_survives_tcp_exchange_t14_24() {
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let runners = vec!["large_a".to_string(), "large_b".to_string()];
+        let hash = "large-manifest-hash".to_string();
+
+        // Build a ~8 KB manifest by listing 256 distinct effective_names
+        // each ~25 chars long. Serialised JSON is well over 4 KB.
+        let jobs_a: Vec<String> = (0..256).map(|i| format!("variantA-suffix-name-{i:04}")).collect();
+        let jobs_b: Vec<String> = (0..256).map(|i| format!("variantB-suffix-name-{i:04}")).collect();
+        let jobs_a_clone = jobs_a.clone();
+        let jobs_b_clone = jobs_b.clone();
+
+        let runners_a = runners.clone();
+        let hash_a = hash.clone();
+        let thread_a = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "large_a".into(),
+                &runners_a,
+                hash_a,
+                port,
+                "sub".into(),
+                "run-large".into(),
+                true,
+            )
+            .unwrap();
+            coord.discover().unwrap();
+            coord.exchange_resume_manifest(jobs_a_clone, Duration::from_secs(30))
+        });
+
+        let runners_b = runners;
+        let thread_b = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "large_b".into(),
+                &runners_b,
+                hash,
+                port,
+                "sub".into(),
+                "run-large".into(),
+                true,
+            )
+            .unwrap();
+            coord.discover().unwrap();
+            coord.exchange_resume_manifest(jobs_b_clone, Duration::from_secs(30))
+        });
+
+        let res_a = thread_a
+            .join()
+            .unwrap()
+            .expect("large_a manifest must converge");
+        let res_b = thread_b
+            .join()
+            .unwrap()
+            .expect("large_b manifest must converge");
+
+        assert_eq!(res_a.len(), 2, "large_a must observe both manifests");
+        assert_eq!(res_b.len(), 2, "large_b must observe both manifests");
+        assert_eq!(res_a.get("large_a"), Some(&jobs_a));
+        assert_eq!(res_a.get("large_b"), Some(&jobs_b));
+        assert_eq!(res_b.get("large_a"), Some(&jobs_a));
+        assert_eq!(res_b.get("large_b"), Some(&jobs_b));
+    }
+
+    /// T14.24 regression: empty manifests on both sides still converge
+    /// over the new TCP path. This is the "fresh resume against a freshly
+    /// created log subfolder" case — neither peer has any complete jobs
+    /// yet.
+    #[test]
+    fn empty_manifests_converge_via_tcp_t14_24() {
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let runners = vec!["empty_a".to_string(), "empty_b".to_string()];
+        let hash = "empty-manifest-hash".to_string();
+
+        let runners_a = runners.clone();
+        let hash_a = hash.clone();
+        let thread_a = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "empty_a".into(),
+                &runners_a,
+                hash_a,
+                port,
+                "sub".into(),
+                "run-empty".into(),
+                true,
+            )
+            .unwrap();
+            coord.discover().unwrap();
+            coord.exchange_resume_manifest(vec![], Duration::from_secs(30))
+        });
+
+        let runners_b = runners;
+        let thread_b = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "empty_b".into(),
+                &runners_b,
+                hash,
+                port,
+                "sub".into(),
+                "run-empty".into(),
+                true,
+            )
+            .unwrap();
+            coord.discover().unwrap();
+            coord.exchange_resume_manifest(vec![], Duration::from_secs(30))
+        });
+
+        let res_a = thread_a.join().unwrap().expect("empty_a must converge");
+        let res_b = thread_b.join().unwrap().expect("empty_b must converge");
+        assert_eq!(res_a.len(), 2);
+        assert_eq!(res_b.len(), 2);
+        assert_eq!(res_a.get("empty_a"), Some(&Vec::<String>::new()));
+        assert_eq!(res_a.get("empty_b"), Some(&Vec::<String>::new()));
+        assert_eq!(res_b.get("empty_a"), Some(&Vec::<String>::new()));
+        assert_eq!(res_b.get("empty_b"), Some(&Vec::<String>::new()));
+    }
+
+    /// T14.24: the pairing rule (lower-sorted-name accepts, higher
+    /// connects) must work for any name pair. Exercise an unambiguous
+    /// ordering ("alpha" < "zulu") and confirm both peers receive each
+    /// other's manifest. Failure mode would be either both sides trying
+    /// to bind the same listener (one fails) or both sides trying to
+    /// connect to a non-listening port (timeout).
+    #[test]
+    fn tcp_pairing_uses_lower_sorted_name_t14_24() {
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let runners = vec!["alpha".to_string(), "zulu".to_string()];
+        let hash = "pairing-hash".to_string();
+
+        let runners_a = runners.clone();
+        let hash_a = hash.clone();
+        let thread_a = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "alpha".into(),
+                &runners_a,
+                hash_a,
+                port,
+                "sub".into(),
+                "run-pair".into(),
+                true,
+            )
+            .unwrap();
+            coord.discover().unwrap();
+            coord.exchange_resume_manifest(
+                vec!["one".into(), "two".into()],
+                Duration::from_secs(30),
+            )
+        });
+
+        let runners_b = runners;
+        let thread_b = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "zulu".into(),
+                &runners_b,
+                hash,
+                port,
+                "sub".into(),
+                "run-pair".into(),
+                true,
+            )
+            .unwrap();
+            coord.discover().unwrap();
+            coord.exchange_resume_manifest(
+                vec!["three".into(), "four".into()],
+                Duration::from_secs(30),
+            )
+        });
+
+        let res_a = thread_a.join().unwrap().expect("alpha must converge");
+        let res_b = thread_b.join().unwrap().expect("zulu must converge");
+        assert_eq!(
+            res_a.get("alpha"),
+            Some(&vec!["one".to_string(), "two".to_string()])
+        );
+        assert_eq!(
+            res_a.get("zulu"),
+            Some(&vec!["three".to_string(), "four".to_string()])
+        );
+        assert_eq!(
+            res_b.get("alpha"),
+            Some(&vec!["one".to_string(), "two".to_string()])
+        );
+        assert_eq!(
+            res_b.get("zulu"),
+            Some(&vec!["three".to_string(), "four".to_string()])
+        );
     }
 
     #[test]
