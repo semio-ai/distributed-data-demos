@@ -130,15 +130,18 @@ manifest of which spawn jobs they consider locally complete:
    non-empty. **Empty files are deleted at this point** (they represent
    crashed/aborted prior attempts and must be re-run cleanly).
 
-3. Each runner broadcasts a `ResumeManifest` message containing:
+3. Each runner exchanges a `ResumeManifest` payload with every peer via
+   a per-peer-pair TCP connection (see "Manifest exchange transport
+   (T14.24)" below). The payload carries:
    - `name`: this runner's identity
    - `run`: the bench config's run id (echoed for safety)
    - `complete_jobs`: sorted, deduplicated array of `effective_name`
      strings for which the local log file exists and is non-empty
 
 4. Each runner waits until it has received a manifest from every peer
-   listed in `runners` (with periodic re-broadcast every 500 ms, identical
-   to discovery's loss-recovery pattern).
+   listed in `runners` (the TCP exchange handles loss and ordering via
+   TCP's own retransmit; per-pair connect attempts retry until the peer's
+   listener binds, bounded by `--barrier-timeout-secs`).
 
 5. **Intersection rule**: a job is considered "fully complete" for the run
    iff its `effective_name` appears in every runner's manifest (including
@@ -158,6 +161,61 @@ Single-runner mode in resume: the inventory step still runs, but the
 intersection is just "self". A non-empty self-log = skip; otherwise run.
 No network exchange is needed; the cleanup rule still applies (delete
 empty files; partial-from-self is treated as complete-for-self).
+
+### Manifest exchange transport (T14.24)
+
+The manifest exchange uses **per-peer-pair TCP**, not UDP multicast. The
+ready / done barriers remain on UDP multicast for now; only Phase 1.25's
+ResumeManifest moved to TCP.
+
+Motivation: at full-matrix scale (e.g. all-variants-01 with ~192 spawn
+jobs), the serialised `ResumeManifest` JSON exceeds the runner's 4 KB
+UDP recv buffer. The pre-T14.24 UDP implementation silently truncated
+oversized datagrams, the receiver's parse returned `None`, and every
+500 ms re-broadcast resent the same over-sized payload. Both runners
+timed out at 120 s waiting for a manifest the kernel had already dropped.
+TCP per-peer-pair eliminates the truncation class of failure entirely
+and inherits TCP retransmit for free.
+
+Wire details:
+
+- **Pairing.** For each unordered peer pair `(a, b)` with
+  `a < b` lexicographically (by runner name), `a` accepts and `b`
+  connects. Self-loops do not exchange; only inter-peer pairs.
+- **Port derivation.** Each runner listens on
+  `--port + 32 + runner_index`, where `runner_index` is the runner's
+  position in the config's `runners` array (zero-based). The UDP
+  coordination range remains at `--port + runner_index`. The constant
+  `32` is the `RESUME_MANIFEST_TCP_OFFSET` in `runner/src/protocol.rs`
+  — chosen large enough to leave headroom for many-runner experiments
+  while staying inside the same low-numbered ephemeral region operators
+  already need to permit through the firewall for UDP coordination.
+- **Framing.** Each direction sends one length-prefixed frame:
+  `[u32 BE length][JSON bytes]`. The JSON is the same `ResumeManifest`
+  message wire-shape as the older UDP version. The accept side reads
+  first, then writes; the connect side writes first, then reads — this
+  matches by design and avoids any chance of a write-write deadlock.
+- **Reliability.** The connecting side retries its connect attempt
+  until the accepting side's listener has bound (process-startup skew
+  tolerance), bounded by the overall `--barrier-timeout-secs` deadline.
+  Once connected, TCP retransmit handles in-flight loss; an I/O error
+  fails that attempt and the connector retries.
+- **Defensive bounds.** Manifest payloads above 4 MiB
+  (`RESUME_MANIFEST_MAX_BYTES`) are rejected on read; this is well
+  above any plausible benchmark scale and prevents an unbounded
+  allocation on a peer that lies about its length prefix.
+
+On overall timeout (no convergence within `--barrier-timeout-secs`) the
+runner exits with code 75 (`EX_TEMPFAIL`) just like the ready / done
+barriers, and the wrapper scripts re-launch with `--resume` appended.
+
+The on-disk artefacts and intersection / cleanup semantics are
+**unchanged**; only the transport differs. A peer-pair where one side
+runs an older binary that still expects UDP multicast for ResumeManifest
+is not interoperable — but this is an internal coordination protocol on
+a single coordination port range, so all peers must run the same binary
+version anyway (the discovery `config_hash` check already enforces this
+indirectly via mismatched compiled config layouts).
 
 ## Phase 1.5: Initial Clock Sync
 
@@ -299,6 +357,11 @@ The resume protocol adds one new message type:
 
 The discover message gains two fields documented in Phase 1: `log_subdir`
 (string) and `resume` (bool).
+
+The `resume_manifest` message wire-shape is unchanged, but as of T14.24
+it is exchanged over a per-peer-pair TCP connection (length-prefixed
+JSON frame), not UDP multicast. See "Manifest exchange transport
+(T14.24)" under Phase 1.25 for the framing and pairing rules.
 
 ## Barrier Timeout
 
