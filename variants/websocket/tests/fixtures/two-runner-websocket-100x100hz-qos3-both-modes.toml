@@ -1,0 +1,27 @@
+# T14.2 regression fixture: two-runner-on-localhost websocket spawn at
+# the same (vpt, hz, qos) shape as `two-runner-websocket-100x100hz-qos3.toml`
+# but exercising BOTH threading modes via the runner's `threading_modes`
+# expansion. The expectations match the T-impl.4 fixture (non-zero
+# writes + non-zero cross-receives) in each mode.
+
+run = "websocket-tImpl14_2-100x100hz-qos3"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "websocket-100x100hz-qos3"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 3
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 3
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  ws_base_port = 19960

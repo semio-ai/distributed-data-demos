@@ -254,13 +254,115 @@ Where it lives:
 - `src/hybrid.rs::Variant::publish` — unchanged; keeps the
   spin-on-WouldBlock UDP send and the blocking TCP broadcast.
 
+### Threading modes (T14.4)
+
+Hybrid declares
+`supported_threading_modes() = &[Single, Multi]`. The driver chooses
+which mode to use per spawn via `--threading-mode` (runner-injected,
+T14.1) and the variant branches its receive path accordingly.
+
+**Audit (T14.4 first step)**: before T14.4, Hybrid was fully inline —
+zero `thread::spawn`, zero `mpsc`, zero `JoinHandle` in `src/`. The
+TCP path used per-peer `SO_RCVTIMEO`-driven polled reads (1 ms
+timeout, fault-tolerant on per-peer error) and the UDP path used
+non-blocking `recv_from`. The high-rate fixture (100 K msg/s) passes
+this way thanks to kernel back-pressure on the blocking TCP writes,
+not because of reader threads. See
+`metak-orchestrator/STATUS.md` "T14.4 -- variants/hybrid audit
+(2026-05-11)" for the full audit report.
+
+**Single mode** (`ThreadingMode::Single`): unchanged inline behaviour.
+`poll_receive` does a bounded loop probing UDP (`UdpTransport::try_recv`,
+non-blocking) and every TCP peer (`TcpPeer::try_recv_framed`, polled
+with `SO_RCVTIMEO = 1 ms` via the read clone). Each iteration
+consumes at most one frame; the loop returns Data, returns None
+(idle), or strictly drains a buffered frame. Single mode at high
+symmetric rates may saturate the driver thread — the variant has
+to interleave publish and receive on one OS thread — and the
+delivery measurement is the point of the dimension.
+
+**Multi mode** (`ThreadingMode::Multi`): `start_reader_threads(Multi)`
+spawns:
+
+- one UDP recv thread (`src/reader.rs::spawn_udp_reader`) that owns a
+  dedicated blocking recv-side `UdpSocket`. The primary UDP socket
+  stays non-blocking for `try_send_nonblocking` (the back-pressure
+  signal for QoS 1/2); the recv socket is a SECOND socket joined to
+  the same multicast group via `SO_REUSEADDR` + `join_multicast_v4`,
+  in BLOCKING mode with a short `SO_RCVTIMEO`
+  (`reader::UDP_READER_TIMEOUT = 200 ms`) so the reader can poll the
+  shutdown flag between attempts. Built by
+  `UdpTransport::make_blocking_recv_socket`.
+- one per-peer TCP reader thread (`src/reader.rs::spawn_tcp_reader`).
+  Each thread owns the read clone taken from a `TcpPeer` via
+  `TcpPeer::take_read_stream`, raised to `SO_RCVTIMEO = 200 ms` so
+  the reader wakes periodically to check shutdown.
+
+Both reader-thread families pre-decode `Frame`s and push
+`HubMessage`s onto a bounded `mpsc::sync_channel`
+(`reader::READER_CHANNEL_CAPACITY = 4096`). `try_send` (no blocking)
+drops on full-channel rather than blocking the reader; the driver
+drains the channel via `try_recv` inside
+`HybridVariant::poll_receive_multi`.
+
+Lifecycle:
+
+- `start_reader_threads` runs RIGHT AFTER `connect` returns. It
+  first calls `accept_pending_with_buffer` in a 5 s busy-wait so
+  inbound TCP connections are present before their reader threads
+  spawn (the stabilize phase gives the other runner time to dial).
+- `stop_reader_threads` is called by the driver BEFORE `disconnect`.
+  It flips the shared `AtomicBool`, calls `shutdown(Both)` on each
+  per-peer TCP read-side handle (to wake blocked reads), flips the
+  UDP recv socket to non-blocking (to wake the blocked recv), and
+  joins handles with a 2 s budget per handle via
+  `JoinHandle::is_finished` polling (detaches anything still
+  blocked).
+
+**`--recv-buffer-kb` plumbing (T14.1 / T14.4)**: every recv-side
+socket gets `SO_RCVBUF = recv_buffer_kb * 1024` applied:
+
+- primary UDP socket via `UdpTransport::apply_recv_buffer_kb` in
+  `connect`;
+- dedicated Multi-mode UDP recv socket at creation time
+  (`make_blocking_recv_socket`);
+- every outbound TCP socket inside `TcpTransport::connect_to_peer`;
+- every inbound TCP socket inside `TcpTransport::accept_pending`
+  (and the Multi-mode `accept_pending_with_buffer`).
+
+The user-tunable knob OVERRIDES the implicit 8 MiB target from
+`variant_base::tune_udp_buffers` (which is the default). A
+warning is emitted if the achieved `SO_RCVBUF` lands below the
+requested value (e.g. Windows silently clamping).
+
+**TCP connect race fix**: both runners pass the ready barrier and
+call `connect_to_peer` near-simultaneously; either side's listener
+may not be bound yet. `TcpTransport::connect_to_peer` now retries
+on `ConnectionRefused` / `TimedOut` / `WouldBlock` for a bounded
+5 s budget (mirrors the websocket variant's `ws_client_connect`).
+Without this retry, the qos4-multi spawn flakes ~50% of the time
+on Windows even on localhost.
+
 ### Testing
 
 - Unit test: message serialization/deserialization.
 - Unit test: QoS 2 stale-discard logic.
+- Unit test (T14.4 `reader.rs`): `ReaderHub::new`,
+  `stop_and_join` on empty hub, `push_or_drop` on
+  disconnected / full channels.
 - Integration test: single-process loopback. Synthesize the new CLI shape:
   `--peers self=127.0.0.1`, `--runner self`, `--multicast-group 239.0.0.1:<port>`,
   `--tcp-base-port <port>`, `--qos <1..4>`. Note that with a single-peer
   map, there are no peers to connect to (self is excluded by design); the
   test exercises bind/listen and message framing only. Cross-peer flow is
   validated end-to-end via two runners on localhost during T9.3 acceptance.
+- Two-runner regression (existing): `two_runner_regression_correctness_sweep`,
+  `two_runner_regression_highrate_no_cascade` (Single mode only, the
+  current behaviour these were written against).
+- Two-runner regression (T14.4): `two_runner_threading_modes_qos4_both_modes`
+  in `tests/two_runner_threading_modes.rs` exercises the
+  `threading_modes = ["single", "multi"]` expansion at
+  100 vpt * 100 Hz = 10 K msg/s symmetric on QoS 4. Asserts non-zero
+  cross-receives in both modes; does NOT assert a delivery threshold
+  for Single mode (per the T14.4 task spec, the actual figure is
+  just recorded in the test output).

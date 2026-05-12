@@ -437,3 +437,199 @@ fn two_runner_websocket_same_host_qos3_no_port_collision() {
          data path not established"
     );
 }
+
+/// T14.2 regression: run a 100x100hz qos3 fixture in both threading
+/// modes via `threading_modes = ["single", "multi"]`. Each expanded
+/// spawn must produce non-zero writes AND non-zero cross-receives.
+#[test]
+#[ignore]
+fn two_runner_websocket_both_modes_qos3_smoke() {
+    let _guard = serialize_tests().lock().unwrap_or_else(|p| p.into_inner());
+    let test_name = "both-modes-qos3";
+    if check_binaries_or_skip(test_name) {
+        return;
+    }
+    let fixture = repo_root()
+        .join("variants")
+        .join("websocket")
+        .join("tests")
+        .join("fixtures")
+        .join("two-runner-websocket-100x100hz-qos3-both-modes.toml");
+
+    let base_port: u16 = 30900;
+    let run = "websocket-tImpl14_2-100x100hz-qos3";
+
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = materialize_fixture(&fixture, tmpdir.path());
+
+    let start = Instant::now();
+    let deadline = start + PER_FIXTURE_TIMEOUT * 2;
+
+    let alice = spawn_runner("alice", &cfg_path, base_port);
+    let bob = spawn_runner("bob", &cfg_path, base_port);
+
+    let (alice_status, _alice_stdout, alice_stderr, alice_wall) =
+        wait_with_timeout(alice, "alice", deadline);
+    let (bob_status, _bob_stdout, bob_stderr, bob_wall) =
+        wait_with_timeout(bob, "bob", deadline);
+
+    let alice_stderr_s = String::from_utf8_lossy(&alice_stderr).into_owned();
+    let bob_stderr_s = String::from_utf8_lossy(&bob_stderr).into_owned();
+
+    eprintln!(
+        "[T14.2-ws] {test_name}: alice exit={:?} wall={:.2}s, bob exit={:?} wall={:.2}s",
+        alice_status.code(),
+        alice_wall.as_secs_f64(),
+        bob_status.code(),
+        bob_wall.as_secs_f64(),
+    );
+
+    assert!(
+        alice_status.success(),
+        "{test_name}: alice exited non-zero ({alice_status:?}); stderr:\n{alice_stderr_s}"
+    );
+    assert!(
+        bob_status.success(),
+        "{test_name}: bob exited non-zero ({bob_status:?}); stderr:\n{bob_stderr_s}"
+    );
+
+    let session_dir = find_session_dir(tmpdir.path(), run);
+
+    for mode in ["single", "multi"] {
+        let spawn_name = format!("websocket-100x100hz-qos3-{mode}");
+        let alice_log = locate_jsonl(&session_dir, &spawn_name, "alice", run);
+        let bob_log = locate_jsonl(&session_dir, &spawn_name, "bob", run);
+        assert!(alice_log.exists(), "missing alice JSONL ({mode})");
+        assert!(bob_log.exists(), "missing bob JSONL ({mode})");
+
+        let alice_parsed = parse_jsonl(&alice_log);
+        let bob_parsed = parse_jsonl(&bob_log);
+        let alice_writes = alice_parsed.writes_in_window();
+        let bob_writes = bob_parsed.writes_in_window();
+        let alice_recv_from_bob =
+            alice_parsed.receives_from_in_writer_window("bob", &bob_parsed);
+        let bob_recv_from_alice =
+            bob_parsed.receives_from_in_writer_window("alice", &alice_parsed);
+
+        eprintln!(
+            "[T14.2-ws/{mode}] alice <- bob: {alice_recv_from_bob}/{bob_writes} \
+             (alice_writes={alice_writes})"
+        );
+        eprintln!(
+            "[T14.2-ws/{mode}] bob <- alice: {bob_recv_from_alice}/{alice_writes} \
+             (bob_writes={bob_writes})"
+        );
+
+        assert!(alice_writes > 0, "T14.2/{mode}: alice zero writes");
+        assert!(bob_writes > 0, "T14.2/{mode}: bob zero writes");
+        assert!(alice_recv_from_bob > 0, "T14.2/{mode}: alice zero recv from bob");
+        assert!(bob_recv_from_alice > 0, "T14.2/{mode}: bob zero recv from alice");
+    }
+
+    drop(tmpdir);
+}
+
+/// T14.2 high-rate Multi-mode regression: 1000x100Hz (100 K msg/s) over
+/// QoS 4, threading_modes = ["multi"]. Asserts delivery >= 99% on both
+/// directions. This is the workload that exposed the T-impl.10 residual
+/// deadlock under Single mode.
+///
+/// Marked `#[ignore]` so default CI stays fast; run via:
+///     cargo test --release -p variant-websocket -- --ignored
+#[test]
+#[ignore]
+fn two_runner_websocket_1000x100hz_multi_high_rate() {
+    let _guard = serialize_tests().lock().unwrap_or_else(|p| p.into_inner());
+    let test_name = "1000x100hz-multi";
+    if check_binaries_or_skip(test_name) {
+        return;
+    }
+    let fixture = repo_root()
+        .join("variants")
+        .join("websocket")
+        .join("tests")
+        .join("fixtures")
+        .join("two-runner-websocket-1000x100hz-multi.toml");
+
+    let base_port: u16 = 30950;
+    let spawn_name = "websocket-1000x100hz-multi";
+    let run = "websocket-tImpl14_2-1000x100hz-multi";
+
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = materialize_fixture(&fixture, tmpdir.path());
+
+    let start = Instant::now();
+    let deadline = start + PER_FIXTURE_TIMEOUT * 3;
+
+    let alice = spawn_runner("alice", &cfg_path, base_port);
+    let bob = spawn_runner("bob", &cfg_path, base_port);
+
+    let (alice_status, _alice_stdout, alice_stderr, alice_wall) =
+        wait_with_timeout(alice, "alice", deadline);
+    let (bob_status, _bob_stdout, bob_stderr, bob_wall) =
+        wait_with_timeout(bob, "bob", deadline);
+
+    let alice_stderr_s = String::from_utf8_lossy(&alice_stderr).into_owned();
+    let bob_stderr_s = String::from_utf8_lossy(&bob_stderr).into_owned();
+
+    eprintln!(
+        "[T14.2-ws] {test_name}: alice exit={:?} wall={:.2}s, bob exit={:?} wall={:.2}s",
+        alice_status.code(),
+        alice_wall.as_secs_f64(),
+        bob_status.code(),
+        bob_wall.as_secs_f64(),
+    );
+
+    assert!(
+        alice_status.success(),
+        "{test_name}: alice exited non-zero ({alice_status:?}); stderr:\n{alice_stderr_s}"
+    );
+    assert!(
+        bob_status.success(),
+        "{test_name}: bob exited non-zero ({bob_status:?}); stderr:\n{bob_stderr_s}"
+    );
+
+    let session_dir = find_session_dir(tmpdir.path(), run);
+    let alice_log = locate_jsonl(&session_dir, spawn_name, "alice", run);
+    let bob_log = locate_jsonl(&session_dir, spawn_name, "bob", run);
+    let alice_parsed = parse_jsonl(&alice_log);
+    let bob_parsed = parse_jsonl(&bob_log);
+
+    let alice_writes = alice_parsed.writes_in_window();
+    let bob_writes = bob_parsed.writes_in_window();
+    let alice_recv_from_bob = alice_parsed.receives_from_in_writer_window("bob", &bob_parsed);
+    let bob_recv_from_alice = bob_parsed.receives_from_in_writer_window("alice", &alice_parsed);
+
+    let a_delivery = if bob_writes == 0 {
+        0.0
+    } else {
+        (alice_recv_from_bob as f64 / bob_writes as f64) * 100.0
+    };
+    let b_delivery = if alice_writes == 0 {
+        0.0
+    } else {
+        (bob_recv_from_alice as f64 / alice_writes as f64) * 100.0
+    };
+
+    eprintln!(
+        "[T14.2-ws/multi] alice <- bob: {alice_recv_from_bob}/{bob_writes} ({:.2}%)",
+        a_delivery
+    );
+    eprintln!(
+        "[T14.2-ws/multi] bob <- alice: {bob_recv_from_alice}/{alice_writes} ({:.2}%)",
+        b_delivery
+    );
+
+    drop(tmpdir);
+
+    assert!(alice_writes > 0, "alice writes == 0; spawn did not reach operate");
+    assert!(bob_writes > 0, "bob writes == 0; spawn did not reach operate");
+    assert!(
+        a_delivery >= 99.0,
+        "T14.2 Multi-mode delivery alice <- bob = {a_delivery:.2}% < 99% threshold"
+    );
+    assert!(
+        b_delivery >= 99.0,
+        "T14.2 Multi-mode delivery bob <- alice = {b_delivery:.2}% < 99% threshold"
+    );
+}

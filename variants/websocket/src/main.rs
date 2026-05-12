@@ -47,7 +47,8 @@ fn run() -> Result<()> {
     let derived = derive_endpoints(&peer_map, &args.runner, ws_base_port, args.qos)
         .context("WebSocket port derivation failed")?;
 
-    let config = WebSocketConfig::from_derived(derived, qos);
+    let config =
+        WebSocketConfig::from_derived(derived, qos, args.recv_buffer_kb, args.values_per_tick);
     let mut variant = WebSocketVariant::new(&args.runner, config);
     run_protocol(&mut variant, &args)?;
     Ok(())

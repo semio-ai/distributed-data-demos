@@ -246,39 +246,135 @@ After implementation:
   has the expected `connected` / `phase` / `eot_sent` / `eot_received`
   events and that delivery is ≥ 99% over the operate window.
 
-## Backpressure semantics (T-impl.7)
+## Threading modes (T14.2)
+
+The variant declares `supported_threading_modes() = &[Single, Multi]`
+and branches its IO model based on the `--threading-mode` CLI flag
+captured at `connect` time. `start_reader_threads(mode)` /
+`stop_reader_threads()` are the per-spawn lifecycle hooks called by
+`variant-base`'s driver around connect/disconnect.
+
+### When each mode is chosen
+
+- **Single** mode: pre-E14 behaviour. The driver thread does inline
+  reads + writes via tungstenite. Suitable for low-rate workloads
+  (e.g. 100 vpt * 100 Hz = 10 K msg/s) where the driver can interleave
+  publish + drain within the tick budget without falling behind. Single
+  mode is the default and is what runs when `--threading-mode` is
+  absent (T14.1 rollout phase) or set to `single`.
+- **Multi** mode: per-peer OS reader thread + bounded mpsc + driver-side
+  `try_recv`. Suitable for high symmetric rates (e.g. 1000 vpt * 100 Hz
+  = 100 K msg/s) where Single mode's inline-read budget is exhausted
+  by `publish` overhead and the driver can no longer drain the recv
+  buffer in time. Multi mode is the deadlock-breaking path for the
+  T-impl.10 residual failure.
+
+### Reader-thread ownership model
+
+For each peer, after the WS handshake completes, the variant captures
+the underlying `TcpStream` and:
+
+- In Single mode: stores the full `WebSocket<TcpStream>` inside the
+  peer record. The driver thread calls `ws.read()` / `ws.send()`
+  directly.
+- In Multi mode: clones the underlying `TcpStream` (via
+  `TcpStream::try_clone`), hands the original `WebSocket<TcpStream>`
+  to a dedicated reader thread, and stores the cloned stream + a
+  separate `WebSocketContext` (write-side framing state, Role-matched
+  to the per-pair role) inside the peer record behind an
+  `Arc<Mutex<MultiWriter>>`. The driver thread takes the writer mutex
+  briefly for each `publish` call. The reader thread loops on
+  `WebSocket::read` with the short SO_RCVTIMEO and pushes decoded
+  frames into a shared `SyncSender<ReaderItem>`.
+
+The mutex serialises outbound frames so two concurrent publishers
+never interleave WebSocket frame bytes on the wire (illegal framing).
+The reader thread never writes to the shared TCP socket from
+publish-bytes -- only tungstenite-internal auto-pong responses go
+through the read-side socket, which is the same kernel TCP connection
+as the write-side clone so pongs reach the peer correctly.
+
+### Bounded-channel rationale and drop-on-full
+
+The shared mpsc is sized `4 * values_per_tick * peer_count`, floored
+at 16 for tiny tests. The bound prevents OOM if the driver thread
+stalls. To break the T-impl.10 deadlock at high symmetric rates we
+take an explicit position:
+
+- **Data items use drop-on-full.** When the channel is full, the
+  reader thread drops the decoded frame and continues reading the
+  next byte off the TCP socket. This is the critical property that
+  prevents the symmetric-flood deadlock: the reader thread NEVER
+  blocks on the channel, so the kernel TCP recv buffer keeps
+  draining, so the peer's writer never blocks indefinitely on its
+  end-of-test broadcast. Dropping a data item undercounts JSONL
+  `receive` events for that peer but does not affect on-wire
+  transport (QoS 3/4 reliability is provided by kernel TCP, not by
+  the variant's logging path).
+- **EOT items use blocking-send with shutdown escape.** EOT markers
+  are critical for the end-of-test synchronization; dropping one
+  forces the peer's driver to wait the full `eot_timeout`. By EOT
+  time the data flood has stopped and the channel is draining, so
+  blocking briefly (1 ms retry loop) is safe.
+
+### `stop_reader_threads` semantics
+
+Called by the driver immediately before `disconnect`. Sets an
+`AtomicBool` shutdown flag and drops the variant's retained sender so
+the receiver will eventually observe `Disconnected` on drain. Each
+reader thread checks the flag every ~1 ms (between SO_RCVTIMEO-bounded
+reads) and exits on the next iteration. The join uses a 2 s wallclock
+budget per thread; if a reader is wedged inside a long Windows
+overlapped-recv beyond that, we log a warning and abandon the thread
+-- Rust will tear it down at process exit. This is the documented
+Windows caveat from T-impl.8.
+
+### `SO_RCVBUF` tuning
+
+In BOTH modes, immediately after the WS handshake completes, the
+variant calls `setsockopt(SO_RCVBUF, recv_buffer_kb * 1024)` on the
+underlying TCP socket via `socket2::Socket`. On failure (some
+OSes silently cap very large requests) the variant logs a warning
+and continues with the kernel default. `recv_buffer_kb` is plumbed
+through from `variant-base`'s `--recv-buffer-kb` CLI arg (default
+4096 / 4 MiB).
+
+## Historical notes
+
+### Backpressure semantics (T-impl.7) -- superseded by T14.2 for high-rate workloads
 
 T-impl.7 added `Variant::try_publish` so transports that can cheaply
 detect backpressure can return `Ok(false)` and let the driver log a
-`backpressure_skipped` event instead of fire-and-forget. **The
-WebSocket variant intentionally does NOT override `try_publish`** --
-the trait's default implementation (delegate to `publish`, return
-`Ok(true)`) is exactly what we want.
+`backpressure_skipped` event instead of fire-and-forget. The WebSocket
+variant intentionally does NOT override `try_publish` -- the trait's
+default implementation (delegate to `publish`, return `Ok(true)`) is
+what runs.
 
-Rationale:
+This is correct under Single mode and remains the right policy for
+the publish path under Multi mode as well: reliable QoS (3, 4) must
+never return `Ok(false)` (that would create a receiver-visible seq
+gap). The Multi-mode contribution is on the **receive** path -- the
+reader thread drains and drop-on-full guards against the symmetric-
+flood deadlock that the Single-mode "block the writer" policy alone
+could not break.
+
+Rationale for keeping the default `try_publish`:
 
 - The variant supports **only reliable QoS** (3 and 4); QoS 1 and 2
   are rejected outright at `publish` and at `connect` time. There is
   no unreliable code path that could benefit from a skip.
 - For reliable QoS, returning `Ok(false)` would create a
-  receiver-visible seq gap that breaks the ordering / completeness
-  guarantees we make for QoS 3/4 (the driver assigns and consumes
-  `seq` *before* calling `try_publish`, so any `Ok(false)` is a hole
-  the receiver will observe). The correct semantics for a backed-up
-  reliable transport are "block the writer", which `tungstenite::send`
-  already does because the underlying TCP socket stays in blocking
-  mode (see `connect` -> `set_write_timeout(None)` in
-  `src/websocket.rs`).
-- Genuine connection failure (half-broken TCP, peer dropped) is
-  reported via the existing `Err(...)` return path in `publish`, not
-  via `Ok(false)`. The two concerns -- backpressure vs. failure --
-  are kept distinct.
+  receiver-visible seq gap.
+- Genuine connection failure is reported via the existing `Err(...)`
+  return path in `publish`, not via `Ok(false)`.
 
-If a future requirement adds half-broken-connection detection or
-explicit refusal semantics, that would naturally fit as an
-`Err(...)` from `try_publish` rather than `Ok(false)`. See
-`metak-orchestrator/TASKS.md` T-impl.7 and
-`variant-base/src/variant_trait.rs` for the contract.
+### Cross-reference: T-impl.10 receive-drain widening -- still in place
+
+T-impl.10 widened the driver's per-tick receive-drain budget in
+`variant-base/src/driver.rs`. That widening still applies in both
+modes and is complementary to T14.2: the driver's `try_recv` in Multi
+mode is fast, but the channel can still build up if the driver is
+busy publishing during the tick.
 
 ## Out of scope
 
