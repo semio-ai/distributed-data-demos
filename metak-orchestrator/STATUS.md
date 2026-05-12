@@ -8577,3 +8577,61 @@ unrelated to this task.
   is already there and a new `HubLifecycleMessage::PeerDropped`
   variant is a one-liner addition.
 
+
+---
+
+## T14.13 audit — QUIC qos4 ordering failure (started 2026-05-11)
+
+### Audit findings (read first)
+
+Read `variants/quic/src/quic.rs` end-to-end before any code change. The
+per-QoS stream strategy currently in tree:
+
+- **qos 1 / qos 2** (BestEffort, LatestValue): unreliable datagrams via
+  `quinn::Connection::send_datagram`. Out-of-order is acceptable here
+  by the QoS contract.
+- **qos 3 / qos 4** (ReliableUdp, ReliableTcp): the `send_loop` opens a
+  **fresh unidirectional QUIC stream per message** via
+  `conn.open_uni().await`, then `tokio::spawn`s a task that calls
+  `send_stream.write_all(&data).await` followed by `send_stream.finish()`.
+  One stream per message, both for data and for the EOT trailer.
+- **Receive side**: `handle_connection`'s stream task loops on
+  `connection.accept_uni()` and, for each accepted stream, **spawns a new
+  tokio task** that does `recv_stream.read_to_end(64 * 1024).await` then
+  dispatches the decoded frame into the shared unbounded mpsc
+  `recv_tx` channel.
+
+This is **Outcome A** from the task brief: qos4 is using N parallel
+streams (one per message, ~10 K streams/s at the smoke rate). QUIC's
+ordering guarantee is **per-stream**; across streams the network/scheduler
+can deliver them in any interleaving, and the receiver's per-stream
+`tokio::spawn`-and-push-to-mpsc pattern adds a *second* source of
+reordering (whoever wins the mpsc-send race surfaces first).
+
+At 100 vpt x 100 Hz = 10 K msg/s with two writers, that explains the
+~42 K out-of-order receives per direction observed in the
+`quic-100x100hz-multi` smoke: every cross-stream interleave is one
+out-of-order event against the prev-seq scan the analysis tool uses.
+
+### Implementation plan (Outcome A)
+
+Consolidate the qos 3/4 reliable path to **one long-lived
+unidirectional stream per (writer-side, peer-connection)**. Writes are
+length-delimited frames on that stream (u32 BE length prefix + frame).
+Receiver runs a **single read loop** per accepted reliable stream that
+peels off frames in order and pushes them through the existing
+`dispatch_decoded` path. EOT becomes the final reliable frame followed
+by `finish()` — same trailing-EOT pattern as the existing
+`test_stream_close_with_trailer`, just on the long-lived stream.
+
+Datagram path (qos 1/2) is untouched.
+
+This will:
+- Make the qos4 receive order strictly equal to the qos4 send order on
+  each (writer, receiver) pair (QUIC per-stream ordering invariant).
+- Drop the per-message stream-open overhead (10 K stream-opens/s today
+  → 1 stream per peer-pair for the whole spawn).
+- Preserve the existing `try_publish` reliable behaviour (delegates to
+  `publish`, returns `Ok(true)`) — the writes still go through the
+  send_loop mpsc and are serialised onto the stream there.
+
