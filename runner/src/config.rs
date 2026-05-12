@@ -9,6 +9,121 @@ use std::path::Path;
 /// the next spawn re-binds the same port.
 pub const DEFAULT_INTER_QOS_GRACE_MS: u64 = 250;
 
+/// Default receive-side socket buffer size in KiB, used when
+/// `[variant.common] recv_buffer_kb` is absent. Matches the variant-base
+/// default so a variant that defaults to its own constant and a variant that
+/// receives the runner-injected default agree on the wire. (4 MiB.)
+pub const DEFAULT_RECV_BUFFER_KB: u32 = 4096;
+
+/// Inclusive range for `recv_buffer_kb`. Lower bound keeps recv enough headroom
+/// for the smallest sane two-peer benchmark; upper bound (64 MiB) is the
+/// largest size we are willing to commit on a Raspberry-Pi-class device.
+/// Values outside this range are a parse-time config error.
+pub const RECV_BUFFER_KB_MIN: u32 = 64;
+pub const RECV_BUFFER_KB_MAX: u32 = 65536;
+
+/// E14 threading-mode dimension. Mirrors `variant_base::ThreadingMode`
+/// (kept as a string-only enum here because the runner does NOT depend on
+/// `variant-base` -- it treats variants as opaque child processes).
+///
+/// Wire value lowercase to match `variant-base`'s `--threading-mode` CLI
+/// parser and the JSONL `connected` event's `threading_mode` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ThreadingMode {
+    /// Multi-threaded execution model. Sorted-first per the contract
+    /// ("multi" before "single" alphabetically).
+    Multi,
+    /// Single-threaded, fully synchronous execution model. WASM-compatible.
+    Single,
+}
+
+impl ThreadingMode {
+    /// Wire-form string used on the CLI (`--threading-mode <value>`) and in
+    /// the JSONL `connected` event's `threading_mode` field.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThreadingMode::Multi => "multi",
+            ThreadingMode::Single => "single",
+        }
+    }
+
+    /// Parse a string into a `ThreadingMode`. Accepts the exact wire forms
+    /// only ("single", "multi"). Anything else is a config error.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "single" => Ok(ThreadingMode::Single),
+            "multi" => Ok(ThreadingMode::Multi),
+            other => bail!(
+                "invalid threading_mode '{other}' (expected \"single\" or \"multi\")"
+            ),
+        }
+    }
+}
+
+/// Threading-modes specification for a `[[variant]]` entry. Mirrors the
+/// QosSpec/PositiveSpec pattern: accepts either a scalar string, a
+/// non-empty list of strings, or omission (defaults to single).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadingModesSpec {
+    /// `threading_modes = "..."` -- a single concrete mode.
+    Single(ThreadingMode),
+    /// `threading_modes = [..]` -- an explicit list of modes.
+    Multi(Vec<ThreadingMode>),
+    /// `threading_modes` key omitted -- defaults to `["single"]`
+    /// (backwards-compatible with pre-T14.8 configs).
+    Default,
+}
+
+impl ThreadingModesSpec {
+    /// Return the concrete modes to run, deduplicated, sorted in stable
+    /// order matching the contract (`multi` before `single` alphabetically).
+    pub fn modes(&self) -> Vec<ThreadingMode> {
+        match self {
+            ThreadingModesSpec::Single(m) => vec![*m],
+            ThreadingModesSpec::Multi(v) => {
+                let set: BTreeSet<ThreadingMode> = v.iter().copied().collect();
+                set.into_iter().collect()
+            }
+            ThreadingModesSpec::Default => vec![ThreadingMode::Single],
+        }
+    }
+
+    /// Validate that the array form is non-empty.
+    pub fn validate(&self) -> Result<()> {
+        if let ThreadingModesSpec::Multi(v) = self {
+            if v.is_empty() {
+                bail!("threading_modes array must be non-empty");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse a `ThreadingModesSpec` from a TOML value. Accepts a string or a
+/// non-empty array of strings. Returns an error for any other shape or for
+/// unknown mode names.
+fn parse_threading_modes_spec(val: &toml::Value) -> Result<ThreadingModesSpec> {
+    if let Some(s) = val.as_str() {
+        let mode = ThreadingMode::parse(s)?;
+        return Ok(ThreadingModesSpec::Single(mode));
+    }
+    if let Some(arr) = val.as_array() {
+        let mut out: Vec<ThreadingMode> = Vec::with_capacity(arr.len());
+        for item in arr {
+            let s = item.as_str().with_context(|| {
+                format!("threading_modes array element is not a string: {item:?}")
+            })?;
+            out.push(ThreadingMode::parse(s)?);
+        }
+        let spec = ThreadingModesSpec::Multi(out);
+        spec.validate()?;
+        return Ok(spec);
+    }
+    bail!(
+        "threading_modes must be a string, an array of strings, or omitted (got {val:?})"
+    );
+}
+
 /// QoS specification for a `[[variant]]` entry. Accepts an integer, an array
 /// of integers, or omission. Drives spawn-job expansion: each concrete level
 /// produces one spawn invocation.
@@ -199,6 +314,18 @@ pub struct VariantConfig {
     pub common: toml::Table,
     /// Variant-specific arguments.
     pub specific: Option<toml::Table>,
+    /// E14 capability declaration: the threading modes this variant binary
+    /// supports. Static TOML mechanism (chosen over a runtime probe for
+    /// simplicity; see `runner/CUSTOM.md` "Threading-mode dimension" for
+    /// rationale).
+    ///
+    /// Accepted values: `["single"]`, `["multi"]`, `["single", "multi"]`.
+    /// Absent => "all modes the config requests are supported" (with a
+    /// one-time stderr note per variant entry). This permissive default
+    /// keeps T14.8 forward-compatible while T14.2-T14.7 land the
+    /// capability declarations on each variant entry's TOML config.
+    #[serde(default)]
+    pub supported_modes: Option<Vec<String>>,
 }
 
 impl VariantConfig {
@@ -262,6 +389,66 @@ impl VariantConfig {
             .get("values_per_tick")
             .context("values_per_tick is required in [variant.common]")?;
         parse_positive_spec("values_per_tick", val)
+    }
+
+    /// Parse the `threading_modes` field from `[variant.common]` into a
+    /// `ThreadingModesSpec`. Returns `ThreadingModesSpec::Default` if the
+    /// key is absent (-> `["single"]`, backwards-compatible with pre-T14.8
+    /// configs).
+    pub fn threading_modes_spec(&self) -> Result<ThreadingModesSpec> {
+        let Some(val) = self.common.get("threading_modes") else {
+            return Ok(ThreadingModesSpec::Default);
+        };
+        parse_threading_modes_spec(val)
+    }
+
+    /// Parse the `recv_buffer_kb` field from `[variant.common]`. Returns
+    /// `DEFAULT_RECV_BUFFER_KB` when absent. Validates the value is within
+    /// `[RECV_BUFFER_KB_MIN, RECV_BUFFER_KB_MAX]` at parse time.
+    pub fn recv_buffer_kb(&self) -> Result<u32> {
+        let Some(val) = self.common.get("recv_buffer_kb") else {
+            return Ok(DEFAULT_RECV_BUFFER_KB);
+        };
+        let n = val
+            .as_integer()
+            .with_context(|| format!("recv_buffer_kb must be an integer, got {val:?}"))?;
+        let n = u32::try_from(n)
+            .with_context(|| format!("recv_buffer_kb value {n} does not fit in u32"))?;
+        if !(RECV_BUFFER_KB_MIN..=RECV_BUFFER_KB_MAX).contains(&n) {
+            bail!(
+                "recv_buffer_kb {n} is out of range (must be {RECV_BUFFER_KB_MIN}..={RECV_BUFFER_KB_MAX})"
+            );
+        }
+        Ok(n)
+    }
+
+    /// Resolve the variant's declared supported threading modes.
+    ///
+    /// Returns `Ok(Some(modes))` when the entry declared `supported_modes`
+    /// in TOML; the runner gates the per-spawn expansion against this set.
+    /// Returns `Ok(None)` when the entry omitted the field; the runner
+    /// then treats every requested mode as supported (with a one-time
+    /// stderr note) so T14.8 lands without blocking on T14.2-T14.7's
+    /// per-variant capability declarations.
+    pub fn supported_modes_resolved(&self) -> Result<Option<Vec<ThreadingMode>>> {
+        let Some(list) = self.supported_modes.as_ref() else {
+            return Ok(None);
+        };
+        if list.is_empty() {
+            bail!(
+                "variant '{}' has an empty supported_modes list; remove the field to default \
+                 to permissive mode, or list at least one mode",
+                self.name
+            );
+        }
+        let mut modes: Vec<ThreadingMode> = Vec::with_capacity(list.len());
+        for s in list {
+            modes.push(ThreadingMode::parse(s).with_context(|| {
+                format!("variant '{}': invalid supported_modes entry", self.name)
+            })?);
+        }
+        let set: BTreeSet<ThreadingMode> = modes.iter().copied().collect();
+        Ok(Some(set.into_iter().collect()))
     }
 }
 
@@ -375,6 +562,15 @@ impl BenchConfig {
             })?;
             v.values_per_tick_spec().with_context(|| {
                 format!("config: variant '{}' has invalid values_per_tick", v.name)
+            })?;
+            v.threading_modes_spec().with_context(|| {
+                format!("config: variant '{}' has invalid threading_modes", v.name)
+            })?;
+            v.recv_buffer_kb().with_context(|| {
+                format!("config: variant '{}' has invalid recv_buffer_kb", v.name)
+            })?;
+            v.supported_modes_resolved().with_context(|| {
+                format!("config: variant '{}' has invalid supported_modes", v.name)
             })?;
         }
 
