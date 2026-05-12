@@ -1,0 +1,39 @@
+# T14.4 regression fixture: two-runner-on-localhost Hybrid spawn at a
+# less-demanding rate (100 vpt x 100 Hz = 10 K msg/s symmetric) on QoS 4
+# only, exercised in BOTH threading modes via the runner's
+# `threading_modes` expansion. QoS 4 is the most demanding (TCP, reliable)
+# and exercises the per-peer TCP reader thread end-to-end in Multi mode.
+#
+# Goal: cross-product is (qos 4) x (single, multi) = 2 spawns per runner.
+# Multi mode must deliver substantial cross-receives. Single mode (TCP
+# path, kernel-reliable) must also deliver substantial cross-receives.
+#
+# Distinct port range / log dir / run name from the existing fixtures so
+# they can coexist without TIME_WAIT collisions or log mixups.
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/hybrid/tests/fixtures/two-runner-hybrid-100x100hz-both-modes.toml
+#   target/release/runner --name bob   --config variants/hybrid/tests/fixtures/two-runner-hybrid-100x100hz-both-modes.toml
+
+run = "hybrid-t144-both-modes"
+runners = ["alice", "bob"]
+default_timeout_secs = 90
+
+[[variant]]
+name = "hybrid-t144"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 3
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 4
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19742"
+  tcp_base_port = 28140
