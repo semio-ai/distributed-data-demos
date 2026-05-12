@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::{PeerEot, Variant};
 
+use crate::controltcp::{self, ControlFrame, ControlPeer, ControlPeerEndpoint, ControlRole};
 use crate::protocol::{self, Frame};
 use crate::reader::{self, HubDataMessage, HubLifecycleMessage, ReaderHub};
 use crate::tcp::TcpTransport;
@@ -19,13 +20,9 @@ use crate::udp::UdpTransport;
 /// Receive buffer size for UDP datagrams.
 const UDP_RECV_BUF_SIZE: usize = 65536;
 
-/// Number of times an EOT marker is sent on the UDP path. The contract
-/// (`metak-shared/api-contracts/eot-protocol.md` "Hybrid") prescribes 5
-/// retries with 5 ms spacing for redundancy under multicast loss.
-const UDP_EOT_RETRIES: u32 = 5;
-
-/// Spacing between consecutive UDP EOT sends.
-const UDP_EOT_SPACING: Duration = Duration::from_millis(5);
+/// Default EOT timeout when `--eot-timeout-secs` is not provided by the
+/// runner. Used in `disconnect()` to bound the control-channel drain.
+const DEFAULT_EOT_TIMEOUT_SECS: u64 = 5;
 
 /// Outcome of a single `try_recv_*` poll.
 enum RecvOutcome {
@@ -55,13 +52,25 @@ pub struct HybridConfig {
     pub tcp_listen_addr: SocketAddr,
     /// Concrete TCP endpoints to dial (excludes self).
     pub tcp_peers: Vec<SocketAddr>,
-    /// Active QoS for this spawn. Determines which path is used by
-    /// `signal_end_of_test`.
+    /// Active QoS for this spawn. Pre-T14.18 this drove which path
+    /// `signal_end_of_test` used; T14.18 routes EOT exclusively over
+    /// the control connection, so this is now informational and kept
+    /// for compatibility with the existing config-injection plumbing.
+    #[allow(dead_code)]
     pub qos: Qos,
     /// `--recv-buffer-kb` from the runner-injected CLI (T14.1).
     /// Applied to the UDP socket via `SO_RCVBUF` and to each TCP
     /// peer's underlying socket on connect / accept.
     pub recv_buffer_kb: u32,
+    /// T14.18: Local control TCP listen address. QoS-independent;
+    /// one per (runner, variant binary) regardless of QoS.
+    pub control_listen_addr: SocketAddr,
+    /// T14.18: Per-peer control wiring. Server peers we accept FROM;
+    /// client peers we dial.
+    pub control_peers: Vec<ControlPeerEndpoint>,
+    /// T14.18: `--eot-timeout-secs` from CLI, used to bound the
+    /// control-channel drain at `disconnect()`. `None` -> default.
+    pub eot_timeout_secs: Option<u64>,
 }
 
 /// Hybrid UDP/TCP variant implementing the Variant trait.
@@ -85,6 +94,17 @@ pub struct HybridVariant {
     /// Reader-thread hub. `Some` in Multi mode after
     /// `start_reader_threads`; `None` in Single mode.
     reader_hub: Option<ReaderHub>,
+    /// T14.18: per-peer control connections. Populated by `connect()`.
+    /// In Single mode the variant polls these inline via
+    /// `poll_control_peers`. In Multi mode the read clones are taken
+    /// out and given to dedicated reader threads (see
+    /// `start_reader_threads`); the write halves stay here so
+    /// `signal_end_of_test` can broadcast.
+    control_peers: Vec<ControlPeer>,
+    /// T14.18: Multi-mode shutdown flag + join handles for the
+    /// per-peer control reader threads.
+    control_threads: Vec<std::thread::JoinHandle<()>>,
+    control_shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl HybridVariant {
@@ -100,7 +120,128 @@ impl HybridVariant {
             pending_eots: VecDeque::new(),
             threading_mode: ThreadingMode::Single,
             reader_hub: None,
+            control_peers: Vec::new(),
+            control_threads: Vec::new(),
+            control_shutdown: None,
         }
+    }
+
+    /// T14.18: establish the per-peer control TCP connections.
+    ///
+    /// For each peer endpoint declared in `config.control_peers`:
+    /// - If our role is `Server`, listen on `config.control_listen_addr`
+    ///   and accept one connection (with budget).
+    /// - If our role is `Client`, dial the peer's listen addr (with
+    ///   bounded retry on `ConnectionRefused`).
+    ///
+    /// Both sides set `TCP_NODELAY` immediately. The resulting
+    /// `ControlPeer` is stored on `self.control_peers`. The listener is
+    /// dropped after all server-side accepts complete.
+    fn setup_control_channel(&mut self) -> Result<()> {
+        if self.config.control_peers.is_empty() {
+            return Ok(());
+        }
+
+        // Count how many peers we need to accept inbound from.
+        let server_peers: Vec<ControlPeerEndpoint> = self
+            .config
+            .control_peers
+            .iter()
+            .filter(|p| p.role == ControlRole::Server)
+            .cloned()
+            .collect();
+        let client_peers: Vec<ControlPeerEndpoint> = self
+            .config
+            .control_peers
+            .iter()
+            .filter(|p| p.role == ControlRole::Client)
+            .cloned()
+            .collect();
+
+        // Bind the listener regardless (server peers need it; client-
+        // only configurations could skip but keeping it simple is fine).
+        let listener =
+            std::net::TcpListener::bind(self.config.control_listen_addr).with_context(|| {
+                format!(
+                    "T14.18: failed to bind control listener on {}",
+                    self.config.control_listen_addr
+                )
+            })?;
+
+        // Server-side accepts. We accept in any order; map by peer
+        // accepted addr is not necessary because we currently don't
+        // identify peers on the wire (one stream per pair).
+        let deadline = std::time::Instant::now() + controltcp::CONTROL_ACCEPT_BUDGET;
+        for expected in &server_peers {
+            let (stream, accepted_addr) = controltcp::accept_with_budget(&listener, deadline)
+                .with_context(|| {
+                    format!(
+                        "T14.18: control accept for peer {} timed out",
+                        expected.peer_name
+                    )
+                })?;
+            let peer = ControlPeer::from_stream(stream, expected.peer_name.clone(), accepted_addr)?;
+            self.control_peers.push(peer);
+        }
+        drop(listener);
+
+        // Client-side dials.
+        for endpoint in &client_peers {
+            let stream = controltcp::connect_with_budget(
+                endpoint.peer_addr,
+                controltcp::CONTROL_CONNECT_BUDGET,
+            )
+            .with_context(|| {
+                format!(
+                    "T14.18: control connect to peer {} ({}) failed",
+                    endpoint.peer_name, endpoint.peer_addr
+                )
+            })?;
+            let peer =
+                ControlPeer::from_stream(stream, endpoint.peer_name.clone(), endpoint.peer_addr)?;
+            self.control_peers.push(peer);
+        }
+        Ok(())
+    }
+
+    /// T14.18 Single mode: poll every control peer once. Returns the
+    /// number of EOT frames newly recorded.
+    fn poll_control_peers(&mut self) -> usize {
+        let mut newly_recorded = 0usize;
+        let mut dropped = Vec::new();
+        for (i, peer) in self.control_peers.iter_mut().enumerate() {
+            match peer.try_recv_frame() {
+                Ok(Some(ControlFrame::Eot { writer, eot_id })) => {
+                    if writer != self.runner && self.seen_eots.insert((writer.clone(), eot_id)) {
+                        self.pending_eots.push_back(PeerEot { writer, eot_id });
+                        newly_recorded += 1;
+                    }
+                }
+                Ok(Some(ControlFrame::Bye)) => {
+                    // Peer is done. Stay connected for the drain.
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!(
+                        "[variant-hybrid] control peer {} read error: {:#}; dropping",
+                        peer.peer_addr, e
+                    );
+                    peer.shutdown();
+                    dropped.push(i);
+                }
+            }
+        }
+        for &i in dropped.iter().rev() {
+            self.control_peers.remove(i);
+        }
+        newly_recorded
+    }
+
+    /// Effective EOT timeout (seconds) for the control-channel drain.
+    fn effective_eot_timeout_secs(&self) -> u64 {
+        self.config
+            .eot_timeout_secs
+            .unwrap_or(DEFAULT_EOT_TIMEOUT_SECS)
     }
 
     /// Check if a QoS 2 message is stale (seq <= last seen for this writer+path).
@@ -324,6 +465,14 @@ impl Variant for HybridVariant {
         }
 
         self.tcp = Some(tcp);
+
+        // T14.18: establish per-peer-pair TCP control connections for
+        // EOT exchange, separate from the data path. Done after the
+        // data-path setup so a control-side failure surfaces cleanly
+        // and the existing UDP/TCP teardown still runs.
+        self.setup_control_channel()
+            .context("T14.18: failed to set up control TCP side-channel")?;
+
         Ok(())
     }
 
@@ -387,6 +536,32 @@ impl Variant for HybridVariant {
                 spawn_tcp_reader_for(peer, "in", &data_tx, &lifecycle_tx, &shutdown, &mut hub)?;
             }
         }
+        // T14.18: per-peer control reader threads. Take the read clone
+        // from each ControlPeer and hand it to a dedicated thread; the
+        // write half stays on the ControlPeer for outbound EOT sends.
+        let control_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut control_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        for peer in self.control_peers.iter_mut() {
+            if let Some(read_clone) = peer.take_read_clone() {
+                let label = format!("{}-{}", peer.peer_name, peer.peer_addr);
+                let handle = controltcp::spawn_control_reader(
+                    read_clone,
+                    label,
+                    lifecycle_tx.clone(),
+                    control_shutdown.clone(),
+                )
+                .with_context(|| {
+                    format!(
+                        "T14.18: spawn control reader for {} ({})",
+                        peer.peer_name, peer.peer_addr
+                    )
+                })?;
+                control_handles.push(handle);
+            }
+        }
+        self.control_shutdown = Some(control_shutdown);
+        self.control_threads = control_handles;
+
         // Drop the variant-held senders so the channels correctly
         // report `Disconnected` after every reader thread exits.
         drop(data_tx);
@@ -397,6 +572,41 @@ impl Variant for HybridVariant {
     }
 
     fn stop_reader_threads(&mut self) -> Result<()> {
+        // T14.18: signal control reader threads to stop. Shutting down
+        // the read side of each control TcpStream is the wake-up. We
+        // close those streams via the variant's `disconnect` after
+        // `stop_reader_threads` returns, but a defensive shutdown here
+        // makes the join window short. The hub's reader threads are
+        // joined first; the control reader threads use a separate
+        // shutdown flag.
+        if let Some(shutdown) = self.control_shutdown.take() {
+            shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Close the read side on each control peer to wake blocked
+            // reads. This DOES affect the write side too (Shutdown::Both),
+            // but we are tearing down at this point.
+            for peer in &self.control_peers {
+                peer.shutdown();
+            }
+            let join_deadline = std::time::Instant::now() + controltcp::READER_JOIN_TIMEOUT;
+            for handle in self.control_threads.drain(..) {
+                let remaining = join_deadline.saturating_duration_since(std::time::Instant::now());
+                let poll_step = Duration::from_millis(20);
+                let mut waited = Duration::ZERO;
+                while !handle.is_finished() && waited < remaining {
+                    std::thread::sleep(poll_step);
+                    waited += poll_step;
+                }
+                if handle.is_finished() {
+                    let _ = handle.join();
+                } else {
+                    eprintln!(
+                        "[variant-hybrid] warning: control reader thread did not exit within {:?}; detaching",
+                        controltcp::READER_JOIN_TIMEOUT
+                    );
+                }
+            }
+        }
+
         if let Some(hub) = self.reader_hub.take() {
             hub.stop_and_join()
                 .context("failed to stop hybrid reader threads")?;
@@ -458,8 +668,15 @@ impl Variant for HybridVariant {
     fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
         // T14.4: Multi mode pulls from the reader-thread hub.
         if self.threading_mode == ThreadingMode::Multi && self.reader_hub.is_some() {
+            // T14.18: control peers in Multi mode are read by their own
+            // threads which push onto lifecycle_tx. Nothing to do here.
             return self.poll_receive_multi();
         }
+
+        // T14.18: Single mode polls the control fd alongside the data
+        // path. EOTs from the control connection are recorded directly
+        // into `pending_eots`; the data fast-path remains UDP/TCP.
+        self.poll_control_peers();
 
         // Single-mode inline polling (existing behaviour).
         const POLL_BUDGET: u32 = 256;
@@ -484,6 +701,34 @@ impl Variant for HybridVariant {
     }
 
     fn disconnect(&mut self) -> Result<()> {
+        // T14.18: graceful control-channel teardown. Send `bye`,
+        // half-close the write side, drain the read side until peer
+        // closes or `eot_timeout_secs` elapses, then drop. The drain
+        // captures any last EOT that raced our own `bye`. We only run
+        // the inline drain in Single mode -- in Multi mode the reader
+        // threads have already been stopped by `stop_reader_threads`
+        // and the read clones moved out, so the drain would be a no-op.
+        let drain_budget = Duration::from_secs(self.effective_eot_timeout_secs().clamp(1, 30));
+        let drain_deadline = std::time::Instant::now() + drain_budget;
+        let single_mode = self.threading_mode == ThreadingMode::Single;
+        for peer in self.control_peers.iter_mut() {
+            peer.send_bye();
+            peer.shutdown_write();
+            if single_mode {
+                let last_frames = peer.drain_until_closed(drain_deadline);
+                for frame in last_frames {
+                    if let ControlFrame::Eot { writer, eot_id } = frame {
+                        if writer != self.runner && self.seen_eots.insert((writer.clone(), eot_id))
+                        {
+                            self.pending_eots.push_back(PeerEot { writer, eot_id });
+                        }
+                    }
+                }
+            }
+            peer.shutdown();
+        }
+        self.control_peers.clear();
+
         if let Some(udp) = self.udp.take() {
             udp.close()?;
         }
@@ -494,37 +739,31 @@ impl Variant for HybridVariant {
         Ok(())
     }
 
-    /// Generate an EOT id and dispatch the marker over the active path.
+    /// T14.18: Generate an EOT id and dispatch the marker over the
+    /// per-peer-pair TCP control connection, regardless of QoS.
     ///
-    /// QoS 1-2: UDP multicast, sent `UDP_EOT_RETRIES` times with
-    /// `UDP_EOT_SPACING` between sends, since multicast can drop datagrams.
-    /// QoS 3-4: TCP, sent once per outbound peer (TCP delivery semantics
-    /// take care of reliability and ordering).
+    /// The control connection is QoS-independent and was established at
+    /// `connect()` time. EOT frames are length-prefixed binary
+    /// (`[u32 BE length][control_frame]`) so they cannot be dropped by
+    /// data-path saturation (kernel UDP recv overrun, TCP send-buffer
+    /// fill, etc.). Per-peer write failures drop only that peer; the
+    /// EOT phase continues with the surviving peers.
     fn signal_end_of_test(&mut self) -> Result<u64> {
         let eot_id: u64 = rand::random();
-        match self.config.qos {
-            Qos::BestEffort | Qos::LatestValue => {
-                let udp = self.udp.as_ref().context("UDP transport not connected")?;
-                let frame = protocol::encode_eot(&self.runner, eot_id);
-                for i in 0..UDP_EOT_RETRIES {
-                    udp.send(&frame).with_context(|| {
-                        format!(
-                            "failed to send UDP EOT (attempt {} of {})",
-                            i + 1,
-                            UDP_EOT_RETRIES
-                        )
-                    })?;
-                    if i + 1 < UDP_EOT_RETRIES {
-                        std::thread::sleep(UDP_EOT_SPACING);
-                    }
-                }
+        let frame = controltcp::encode_eot_frame(&self.runner, eot_id);
+        let mut failed_idx = Vec::new();
+        for (i, peer) in self.control_peers.iter_mut().enumerate() {
+            if let Err(e) = peer.send_frame(&frame) {
+                eprintln!(
+                    "[variant-hybrid] T14.18: control EOT send to peer {} failed: {:#}; dropping peer",
+                    peer.peer_addr, e
+                );
+                peer.shutdown();
+                failed_idx.push(i);
             }
-            Qos::ReliableUdp | Qos::ReliableTcp => {
-                let tcp = self.tcp.as_mut().context("TCP transport not connected")?;
-                let frame = protocol::encode_eot_framed(&self.runner, eot_id);
-                tcp.broadcast(&frame)
-                    .context("failed to broadcast TCP EOT marker")?;
-            }
+        }
+        for &i in failed_idx.iter().rev() {
+            self.control_peers.remove(i);
         }
         Ok(eot_id)
     }
@@ -551,6 +790,9 @@ mod tests {
             tcp_peers: Vec::new(),
             qos: Qos::BestEffort,
             recv_buffer_kb: 4096,
+            control_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            control_peers: Vec::new(),
+            eot_timeout_secs: Some(2),
         }
     }
 
@@ -677,81 +919,61 @@ mod tests {
         assert!(v.poll_peer_eots().unwrap().is_empty());
     }
 
-    /// `signal_end_of_test` returns a non-zero `eot_id` and dispatches the
-    /// marker on the configured UDP path (qos 1-2). We use a real
-    /// loopback-multicast socket so the retry loop and ordering are
-    /// exercised end-to-end. Receiving the marker ourselves and feeding it
-    /// through `record_eot` would normally happen in `poll_receive`; here
-    /// we verify that the encoded bytes round-trip via `decode_frame`.
+    /// T14.18: `signal_end_of_test` returns a non-zero `eot_id`
+    /// regardless of QoS. With no control peers, it should still
+    /// succeed (the broadcast loop has nothing to do).
     #[test]
-    fn signal_end_of_test_udp_returns_nonzero_id() {
-        // Use an ephemeral multicast group/port to avoid colliding with
-        // other tests that bind 239.0.0.1:9000.
-        let mut config = dummy_config();
-        config.multicast_group = "239.0.0.1:19850".parse().unwrap();
-        config.qos = Qos::BestEffort;
-
+    fn signal_end_of_test_returns_nonzero_id_no_peers() {
+        let config = dummy_config();
         let mut v = HybridVariant::new("self-udp", config);
-        v.connect(variant_base::ThreadingMode::Single)
-            .expect("connect must succeed");
-
+        // No connect() call -- control_peers stays empty. The function
+        // must still produce a non-zero id without panicking.
         let id1 = v
             .signal_end_of_test()
-            .expect("UDP signal_end_of_test must succeed");
+            .expect("signal_end_of_test must succeed with no control peers");
         let id2 = v
             .signal_end_of_test()
-            .expect("UDP signal_end_of_test must succeed (second call)");
-
-        // Random, so the two ids are very unlikely to collide. Both must
-        // also be non-zero (unlike the trait default impl).
+            .expect("signal_end_of_test must succeed (second call)");
         assert_ne!(id1, 0);
         assert_ne!(id2, 0);
         assert_ne!(id1, id2);
-
-        v.disconnect().ok();
     }
 
-    /// Same as above but for the TCP path. Spins up a single peer that
-    /// listens on an ephemeral port, dials it, then signals EOT and
-    /// verifies the framed EOT bytes hit the wire in a decodeable shape.
+    /// T14.18: `signal_end_of_test` dispatches the EOT marker over the
+    /// per-peer control TCP connection. Spin up a fake peer that
+    /// listens on an ephemeral port, connect to it as a `ControlPeer`
+    /// directly, signal EOT, and verify the bytes hit the wire in a
+    /// decodeable shape (length-prefixed control frame).
     #[test]
-    fn signal_end_of_test_tcp_dispatches_to_peer() {
+    fn signal_end_of_test_dispatches_over_control() {
         use std::io::Read;
         use std::net::TcpListener;
         use std::time::Duration;
 
-        // Listener that the variant will dial as a peer.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let peer_addr = listener.local_addr().unwrap();
 
-        let mut config = HybridConfig {
-            multicast_group: "239.0.0.1:19851".parse().unwrap(),
-            bind_addr: Ipv4Addr::UNSPECIFIED,
-            tcp_listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            tcp_peers: vec![peer_addr],
-            qos: Qos::ReliableTcp,
-            recv_buffer_kb: 4096,
-        };
-        // Borrow checker convenience: ensure we drop config so the
-        // variant fully owns it.
-        let _ = &mut config;
-
+        let mut config = dummy_config();
+        config.qos = Qos::BestEffort;
         let mut v = HybridVariant::new("hybrid-writer", config);
-        v.connect(variant_base::ThreadingMode::Single)
-            .expect("connect must succeed");
 
-        // Accept the inbound on the listener side.
+        // Splice in a single client control peer directly (skip
+        // setup_control_channel since we already have a listener).
+        let stream = std::net::TcpStream::connect(peer_addr).unwrap();
+        let peer = ControlPeer::from_stream(stream, "fake-peer".to_string(), peer_addr).unwrap();
+        v.control_peers.push(peer);
+
+        // Accept on the listener side.
         let (mut peer_stream, _) = listener.accept().unwrap();
         peer_stream
             .set_read_timeout(Some(Duration::from_millis(500)))
             .unwrap();
 
-        let id = v
-            .signal_end_of_test()
-            .expect("TCP signal_end_of_test must succeed");
+        let id = v.signal_end_of_test().expect("signal_end_of_test");
         assert_ne!(id, 0);
 
-        // Read the framed EOT bytes off the peer end and decode.
+        // Read the length prefix + control frame off the peer end and
+        // decode.
         let mut len_buf = [0u8; 4];
         peer_stream
             .read_exact(&mut len_buf)
@@ -760,15 +982,15 @@ mod tests {
         let mut payload = vec![0u8; frame_len];
         peer_stream
             .read_exact(&mut payload)
-            .expect("must read framed payload");
+            .expect("must read control frame payload");
 
-        let frame = protocol::decode_frame(&payload).expect("frame must decode");
+        let frame = crate::controltcp::decode_control_frame(&payload).expect("must decode");
         match frame {
-            Frame::Eot { writer, eot_id } => {
+            ControlFrame::Eot { writer, eot_id } => {
                 assert_eq!(writer, "hybrid-writer");
                 assert_eq!(eot_id, id);
             }
-            other => panic!("expected Frame::Eot, got {other:?}"),
+            other => panic!("expected ControlFrame::Eot, got {other:?}"),
         }
 
         v.disconnect().ok();

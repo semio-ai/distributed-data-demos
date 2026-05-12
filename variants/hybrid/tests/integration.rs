@@ -53,6 +53,13 @@ fn run_hybrid_variant(multicast_group: &str, tcp_base_port: &str, qos: u8, run_i
     let binary = env!("CARGO_BIN_EXE_variant-hybrid");
     let tmp = tempfile::tempdir().unwrap();
     let qos_str = qos.to_string();
+    // T14.18: derive a unique --control-base-port per fixture so the
+    // self-only single-peer tests don't collide on the control listen
+    // port.
+    let control_base_port = format!(
+        "{}",
+        tcp_base_port.parse::<u16>().unwrap().saturating_add(200)
+    );
 
     let mut child = std::process::Command::new(binary)
         .args([
@@ -88,6 +95,8 @@ fn run_hybrid_variant(multicast_group: &str, tcp_base_port: &str, qos: u8, run_i
             multicast_group,
             "--tcp-base-port",
             tcp_base_port,
+            "--control-base-port",
+            &control_base_port,
         ])
         .spawn()
         .expect("failed to spawn variant-hybrid");
@@ -155,6 +164,8 @@ fn runner_not_in_peers_fails() {
             "239.0.0.1:19805",
             "--tcp-base-port",
             "19924",
+            "--control-base-port",
+            "20124",
         ])
         .output()
         .expect("failed to run variant-hybrid");

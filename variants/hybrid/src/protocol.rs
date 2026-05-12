@@ -200,6 +200,12 @@ pub fn encode_framed(qos: Qos, seq: u64, path: &str, writer: &str, payload: &[u8
 }
 
 /// Encode an EOT frame with a 4-byte length prefix for TCP framing.
+///
+/// Pre-T14.18 this was used to dispatch EOT on the data-path TCP
+/// stream at QoS 3-4. After T14.18 EOT routes exclusively over the
+/// dedicated control TCP connection (see `controltcp::encode_eot_frame`),
+/// but the helper is kept for tests + legacy reference.
+#[allow(dead_code)]
 pub fn encode_eot_framed(writer: &str, eot_id: u64) -> Vec<u8> {
     let inner = encode_eot(writer, eot_id);
     prepend_len_prefix(inner)

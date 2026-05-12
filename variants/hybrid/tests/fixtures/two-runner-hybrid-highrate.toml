@@ -43,3 +43,5 @@ binary = "target/release/variant-hybrid.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19642"
   tcp_base_port = 19840
+  # T14.18: per-pair control connection for EOT. QoS-independent.
+  control_base_port = 20040
