@@ -67,6 +67,26 @@ const TCP_SINGLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Matches the pre-existing connect-time tolerance used by other variants.
 const TCP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// T14.22: bounded retry budget for the QoS-4 outbound `TcpStream::connect`.
+/// The two-runner localhost startup is a known race: both sides hit the
+/// ready barrier and call `connect` near simultaneously; the other side's
+/// `listen()` may not yet be accepting and the kernel returns
+/// `ConnectionRefused`. Without this retry the first attempt fails, the
+/// peer is silently dropped from `tcp_out_streams`, and the spawn proceeds
+/// in disconnected state (alice times out waiting for the inbound TCP
+/// peer; bob writes into the void).
+///
+/// 30 s matches `controltcp::CONTROL_CONNECT_BUDGET` and hybrid's
+/// `connect_with_retry` budget — see `variants/hybrid/src/tcp.rs`'s
+/// `connect_with_retry` (T14.4 follow-up commit `c163042` bumped that
+/// budget to 30 s after observing transient delays in practice).
+const TCP_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(30);
+
+/// T14.22: per-attempt sleep between `connect()` retries. Short enough
+/// that we race the peer's `listen()` past the barrier quickly, long
+/// enough to avoid spinning the kernel.
+const TCP_CONNECT_RETRY_SLEEP: Duration = Duration::from_millis(50);
+
 /// Maximum wall-clock time we wait for a reader thread to join during
 /// `stop_reader_threads`. Threads that fail to exit within this window are
 /// logged as wedged and abandoned -- preferred over deadlocking the
@@ -274,6 +294,53 @@ fn apply_recv_buffer_kb_tcp(stream: &TcpStream, recv_buffer_kb: u32) {
             "[custom-udp] warning: set_recv_buffer_size({}) on TCP stream failed: {}",
             requested, e
         );
+    }
+}
+
+/// T14.22: connect to `addr` with bounded retry ONLY on
+/// `ConnectionRefused`. The two-runner startup is a known race: both
+/// sides hit the ready barrier and call `connect` near simultaneously;
+/// either side's listener may not be bound yet. On `ConnectionRefused`,
+/// retry every `TCP_CONNECT_RETRY_SLEEP` for up to `budget`. All other
+/// error kinds (including `TimedOut`) propagate immediately so we don't
+/// paper over real connectivity problems.
+///
+/// Mirrors `variants/hybrid/src/tcp.rs::connect_with_retry` (T14.4 / the
+/// hybrid prior art). Uses the BLOCKING `TcpStream::connect` (no
+/// per-attempt timeout) to preserve the existing kernel-default connect
+/// behaviour: a successful connect on a healthy LAN returns within
+/// milliseconds.
+///
+/// Generic over a connector closure so the retry loop can be exercised
+/// without a real TCP listener — the unit test in this module supplies
+/// a stub closure that refuses the first N attempts then "accepts".
+fn connect_qos4_with_retry(addr: SocketAddr, budget: Duration) -> io::Result<TcpStream> {
+    connect_qos4_with_retry_inner(addr, budget, TcpStream::connect)
+}
+
+fn connect_qos4_with_retry_inner<F>(
+    addr: SocketAddr,
+    budget: Duration,
+    mut connector: F,
+) -> io::Result<TcpStream>
+where
+    F: FnMut(SocketAddr) -> io::Result<TcpStream>,
+{
+    let deadline = Instant::now() + budget;
+    loop {
+        match connector(addr) {
+            Ok(stream) => return Ok(stream),
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("TCP connect to {addr} kept getting refused after {budget:?}: {e}"),
+                    ));
+                }
+                thread::sleep(TCP_CONNECT_RETRY_SLEEP);
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -553,7 +620,13 @@ impl UdpVariant {
         // blocking writes, polled reads via SO_RCVTIMEO" for the same
         // pattern on hybrid).
         for peer_addr in &self.config.tcp_peers {
-            match TcpStream::connect(peer_addr) {
+            // T14.22: bounded retry on `ConnectionRefused`. Both runners
+            // race past the ready barrier and call `connect()` near
+            // simultaneously; the peer's `listen()` may not yet be
+            // accepting. Without retry the first refusal silently drops
+            // the peer from the broadcast set. Same shape as hybrid's
+            // `tcp::connect_with_retry`.
+            match connect_qos4_with_retry(*peer_addr, TCP_CONNECT_RETRY_BUDGET) {
                 Ok(stream) => {
                     let _ = stream.set_nodelay(true);
                     // Explicit blocking — `TcpStream::connect` already
@@ -584,9 +657,15 @@ impl UdpVariant {
                     self.tcp_out_streams.push(stream);
                 }
                 Err(e) => {
+                    // T14.22: the retry budget has been exhausted (or a
+                    // non-ConnectionRefused error surfaced immediately).
+                    // Log once and continue — the spawn proceeds without
+                    // this peer; broadcast-time peer-loss handling will
+                    // surface the disconnected state via missing inbound
+                    // TCP frames.
                     eprintln!(
-                        "[custom-udp] warning: failed to connect to peer {}: {}",
-                        peer_addr, e
+                        "[custom-udp] warning: failed to connect to peer {} after {:?}: {}",
+                        peer_addr, TCP_CONNECT_RETRY_BUDGET, e
                     );
                 }
             }
@@ -2289,6 +2368,187 @@ mod tests {
             0,
             "T14.19: peer should be dropped after the write hits SO_SNDTIMEO; \
              iterations spent={iterations}"
+        );
+    }
+
+    // ---- T14.22: connect-with-retry ----
+
+    /// Stub connector that returns `ConnectionRefused` for the first
+    /// `refusals` calls, then delegates to a real `TcpStream::connect`
+    /// against a listener that has been bound up front. The retry loop
+    /// must succeed within the budget without ever surfacing the
+    /// transient refusal to the caller.
+    #[test]
+    fn connect_with_retry_succeeds_after_transient_refusals() {
+        use std::net::TcpListener;
+
+        // Pre-bind so the real connect inside the stub succeeds.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Spawn a tiny accept loop so the kernel doesn't backlog-shed.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let accept_thread = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("listener nonblocking");
+            while !stop_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((_s, _a)) => {} // drop accepted stream
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+
+        let mut attempts: u32 = 0;
+        let refusals: u32 = 5;
+        let start = Instant::now();
+        let result = connect_qos4_with_retry_inner(addr, Duration::from_secs(5), |a| {
+            attempts += 1;
+            if attempts <= refusals {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "stub refusal",
+                ));
+            }
+            TcpStream::connect(a)
+        });
+        let elapsed = start.elapsed();
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = accept_thread.join();
+
+        assert!(
+            result.is_ok(),
+            "retry loop must succeed; err={:?}",
+            result.err()
+        );
+        assert!(
+            attempts > refusals,
+            "expected connector to be called > {} times; got {}",
+            refusals,
+            attempts
+        );
+        // Each refusal costs ~TCP_CONNECT_RETRY_SLEEP. The full loop
+        // must complete well below the budget at 5 refusals * 50 ms.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "retry loop took too long: {:?}",
+            elapsed
+        );
+    }
+
+    /// The retry loop must give up cleanly once the budget elapses if
+    /// `ConnectionRefused` never stops, and must surface a
+    /// `ConnectionRefused` error.
+    #[test]
+    fn connect_with_retry_gives_up_after_budget() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let start = Instant::now();
+        let result = connect_qos4_with_retry_inner(addr, Duration::from_millis(200), |_a| {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "always refuse",
+            ))
+        });
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("retry loop must surface error once budget elapses");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::ConnectionRefused,
+            "expected ConnectionRefused, got {:?}",
+            err.kind()
+        );
+        // The loop must at least wait the budget before giving up.
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "retry loop bailed before exhausting budget: {:?}",
+            elapsed
+        );
+        // And shouldn't loop unboundedly long after the budget.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "retry loop overshot budget significantly: {:?}",
+            elapsed
+        );
+    }
+
+    /// Non-ConnectionRefused errors must propagate IMMEDIATELY without
+    /// retrying — otherwise we mask real connectivity problems behind a
+    /// 30 s delay.
+    #[test]
+    fn connect_with_retry_does_not_retry_other_errors() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut attempts: u32 = 0;
+        let start = Instant::now();
+        let result = connect_qos4_with_retry_inner(addr, Duration::from_secs(30), |_a| {
+            attempts += 1;
+            Err(io::Error::new(io::ErrorKind::TimedOut, "synthetic timeout"))
+        });
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("non-refused error must propagate");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            attempts, 1,
+            "expected exactly 1 attempt on non-refused error"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "non-refused error must not consume the retry budget; elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Integration-style: bind a listener LATE (after a short
+    /// pre-listen delay) on a separate thread; the connect side calls
+    /// `connect_qos4_with_retry` against that address. The retry loop
+    /// must absorb the early `ConnectionRefused` failures and succeed
+    /// once the late `listen()` arrives. Mirrors the two-runner
+    /// startup race that motivated T14.22.
+    #[test]
+    fn connect_with_retry_handles_late_listener() {
+        use std::net::TcpListener;
+
+        // Pick an ephemeral port up front by binding+dropping; another
+        // process *could* race for the port but on a healthy CI host
+        // this is extremely unlikely in the ~150 ms window.
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        // Late-binding listener thread.
+        let listener_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            let l = TcpListener::bind(addr).expect("late bind must succeed");
+            // Accept one connection, then exit.
+            let (_s, _a) = l.accept().expect("late accept must succeed");
+        });
+
+        let start = Instant::now();
+        let result = connect_qos4_with_retry(addr, Duration::from_secs(5));
+        let elapsed = start.elapsed();
+
+        listener_thread.join().expect("listener thread joined");
+
+        assert!(
+            result.is_ok(),
+            "retry loop must connect once late listener binds; elapsed={:?}, err={:?}",
+            elapsed,
+            result.err()
+        );
+        // Should have taken at least the listener-delay; well under
+        // the budget.
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "retry loop returned before the listener bound: {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "retry loop took longer than expected: {:?}",
+            elapsed
         );
     }
 
