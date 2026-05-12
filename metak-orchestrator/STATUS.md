@@ -9441,3 +9441,118 @@ top-level `logs/` only holds timestamped sub-directories. The
 real-logs validation above (against the `same-machine-all-
 variants-01-20260511_104934` sub-run) is the stronger evidence the
 spec asked for.
+
+---
+
+## T14.24 — resume_manifest barrier audit (2026-05-12)
+
+**Worker:** runner subfolder. **Status:** audit posted, fix in progress.
+
+### Audit findings
+
+1. **How is `resume_manifest` exchanged?** UDP multicast (with a
+   localhost-loopback fallback), same as `ready` / `done`. The runner
+   binds one UDP socket per process at `<port>+<runner_index>`,
+   joins multicast group `239.77.66.55`, and broadcasts to *every*
+   peer port (multicast + 127.0.0.1) every 500 ms. See
+   `Coordinator::exchange_resume_manifest` in `runner/src/protocol.rs`
+   lines 807-913.
+
+2. **Retry / ACK shape?** There are NO acknowledgements. The
+   broadcast is idempotent (same manifest each tick) and the
+   convergence criterion is "I have received exactly one
+   `ResumeManifest` from every peer in `self.expected`, then linger
+   2 s while continuing to re-broadcast." If a datagram is lost and
+   the peer has already exited its linger window, the receiver never
+   learns about it. Timeout fires at 120 s and the runner exits 75.
+
+3. **Shared code with ready/done barriers?** Yes — `ready_barrier`
+   (lines 526-639), `done_barrier` (lines 651-791), and
+   `exchange_resume_manifest` (lines 807-913) all follow the same
+   structural template: send-broadcast / recv-with-100ms-timeout
+   loop / accept-by-`(variant,run,name)` filter / 2 s linger on
+   quorum / 120 s overall deadline. The same UDP socket, the same
+   multicast group, and the same `send()` / `recv_from()` helpers
+   are reused. Differences are purely the message type accepted and
+   the per-peer key (variant/run/status for done, variant/run for
+   ready, just `name` for resume_manifest).
+
+4. **What makes `resume_manifest` more fragile in practice?**
+
+   - **Timing of when it fires.** Right after discovery completes —
+     i.e. immediately after the discovery linger and ALL the prior
+     run's last `done_barrier` linger have just finished broadcasting
+     onto the same UDP/multicast plane. On Windows / same-host the
+     kernel's UDP receive buffer can be saturated by the discovery
+     traffic backlog at exactly this point.
+   - **Larger payload.** `ResumeManifest.complete_jobs` is a list
+     of every effective_name the peer considers complete — for a
+     full run (e.g. all-variants-01 has 192 spawn jobs) this can
+     reach ~5-8 KB serialised JSON. The receive buffer is
+     `MAX_MSG_SIZE = 4096` bytes (`protocol.rs:15`). **Manifests
+     longer than 4096 bytes are silently truncated by `recv_from`
+     and then fail to parse via `Message::from_bytes` → `None`,
+     producing no error and no log line.** This is, with
+     near-certainty, the dominant root cause of the all-variants
+     resume failure: both runners' manifests exceed 4 KB at full
+     matrix scale.
+   - **Single datagram, no fragmentation.** Each `send()` posts
+     the full serialised JSON as one UDP datagram. Beyond
+     ~1500 bytes (MTU) it relies on IP fragmentation, which on
+     loopback works but on a real LAN is brittle. On loopback the
+     kernel still hands the full payload to the receiver, but the
+     receiver's 4 KB buffer is the cut-off.
+   - **No congestion-aware retry.** The 500 ms tick is fixed; if
+     the kernel is dropping datagrams under same-host pressure
+     there's no backoff or coalescing.
+
+5. **Hypothesis (concrete, evidence-backed).** The 120 s timeout is
+   triggered by the combination of (a) `MAX_MSG_SIZE = 4096` byte
+   recv buffer being too small for a full-matrix manifest and
+   (b) loss of any single datagram is permanently fatal because
+   the receiver's parse silently drops the truncated payload and
+   the receiver has no way to ask for retransmit. The 500 ms
+   re-broadcast cannot recover because every retry sends the *same*
+   over-sized payload that the receiver's buffer cannot accept.
+
+   This explains the symmetric symptom in the failure log: both
+   runners broadcast happily every 500 ms; both runners' `recv_from`
+   returns truncated bytes that fail to parse; both runners' `seen`
+   sets never grow past their own self-entry.
+
+### Decision: Path B (TCP per peer pair)
+
+- Path A (UDP + ACK + retries) does NOT solve the buffer-truncation
+  root cause unless we also fragment the manifest application-side,
+  which is essentially re-implementing TCP poorly.
+- Path B follows the T14.18 pattern that already proved out for the
+  EOT side-channel: lower-sorted-name accepts on a derived port,
+  higher-sorted connects. Length-prefixed framing handles arbitrarily
+  long manifests cleanly; TCP retransmit gives us reliability for
+  free.
+- Scope is bounded: resume_manifest fires once per resume invocation,
+  reliability matters far more than speed; ready/done barriers stay
+  on UDP for now per the task's out-of-scope clause.
+
+### Implementation plan (next commits)
+
+- Derive the manifest-exchange TCP port as `cli.port + N + index`
+  where N is the runners count, keeping it well away from the UDP
+  coordination port range. No new TOML / CLI surface — the runner
+  already knows its peer index from the config's `runners` order.
+- For each peer pair, lower-sorted-name binds + listens, higher
+  connects; both exchange length-prefixed manifests, then both
+  close. Per-pair timeout = the existing `--barrier-timeout-secs`
+  (default 120 s).
+- Replace `Coordinator::exchange_resume_manifest`'s UDP loop with
+  a TCP-per-pair pump that produces the same
+  `HashMap<runner_name, Vec<String>>` return value, so `main.rs`'s
+  call site is unchanged.
+- Tests:
+  - Unit: per-pair TCP convergence with a mocked peer.
+  - Existing `single_runner_resume_manifest_exchange_is_local_only`
+    must still pass.
+  - Existing `two_runner_resume_manifest_exchange` migrates to the
+    new TCP path.
+  - New integration: large-manifest (>>4 KB) round-trip both ways.
+
