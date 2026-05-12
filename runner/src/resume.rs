@@ -740,7 +740,7 @@ mod tests {
             "expected 192 bob jsonl files in the failing dataset, found {pre_count}"
         );
         assert!(
-            manifest.deleted_partial.len() >= 1,
+            !manifest.deleted_partial.is_empty(),
             "T14.23: at least one partial file must be detected"
         );
         let partial_names: Vec<String> = manifest
