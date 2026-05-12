@@ -7046,3 +7046,94 @@ custom-udp-1000x100hz-qos1all-variants-01 single          10,483        29,225  
 - `200eab2` feat(analysis): threading_mode grouping dimension with single-default fallback
 - `238872c` docs: update metak-shared/ANALYSIS.md with new metric ordering
 - `bdeb40a` test(analysis): backwards-compat regression on synthetic dataset
+
+---
+
+## T14.4 -- variants/hybrid audit (2026-05-11)
+
+### AUDIT findings
+
+Read every file under `variants/hybrid/src/` (`hybrid.rs`, `tcp.rs`,
+`udp.rs`, `protocol.rs`, `main.rs`). The current implementation is
+**fully inline / single-threaded** -- branch B per the T14.4 task
+spec:
+
+- `grep -n 'thread::spawn|thread::Builder|spawn('` over
+  `variants/hybrid/src/` returns **zero hits**.
+- `grep -n 'mpsc|channel|JoinHandle'` over `variants/hybrid/src/`
+  returns **zero hits**.
+- `HybridVariant::connect` in `src/hybrid.rs:180` accepts
+  `threading_mode: ThreadingMode` but immediately discards it
+  (`let _ = threading_mode;` -- explicit "T14.1 compile-fix only,
+  Multi mode lives in T14.4" comment).
+- `HybridVariant::poll_receive` polls both the UDP socket
+  (`UdpTransport::try_recv`, non-blocking `recv_from`) and every
+  TCP peer (`TcpPeer::try_recv_framed`, blocking read with
+  `SO_RCVTIMEO = 1 ms`) inline on the driver thread.
+- TCP writes are blocking on the socket (no `set_nonblocking(true)`
+  on the write side) -- the back-pressure signal we want to measure.
+  See `CUSTOM.md` "TCP connection management". This is unrelated to
+  reader-thread machinery and stays as-is.
+- UDP path uses `tune_udp_buffers` from `variant-base::socket` at
+  socket-creation time (8 MiB SO_RCVBUF/SNDBUF, T-impl.2). The
+  per-variant `--recv-buffer-kb` arg is NOT yet wired into either
+  socket -- it must override the UDP default and also be applied to
+  the read side of every TCP peer socket.
+
+### STATUS.md L30 cross-reference
+
+The line referenced in the T14.4 prompt ("Hybrid handles high-rate
+qos4 today") is the result of `tune_udp_buffers` + blocking TCP
+writes + the per-peer `SO_RCVTIMEO`-driven polled-read fault-
+tolerance loop -- NOT reader threads. The high-rate test
+(`two_runner_regression_highrate_no_cascade`) passes today at
+100 K msg/s symmetric on a single OS thread.
+
+### Implementation path
+
+Branch B per the task spec:
+
+1. Declare `supported_threading_modes() = &[Single, Multi]`.
+2. Plumb `recv_buffer_kb` from `CliArgs` through `HybridConfig`.
+   Apply `SO_RCVBUF` from `recv_buffer_kb * 1024` on the UDP
+   socket (replacing the implicit 8 MiB target from
+   `tune_udp_buffers` -- the user-tunable knob wins) and on every
+   TCP peer's underlying socket. Both modes.
+3. `connect(mode)` stashes the chosen mode on `self`. Behaviour
+   inside `connect` is unchanged from today.
+4. `start_reader_threads(Multi)` spawns:
+   - one UDP recv thread that does blocking `recv_from` and pushes
+     decoded `Frame`s onto a bounded `mpsc::SyncSender`;
+   - one per-peer TCP reader thread that does blocking `read` on
+     the per-peer read clone (no `SO_RCVTIMEO`; the thread is
+     allowed to block) and pushes decoded `Frame`s onto the same
+     channel.
+   Threads exit when a shared `AtomicBool` flips or when the
+   socket is shut down (whichever comes first). Reader threads
+   pre-T14.4 do not exist; lifecycle is rooted in the new
+   `start_reader_threads` / `stop_reader_threads` hooks.
+5. `start_reader_threads(Single)` is a no-op (default `Ok(())`).
+6. `poll_receive` in Multi mode `try_recv`s from the channel.
+   In Single mode it does the existing inline UDP + TCP probing.
+7. `stop_reader_threads` flips the atomic, shuts down the
+   sockets (forcing any blocked `recv`/`read` to return), and
+   joins handles with a generous timeout. Called by the driver
+   BEFORE `disconnect`, so subsequent `disconnect` only has to
+   drop the (now-quiet) sockets.
+
+### Open concerns
+
+None at audit time. The websocket variant (T14.2) is also still
+in T14.1-compile-fix state, so Hybrid is the first non-dummy
+variant to actually implement Multi mode. The reader-thread
+shape proposed above is the one the orchestrator's T14.2 task
+spec sketches, but adapted to Hybrid's two-transport model
+(one UDP recv thread plus per-peer TCP reader threads). Bounded
+mpsc capacity formula taken from the T14.2 spec
+(`4 * values_per_tick * peer_count` slots), but Hybrid does not
+have direct access to `values_per_tick` in `start_reader_threads`
+-- a constant `4096`-slot channel is used instead. The
+constant is well above the 4 * 1000 vpt * 1 peer (= 4000)
+high-rate fixture working set; a follow-up could thread
+`values_per_tick` through if profiling shows the bound matters.
+
