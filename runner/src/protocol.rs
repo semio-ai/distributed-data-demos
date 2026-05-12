@@ -1835,8 +1835,12 @@ mod tests {
 
         // Build a ~8 KB manifest by listing 256 distinct effective_names
         // each ~25 chars long. Serialised JSON is well over 4 KB.
-        let jobs_a: Vec<String> = (0..256).map(|i| format!("variantA-suffix-name-{i:04}")).collect();
-        let jobs_b: Vec<String> = (0..256).map(|i| format!("variantB-suffix-name-{i:04}")).collect();
+        let jobs_a: Vec<String> = (0..256)
+            .map(|i| format!("variantA-suffix-name-{i:04}"))
+            .collect();
+        let jobs_b: Vec<String> = (0..256)
+            .map(|i| format!("variantB-suffix-name-{i:04}"))
+            .collect();
         let jobs_a_clone = jobs_a.clone();
         let jobs_b_clone = jobs_b.clone();
 
@@ -1971,10 +1975,8 @@ mod tests {
             )
             .unwrap();
             coord.discover().unwrap();
-            coord.exchange_resume_manifest(
-                vec!["one".into(), "two".into()],
-                Duration::from_secs(30),
-            )
+            coord
+                .exchange_resume_manifest(vec!["one".into(), "two".into()], Duration::from_secs(30))
         });
 
         let runners_b = runners;
