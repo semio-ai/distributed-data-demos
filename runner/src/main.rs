@@ -286,12 +286,15 @@ fn run(cli: &Cli) -> Result<()> {
     // Expand the variant config into the same ordered list of spawn jobs that
     // Phase 2 will iterate. Done once up front so resume-mode inventory and
     // the Phase 2 loop agree on the `effective_name` set.
-    let mut all_jobs: Vec<(usize, spawn_job::SpawnJob)> = Vec::new();
-    for (idx, variant) in bench_config.variant.iter().enumerate() {
-        for job in spawn_job::expand_variant(idx, variant)? {
-            all_jobs.push((idx, job));
-        }
-    }
+    //
+    // T14.8 capability gating runs HERE, before resume-inventory and Phase 2,
+    // so the skip set / barrier identifiers / log files are all aligned on
+    // the post-gating job list. Per-variant entries declare their supported
+    // threading modes via `[[variant]].supported_modes = [...]` (Option A
+    // -- static TOML declaration; see CUSTOM.md "Threading-mode dimension"
+    // for the rationale and the permissive default for entries that omit
+    // the field).
+    let all_jobs = expand_and_gate_jobs(&bench_config, &cli.name, |line| eprintln!("{line}"))?;
     let all_effective_names: Vec<String> = all_jobs
         .iter()
         .map(|(_, j)| j.effective_name.clone())
@@ -764,6 +767,69 @@ fn require_initial_sync_complete(failed_peers: &[String]) -> Result<()> {
     }
 }
 
+/// Expand every `[[variant]]` entry into spawn jobs and apply T14.8
+/// threading-mode capability gating.
+///
+/// Each `[[variant]]` entry may declare `supported_modes = [...]` to gate
+/// the expansion. Behaviour:
+///
+/// - **Declared, mode supported:** the spawn job is included.
+/// - **Declared, mode not supported:** the spawn is silently skipped, a
+///   single stderr line is emitted via the `report` callback, and the
+///   spawn does NOT appear in the run summary table.
+/// - **Not declared:** every requested mode is treated as supported and a
+///   one-time stderr note is emitted per source entry. Permissive default
+///   for the T14.2-T14.7 rollout window; documented in `runner/CUSTOM.md`.
+///
+/// The exact stderr-line shape is part of the contract surface — see
+/// `metak-orchestrator/TASKS.md` T14.8 and the integration test in
+/// `tests/integration.rs`. The `report` callback is a parameter so unit
+/// tests can capture the lines without relying on a global stderr.
+fn expand_and_gate_jobs<F>(
+    bench_config: &config::BenchConfig,
+    runner_name: &str,
+    mut report: F,
+) -> Result<Vec<(usize, spawn_job::SpawnJob)>>
+where
+    F: FnMut(&str),
+{
+    let mut out: Vec<(usize, spawn_job::SpawnJob)> = Vec::new();
+    let mut warned_permissive: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    for (idx, variant) in bench_config.variant.iter().enumerate() {
+        let declared = variant.supported_modes_resolved()?;
+        for job in spawn_job::expand_variant(idx, variant)? {
+            match declared.as_ref() {
+                Some(modes) if !modes.contains(&job.threading_mode) => {
+                    // Capability gating: skip with stderr notice, do not
+                    // append to out (excluded from summary). The exact
+                    // shape of the line is part of the T14.8 contract.
+                    report(&format!(
+                        "[runner:{runner_name}] skipping {}: variant does not support threading_mode={}",
+                        job.effective_name,
+                        job.threading_mode.as_str()
+                    ));
+                    continue;
+                }
+                None if warned_permissive.insert(idx) => {
+                    // One-time stderr note per variant entry that did
+                    // not declare its capability. Keeps the rollout
+                    // window forward-compatible while T14.2-T14.7 land
+                    // per-variant capability declarations.
+                    report(&format!(
+                        "[runner:{runner_name}] note: variant '{}' has no supported_modes \
+                         declared; treating every requested threading_mode as supported",
+                        variant.name
+                    ));
+                }
+                _ => {}
+            }
+            out.push((idx, job));
+        }
+    }
+    Ok(out)
+}
+
 struct SummaryRow {
     variant: String,
     runner: String,
@@ -909,5 +975,140 @@ mod tests {
             .expect_err("any failed peer must abort the run");
         let msg = err.to_string();
         assert!(msg.contains("bob") && msg.contains("carol"), "msg={msg}");
+    }
+
+    // -----------------------------------------------------------------
+    // T14.8: expand_and_gate_jobs capability gating.
+    // -----------------------------------------------------------------
+
+    fn parse_bench_config(toml_str: &str) -> config::BenchConfig {
+        let mut cfg: config::BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        cfg.validate().unwrap();
+        cfg
+    }
+
+    #[test]
+    fn gating_skips_unsupported_mode_with_eprintln_notice() {
+        // Variant supports only `single`; config asks for both modes.
+        // The multi spawn must be skipped with the exact contract line
+        // and must NOT appear in the returned job list.
+        let cfg = parse_bench_config(
+            r#"
+run = "g"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "single-only"
+binary = "./x"
+supported_modes = ["single"]
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1
+  qos = 1
+  threading_modes = ["single", "multi"]
+"#,
+        );
+        let mut lines: Vec<String> = Vec::new();
+        let jobs = expand_and_gate_jobs(&cfg, "a", |l| lines.push(l.to_string())).unwrap();
+
+        // Only the single-mode spawn survives.
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].1.effective_name, "single-only-single");
+        assert_eq!(jobs[0].1.threading_mode, config::ThreadingMode::Single);
+
+        // The exact contract-pin stderr line for the skipped multi spawn.
+        let skip_line = lines
+            .iter()
+            .find(|l| l.contains("skipping single-only-multi"))
+            .expect("skipping notice must be emitted; got lines: {lines:?}");
+        assert!(
+            skip_line
+                .contains("variant does not support threading_mode=multi"),
+            "skip line shape: {skip_line}"
+        );
+        assert!(
+            skip_line.starts_with("[runner:a] "),
+            "skip line must carry [runner:<name>] prefix: {skip_line}"
+        );
+    }
+
+    #[test]
+    fn gating_permissive_default_emits_one_time_note() {
+        // A variant entry that omits `supported_modes` runs every requested
+        // mode and emits a single stderr note (per variant, not per spawn).
+        let cfg = parse_bench_config(
+            r#"
+run = "g"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "permissive"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1
+  qos = [1, 2]
+  threading_modes = ["single", "multi"]
+"#,
+        );
+        let mut lines: Vec<String> = Vec::new();
+        let jobs = expand_and_gate_jobs(&cfg, "a", |l| lines.push(l.to_string())).unwrap();
+
+        // All four spawns survive (no gating).
+        assert_eq!(jobs.len(), 4);
+
+        // Exactly one note line, regardless of how many spawns.
+        let notes: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("has no supported_modes declared"))
+            .collect();
+        assert_eq!(
+            notes.len(),
+            1,
+            "expected exactly one permissive-default note, got {}: {lines:?}",
+            notes.len()
+        );
+    }
+
+    #[test]
+    fn gating_no_skip_when_variant_supports_all_requested_modes() {
+        let cfg = parse_bench_config(
+            r#"
+run = "g"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "both"
+binary = "./x"
+supported_modes = ["single", "multi"]
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1
+  qos = 1
+  threading_modes = ["single", "multi"]
+"#,
+        );
+        let mut lines: Vec<String> = Vec::new();
+        let jobs = expand_and_gate_jobs(&cfg, "a", |l| lines.push(l.to_string())).unwrap();
+
+        // Both spawns survive.
+        assert_eq!(jobs.len(), 2);
+        // No skipping notice for declared variants whose requested modes
+        // are all supported.
+        assert!(
+            !lines.iter().any(|l| l.contains("skipping")),
+            "must not skip when all modes are supported, got: {lines:?}"
+        );
+        // No permissive note for declared variants.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("has no supported_modes declared")),
+            "must not emit permissive note when supported_modes is declared, got: {lines:?}"
+        );
     }
 }
