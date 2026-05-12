@@ -29,6 +29,7 @@ from pathlib import Path
 
 from cache import discover_groups, scan_group, update_cache
 from correlate import correlate_lazy
+from incomplete_warnings import emit_incomplete_warnings
 from integrity import IntegrityResult, integrity_for_group
 from performance import PerformanceResult, performance_for_group
 from tables import format_integrity_table, format_performance_table
@@ -283,6 +284,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             print(format_performance_table(performance_results))
+
+            # T14.21: surface job-run cases with incomplete samples
+            # (non-completed spawn / delivery shortfall / late tail)
+            # on stderr so the operator doesn't have to scan the
+            # tables row-by-row. Exit code unchanged.
+            emit_incomplete_warnings(integrity_results, performance_results)
 
         # Step 4: diagrams.
         if do_diagrams:
