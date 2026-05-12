@@ -1,0 +1,41 @@
+# Custom-UDP T14.3 two-runner regression: QoS 4 (TCP) in BOTH threading modes.
+#
+# Cross-product: qos=4, threading_modes=["single", "multi"]. The runner
+# expansion (T14.8) yields two spawns:
+#   - custom-udp-t143-qos4-single
+#   - custom-udp-t143-qos4-multi
+#
+# Single mode preserves pre-E14 behaviour: the driver thread reads
+# the UDP multicast socket and the inbound TCP streams inline on
+# poll_receive. Multi mode spawns one OS reader thread per UDP socket +
+# one per accepted inbound TCP peer; reader threads parse the binary
+# header and push to a shared bounded mpsc; poll_receive drains the
+# channel via try_recv. See `variants/custom-udp/CUSTOM.md` "Threading
+# modes (T14.3)".
+#
+# Used by `two_runner_regression_qos4_both_modes` in
+# `tests/two_runner_regression.rs`.
+
+run = "custom-udp-t143"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "custom-udp-t143"
+binary = "target/release/variant-custom-udp.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 3
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 5
+  qos = 4
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19545"
+  buffer_size = 65536
+  tcp_base_port = 19850

@@ -55,6 +55,16 @@ const QOS1_RUN_NAME: &str = "custom-udp-t123-eot-udp";
 const QOS1_SPAWN_NAME: &str = "custom-udp-eot-qos1";
 const QOS1_LEVEL: u8 = 1;
 
+/// T14.3 multi-mode regression. The fixture declares
+/// `threading_modes = ["single", "multi"]` so the runner expands the
+/// `[[variant]]` entry into two per-mode spawns. We assert each spawn's
+/// per-runner JSONL exists and that cross-peer delivery clears the same
+/// 99% threshold in both modes.
+const QOS4_MULTI_FIXTURE_PATH: &str = "tests/fixtures/two-runner-custom-udp-qos4-multi.toml";
+const QOS4_MULTI_RUN_NAME: &str = "custom-udp-t143";
+const QOS4_MULTI_VARIANT_BASE: &str = "custom-udp-t143";
+const QOS4_MULTI_LEVEL: u8 = 4;
+
 const DELIVERY_THRESHOLD: f64 = 0.99;
 const TEST_BUDGET: Duration = Duration::from_secs(120);
 
@@ -84,12 +94,48 @@ fn two_runner_regression_qos1_no_loss() {
     });
 }
 
+/// T14.3 two-runner regression: QoS 4 in BOTH `single` and `multi`
+/// threading modes via a single fixture with
+/// `threading_modes = ["single", "multi"]`. The runner expands the entry
+/// into two per-mode spawns and runs them back-to-back. We then validate
+/// each spawn's cross-peer delivery clears the same 99% threshold the
+/// pre-E14 tests enforced.
+#[test]
+#[ignore]
+fn two_runner_regression_qos4_both_modes() {
+    run_two_runner_multi_mode_case(MultiModeCase {
+        tag: "T14.3-custom-udp/qos4",
+        fixture_rel: QOS4_MULTI_FIXTURE_PATH,
+        run_name: QOS4_MULTI_RUN_NAME,
+        variant_base: QOS4_MULTI_VARIANT_BASE,
+        modes: &["single", "multi"],
+        qos: QOS4_MULTI_LEVEL,
+        threshold: DELIVERY_THRESHOLD,
+    });
+}
+
 /// Inputs for one two-runner regression invocation.
 struct TwoRunnerCase {
     tag: &'static str,
     fixture_rel: &'static str,
     run_name: &'static str,
     spawn_name: &'static str,
+    qos: u8,
+    threshold: f64,
+}
+
+/// Inputs for the T14.3 multi-mode regression. The fixture's
+/// `threading_modes = ["single", "multi"]` expansion produces
+/// `<variant_base>-<mode>` per-mode spawns; we assert each separately.
+struct MultiModeCase {
+    tag: &'static str,
+    fixture_rel: &'static str,
+    run_name: &'static str,
+    /// The `[[variant]].name` value from the fixture, used to construct
+    /// the per-mode `<variant_base>-<mode>` spawn names.
+    variant_base: &'static str,
+    /// Threading modes declared in the fixture, in order.
+    modes: &'static [&'static str],
     qos: u8,
     threshold: f64,
 }
@@ -639,4 +685,223 @@ fn count_cross_peer_receives_in_window(
         }
     }
     count
+}
+
+/// T14.3 driver: read the fixture, substitute `log_dir`, spawn alice +
+/// bob, and validate cross-peer delivery for each per-mode spawn.
+fn run_two_runner_multi_mode_case(case: MultiModeCase) {
+    let _guard = REGRESSION_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let MultiModeCase {
+        tag,
+        fixture_rel,
+        run_name,
+        variant_base,
+        modes,
+        qos,
+        threshold,
+    } = case;
+
+    let repo_root: PathBuf = repo_root();
+    let runner_bin: PathBuf = repo_root
+        .join("runner")
+        .join("target")
+        .join("release")
+        .join("runner.exe");
+    let variant_bin: PathBuf = repo_root
+        .join("variants")
+        .join("custom-udp")
+        .join("target")
+        .join("release")
+        .join("variant-custom-udp.exe");
+
+    if !runner_bin.exists() {
+        eprintln!(
+            "[{tag}] SKIP: runner binary missing at {}. \
+             Build it with `cargo build --release -p runner` from the repo root.",
+            runner_bin.display()
+        );
+        return;
+    }
+    if !variant_bin.exists() {
+        eprintln!(
+            "[{tag}] SKIP: variant-custom-udp binary missing at {}. \
+             Build it with `cargo build --release -p variant-custom-udp` from the repo root.",
+            variant_bin.display()
+        );
+        return;
+    }
+
+    let tmp: tempfile::TempDir = tempfile::tempdir().expect("failed to create tempdir");
+    let tmp_path: &Path = tmp.path();
+    let tmp_str: String = tmp_path
+        .to_str()
+        .expect("tempdir path is not valid UTF-8")
+        .replace('\\', "/");
+
+    let fixture_abs: PathBuf = repo_root.join("variants/custom-udp").join(fixture_rel);
+    let fixture_text: String = std::fs::read_to_string(&fixture_abs)
+        .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", fixture_abs.display()));
+    assert!(
+        fixture_text.contains("log_dir = \"./logs\""),
+        "[{tag}] fixture {} does not contain expected `log_dir = \"./logs\"` line",
+        fixture_abs.display()
+    );
+    let patched_text: String =
+        fixture_text.replace("log_dir = \"./logs\"", &format!("log_dir = \"{tmp_str}\""));
+    let config_path: PathBuf = tmp_path.join("config.toml");
+    std::fs::write(&config_path, &patched_text)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", config_path.display()));
+
+    let test_start: Instant = Instant::now();
+    let mut alice: Child = spawn_runner(&runner_bin, &repo_root, "alice", &config_path);
+    let mut bob: Child = spawn_runner(&runner_bin, &repo_root, "bob", &config_path);
+
+    let alice_outcome: ProcessOutcome = wait_with_budget(&mut alice, TEST_BUDGET);
+    let alice_elapsed: Duration = test_start.elapsed();
+    let remaining: Duration = TEST_BUDGET.saturating_sub(alice_elapsed);
+    let bob_outcome: ProcessOutcome = wait_with_budget(&mut bob, remaining);
+    let wall_time: Duration = test_start.elapsed();
+
+    let alice_capture: Capture = alice_outcome.capture;
+    let bob_capture: Capture = bob_outcome.capture;
+
+    if !alice_outcome.exited {
+        let _ = alice.kill();
+        panic!(
+            "[{tag}] alice timed out after {:?}; stdout=<<<\n{}>>>; stderr=<<<\n{}>>>",
+            wall_time, alice_capture.stdout, alice_capture.stderr
+        );
+    }
+    if !bob_outcome.exited {
+        let _ = bob.kill();
+        panic!(
+            "[{tag}] bob timed out after {:?}; stdout=<<<\n{}>>>; stderr=<<<\n{}>>>",
+            wall_time, alice_capture.stdout, bob_capture.stderr
+        );
+    }
+
+    let alice_status = alice_outcome.status.expect("alice exit status missing");
+    let bob_status = bob_outcome.status.expect("bob exit status missing");
+    assert!(
+        alice_status.success(),
+        "[{tag}] alice exited non-zero ({:?}); stdout=<<<\n{}>>>; stderr=<<<\n{}>>>",
+        alice_status.code(),
+        alice_capture.stdout,
+        alice_capture.stderr
+    );
+    assert!(
+        bob_status.success(),
+        "[{tag}] bob exited non-zero ({:?}); stdout=<<<\n{}>>>; stderr=<<<\n{}>>>",
+        bob_status.code(),
+        bob_capture.stdout,
+        bob_capture.stderr
+    );
+
+    let combined_stderr: String = format!("{}\n{}", alice_capture.stderr, bob_capture.stderr);
+    let combined_stderr_lc: String = combined_stderr.to_lowercase();
+    assert!(
+        !combined_stderr_lc.contains("panic"),
+        "[{tag}] combined stderr contains 'panic'; stderr=<<<\n{combined_stderr}>>>"
+    );
+
+    let session_dir: PathBuf = find_session_dir(tmp_path, run_name).unwrap_or_else(|| {
+        panic!(
+            "[{tag}] no session subfolder matching `{run_name}-*` found under {} \
+             after spawn. Tempdir entries: {:?}",
+            tmp_path.display(),
+            list_dir(tmp_path)
+        )
+    });
+
+    // Validate each per-mode spawn separately. Naming convention from
+    // T14.8 / spawn_job.rs: when only `threading_modes` is expanded,
+    // each spawn name is `<variant_base>-<mode>`. With one runner each
+    // spawn yields one JSONL per runner: `<spawn>-<runner>-<run>.jsonl`.
+    for mode in modes {
+        let spawn_name: String = format!("{variant_base}-{mode}");
+        let alice_log: PathBuf = session_dir.join(format!("{spawn_name}-alice-{run_name}.jsonl"));
+        let bob_log: PathBuf = session_dir.join(format!("{spawn_name}-bob-{run_name}.jsonl"));
+        assert!(
+            alice_log.exists(),
+            "[{tag}/{mode}] expected alice JSONL not found: {}",
+            alice_log.display()
+        );
+        assert!(
+            bob_log.exists(),
+            "[{tag}/{mode}] expected bob JSONL not found: {}",
+            bob_log.display()
+        );
+
+        let alice_window: OperateWindow = parse_operate_window(&alice_log, tag, "alice");
+        let bob_window: OperateWindow = parse_operate_window(&bob_log, tag, "bob");
+
+        let alice_writes_in_window: u64 = count_writes_in_window(&alice_log, &alice_window);
+        let bob_writes_in_window: u64 = count_writes_in_window(&bob_log, &bob_window);
+
+        let bob_recv_from_alice: u64 =
+            count_cross_peer_receives_in_window(&bob_log, "alice", &alice_window);
+        let alice_recv_from_bob: u64 =
+            count_cross_peer_receives_in_window(&alice_log, "bob", &bob_window);
+
+        let alice_to_bob_ratio: f64 = if alice_writes_in_window == 0 {
+            0.0
+        } else {
+            bob_recv_from_alice as f64 / alice_writes_in_window as f64
+        };
+        let bob_to_alice_ratio: f64 = if bob_writes_in_window == 0 {
+            0.0
+        } else {
+            alice_recv_from_bob as f64 / bob_writes_in_window as f64
+        };
+
+        println!(
+            "[{tag}/{mode}] alice -> bob qos{}: {}/{} ({:.2}%) {}",
+            qos,
+            bob_recv_from_alice,
+            alice_writes_in_window,
+            alice_to_bob_ratio * 100.0,
+            if alice_to_bob_ratio >= threshold {
+                "OK"
+            } else {
+                "FAIL"
+            }
+        );
+        println!(
+            "[{tag}/{mode}] bob -> alice qos{}: {}/{} ({:.2}%) {}",
+            qos,
+            alice_recv_from_bob,
+            bob_writes_in_window,
+            bob_to_alice_ratio * 100.0,
+            if bob_to_alice_ratio >= threshold {
+                "OK"
+            } else {
+                "FAIL"
+            }
+        );
+
+        assert!(
+            alice_writes_in_window > 0,
+            "[{tag}/{mode}] alice produced zero writes in operate window"
+        );
+        assert!(
+            bob_writes_in_window > 0,
+            "[{tag}/{mode}] bob produced zero writes in operate window"
+        );
+        assert!(
+            alice_to_bob_ratio >= threshold,
+            "[{tag}/{mode}] alice -> bob delivery {:.4} below threshold {:.2}",
+            alice_to_bob_ratio,
+            threshold
+        );
+        assert!(
+            bob_to_alice_ratio >= threshold,
+            "[{tag}/{mode}] bob -> alice delivery {:.4} below threshold {:.2}",
+            bob_to_alice_ratio,
+            threshold
+        );
+    }
+    println!("[{tag}] wall-time: {:?}", wall_time);
 }
