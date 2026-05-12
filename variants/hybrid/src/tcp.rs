@@ -241,9 +241,17 @@ impl TcpTransport {
     ///
     /// Connect uses a bounded retry on `ConnectionRefused` so both
     /// runners can race past the ready barrier without one's `connect`
-    /// failing before the other's listener is bound.
+    /// failing before the other's listener is bound. 30 s budget: on
+    /// Windows under cargo-test load the peer subprocess's `bind`
+    /// can take several seconds after the barrier releases. The
+    /// legacy `TcpStream::connect` had no app-level cap and would
+    /// wait up to the kernel default (~21 s on Windows) before
+    /// returning `ConnectionRefused`; this stays at the same order of
+    /// magnitude while still being bounded so a permanently-
+    /// unreachable peer surfaces a clean error instead of hanging
+    /// the whole spawn forever.
     pub fn connect_to_peer(&mut self, addr: SocketAddr, recv_buffer_kb: Option<u32>) -> Result<()> {
-        let stream = connect_with_retry(addr, Duration::from_secs(5))
+        let stream = connect_with_retry(addr, Duration::from_secs(30))
             .with_context(|| format!("failed to connect TCP to peer {}", addr))?;
         stream
             .set_nonblocking(false)
