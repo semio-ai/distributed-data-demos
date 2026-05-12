@@ -1,21 +1,35 @@
 ﻿# Comprehensive benchmark: every variant family, every (vpt, hz) sweep, every
-# QoS level. Two runners on a LAN. Total spawn count = 48 [[variant]] entries
-# expanded across QoS levels = 176 spawns (custom-udp 32 + hybrid 32 +
-# quic 32 + zenoh 32 + websocket 16 + webrtc 32; websocket only contributes
-# 8x2 because it supports only reliable QoS [3, 4]). Each runs the full
-# stabilize/operate/silent cycle independently. Total runtime: ~10-15 minutes.
+# QoS level, both threading modes where supported (E14). Two runners on a LAN.
+# Total spawn count = 48 [[variant]] entries expanded across QoS levels x
+# threading_modes = 256 spawns:
+#   - custom-udp / hybrid: 8 entries x 4 qos x 2 modes  = 64 each
+#   - quic / zenoh / webrtc: 8 x 4 x 1 (Multi-only)     = 32 each
+#   - websocket: 8 x 2 (qos [3, 4]) x 2 modes           = 32
+# Each runs the full stabilize/operate/silent cycle independently.
+# Total runtime: ~15-25 minutes (was ~10-15 pre-E14).
 #
 # Run from the repo root with two terminals:
 #   target/release/runner --name alice --config configs/two-runner-all-variants.toml
 #   target/release/runner --name bob   --config configs/two-runner-all-variants.toml
 #
 # Structure: each variant binary has a [[variant_template]] capturing the
-# shared common + specific defaults (binary, multicast/port settings,
-# workload, stabilize/operate/silent durations, log_dir). Each [[variant]]
-# entry then only declares its differing fields (tick_rate_hz, values_per_tick,
-# and -- for max-throughput entries -- the workload override). qos is
-# omitted from every entry, so the runner expands each entry into 4 spawn
-# jobs (qos 1..=4) per the contract.
+# shared common + specific defaults (binary, supported_modes, multicast/port
+# settings, workload, stabilize/operate/silent durations, log_dir,
+# threading_modes). Each [[variant]] entry then only declares its differing
+# fields (tick_rate_hz, values_per_tick, and -- for max-throughput entries --
+# the workload override). qos is omitted from every entry, so the runner
+# expands each entry into 4 spawn jobs (qos 1..=4) per the contract -- except
+# websocket which sets qos = [3, 4] in its template since it only supports
+# reliable QoS.
+#
+# threading_modes = ["single", "multi"] on every template runs each spawn in
+# both threading regimes (E14). supported_modes per template tells the runner
+# which modes the variant binary actually supports; unsupported expansions are
+# silently skipped with a stderr notice (no failed spawns from capability
+# mismatches). QUIC, Zenoh, and WebRTC declare supported_modes = ["multi"]
+# because they fundamentally rely on async runtimes; their Single spawns are
+# skipped. TCP-family variants (custom-udp, hybrid, websocket) support both.
+# See metak-shared/api-contracts/toml-config-schema.md "E14 additions".
 #
 # Per-runner / per-qos port disambiguation is handled by the variants
 # themselves (see metak-shared/api-contracts/toml-config-schema.md "Port
@@ -32,12 +46,14 @@ default_timeout_secs = 120
 [[variant_template]]
 name = "custom-udp-base"
 binary = "target/release/variant-custom-udp.exe"
+supported_modes = ["single", "multi"]
   [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
   silent_secs = 3
   workload = "scalar-flood"
   log_dir = "./logs"
+  threading_modes = ["single", "multi"]
   [variant_template.specific]
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
@@ -106,12 +122,14 @@ name = "custom-udp-max"
 [[variant_template]]
 name = "hybrid-base"
 binary = "target/release/variant-hybrid.exe"
+supported_modes = ["single", "multi"]
   [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
   silent_secs = 3
   workload = "scalar-flood"
   log_dir = "./logs"
+  threading_modes = ["single", "multi"]
   [variant_template.specific]
   multicast_group = "239.0.0.1:19503"
   tcp_base_port = 19900
@@ -179,12 +197,14 @@ name = "hybrid-max"
 [[variant_template]]
 name = "quic-base"
 binary = "target/release/variant-quic.exe"
+supported_modes = ["multi"]
   [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
   silent_secs = 3
   workload = "scalar-flood"
   log_dir = "./logs"
+  threading_modes = ["single", "multi"]
   [variant_template.specific]
   base_port = 19930
 
@@ -251,12 +271,14 @@ name = "quic-max"
 [[variant_template]]
 name = "zenoh-base"
 binary = "target/release/variant-zenoh.exe"
+supported_modes = ["multi"]
   [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
   silent_secs = 3
   workload = "scalar-flood"
   log_dir = "./logs"
+  threading_modes = ["single", "multi"]
   [variant_template.specific]
   zenoh_mode = "peer"
 
@@ -323,6 +345,7 @@ name = "zenoh-max"
 [[variant_template]]
 name = "websocket-base"
 binary = "target/release/variant-websocket.exe"
+supported_modes = ["single", "multi"]
   [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
@@ -330,6 +353,7 @@ binary = "target/release/variant-websocket.exe"
   workload = "scalar-flood"
   log_dir = "./logs"
   qos = [3, 4]
+  threading_modes = ["single", "multi"]
   [variant_template.specific]
   ws_base_port = 19960
 
@@ -396,12 +420,14 @@ name = "websocket-max"
 [[variant_template]]
 name = "webrtc-base"
 binary = "target/release/variant-webrtc.exe"
+supported_modes = ["multi"]
   [variant_template.common]
   stabilize_secs = 3
   operate_secs = 30
   silent_secs = 3
   workload = "scalar-flood"
   log_dir = "./logs"
+  threading_modes = ["single", "multi"]
   [variant_template.specific]
   signaling_base_port = 19980
   media_base_port = 20000
