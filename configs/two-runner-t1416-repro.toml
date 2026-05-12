@@ -1,0 +1,57 @@
+# T14.16 end-to-end repro: re-creates the all-variants qos2 100K msg/s
+# multi-mode case that surfaced the asymmetric same-host timeout where
+# one runner's reader-channel saturation dropped the peer's EOT marker
+# and forced a 120 s status=timeout exit.
+#
+# Run from the repo root with two terminals:
+#   target/release/runner --name alice --config configs/two-runner-t1416-repro.toml
+#   target/release/runner --name bob   --config configs/two-runner-t1416-repro.toml
+#
+# Both runners must reach `eot_sent` AND `eot_received` and complete
+# with `status=success`. The pre-T14.16 build asymmetrically timed out
+# under this workload (one runner clean, the other with many
+# `[custom-udp] multi: reader channel full -- dropping frame
+# (receiver saturated)` lines).
+
+run = "t1416-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+# ─── Custom UDP: qos2 multi-mode at 100K msg/s ───────────────────────────────
+
+[[variant]]
+name = "custom-udp-1000x100hz"
+binary = "target/release/variant-custom-udp.exe"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  stabilize_secs = 3
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  qos = [2]
+  threading_modes = ["multi"]
+  log_dir = "./logs"
+  [variant.specific]
+  multicast_group = "239.0.0.1:19501"
+  buffer_size = 65536
+  tcp_base_port = 19800
+
+# ─── Hybrid: qos2 multi-mode at 100K msg/s (same symmetry) ───────────────────
+
+[[variant]]
+name = "hybrid-1000x100hz"
+binary = "target/release/variant-hybrid.exe"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  stabilize_secs = 3
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  qos = [2]
+  threading_modes = ["multi"]
+  log_dir = "./logs"
+  [variant.specific]
+  multicast_group = "239.0.0.1:19503"
+  tcp_base_port = 19840
