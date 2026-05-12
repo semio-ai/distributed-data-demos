@@ -630,6 +630,8 @@ fn run(cli: &Cli) -> Result<()> {
             job.qos,
             job.tick_rate_hz,
             job.values_per_tick,
+            job.threading_mode,
+            job.recv_buffer_kb,
             &peer_hosts,
         );
 

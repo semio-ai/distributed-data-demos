@@ -1,4 +1,4 @@
-use crate::config::VariantConfig;
+use crate::config::{ThreadingMode, VariantConfig};
 use std::collections::HashMap;
 
 /// Convert a snake_case key to --kebab-case CLI argument.
@@ -54,16 +54,26 @@ pub fn build_variant_args(
     effective_qos: u8,
     effective_tick_rate_hz: u32,
     effective_values_per_tick: u32,
+    effective_threading_mode: ThreadingMode,
+    effective_recv_buffer_kb: u32,
     peer_hosts: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut args = Vec::new();
 
     // Common args from [variant.common] table. Per-spawn dimensions
-    // (qos, tick_rate_hz, values_per_tick) are skipped here -- the
-    // runner-injected scalars below carry the concrete per-spawn values
-    // and override any array/omitted form in the common table.
+    // (qos, tick_rate_hz, values_per_tick, threading_modes, recv_buffer_kb)
+    // are skipped here -- the runner-injected scalars below carry the
+    // concrete per-spawn values and override any array/omitted form in the
+    // common table.
     for (key, val) in &variant.common {
-        if matches!(key.as_str(), "qos" | "tick_rate_hz" | "values_per_tick") {
+        if matches!(
+            key.as_str(),
+            "qos"
+                | "tick_rate_hz"
+                | "values_per_tick"
+                | "threading_modes"
+                | "recv_buffer_kb"
+        ) {
             continue;
         }
         args.push(to_kebab_flag(key));
@@ -86,6 +96,15 @@ pub fn build_variant_args(
     args.push(effective_values_per_tick.to_string());
     args.push("--qos".to_string());
     args.push(effective_qos.to_string());
+    // E14 (T14.8): always inject `--threading-mode` and `--recv-buffer-kb`.
+    // The variant-base CLI defaults `--threading-mode` to `single` during
+    // the rollout window, but from T14.8 onward the runner emits it
+    // unconditionally so analysis can rely on it being present in every
+    // log file.
+    args.push("--threading-mode".to_string());
+    args.push(effective_threading_mode.as_str().to_string());
+    args.push("--recv-buffer-kb".to_string());
+    args.push(effective_recv_buffer_kb.to_string());
 
     // Runner-injected args (before specific args, because specific args
     // are passed as trailing args after `--` and clap would absorb
@@ -189,6 +208,8 @@ timeout_secs = 30
             2,
             100,
             10,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
         );
 
@@ -249,6 +270,8 @@ timeout_secs = 30
             2,
             100,
             10,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
         );
 
@@ -288,6 +311,8 @@ binary = "./simple"
             1,
             10,
             5,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
         );
 
@@ -319,6 +344,8 @@ binary = "./simple"
             3,
             100,
             10,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
         );
 
@@ -369,6 +396,8 @@ binary = "./x"
             1,
             100,
             1000,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
         );
 
@@ -425,6 +454,8 @@ binary = "./x"
             1,
             100,
             10,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
         );
         let peers_idx = args.iter().position(|a| a == "--peers").unwrap();
@@ -469,6 +500,8 @@ binary = "./x"
             1,
             100,
             1,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
         );
 
@@ -519,12 +552,130 @@ binary = "./x"
             1,
             100,
             1,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
         );
 
         assert!(
             !args.iter().any(|a| a == "--eot-timeout-secs"),
             "--eot-timeout-secs must be absent when not in [variant.common]; got args = {args:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // T14.8: --threading-mode and --recv-buffer-kb injection.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_args_injects_threading_mode_unconditionally() {
+        // From T14.8 the runner emits `--threading-mode` for every spawn
+        // regardless of whether the source config declared `threading_modes`.
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1
+  qos = 1
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v",
+            1,
+            100,
+            1,
+            ThreadingMode::Multi,
+            8192,
+            &peers,
+        );
+
+        let mode_idx = args
+            .iter()
+            .position(|a| a == "--threading-mode")
+            .expect("--threading-mode must be injected unconditionally");
+        assert_eq!(args[mode_idx + 1], "multi");
+
+        let buf_idx = args
+            .iter()
+            .position(|a| a == "--recv-buffer-kb")
+            .expect("--recv-buffer-kb must be injected unconditionally");
+        assert_eq!(args[buf_idx + 1], "8192");
+    }
+
+    #[test]
+    fn build_args_threading_modes_common_value_does_not_leak() {
+        // If a user puts `threading_modes = [...]` in [variant.common]
+        // it must NOT leak through as a stray `--threading-modes` flag.
+        // The per-spawn `--threading-mode` injection is the only signal.
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1
+  qos = 1
+  threading_modes = ["single", "multi"]
+  recv_buffer_kb = 16384
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v-single",
+            1,
+            100,
+            1,
+            ThreadingMode::Single,
+            16384,
+            &peers,
+        );
+
+        // The raw common-section keys must NOT leak as CLI args.
+        assert!(
+            !args.iter().any(|a| a == "--threading-modes"),
+            "--threading-modes (the plural array form) must not leak through, got {args:?}"
+        );
+
+        // The injected per-spawn flags ARE present and correct.
+        let mode_idx = args.iter().position(|a| a == "--threading-mode").unwrap();
+        assert_eq!(args[mode_idx + 1], "single");
+
+        let buf_idx = args.iter().position(|a| a == "--recv-buffer-kb").unwrap();
+        assert_eq!(args[buf_idx + 1], "16384");
+
+        // Each appears exactly once.
+        assert_eq!(
+            args.iter().filter(|a| *a == "--threading-mode").count(),
+            1,
+            "--threading-mode must appear exactly once"
+        );
+        assert_eq!(
+            args.iter().filter(|a| *a == "--recv-buffer-kb").count(),
+            1,
+            "--recv-buffer-kb must appear exactly once"
         );
     }
 }
