@@ -8,6 +8,52 @@ use variant_base::driver::run_protocol;
 use variant_base::dummy::VariantDummy;
 use variant_base::types::ThreadingMode;
 
+/// Helper to build the canonical CLI arg list for spawning the
+/// `variant-dummy` binary in tests. `progress_stdout_interval_ms` is
+/// the only knob the smoke tests exercise; everything else is fixed.
+fn dummy_binary_args(
+    log_dir: &str,
+    launch_ts: &str,
+    runner: &str,
+    progress_stdout_interval_ms: u32,
+    operate_secs: &str,
+) -> Vec<String> {
+    vec![
+        "--tick-rate-hz".to_string(),
+        "100".to_string(),
+        "--stabilize-secs".to_string(),
+        "0".to_string(),
+        "--operate-secs".to_string(),
+        operate_secs.to_string(),
+        "--silent-secs".to_string(),
+        "0".to_string(),
+        "--eot-timeout-secs".to_string(),
+        "1".to_string(),
+        "--workload".to_string(),
+        "scalar-flood".to_string(),
+        "--values-per-tick".to_string(),
+        "5".to_string(),
+        "--qos".to_string(),
+        "1".to_string(),
+        "--log-dir".to_string(),
+        log_dir.to_string(),
+        "--launch-ts".to_string(),
+        launch_ts.to_string(),
+        "--variant".to_string(),
+        "dummy".to_string(),
+        "--runner".to_string(),
+        runner.to_string(),
+        "--run".to_string(),
+        "run-bin".to_string(),
+        "--threading-mode".to_string(),
+        "single".to_string(),
+        "--progress-stdout-interval-ms".to_string(),
+        progress_stdout_interval_ms.to_string(),
+        "--peers".to_string(),
+        format!("{runner}=127.0.0.1"),
+    ]
+}
+
 /// Build CLI args for a short test run.
 fn test_args(log_dir: &str) -> CliArgs {
     test_args_with_mode(log_dir, ThreadingMode::Single)
@@ -326,4 +372,162 @@ fn test_variant_dummy_runs_in_both_threading_modes() {
             "every write should have a matching receive in {mode} mode (dummy echoes)"
         );
     }
+}
+
+/// T15.1: spawn `variant-dummy` with `--progress-stdout-interval-ms 200`,
+/// capture its stdout, and verify the emitted stream is one well-formed
+/// JSON progress event per ~200 ms with the expected phase sequence
+/// visible.
+#[test]
+fn test_variant_dummy_emits_progress_to_stdout() {
+    let binary = env!("CARGO_BIN_EXE_variant-dummy");
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let launch_ts = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .to_string();
+
+    // 200 ms interval, 2 s operate -> approximately 10 lines over the
+    // operate phase. The dummy's stabilize / silent windows are zero so
+    // operate dominates wallclock.
+    let args = dummy_binary_args(log_dir, &launch_ts, "stdout-test", 200, "2");
+
+    let output = Command::new(binary)
+        .args(&args)
+        .output()
+        .expect("variant-dummy binary should run");
+    assert!(
+        output.status.success(),
+        "variant-dummy should exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
+    // Every non-empty stdout line must be one of our progress JSON
+    // events. There is no other line variant-base writes to stdout.
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        !lines.is_empty(),
+        "variant-dummy with progress emission should emit at least one line"
+    );
+
+    // Lower bound: at 200 ms interval over a 2 s operate phase plus
+    // connect/eot phases, we should comfortably see >=5 lines (we err
+    // generously low to absorb CI scheduling drift). Upper bound is
+    // sanity-only -- absurdly high counts would indicate runaway
+    // emission.
+    assert!(
+        (5..=60).contains(&lines.len()),
+        "expected 5..=60 progress lines, got {} for stdout:\n{stdout}",
+        lines.len()
+    );
+
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            serde_json::from_str(l)
+                .unwrap_or_else(|e| panic!("line {i} did not parse as JSON: {e}\nraw: {l}"))
+        })
+        .collect();
+
+    // Schema check: every line carries the documented fields.
+    for (i, v) in parsed.iter().enumerate() {
+        assert_eq!(v["event"], "progress", "line {i} missing event=progress");
+        assert!(v["ts"].is_string(), "line {i} missing string ts");
+        assert!(v["phase"].is_string(), "line {i} missing string phase");
+        assert!(v["sent"].is_u64(), "line {i} sent must be u64");
+        assert!(v["received"].is_u64(), "line {i} received must be u64");
+        assert!(v["eot_sent"].is_boolean(), "line {i} eot_sent must be bool");
+        assert!(
+            v["eot_received"].is_boolean(),
+            "line {i} eot_received must be bool"
+        );
+    }
+
+    // Timestamps must be RFC 3339 and monotonically non-decreasing.
+    let timestamps: Vec<chrono::DateTime<chrono::FixedOffset>> = parsed
+        .iter()
+        .map(|v| chrono::DateTime::parse_from_rfc3339(v["ts"].as_str().unwrap()).unwrap())
+        .collect();
+    for window in timestamps.windows(2) {
+        assert!(
+            window[1] >= window[0],
+            "timestamps must be monotonic non-decreasing"
+        );
+    }
+
+    // Phase transitions: at minimum operate -> done must appear (the
+    // 0-duration stabilize and silent phases mean their progress
+    // window is tight and may be missed by the 200 ms emitter, which
+    // is expected -- the runner-side state machine treats absence of
+    // a phase as just-passed-through, not an error). `operate` and
+    // `done` are the load-bearing transitions for T15.1.
+    let phases: Vec<&str> = parsed
+        .iter()
+        .map(|v| v["phase"].as_str().unwrap())
+        .collect();
+    assert!(
+        phases.contains(&"operate"),
+        "operate phase missing from progress stream: {phases:?}"
+    );
+    assert!(
+        phases.contains(&"done"),
+        "done phase missing from progress stream: {phases:?}"
+    );
+
+    // sent / received counters must be monotonic non-decreasing.
+    let mut prev_sent = 0u64;
+    let mut prev_received = 0u64;
+    for v in &parsed {
+        let s = v["sent"].as_u64().unwrap();
+        let r = v["received"].as_u64().unwrap();
+        assert!(s >= prev_sent, "sent must be monotonic: {prev_sent} -> {s}");
+        assert!(
+            r >= prev_received,
+            "received must be monotonic: {prev_received} -> {r}"
+        );
+        prev_sent = s;
+        prev_received = r;
+    }
+    // At least one line must have advanced both counters (the dummy
+    // publishes and echoes during operate, so both grow).
+    assert!(
+        prev_sent > 0,
+        "final sent counter must be > 0 after a 2 s operate phase"
+    );
+    assert!(
+        prev_received > 0,
+        "final received counter must be > 0 after a 2 s operate phase"
+    );
+}
+
+/// T15.1: with `--progress-stdout-interval-ms 0`, the variant must
+/// emit ZERO stdout lines (back-compat path).
+#[test]
+fn test_variant_dummy_progress_stdout_zero_disables_emission() {
+    let binary = env!("CARGO_BIN_EXE_variant-dummy");
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let launch_ts = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .to_string();
+
+    let args = dummy_binary_args(log_dir, &launch_ts, "stdout-off", 0, "1");
+
+    let output = Command::new(binary)
+        .args(&args)
+        .output()
+        .expect("variant-dummy binary should run");
+    assert!(
+        output.status.success(),
+        "variant-dummy should exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
+    assert!(
+        stdout.trim().is_empty(),
+        "--progress-stdout-interval-ms=0 must produce empty stdout, got:\n{stdout}"
+    );
 }
