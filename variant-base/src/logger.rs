@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -253,6 +254,69 @@ impl Logger {
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())
+    }
+}
+
+/// Thread-safe shared handle to a [`Logger`].
+///
+/// Wraps an `Arc<Mutex<Logger>>` so multiple threads can write events
+/// concurrently. Designed for variants whose Multi-mode reader threads
+/// need to emit `receive` events directly off the driver thread (T14.10).
+///
+/// The lock is held for the duration of a single `write_line` call --
+/// microseconds for one JSONL line in the common case. Contention is
+/// expected to be the new bottleneck cliff at extreme symmetric rates;
+/// see `variants/websocket/CUSTOM.md` "Threading modes (T14.2 + T14.10)".
+///
+/// The handle does NOT take ownership of the underlying `Logger`; the
+/// driver still owns the original instance and clones a `LoggerHandle`
+/// into the variant via [`crate::variant_trait::Variant::attach_logger`].
+/// All public methods are intentionally narrow -- only events that may
+/// be emitted from a non-driver thread are exposed. Driver-only events
+/// (phase, connected, write, eot_sent, ...) stay on the locked path
+/// through the original `Logger` handle.
+#[derive(Clone)]
+pub struct LoggerHandle {
+    inner: Arc<Mutex<Logger>>,
+}
+
+impl LoggerHandle {
+    /// Wrap an owned `Logger` for cross-thread use. The driver retains
+    /// its own clone of the `Arc` so the original can keep emitting
+    /// driver-side events while reader threads use additional clones.
+    pub fn new(logger: Logger) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(logger)),
+        }
+    }
+
+    /// Borrow the inner `Arc<Mutex<Logger>>` -- the driver uses this to
+    /// reach driver-only event methods (log_phase, log_write, etc.)
+    /// without exposing them on the cross-thread handle surface.
+    pub fn inner(&self) -> &Arc<Mutex<Logger>> {
+        &self.inner
+    }
+
+    /// Emit a `receive` event from any thread.
+    ///
+    /// Acquires the shared mutex and writes one JSONL line; the lock is
+    /// released before this returns. Errors are mapped through the
+    /// `anyhow::Result` channel; callers in reader-thread paths typically
+    /// log-and-continue on Err since dropping the variant during an
+    /// in-flight write is the only realistic source of failure.
+    pub fn log_receive(
+        &self,
+        writer: &str,
+        seq: u64,
+        path: &str,
+        qos: Qos,
+        bytes: usize,
+    ) -> Result<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("LoggerHandle mutex poisoned"))?;
+        guard.log_receive(writer, seq, path, qos, bytes)
     }
 }
 

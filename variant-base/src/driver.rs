@@ -5,12 +5,88 @@ use anyhow::Result;
 use chrono::DateTime;
 
 use crate::cli::{parse_peer_names_from_extra, CliArgs};
-use crate::logger::Logger;
+use crate::logger::{Logger, LoggerHandle};
 use crate::resource::ResourceMonitor;
 use crate::seq::SeqGenerator;
-use crate::types::{Phase, Qos};
+use crate::types::{Phase, Qos, ThreadingMode};
 use crate::variant_trait::Variant;
 use crate::workload::create_workload;
+
+/// Thin proxy that exposes the `Logger` event API on top of a
+/// [`LoggerHandle`]. Used by the driver so existing call sites can keep
+/// the historical `logger.log_*` shape after the underlying logger was
+/// moved behind `Arc<Mutex<Logger>>` for T14.10. Each call locks the
+/// mutex briefly, emits the event, then releases.
+struct LoggerProxy<'a> {
+    handle: &'a LoggerHandle,
+}
+
+impl<'a> LoggerProxy<'a> {
+    fn new(handle: &'a LoggerHandle) -> Self {
+        Self { handle }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Logger>> {
+        self.handle
+            .inner()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("LoggerHandle mutex poisoned"))
+    }
+
+    fn log_phase(&mut self, phase: Phase, profile: Option<&str>) -> Result<()> {
+        self.lock()?.log_phase(phase, profile)
+    }
+
+    fn log_connected(
+        &mut self,
+        launch_ts: &str,
+        elapsed_ms: f64,
+        threading_mode: ThreadingMode,
+        recv_buffer_kb: u32,
+    ) -> Result<()> {
+        self.lock()?
+            .log_connected(launch_ts, elapsed_ms, threading_mode, recv_buffer_kb)
+    }
+
+    fn log_write(&mut self, seq: u64, path: &str, qos: Qos, bytes: usize) -> Result<()> {
+        self.lock()?.log_write(seq, path, qos, bytes)
+    }
+
+    fn log_backpressure_skipped(&mut self, path: &str, qos: Qos) -> Result<()> {
+        self.lock()?.log_backpressure_skipped(path, qos)
+    }
+
+    fn log_receive(
+        &mut self,
+        writer: &str,
+        seq: u64,
+        path: &str,
+        qos: Qos,
+        bytes: usize,
+    ) -> Result<()> {
+        self.lock()?.log_receive(writer, seq, path, qos, bytes)
+    }
+
+    fn log_eot_sent(&mut self, eot_id: u64) -> Result<()> {
+        self.lock()?.log_eot_sent(eot_id)
+    }
+
+    fn log_eot_received(&mut self, writer: &str, eot_id: u64) -> Result<()> {
+        self.lock()?.log_eot_received(writer, eot_id)
+    }
+
+    fn log_eot_timeout(&mut self, missing: &[String], wait_ms: u64) -> Result<()> {
+        self.lock()?.log_eot_timeout(missing, wait_ms)
+    }
+
+    fn log_resource(&mut self, cpu_percent: f64, memory_mb: f64) -> Result<()> {
+        self.lock()?.log_resource(cpu_percent, memory_mb)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.lock()?.flush()
+    }
+}
 
 /// Minimum EOT-phase drain budget in seconds when no explicit override is
 /// provided. Replaces the previous 5-second floor: even short fixture runs
@@ -98,12 +174,19 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     let qos = Qos::from_int(config.qos)
         .ok_or_else(|| anyhow::anyhow!("invalid QoS level: {}", config.qos))?;
 
-    let mut logger = Logger::new(
+    let owned_logger = Logger::new(
         &config.log_dir,
         &config.variant,
         &config.runner,
         &config.run,
     )?;
+    // Wrap the logger in a thread-safe handle (T14.10) so variants
+    // whose reader threads emit `receive` events directly can clone it
+    // into the spawned thread. Driver-side event emission goes through
+    // a `LoggerProxy` that locks the mutex per event -- the proxy keeps
+    // the historical `logger.log_*` call shape unchanged at all sites.
+    let logger_handle = LoggerHandle::new(owned_logger);
+    let mut logger = LoggerProxy::new(&logger_handle);
     let mut seq_gen = SeqGenerator::new();
     let mut resource_monitor = ResourceMonitor::new();
     let mut workload = create_workload(&config.workload)?;
@@ -117,6 +200,11 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // impl is a no-op for Single-only variants. See E14 / T14.1.
     logger.log_phase(Phase::Connect, None)?;
     variant.connect(config.threading_mode)?;
+    // Hand the variant a thread-safe logger handle BEFORE reader
+    // threads are spawned so they capture it at spawn time. The default
+    // trait impl is a no-op for variants that route all logging
+    // through the driver thread.
+    variant.attach_logger(logger_handle.clone());
     variant.start_reader_threads(config.threading_mode)?;
 
     let launch_ts = DateTime::parse_from_rfc3339(&config.launch_ts)?;

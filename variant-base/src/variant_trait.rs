@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use crate::logger::LoggerHandle;
 use crate::types::{Qos, ReceivedUpdate, ThreadingMode};
 
 /// A peer end-of-test marker observed by a variant.
@@ -55,6 +56,21 @@ pub trait Variant {
     /// connect-time error path simple and lets variants log a clean
     /// `connected` event before any reader thread starts running.
     fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()>;
+
+    /// Receive a shared, thread-safe handle to the driver's JSONL
+    /// `Logger`.
+    ///
+    /// Called by the driver immediately AFTER `connect` returns and
+    /// BEFORE `start_reader_threads`. Variants whose reader threads
+    /// emit `receive` events directly (T14.10) capture the handle here
+    /// and clone it into each spawned thread. Variants that route all
+    /// logging through the driver thread (the historical model) can
+    /// ignore the call; the default implementation is a no-op.
+    ///
+    /// The handle internally holds an `Arc<Mutex<Logger>>` so any
+    /// number of threads may emit events safely; the driver retains
+    /// its own clone for driver-side events.
+    fn attach_logger(&mut self, _logger: LoggerHandle) {}
 
     /// Spawn per-peer reader threads (or any other multi-thread
     /// machinery) for the chosen mode.
