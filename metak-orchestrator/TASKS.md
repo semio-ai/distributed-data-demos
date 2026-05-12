@@ -5349,6 +5349,241 @@ This task is primarily INVESTIGATIVE. Questions to answer:
 
 ---
 
+### T14.16: variants/custom-udp + variants/hybrid -- EOT survives reader saturation
+
+**Repos**: `variants/custom-udp/`, `variants/hybrid/`.
+**Status**: pending, filed 2026-05-12 by orchestrator after the all-variants
+qos2 smoke surfaced an asymmetric same-host timeout.
+
+#### Background
+
+The user ran `configs/two-runner-all-variants.toml` on localhost. The
+`custom-udp-1000x100hz-qos2-multi` spawn (100 K msg/s symmetric UDP,
+latest-value path) showed asymmetric stderr:
+
+- **alice**: variant printed many
+  `[custom-udp] multi: reader channel full -- dropping frame (receiver saturated)`
+  lines; runner reported `status=timeout, exit_code=-1` at 120 s.
+- **bob**: ran the same spawn cleanly to `status=success, exit_code=0`
+  with no `reader channel full` messages.
+
+Root cause (per orchestrator analysis): at 100 K msg/s same-host UDP,
+scheduling luck consistently gives one side slightly faster publish
+throughput; the other side's reader thread can't drain its bounded
+mpsc fast enough; `try_send` fails and frames are dropped at the
+`ReaderItem` enum level. **And because `Eot` shares the same bounded
+mpsc with `Data`, the peer's EOT marker is also drop-on-fulled.** The
+saturated side never observes EOT, waits 120 s for the runner's
+done-barrier, gets killed.
+
+The "data may drop, EOT must not" invariant is what's missing.
+
+#### Scope
+
+Both `variants/custom-udp/src/udp.rs` (or wherever T14.3 added the
+reader-thread mpsc) and `variants/hybrid/src/reader.rs` (T14.4) share
+the same architectural shape: one bounded `mpsc::sync_channel` for
+all `ReaderItem` variants. The fix in both is:
+
+1. **Split the channel into two**:
+   - `data_tx` -- existing bounded mpsc, carries `ReaderItem::Data`
+     only. Drop-on-full is acceptable here (UDP is best-effort by
+     definition; for TCP qos4, kernel TCP backpressure already prevents
+     the recv buffer from filling pathologically). Keep the existing
+     `4 * vpt * peer_count` (custom-udp) / `4096`-fixed (hybrid) bound.
+   - `lifecycle_tx` -- new **UNBOUNDED** `std::sync::mpsc::channel`
+     for lifecycle items (`Eot`, `TcpPeerDropped`). Unbounded is safe
+     because lifecycle items are infrequent (O(peers) per spawn for
+     `Eot`, O(peers) total for `TcpPeerDropped` across a session).
+     The reader thread `send`s (blocking, but it never blocks because
+     unbounded) lifecycle items here.
+2. **Nack handling** (custom-udp only -- hybrid has no NACK protocol):
+   `ReaderItem::Nack` is used for QoS-3 NACK-based reliable UDP. Nacks
+   under load matter for reliability. The cleanest treatment is to put
+   Nacks on the lifecycle channel too -- they're rare (only fired on
+   gap detection) and losing them would silently break QoS-3 reliability.
+   Worker can choose: separate `nack_tx`, or fold into `lifecycle_tx`.
+3. **Driver-side consumption**: the variant's `poll_receive` now drains
+   both channels per call: drain `lifecycle_tx` first (priority --
+   reading EOT promptly is the whole point), then drain `data_tx`.
+   Existing budget logic stays for `data_tx`; lifecycle is unbounded
+   so just drain to empty.
+4. **stderr message refinement**: the `reader channel full -- dropping
+   frame (receiver saturated)` line should make clear it refers to
+   the DATA channel only -- e.g. rename to
+   `data channel full -- dropping Data frame (receiver saturated)`.
+   Operators will then trust that EOT loss is no longer a possibility
+   if they see only this message.
+
+#### Tests
+
+Per variant:
+
+- Unit: stub-variant test that floods Data items into a small (e.g.
+  64-slot) `data_tx` while interleaving one `Eot` after N saturations.
+  Driver-side `poll_receive` sequence must observe the Eot regardless
+  of how many Data drops occur.
+- Integration regression: existing two-runner same-host high-rate
+  fixtures should NOT regress in delivery percentages, AND both runners
+  should reach EOT cleanly with `status=success`. The failure case
+  observed in the user's all-variants run -- one side `status=success`,
+  the other `status=timeout` -- must become both `status=success`.
+
+#### Validation (MANDATORY)
+
+From workspace root:
+- `cargo build --release -p variant-custom-udp -p variant-hybrid` clean.
+- `cargo test --release -p variant-custom-udp -p variant-hybrid` all-green.
+- `cargo test --release --workspace` no regression.
+- Clippy and fmt clean for both crates.
+- **End-to-end repro (MANDATORY)**: re-run the all-variants config's
+  failing case, OR a focused smoke fixture, that puts both runners at
+  ~100 K msg/s symmetric UDP qos2. Both runners must reach `eot_sent`
+  AND `eot_received` and complete `status=success`. Capture stdouts +
+  per-side write/receive counts in the completion report.
+
+#### Acceptance criteria
+
+- [ ] Channel split landed in custom-udp.
+- [ ] Channel split landed in hybrid.
+- [ ] `poll_receive` drains lifecycle channel first.
+- [ ] stderr message disambiguates "data channel full" vs anything
+      else.
+- [ ] Same-host symmetric 100 K msg/s qos2 repro: both runners exit
+      `status=success` with `eot_sent` + `eot_received` on both sides.
+- [ ] Existing tests pass; clippy / fmt clean.
+- [ ] Each variant's `CUSTOM.md` documents the two-channel architecture.
+
+#### Out of scope
+
+- Generalising T14.10's full log-from-reader pattern to UDP variants
+  (separate task; T14.18 if motivated). T14.16 keeps Data on the mpsc
+  for UDP-family because the analysis-time gap-detection / receive
+  correlation logic in the driver needs to observe Data items for
+  QoS-3 NACK-based reliability and for integrity checks.
+- Generalising to websocket. T14.10 already moved Data off the mpsc;
+  websocket's mpsc is already lifecycle-only.
+- Changing what "EOT" means or how many EOT markers are sent. The
+  current "send EOT, wait for peer EOT" semantics from E12 stay
+  unchanged.
+
+---
+
+### T14.17: analysis -- classify timeout cause (deadlock vs eot-lost vs other)
+
+**Repo**: `analysis/`.
+**Status**: pending, filed 2026-05-12 by orchestrator after the
+all-variants qos2 smoke surfaced EOT-loss-induced timeouts that look
+identical to deadlocks in the current integrity report.
+
+#### Background
+
+A `status=timeout` spawn outcome currently shows up in T11.5's integrity
+report as a generic FAIL. But there are several distinct mechanisms:
+
+1. **Deadlock / crash**: variant got stuck or panicked; JSONL ends
+   mid-record; no `eot_sent` on the writer's own log.
+2. **EOT-lost (this run)**: variant published happily, reached
+   `eot_sent` on its own log, but the peer's reader saturated and
+   dropped the EOT marker. Peer never sees EOT, peer times out.
+   Asymmetric: one side completes, the other times out.
+3. **Variant-rejected**: variant exited cleanly with a non-zero exit
+   code BEFORE operate phase (e.g. unsupported QoS, port collision).
+   T-impl.9's stderr-tail capture surfaces these.
+4. **EOT-timeout (variant-side)**: variant correctly received some
+   EOTs but not all, hit its own `--eot-timeout-secs`, exited cleanly
+   with that diagnostic in JSONL.
+
+The current analysis bins all four into a single FAIL. The operator
+has to manually inspect stderr captures and JSONL files to tell them
+apart. The receive-headline pivot (T11.5) is much more useful if the
+analysis can also TYPE the failure.
+
+#### Scope
+
+In `analysis/integrity.py` (or wherever the integrity report is
+assembled), add a `timeout_classification` field (or `failure_kind` if
+we want to broaden the categorisation to non-timeout failures too).
+Values:
+
+- `"completed"` -- spawn ran to `status=success` and `eot_sent` +
+  matching peer `eot_received` events are present.
+- `"deadlock"` -- spawn `status=timeout`, writer's JSONL has no
+  `eot_sent` event, AND the writer's JSONL ends mid-record (final
+  line is incomplete JSON). Signals: process was killed mid-operate,
+  no graceful exit.
+- `"eot_lost"` -- spawn `status=timeout` on AT LEAST ONE side, but
+  that side's writer JSONL DOES contain `eot_sent`. Strong signal
+  that the side timed-out because the OTHER side never confirmed --
+  i.e. EOT was published but not observed back. Bonus: if the
+  asymmetric side (the one that succeeded) has many
+  `reader channel full` lines in its stderr capture, attach
+  `eot_lost_likely_saturation` as a sub-tag.
+- `"variant_rejected"` -- spawn exited non-zero with a clear stderr
+  message before operate (T-impl.9 stderr capture present and
+  non-empty; JSONL has no `phase=operate` event). Look for known
+  rejection patterns: `does not support single-threaded mode`,
+  `does not support QoS`, etc.
+- `"eot_timeout_internal"` -- variant exited cleanly with the
+  `eot_timeout` event in JSONL (per E12 EOT protocol). Different
+  from `eot_lost` because the variant itself decided to give up
+  rather than being externally killed.
+- `"unknown"` -- doesn't match any of the above. Worth investigating
+  manually.
+
+Add `timeout_classification` as a column in the integrity report and
+as a tag in the per-spawn diagnostic detail. Update `metak-shared/
+ANALYSIS.md` to document the new field.
+
+#### Tests
+
+Synthetic-fixture-driven unit tests:
+
+- Synthesize a JSONL pair where the writer has `eot_sent` but the
+  peer's JSONL doesn't have `eot_received`. Classification: `eot_lost`.
+- Synthesize a JSONL ending with a truncated record and no
+  `eot_sent`. Classification: `deadlock`.
+- Synthesize a stderr capture containing
+  `variant does not support single-threaded mode`.
+  Classification: `variant_rejected`.
+- Synthesize a clean run with `eot_sent` + `eot_received` on both
+  sides. Classification: `completed`.
+- Synthesize an `eot_timeout` event in JSONL. Classification:
+  `eot_timeout_internal`.
+
+#### Validation
+
+- `pytest analysis/tests/` all-green.
+- Run analysis against the existing
+  `logs/all-variants-01-20260512_083021/` (the run that motivated
+  this task). At least one `custom-udp-1000x100hz-qos2-multi` spawn
+  should classify as `eot_lost` for the timed-out side.
+- Run against the existing `logs/smoke-e14-20260512_040533/`. The
+  successful 7 spawns should classify as `completed`.
+- ruff format + ruff check clean.
+
+#### Acceptance criteria
+
+- [ ] `timeout_classification` field computed and reported.
+- [ ] Five classification rules above are correctly implemented.
+- [ ] All five new unit tests pass.
+- [ ] Existing analysis tests still pass.
+- [ ] `metak-shared/ANALYSIS.md` documents the new field.
+- [ ] Re-run on existing failed-spawn datasets correctly types the
+      failures (orchestrator review will spot-check).
+
+#### Out of scope
+
+- Plotting / diagram changes (separate E5/E6 follow-up if motivated).
+- Auto-recovery / retry logic (analysis is offline; retry happens
+  via `--resume` at the runner).
+- Cross-spawn correlation (e.g. detecting whether the same kind of
+  failure recurs across spawns). Each spawn classifies independently.
+- Suggesting fixes per classification. Just type the failure; the
+  human reads the table and decides.
+
+---
+
 ### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (DEFERRED)
 
 **Repo**: `variants/zenoh/`, plus a small runner-side sidecar-spawn
