@@ -254,7 +254,7 @@ Where it lives:
 - `src/hybrid.rs::Variant::publish` — unchanged; keeps the
   spin-on-WouldBlock UDP send and the blocking TCP broadcast.
 
-### Threading modes (T14.4)
+### Threading modes (T14.4 + T14.16)
 
 Hybrid declares
 `supported_threading_modes() = &[Single, Multi]`. The driver chooses
@@ -298,12 +298,36 @@ spawns:
   `TcpPeer::take_read_stream`, raised to `SO_RCVTIMEO = 200 ms` so
   the reader wakes periodically to check shutdown.
 
-Both reader-thread families pre-decode `Frame`s and push
-`HubMessage`s onto a bounded `mpsc::sync_channel`
-(`reader::READER_CHANNEL_CAPACITY = 4096`). `try_send` (no blocking)
-drops on full-channel rather than blocking the reader; the driver
-drains the channel via `try_recv` inside
-`HybridVariant::poll_receive_multi`.
+Both reader-thread families pre-decode `Frame`s and route the
+decoded item onto one of two channels per the T14.16 split:
+
+- `HubDataMessage::Data` -> bounded `data_tx` (an
+  `mpsc::sync_channel` of capacity
+  `reader::READER_CHANNEL_CAPACITY = 4096`). `try_send` (no blocking)
+  drops on full-channel rather than blocking the reader. Drop-on-full
+  is acceptable: QoS 1/2 tolerate loss by definition; QoS 3/4 (TCP)
+  receivers depend on kernel TCP, which applies its own back-pressure
+  before the recv buffer can fill pathologically. The warning line
+  for an overrun is
+  `[variant-hybrid] data channel full (... slots) -- dropping Data frame (receiver saturated)`
+  -- disambiguated from the pre-T14.16 wording so operators can be
+  sure lifecycle items (EOT) were NOT lost when this line appears.
+- `HubLifecycleMessage::Eot` -> unbounded `lifecycle_tx` (a
+  `std::sync::mpsc::channel`). Lifecycle items must NEVER drop: losing
+  an EOT forces the peer's driver to wait the full `eot_timeout`,
+  defeating the EOT contract. Hybrid has no NACK protocol so the
+  lifecycle channel currently only carries `Eot`; per-peer drop
+  signalling is handled inline by the reader thread's local
+  exit-on-error code path (it does not push a separate
+  `PeerDropped` lifecycle item -- the connection-close on the peer
+  side suffices for the driver's downstream logic).
+
+The driver drains both channels via `try_recv` inside
+`HybridVariant::poll_receive_multi`. T14.16 priority: the lifecycle
+channel is drained FIRST on every call (loop until empty), then the
+bounded data channel is drained up to `POLL_BUDGET = 256` items per
+call. This guarantees that EOT observations are never starved by a
+saturated data channel.
 
 Lifecycle:
 
