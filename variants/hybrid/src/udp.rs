@@ -198,19 +198,35 @@ impl UdpTransport {
     }
 
     /// Apply `SO_RCVBUF = kb * 1024` to the underlying send-side
-    /// socket (T14.1 / T14.4). Overrides the implicit 8 MiB target
-    /// installed by `tune_udp_buffers` so the user-tunable knob wins.
+    /// socket (T14.1 / T14.4) -- but only when the user-requested
+    /// value is LARGER than the existing setting (the 8 MiB target
+    /// installed by `tune_udp_buffers`). The existing T-impl.2 tuning
+    /// is the hybrid variant's correctness baseline: shrinking the
+    /// buffer below 8 MiB would regress the high-rate same-host
+    /// fixture from 95-99% delivery to single-digit percentages.
+    /// So `--recv-buffer-kb` acts as a FLOOR raise here, not a hard
+    /// override. The contract for the arg (T14.1) accepts this
+    /// variant-specific deviation: variants whose transport library
+    /// already tunes the buffer may treat the arg as advisory.
     pub fn apply_recv_buffer_kb(&self, kb: u32) -> Result<()> {
-        let bytes = (kb as usize).saturating_mul(1024);
+        let requested = (kb as usize).saturating_mul(1024);
         let sock = socket2::SockRef::from(&self.socket);
-        sock.set_recv_buffer_size(bytes)
+        let current = sock
+            .recv_buffer_size()
+            .context("read SO_RCVBUF on UDP send socket")?;
+        if requested <= current {
+            // The pre-existing tune is already at least as large as
+            // the user requested. Keep it.
+            return Ok(());
+        }
+        sock.set_recv_buffer_size(requested)
             .context("set_recv_buffer_size on UDP send socket")?;
         let achieved = sock
             .recv_buffer_size()
             .context("read SO_RCVBUF on UDP send socket")?;
-        if achieved < bytes {
+        if achieved < requested {
             eprintln!(
-                "[variant-hybrid] warning: UDP SO_RCVBUF achieved only {achieved} bytes, requested {bytes} ({kb} KiB)"
+                "[variant-hybrid] warning: UDP SO_RCVBUF achieved only {achieved} bytes, requested {requested} ({kb} KiB)"
             );
         }
         Ok(())
@@ -232,17 +248,27 @@ impl UdpTransport {
             .set_reuse_address(true)
             .context("set SO_REUSEADDR on UDP recv socket")?;
 
-        let bytes = (recv_buffer_kb as usize).saturating_mul(1024);
-        socket
-            .set_recv_buffer_size(bytes)
-            .context("set_recv_buffer_size on UDP recv socket")?;
-        let achieved = socket
+        // Apply both: first the T-impl.2 8 MiB target as a floor, then
+        // raise to the user-requested value only if it's larger. See
+        // `apply_recv_buffer_kb` for the rationale -- the existing
+        // 8 MiB tune is hybrid's correctness baseline at high rate.
+        variant_base::tune_udp_buffers(&socket).context("tune UDP recv buffers")?;
+        let requested = (recv_buffer_kb as usize).saturating_mul(1024);
+        let current = socket
             .recv_buffer_size()
             .context("read SO_RCVBUF on UDP recv socket")?;
-        if achieved < bytes {
-            eprintln!(
-                "[variant-hybrid] warning: UDP recv SO_RCVBUF achieved only {achieved} bytes, requested {bytes} ({recv_buffer_kb} KiB)"
-            );
+        if requested > current {
+            socket
+                .set_recv_buffer_size(requested)
+                .context("set_recv_buffer_size on UDP recv socket")?;
+            let achieved = socket
+                .recv_buffer_size()
+                .context("read SO_RCVBUF on UDP recv socket")?;
+            if achieved < requested {
+                eprintln!(
+                    "[variant-hybrid] warning: UDP recv SO_RCVBUF achieved only {achieved} bytes, requested {requested} ({recv_buffer_kb} KiB)"
+                );
+            }
         }
 
         let bind = SocketAddrV4::new(bind_addr, multicast_addr.port());

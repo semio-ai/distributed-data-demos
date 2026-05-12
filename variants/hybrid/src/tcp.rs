@@ -393,24 +393,29 @@ impl TcpTransport {
     }
 }
 
-/// Connect to `addr` with a bounded retry on `ConnectionRefused`,
-/// `TimedOut`, or `WouldBlock`. The two-runner startup is a known
-/// race: both sides hit the ready barrier and call `connect` near
-/// simultaneously; either side's listener may not be bound yet. Same
-/// pattern the websocket variant uses (`ws_client_connect`).
+/// Connect to `addr` with a bounded retry ONLY on `ConnectionRefused`.
+/// The two-runner startup is a known race: both sides hit the ready
+/// barrier and call `connect` near simultaneously; either side's
+/// listener may not be bound yet. On `ConnectionRefused`, retry every
+/// 50 ms for up to `budget`. All other error kinds (including
+/// `TimedOut`) propagate immediately so we don't paper over real
+/// connectivity problems.
+///
+/// Uses the BLOCKING `TcpStream::connect` (no per-attempt timeout) to
+/// preserve the existing kernel-default connect behaviour: a successful
+/// connect on a healthy LAN returns within milliseconds. Wrapping with
+/// `connect_timeout(500ms)` would have falsely tripped on slow SYN-ACK
+/// scheduling at higher QoS levels (cause of the qos4 regression in
+/// the first iteration of this helper).
 fn connect_with_retry(addr: SocketAddr, budget: Duration) -> Result<TcpStream> {
     let deadline = Instant::now() + budget;
     loop {
-        match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+        match TcpStream::connect(addr) {
             Ok(s) => return Ok(s),
-            Err(e)
-                if e.kind() == io::ErrorKind::ConnectionRefused
-                    || e.kind() == io::ErrorKind::TimedOut
-                    || e.kind() == io::ErrorKind::WouldBlock =>
-            {
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
                 if Instant::now() >= deadline {
                     return Err(anyhow::anyhow!(
-                        "TCP connect to {addr} timed out after {budget:?}: {e}"
+                        "TCP connect to {addr} kept getting refused after {budget:?}: {e}"
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
