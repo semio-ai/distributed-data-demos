@@ -796,8 +796,7 @@ where
     F: FnMut(&str),
 {
     let mut out: Vec<(usize, spawn_job::SpawnJob)> = Vec::new();
-    let mut warned_permissive: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
+    let mut warned_permissive: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (idx, variant) in bench_config.variant.iter().enumerate() {
         let declared = variant.supported_modes_resolved()?;
         for job in spawn_job::expand_variant(idx, variant)? {
@@ -1026,8 +1025,7 @@ supported_modes = ["single"]
             .find(|l| l.contains("skipping single-only-multi"))
             .expect("skipping notice must be emitted; got lines: {lines:?}");
         assert!(
-            skip_line
-                .contains("variant does not support threading_mode=multi"),
+            skip_line.contains("variant does not support threading_mode=multi"),
             "skip line shape: {skip_line}"
         );
         assert!(

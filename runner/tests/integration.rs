@@ -675,7 +675,11 @@ fn threading_modes_expansion_runs_both_spawns_through_variant_dummy() {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .collect();
-    assert_eq!(subdirs.len(), 1, "expected exactly one timestamped subfolder");
+    assert_eq!(
+        subdirs.len(),
+        1,
+        "expected exactly one timestamped subfolder"
+    );
 
     let jsonl_files: Vec<String> = std::fs::read_dir(subdirs[0].path())
         .unwrap()
@@ -764,9 +768,7 @@ fn threading_modes_capability_gating_skips_unsupported_with_notice() {
 
     // Stderr must carry the exact contract notice for the skipped multi spawn.
     assert!(
-        stderr.contains(
-            "skipping dummy-multi: variant does not support threading_mode=multi"
-        ),
+        stderr.contains("skipping dummy-multi: variant does not support threading_mode=multi"),
         "stderr must carry the capability-gating skip notice, got:\n{stderr}"
     );
 
@@ -787,7 +789,11 @@ fn threading_modes_capability_gating_skips_unsupported_with_notice() {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .collect();
-    assert_eq!(subdirs.len(), 1, "expected exactly one timestamped subfolder");
+    assert_eq!(
+        subdirs.len(),
+        1,
+        "expected exactly one timestamped subfolder"
+    );
     let jsonl_files: Vec<String> = std::fs::read_dir(subdirs[0].path())
         .unwrap()
         .filter_map(|e| e.ok())

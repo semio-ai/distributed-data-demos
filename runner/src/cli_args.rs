@@ -68,11 +68,7 @@ pub fn build_variant_args(
     for (key, val) in &variant.common {
         if matches!(
             key.as_str(),
-            "qos"
-                | "tick_rate_hz"
-                | "values_per_tick"
-                | "threading_modes"
-                | "recv_buffer_kb"
+            "qos" | "tick_rate_hz" | "values_per_tick" | "threading_modes" | "recv_buffer_kb"
         ) {
             continue;
         }

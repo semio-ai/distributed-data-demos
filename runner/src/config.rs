@@ -53,9 +53,7 @@ impl ThreadingMode {
         match s {
             "single" => Ok(ThreadingMode::Single),
             "multi" => Ok(ThreadingMode::Multi),
-            other => bail!(
-                "invalid threading_mode '{other}' (expected \"single\" or \"multi\")"
-            ),
+            other => bail!("invalid threading_mode '{other}' (expected \"single\" or \"multi\")"),
         }
     }
 }
@@ -119,9 +117,7 @@ fn parse_threading_modes_spec(val: &toml::Value) -> Result<ThreadingModesSpec> {
         spec.validate()?;
         return Ok(spec);
     }
-    bail!(
-        "threading_modes must be a string, an array of strings, or omitted (got {val:?})"
-    );
+    bail!("threading_modes must be a string, an array of strings, or omitted (got {val:?})");
 }
 
 /// QoS specification for a `[[variant]]` entry. Accepts an integer, an array

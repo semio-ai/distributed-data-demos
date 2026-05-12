@@ -489,7 +489,10 @@ binary = "./x"
 "#,
         );
         let jobs = expand_variant(0, &cfg.variant[0]).unwrap();
-        assert_eq!(jobs[0].recv_buffer_kb, crate::config::DEFAULT_RECV_BUFFER_KB);
+        assert_eq!(
+            jobs[0].recv_buffer_kb,
+            crate::config::DEFAULT_RECV_BUFFER_KB
+        );
     }
 
     #[test]
