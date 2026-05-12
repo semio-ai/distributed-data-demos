@@ -67,6 +67,8 @@ fn run() -> Result<()> {
         qos,
         tcp_listen_addr: derived.tcp_listen_addr,
         tcp_peers: derived.tcp_peers,
+        recv_buffer_kb: args.recv_buffer_kb,
+        values_per_tick: args.values_per_tick,
     };
     let mut variant = UdpVariant::new(config);
 

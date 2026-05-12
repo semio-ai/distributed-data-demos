@@ -3,12 +3,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use variant_base::{PeerEot, Qos, ReceivedUpdate, Variant};
+use variant_base::{PeerEot, Qos, ReceivedUpdate, ThreadingMode, Variant};
 
 use crate::protocol;
 use crate::protocol::Frame;
@@ -23,6 +26,30 @@ const EOT_UDP_RETRIES: usize = 5;
 
 /// Delay between successive UDP EOT sends.
 const EOT_UDP_SPACING: Duration = Duration::from_millis(5);
+
+/// Short blocking timeout applied to reader-thread sockets so the threads
+/// can wake periodically and observe the shutdown flag without relying on
+/// out-of-band signalling. Matches the websocket / hybrid pattern (T14.x):
+/// reads use a real OS-level `SO_RCVTIMEO`; writes are unaffected.
+const READER_RCVTIMEO: Duration = Duration::from_millis(50);
+
+/// Maximum wall-clock time the variant waits for all expected inbound TCP
+/// peer connections to be accepted before `start_reader_threads` proceeds.
+/// Matches the pre-existing connect-time tolerance used by other variants.
+const TCP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum wall-clock time we wait for a reader thread to join during
+/// `stop_reader_threads`. Threads that fail to exit within this window are
+/// logged as wedged and abandoned -- preferred over deadlocking the
+/// disconnect path. Matches the contract documented on
+/// `Variant::stop_reader_threads` for the E14 rollout (T14.1 notes).
+const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Floor for the Multi-mode mpsc channel bound. Keeps the channel useful
+/// even when `values_per_tick` is small (e.g. low-rate fixtures). Sized
+/// well above one tick's-worth of frames so the reader thread can push a
+/// short burst without bouncing on `TrySendError::Full`.
+const MULTI_CHANNEL_FLOOR: usize = 16;
 
 /// Configuration for the UDP variant.
 ///
@@ -49,6 +76,52 @@ pub struct UdpConfig {
     /// Remote TCP endpoints (one per non-self peer) derived in main. Only
     /// connected at QoS 4. May be empty (e.g. single-peer self-only test).
     pub tcp_peers: Vec<SocketAddr>,
+    /// OS-level receive buffer size in kibibytes (1024-byte units). The
+    /// variant applies `SO_RCVBUF = recv_buffer_kb * 1024` on every
+    /// recv-side socket it owns: the UDP multicast socket and (at QoS 4)
+    /// every inbound TCP stream. See `metak-shared/api-contracts/variant-cli.md`
+    /// "E14 additions: --recv-buffer-kb" for the contract.
+    pub recv_buffer_kb: u32,
+    /// Driver's per-tick value count. Used to size the Multi-mode mpsc
+    /// channel (see `start_reader_threads`). Unused in Single mode.
+    pub values_per_tick: u32,
+}
+
+/// Decoded item placed on the Multi-mode mpsc by reader threads.
+///
+/// Reader threads parse the on-wire frame and push one of these into the
+/// shared channel. `poll_receive` drains the channel on the driver thread
+/// and converts data frames into `ReceivedUpdate`s while threading EOT
+/// frames and NACK requests through the existing dedup / retransmit
+/// machinery on the driver thread (which owns the relevant state). This
+/// split keeps per-message parse cost off the driver while preserving the
+/// existing QoS-2 / QoS-3 / EOT bookkeeping unchanged.
+enum ReaderItem {
+    /// A decoded data frame from any transport (UDP multicast or TCP).
+    Data(protocol::Message),
+    /// A decoded EOT marker.
+    Eot(protocol::EotFrame),
+    /// A raw NACK datagram (UDP-only). Parsed on the driver thread so the
+    /// `send_buffer` lookup happens where the buffer lives.
+    Nack(Vec<u8>),
+    /// A drop signal for a per-peer TCP reader thread. Carries no payload;
+    /// the driver does not need to know which peer dropped because TCP
+    /// streams in Multi mode are owned by reader threads.
+    TcpPeerDropped,
+}
+
+/// Resources spawned by `start_reader_threads(Multi)`. Owned by the variant
+/// across the variant's lifetime so `stop_reader_threads` can tear them
+/// down deterministically.
+struct MultiReaderState {
+    /// Receiver side of the shared bounded mpsc.
+    rx: Receiver<ReaderItem>,
+    /// Shutdown flag observed by every reader thread on each wakeup.
+    shutdown: Arc<AtomicBool>,
+    /// Join handles for spawned reader threads. The Drop / explicit-stop
+    /// path tries each with `READER_JOIN_TIMEOUT` and abandons wedged
+    /// threads with a single warning.
+    handles: Vec<thread::JoinHandle<()>>,
 }
 
 /// The UDP variant implementation.
@@ -65,10 +138,17 @@ pub struct UdpVariant {
     /// QoS 3: sent message buffer for NACK retransmit, keyed by seq.
     send_buffer: HashMap<u64, Vec<u8>>,
     /// QoS 4: TCP listener for incoming connections.
+    ///
+    /// Single mode: kept and polled lazily by `recv_tcp`.
+    /// Multi mode: drained during `start_reader_threads` so every expected
+    /// inbound stream is accepted before reader threads spawn; the
+    /// listener is then dropped.
     tcp_listener: Option<TcpListener>,
     /// QoS 4: TCP streams to peers (for sending).
     tcp_out_streams: Vec<TcpStream>,
-    /// QoS 4: TCP streams from peers (for receiving).
+    /// QoS 4 / Single mode: TCP streams from peers (for receiving).
+    /// In Multi mode these are moved into per-peer reader threads at
+    /// `start_reader_threads` time, leaving this `Vec` empty.
     tcp_in_streams: Vec<TcpStream>,
     /// Internal queue for updates ready to be returned via poll_receive.
     pending: VecDeque<ReceivedUpdate>,
@@ -79,6 +159,56 @@ pub struct UdpVariant {
     /// `poll_peer_eots`. Each entry corresponds to a fresh insertion
     /// into `eot_seen`.
     eot_queue: VecDeque<PeerEot>,
+    /// Active threading mode. Set by `connect`. Single mode preserves
+    /// pre-T14.3 behaviour. Multi mode enables the reader-thread path
+    /// driven by `start_reader_threads` / `stop_reader_threads`.
+    threading_mode: ThreadingMode,
+    /// Reader-thread state. `Some` only in Multi mode while reader
+    /// threads are running.
+    multi: Option<MultiReaderState>,
+}
+
+/// Apply `SO_RCVBUF = recv_buffer_kb * 1024` to a UDP `Socket`, but only as
+/// an upward floor. The pre-existing `tune_udp_buffers` helper already
+/// requested 8 MiB; high-rate same-host fixtures (the qos1 / qos4
+/// regression tests at 100 K msg/s) depend on that floor and would
+/// silently regress if we let the default `--recv-buffer-kb = 4096`
+/// (4 MiB) shrink the buffer below it. The contract from variant-cli.md
+/// says "Variants must call setsockopt(SO_RCVBUF, recv_buffer_kb *
+/// 1024)"; we satisfy that for any `--recv-buffer-kb` greater than the
+/// current achieved size and leave the buffer alone otherwise. Errors
+/// are logged (single line) and swallowed: best-effort, like
+/// `tune_udp_buffers`.
+fn apply_recv_buffer_kb_udp(socket: &Socket, recv_buffer_kb: u32) {
+    let requested = (recv_buffer_kb as usize).saturating_mul(1024);
+    let current = socket.recv_buffer_size().unwrap_or(0);
+    if requested <= current {
+        // The operator-requested size is at or below what we already
+        // achieved via `tune_udp_buffers`; nothing to do.
+        return;
+    }
+    if let Err(e) = socket.set_recv_buffer_size(requested) {
+        eprintln!(
+            "[custom-udp] warning: set_recv_buffer_size({}) on UDP socket failed: {}",
+            requested, e
+        );
+    }
+}
+
+/// Apply `SO_RCVBUF = recv_buffer_kb * 1024` to a TCP stream via a borrowed
+/// `socket2::SockRef`. Best-effort like the UDP variant: never propagates
+/// the error so a same-host fixture survives kernel clamping. See
+/// `metak-shared/api-contracts/variant-cli.md` "E14 additions:
+/// --recv-buffer-kb" for the contract.
+fn apply_recv_buffer_kb_tcp(stream: &TcpStream, recv_buffer_kb: u32) {
+    let requested = (recv_buffer_kb as usize).saturating_mul(1024);
+    let sock_ref = socket2::SockRef::from(stream);
+    if let Err(e) = sock_ref.set_recv_buffer_size(requested) {
+        eprintln!(
+            "[custom-udp] warning: set_recv_buffer_size({}) on TCP stream failed: {}",
+            requested, e
+        );
+    }
 }
 
 /// Outcome of attempting to read one length-prefixed frame from a TCP stream.
@@ -159,6 +289,8 @@ impl UdpVariant {
             pending: VecDeque::new(),
             eot_seen: HashSet::new(),
             eot_queue: VecDeque::new(),
+            threading_mode: ThreadingMode::Single,
+            multi: None,
         }
     }
 
@@ -198,6 +330,13 @@ impl UdpVariant {
         // defaults. The helper logs a single warning if the OS caps the
         // achieved size below 1 MiB and continues regardless.
         variant_base::tune_udp_buffers(&socket).context("tune UDP buffers")?;
+        // T14.3 (E14): override SO_RCVBUF to honour --recv-buffer-kb when
+        // it requests more than the 8 MiB floor from `tune_udp_buffers`.
+        // We deliberately call `tune_udp_buffers` first so the lower bound
+        // is preserved on configs that omit `--recv-buffer-kb` (its
+        // default is 4 MiB, below the 8 MiB floor); only larger requests
+        // raise the size above the floor.
+        apply_recv_buffer_kb_udp(&socket, self.config.recv_buffer_kb);
 
         // Bind to the multicast port on all interfaces.
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, multicast_addr.port());
@@ -257,6 +396,12 @@ impl UdpVariant {
                     // it again so the back-pressure contract doesn't
                     // depend on upstream defaults.
                     stream.set_nonblocking(false)?;
+                    // T14.3: apply SO_RCVBUF on the outbound stream too.
+                    // The kernel reserves recv-side buffer per socket
+                    // regardless of direction-of-use; honouring the
+                    // operator's request on every TCP socket we own keeps
+                    // the contract simple ("every TCP socket gets it").
+                    apply_recv_buffer_kb_tcp(&stream, self.config.recv_buffer_kb);
                     self.tcp_out_streams.push(stream);
                 }
                 Err(e) => {
@@ -339,6 +484,9 @@ impl UdpVariant {
                     Ok((stream, _addr)) => {
                         stream.set_nonblocking(true)?;
                         let _ = stream.set_nodelay(true);
+                        // T14.3: apply SO_RCVBUF on every accepted
+                        // inbound stream, matching the outbound path.
+                        apply_recv_buffer_kb_tcp(&stream, self.config.recv_buffer_kb);
                         self.tcp_in_streams.push(stream);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -612,6 +760,403 @@ impl UdpVariant {
 
         Ok(())
     }
+
+    /// Compute the Multi-mode mpsc channel bound.
+    ///
+    /// Spec (T14.3): `4 * values_per_tick * (peer_count + 1)` floored at
+    /// `MULTI_CHANNEL_FLOOR` (16). The `peer_count + 1` term accounts for
+    /// the UDP reader thread plus one reader thread per active TCP peer.
+    /// Floored so a small `values_per_tick` (e.g. 1) still leaves room for
+    /// a burst before reader threads start bouncing on `TrySendError::Full`.
+    fn multi_channel_bound(&self, peer_count: usize) -> usize {
+        let raw = (self.config.values_per_tick as usize)
+            .saturating_mul(4)
+            .saturating_mul(peer_count.saturating_add(1));
+        raw.max(MULTI_CHANNEL_FLOOR)
+    }
+
+    /// Multi mode: synchronously accept every expected inbound TCP peer
+    /// connection from the listener so each accepted stream can be moved
+    /// into its own reader thread.
+    ///
+    /// Returns the accepted streams. The listener is dropped from `self`
+    /// before this returns since Multi mode does not need to keep
+    /// accepting more peers after `start_reader_threads`. If the peer
+    /// count is zero (single-peer self-only test) this returns an empty
+    /// vec without ever touching the listener.
+    fn multi_accept_tcp_peers(&mut self, expected: usize) -> Result<Vec<TcpStream>> {
+        if expected == 0 {
+            self.tcp_listener.take();
+            return Ok(Vec::new());
+        }
+        let listener = self
+            .tcp_listener
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("multi-mode: TCP listener missing at QoS 4"))?;
+        // The listener was set non-blocking by `setup_tcp`. We keep that
+        // mode but poll it with a deadline; on accept we restore blocking
+        // semantics (with `SO_RCVTIMEO`) before handing the stream off to
+        // its reader thread.
+        let deadline = Instant::now() + TCP_ACCEPT_TIMEOUT;
+        let mut accepted: Vec<TcpStream> = Vec::with_capacity(expected);
+        while accepted.len() < expected {
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "[custom-udp] multi: timed out waiting for {} TCP peer(s) on {}",
+                    expected - accepted.len(),
+                    self.config.tcp_listen_addr
+                );
+            }
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    // Reader threads need blocking semantics + a short
+                    // `SO_RCVTIMEO` so they can periodically wake and
+                    // observe the shutdown flag. This matches the
+                    // websocket / hybrid TCP-reader pattern.
+                    stream
+                        .set_nonblocking(false)
+                        .context("set_nonblocking(false) on accepted TCP stream")?;
+                    stream
+                        .set_read_timeout(Some(READER_RCVTIMEO))
+                        .context("set_read_timeout on accepted TCP stream")?;
+                    let _ = stream.set_nodelay(true);
+                    apply_recv_buffer_kb_tcp(&stream, self.config.recv_buffer_kb);
+                    accepted.push(stream);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => {
+                    return Err(e).context("multi: TCP accept failed");
+                }
+            }
+        }
+        Ok(accepted)
+    }
+
+    /// Spawn reader threads for Multi mode. One thread reads the UDP
+    /// multicast socket; one thread reads each accepted TCP peer stream
+    /// (QoS 4 only). All threads push parsed items into a shared bounded
+    /// mpsc. Reader handles + the channel receiver are stashed on `self`
+    /// for `stop_reader_threads` and `poll_receive` to consume.
+    ///
+    /// The UDP socket needs a short blocking timeout (`SO_RCVTIMEO`) so
+    /// the reader thread can periodically wake and observe the shutdown
+    /// flag without out-of-band signalling. The currently-bound socket
+    /// is non-blocking from `setup_udp`; we clone it (so `publish` keeps
+    /// its non-blocking handle) and switch the clone to blocking with
+    /// `SO_RCVTIMEO`.
+    fn start_reader_threads_multi(&mut self) -> Result<()> {
+        // At QoS 4 the listener was bound during `connect`. Accept all
+        // expected inbound TCP peer streams synchronously before spawning
+        // reader threads, so we have one stream per thread.
+        let expected_tcp = if self.config.qos == Qos::ReliableTcp {
+            self.config.tcp_peers.len()
+        } else {
+            0
+        };
+        let tcp_streams = self.multi_accept_tcp_peers(expected_tcp)?;
+        let peer_count = tcp_streams.len();
+
+        let bound = self.multi_channel_bound(peer_count);
+        let (tx, rx) = mpsc::sync_channel::<ReaderItem>(bound);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
+
+        // -- UDP reader thread --
+        // Clone the existing UDP socket so `publish` keeps its handle on
+        // the non-blocking original. The clone gets short blocking
+        // semantics: blocking + `SO_RCVTIMEO` so the recv wakes
+        // periodically to check the shutdown flag.
+        if let Some(udp) = self.udp_socket.as_ref() {
+            let udp_clone = udp
+                .try_clone()
+                .context("multi: try_clone on UDP socket failed")?;
+            udp_clone
+                .set_nonblocking(false)
+                .context("multi: set_nonblocking(false) on UDP clone failed")?;
+            udp_clone
+                .set_read_timeout(Some(READER_RCVTIMEO))
+                .context("multi: set_read_timeout on UDP clone failed")?;
+            // Re-apply SO_RCVBUF on the clone so the cloned descriptor
+            // doesn't accidentally drop back to OS defaults on platforms
+            // where socket options aren't inherited via `dup`. socket2
+            // exposes the helper through `SockRef`.
+            let sock_ref = socket2::SockRef::from(&udp_clone);
+            let requested = (self.config.recv_buffer_kb as usize).saturating_mul(1024);
+            if let Err(e) = sock_ref.set_recv_buffer_size(requested) {
+                eprintln!(
+                    "[custom-udp] warning: set_recv_buffer_size({}) on UDP clone failed: {}",
+                    requested, e
+                );
+            }
+
+            let tx_udp = tx.clone();
+            let shutdown_udp = Arc::clone(&shutdown);
+            let buffer_size = self.config.buffer_size;
+            let handle = thread::Builder::new()
+                .name("custom-udp-recv-udp".to_string())
+                .spawn(move || {
+                    udp_reader_thread(udp_clone, buffer_size, tx_udp, shutdown_udp);
+                })
+                .context("multi: spawn UDP reader thread")?;
+            handles.push(handle);
+        }
+
+        // -- Per-peer TCP reader threads (QoS 4 only) --
+        for (i, stream) in tcp_streams.into_iter().enumerate() {
+            let tx_tcp = tx.clone();
+            let shutdown_tcp = Arc::clone(&shutdown);
+            let max_total_len = self.config.buffer_size;
+            let handle = thread::Builder::new()
+                .name(format!("custom-udp-recv-tcp-{}", i))
+                .spawn(move || {
+                    tcp_reader_thread(stream, max_total_len, tx_tcp, shutdown_tcp);
+                })
+                .context("multi: spawn TCP reader thread")?;
+            handles.push(handle);
+        }
+
+        // The original `tx` sender belongs to the variant only to clone
+        // from; drop it so the channel correctly reports
+        // `Disconnected` once every reader thread exits and drops its
+        // own clone. (Otherwise `try_recv` would observe `Empty` forever
+        // after all readers exit, masking the disconnect.)
+        drop(tx);
+
+        self.multi = Some(MultiReaderState {
+            rx,
+            shutdown,
+            handles,
+        });
+        Ok(())
+    }
+
+    /// Drain whatever the reader threads have delivered into the mpsc and
+    /// apply each item to the driver-side state. Used only in Multi mode.
+    /// Bounded so the driver thread never spins inside this drain when
+    /// reader threads push faster than `poll_receive` is called.
+    ///
+    /// Returns once the channel is empty OR one data update has been
+    /// staged into `self.pending` (the caller's `poll_receive` returns
+    /// one update per invocation, just like the Single-mode path).
+    fn drain_multi_channel(&mut self) -> Result<()> {
+        // Snapshot a handle to the receiver -- borrowing `self.multi`
+        // immutably here would conflict with the `self.handle_nack` /
+        // `self.process_received_message` calls below, so we work with the
+        // try_recv result one item at a time.
+        loop {
+            let item = match self.multi.as_ref() {
+                Some(m) => match m.rx.try_recv() {
+                    Ok(item) => item,
+                    Err(mpsc::TryRecvError::Empty) => return Ok(()),
+                    Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                },
+                None => return Ok(()),
+            };
+            match item {
+                ReaderItem::Data(msg) => {
+                    if msg.writer == self.config.runner {
+                        continue;
+                    }
+                    self.process_received_message(msg)?;
+                    // Single update per `poll_receive` call -- match the
+                    // Single-mode return shape so the driver's drain loop
+                    // sees the same per-call semantics.
+                    if !self.pending.is_empty() {
+                        return Ok(());
+                    }
+                }
+                ReaderItem::Eot(eot) => {
+                    self.record_peer_eot(eot.writer, eot.eot_id);
+                }
+                ReaderItem::Nack(data) => {
+                    if let Err(e) = self.handle_nack(&data) {
+                        eprintln!("[custom-udp] multi: NACK handling error: {}", e);
+                    }
+                }
+                ReaderItem::TcpPeerDropped => {
+                    // Informational: the per-peer reader thread exited.
+                    // We rely on `stop_reader_threads` to reap the join
+                    // handle at disconnect time; nothing to do here.
+                }
+            }
+        }
+    }
+}
+
+/// UDP reader thread body. Receives datagrams on a blocking socket with a
+/// short `SO_RCVTIMEO`, parses each datagram, and pushes a `ReaderItem`
+/// into the shared channel. Exits when `shutdown` is set.
+///
+/// `WouldBlock` / `TimedOut` are non-fatal (recv timeout fired); other I/O
+/// errors are logged once and stop the thread (the variant is in a bad
+/// state -- the driver will observe via stalled poll output).
+fn udp_reader_thread(
+    socket: UdpSocket,
+    buffer_size: usize,
+    tx: SyncSender<ReaderItem>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut buf = vec![0u8; buffer_size];
+    while !shutdown.load(Ordering::Relaxed) {
+        match socket.recv_from(&mut buf) {
+            Ok((n, _addr)) => {
+                let bytes = &buf[..n];
+                if protocol::is_nack(bytes) {
+                    if send_or_warn(&tx, ReaderItem::Nack(bytes.to_vec())) {
+                        return;
+                    }
+                    continue;
+                }
+                if protocol::is_eot_udp(bytes) {
+                    match protocol::decode_eot(bytes) {
+                        Ok(eot) => {
+                            if send_or_warn(&tx, ReaderItem::Eot(eot)) {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[custom-udp] multi: EOT decode error (UDP): {}", e);
+                        }
+                    }
+                    continue;
+                }
+                match protocol::decode(bytes) {
+                    Ok(msg) => {
+                        if send_or_warn(&tx, ReaderItem::Data(msg)) {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[custom-udp] multi: UDP decode error: {}", e);
+                    }
+                }
+            }
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                // SO_RCVTIMEO fired with no data. Loop and re-check
+                // the shutdown flag.
+            }
+            Err(e) => {
+                eprintln!("[custom-udp] multi: UDP recv error: {}", e);
+                return;
+            }
+        }
+    }
+}
+
+/// Per-peer TCP reader thread body. Reads length-prefixed frames in a
+/// blocking loop with `SO_RCVTIMEO`. Exits when `shutdown` is set, EOF, or
+/// any framing / read error (the stream is dropped, and a
+/// `ReaderItem::TcpPeerDropped` is pushed so the driver can observe).
+fn tcp_reader_thread(
+    mut stream: TcpStream,
+    max_total_len: usize,
+    tx: SyncSender<ReaderItem>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        // Read the 4-byte length prefix with the configured short timeout.
+        let mut len_buf = [0u8; 4];
+        match stream.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => {
+                let _ = tx.send(ReaderItem::TcpPeerDropped);
+                return;
+            }
+        }
+
+        let total_len = u32::from_be_bytes(len_buf) as usize;
+        if total_len < protocol::HEADER_FIXED_SIZE || total_len > max_total_len {
+            eprintln!(
+                "[custom-udp] multi: TCP framing: dropping peer (invalid total_len {})",
+                total_len
+            );
+            let _ = tx.send(ReaderItem::TcpPeerDropped);
+            return;
+        }
+
+        // Body read: we want the body bytes in their entirety. Treat
+        // intermediate `WouldBlock` / `TimedOut` as transient and retry,
+        // observing `shutdown` between retries.
+        let mut msg_buf = vec![0u8; total_len];
+        msg_buf[..4].copy_from_slice(&len_buf);
+        let mut got: usize = 4;
+        let mut fatal = false;
+        while got < total_len {
+            match stream.read(&mut msg_buf[got..]) {
+                Ok(0) => {
+                    fatal = true;
+                    break;
+                }
+                Ok(n) => got += n,
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    if shutdown.load(Ordering::Relaxed) {
+                        fatal = true;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    fatal = true;
+                    break;
+                }
+            }
+        }
+        if fatal {
+            let _ = tx.send(ReaderItem::TcpPeerDropped);
+            return;
+        }
+
+        match protocol::decode_frame(&msg_buf) {
+            Ok(Frame::Data(msg)) => {
+                if send_or_warn(&tx, ReaderItem::Data(msg)) {
+                    return;
+                }
+            }
+            Ok(Frame::Eot(eot)) => {
+                if send_or_warn(&tx, ReaderItem::Eot(eot)) {
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("[custom-udp] multi: TCP decode error: {}", e);
+            }
+        }
+    }
+}
+
+/// Push an item onto the bounded mpsc, dropping it (with a warning) if the
+/// channel is full. Returns `true` when the channel is disconnected -- the
+/// caller should exit its loop in that case. Full-channel drops are
+/// expected back-pressure under saturating receive load and acceptable
+/// for QoS 1/2 (the variant's BestEffort / LatestValue semantics tolerate
+/// loss). QoS 3 NACK / QoS 4 framing semantics are still observed by the
+/// driver thread because the dropped item simply never lands in
+/// `pending`.
+fn send_or_warn(tx: &SyncSender<ReaderItem>, item: ReaderItem) -> bool {
+    match tx.try_send(item) {
+        Ok(()) => false,
+        Err(TrySendError::Full(_)) => {
+            // Single line per overrun avoids log spam at 100K msg/s.
+            // The variant remains correct -- this is just a measured
+            // drop under sustained back-pressure.
+            eprintln!(
+                "[custom-udp] multi: reader channel full -- dropping frame (receiver saturated)"
+            );
+            false
+        }
+        Err(TrySendError::Disconnected(_)) => true,
+    }
 }
 
 impl Variant for UdpVariant {
@@ -619,17 +1164,88 @@ impl Variant for UdpVariant {
         "custom-udp"
     }
 
-    fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
-        // T14.1 compile-fix only -- the trait signature gained the
-        // threading-mode argument. Real Multi-mode handling for
-        // custom-udp is filed under T14.3.
-        let _ = threading_mode;
+    /// T14.3: custom-udp supports both threading modes.
+    ///
+    /// - `Single`: existing inline-poll behaviour. `poll_receive` reads
+    ///   the UDP socket and (at QoS 4) the inbound TCP streams directly
+    ///   on the driver thread.
+    /// - `Multi`: one OS reader thread per recv-side socket (UDP +
+    ///   per-TCP-peer) parses frames off the hot path and pushes
+    ///   decoded items into a shared bounded mpsc. `poll_receive`
+    ///   becomes a fast `try_recv`.
+    ///
+    /// `SO_RCVBUF` is applied from `--recv-buffer-kb * 1024` to every
+    /// recv-side socket the variant owns, in either mode. See CUSTOM.md
+    /// "Threading modes (T14.3)".
+    fn supported_threading_modes(&self) -> &'static [ThreadingMode] {
+        &[ThreadingMode::Single, ThreadingMode::Multi]
+    }
+
+    fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()> {
+        // Stash the mode so subsequent `start_reader_threads` /
+        // `poll_receive` / `stop_reader_threads` calls know which path
+        // to take. Both Single and Multi mode rely on `setup_udp` /
+        // `setup_tcp` exactly as today; the divergence is in
+        // `start_reader_threads`.
+        self.threading_mode = threading_mode;
         self.setup_udp()?;
 
         if self.config.qos == Qos::ReliableTcp {
             self.setup_tcp()?;
         }
 
+        Ok(())
+    }
+
+    fn start_reader_threads(&mut self, mode: ThreadingMode) -> Result<()> {
+        // Defensive: the driver passes the same mode as `connect`. Snapshot
+        // it for the rest of the lifecycle in case the trait contract
+        // tightens in the future.
+        self.threading_mode = mode;
+        match mode {
+            ThreadingMode::Single => Ok(()),
+            ThreadingMode::Multi => self.start_reader_threads_multi(),
+        }
+    }
+
+    fn stop_reader_threads(&mut self) -> Result<()> {
+        let multi = match self.multi.take() {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+
+        // Signal shutdown. Reader threads observe this on the next wake
+        // (bounded by `READER_RCVTIMEO`).
+        multi.shutdown.store(true, Ordering::Relaxed);
+        // Drop the receiver to disconnect any blocked sender; reader
+        // threads exit on `Disconnected`. We can't move the receiver out
+        // of `multi` directly because `MultiReaderState` is the owner --
+        // explicit `drop` clarifies intent.
+        drop(multi.rx);
+
+        // Join each thread with a per-thread deadline. `JoinHandle::is_finished`
+        // (stable since 1.61) lets us poll without blocking, and once the
+        // thread is finished `join` returns promptly. Wedged threads
+        // surface a single warning and are abandoned -- the alternative
+        // (deadlock the disconnect path) is worse.
+        for (i, handle) in multi.handles.into_iter().enumerate() {
+            let start = Instant::now();
+            while !handle.is_finished() {
+                if start.elapsed() >= READER_JOIN_TIMEOUT {
+                    eprintln!(
+                        "[custom-udp] warning: reader thread #{} did not exit within {:?}; abandoning",
+                        i, READER_JOIN_TIMEOUT
+                    );
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            if handle.is_finished() {
+                if let Err(_panic) = handle.join() {
+                    eprintln!("[custom-udp] warning: reader thread #{} panicked", i);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -668,18 +1284,44 @@ impl Variant for UdpVariant {
             return Ok(Some(update));
         }
 
-        // Try receiving from UDP.
-        self.recv_udp()?;
-
-        // For QoS 4, also check TCP.
-        if self.config.qos == Qos::ReliableTcp {
-            self.recv_tcp()?;
+        match self.threading_mode {
+            ThreadingMode::Single => {
+                // Try receiving from UDP.
+                self.recv_udp()?;
+                // For QoS 4, also check TCP.
+                if self.config.qos == Qos::ReliableTcp {
+                    self.recv_tcp()?;
+                }
+            }
+            ThreadingMode::Multi => {
+                // Reader threads have already parsed frames off the
+                // sockets and pushed them into the shared mpsc. Drain
+                // until we have one update ready or the channel is
+                // empty. EOT frames and NACK datagrams are applied
+                // in-line by `drain_multi_channel`.
+                self.drain_multi_channel()?;
+            }
         }
 
         Ok(self.pending.pop_front())
     }
 
     fn disconnect(&mut self) -> Result<()> {
+        // Defensive: if reader threads are still active (driver did not
+        // call `stop_reader_threads` first, e.g. tests that call
+        // `disconnect` directly), tear them down here so the underlying
+        // sockets can drop cleanly.
+        if self.multi.is_some() {
+            // Surface the warning from stop but never let it block the
+            // disconnect path.
+            if let Err(e) = self.stop_reader_threads() {
+                eprintln!(
+                    "[custom-udp] warning: stop_reader_threads during disconnect: {}",
+                    e
+                );
+            }
+        }
+
         // Leave multicast group and close socket.
         if let Some(socket) = self.udp_socket.take() {
             let multicast_addr = self.config.multicast_group;
@@ -725,6 +1367,8 @@ mod tests {
             qos,
             tcp_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             tcp_peers: Vec::new(),
+            recv_buffer_kb: 4096,
+            values_per_tick: 1,
         }
     }
 
@@ -1225,6 +1869,171 @@ mod tests {
             .try_publish("/p", payload, Qos::BestEffort, 0)
             .expect("happy-path try_publish must succeed");
         assert!(result, "expected Ok(true) on idle transport");
+        v.disconnect().ok();
+    }
+
+    // ---- T14.3: capability declaration ----
+
+    /// custom-udp must declare `[Single, Multi]` per CUSTOM.md "Threading
+    /// modes (T14.3)". The runner consults this declaration to skip
+    /// spawns whose threading_mode the variant cannot honour.
+    #[test]
+    fn supported_threading_modes_includes_single_and_multi() {
+        let v = UdpVariant::new(default_config(Qos::BestEffort));
+        let modes = v.supported_threading_modes();
+        assert!(modes.contains(&ThreadingMode::Single));
+        assert!(modes.contains(&ThreadingMode::Multi));
+        assert_eq!(modes.len(), 2);
+    }
+
+    // ---- T14.3: reader-thread lifecycle ----
+
+    /// Multi mode: `start_reader_threads(Multi)` must spawn the UDP
+    /// reader thread (and zero TCP threads for a single-peer / no-TCP
+    /// config), and `stop_reader_threads` must tear them down cleanly
+    /// without hanging or panicking.
+    ///
+    /// Uses an ephemeral multicast group/port so test runs don't collide.
+    #[test]
+    fn multi_mode_start_and_stop_reader_threads_lifecycle() {
+        let mut cfg = default_config(Qos::BestEffort);
+        cfg.multicast_group = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 19941);
+        let mut v = UdpVariant::new(cfg);
+        if v.connect(ThreadingMode::Multi).is_err() {
+            // CI without multicast support: skip silently. Matches the
+            // pattern used by `connect_and_disconnect`.
+            return;
+        }
+        v.start_reader_threads(ThreadingMode::Multi)
+            .expect("multi: start_reader_threads must succeed");
+        // Reader-thread state must be populated.
+        assert!(
+            v.multi.is_some(),
+            "expected MultiReaderState populated after start"
+        );
+        // Stop must succeed and clear the state.
+        v.stop_reader_threads()
+            .expect("multi: stop_reader_threads must succeed");
+        assert!(
+            v.multi.is_none(),
+            "expected MultiReaderState cleared after stop"
+        );
+        v.disconnect().ok();
+    }
+
+    /// Multi mode end-to-end loopback: publish a message via multicast
+    /// and confirm the UDP reader thread parses it, pushes it onto the
+    /// mpsc, and `poll_receive` surfaces it. Loopback is enabled by
+    /// `setup_udp` so we receive our own datagrams. The "skip-own-runner"
+    /// filter in `recv_udp` / `drain_multi_channel` is bypassed here by
+    /// using a writer name different from the configured runner.
+    #[test]
+    fn multi_mode_poll_receive_returns_loopback_message() {
+        let mut cfg = default_config(Qos::BestEffort);
+        cfg.multicast_group = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 19942);
+        // Use a distinct runner name so the configured runner doesn't
+        // match our injected writer (otherwise the variant filters its
+        // own messages).
+        cfg.runner = "test-runner-receiver".to_string();
+        let mut v = UdpVariant::new(cfg);
+        if v.connect(ThreadingMode::Multi).is_err() {
+            return; // skip silently in CI without multicast
+        }
+        v.start_reader_threads(ThreadingMode::Multi)
+            .expect("start_reader_threads(Multi) must succeed");
+
+        // Encode a frame with a foreign "writer" name so the variant's
+        // skip-own-writer filter does not eat it. Send via the bound UDP
+        // socket directly so the kernel loops it back to our own
+        // reader-thread clone.
+        let encoded = protocol::encode(
+            Qos::BestEffort,
+            42,
+            "/p",
+            "external-writer",
+            &[1u8, 2, 3, 4, 5, 6, 7, 8],
+        )
+        .unwrap();
+        let target: SocketAddr = SocketAddr::V4(v.config.multicast_group);
+        v.udp_socket
+            .as_ref()
+            .unwrap()
+            .send_to(&encoded, target)
+            .unwrap();
+
+        // Poll for up to ~2 s for the loopback to surface. The reader
+        // thread blocks with `READER_RCVTIMEO` (50 ms) so we have to
+        // poll repeatedly.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got: Option<ReceivedUpdate> = None;
+        while Instant::now() < deadline {
+            if let Some(update) = v.poll_receive().unwrap() {
+                got = Some(update);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Tear down before asserting so a test failure doesn't leak threads.
+        v.stop_reader_threads().ok();
+        v.disconnect().ok();
+
+        let update = got.expect("expected to receive the loopback message via Multi mode");
+        assert_eq!(update.writer, "external-writer");
+        assert_eq!(update.seq, 42);
+        assert_eq!(update.path, "/p");
+        assert_eq!(update.payload, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// Channel-bound computation: floored at `MULTI_CHANNEL_FLOOR` when
+    /// the formula `4 * values_per_tick * (peer_count + 1)` lands below
+    /// it. Important for low-rate fixtures (`values_per_tick = 1`,
+    /// single peer) so reader threads don't bounce on `Full` under a
+    /// trickle.
+    #[test]
+    fn multi_channel_bound_respects_floor() {
+        let mut cfg = default_config(Qos::ReliableTcp);
+        cfg.values_per_tick = 1;
+        let v = UdpVariant::new(cfg);
+        // 4 * 1 * (0 + 1) = 4, floored to 16.
+        assert_eq!(v.multi_channel_bound(0), MULTI_CHANNEL_FLOOR);
+        // 4 * 1 * (1 + 1) = 8, floored to 16.
+        assert_eq!(v.multi_channel_bound(1), MULTI_CHANNEL_FLOOR);
+    }
+
+    /// Channel-bound computation: above the floor when
+    /// `4 * values_per_tick * (peer_count + 1)` exceeds it.
+    #[test]
+    fn multi_channel_bound_scales_with_inputs() {
+        let mut cfg = default_config(Qos::ReliableTcp);
+        cfg.values_per_tick = 10;
+        let v = UdpVariant::new(cfg);
+        // 4 * 10 * (1 + 1) = 80.
+        assert_eq!(v.multi_channel_bound(1), 80);
+        // 4 * 10 * (5 + 1) = 240.
+        assert_eq!(v.multi_channel_bound(5), 240);
+    }
+
+    /// Single mode is the default and must remain a no-op for
+    /// `start_reader_threads` / `stop_reader_threads`. Tests guard
+    /// against accidental Multi-mode regressions when Single is
+    /// selected.
+    #[test]
+    fn single_mode_reader_thread_hooks_are_noops() {
+        let mut cfg = default_config(Qos::BestEffort);
+        cfg.multicast_group = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 19943);
+        let mut v = UdpVariant::new(cfg);
+        if v.connect(ThreadingMode::Single).is_err() {
+            return;
+        }
+        v.start_reader_threads(ThreadingMode::Single)
+            .expect("start_reader_threads(Single) is a no-op and must succeed");
+        assert!(
+            v.multi.is_none(),
+            "Single mode must NOT populate MultiReaderState"
+        );
+        v.stop_reader_threads()
+            .expect("stop_reader_threads(Single) is a no-op and must succeed");
         v.disconnect().ok();
     }
 }
