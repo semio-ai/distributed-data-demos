@@ -105,6 +105,7 @@ struct MultiWriter {
 /// `Multi`: writes go through `writer`; reads happen in a dedicated OS
 /// thread (owned by the variant's `reader_threads` vec) that pushes
 /// decoded frames into the shared `recv_tx` channel.
+#[allow(clippy::large_enum_variant)]
 enum PeerIo {
     Single(WebSocket<TcpStream>),
     Multi {
@@ -168,11 +169,17 @@ impl WebSocketConfig {
 /// `poll_receive`.
 enum ReaderItem {
     Data(ReceivedUpdate),
-    Eot { writer: String, eot_id: u64 },
+    Eot {
+        writer: String,
+        eot_id: u64,
+    },
     /// Reader observed a fatal per-peer error; the driver thread can
     /// log it and forget the peer. Carries the peer's runner name so
     /// the driver can correlate the drop.
-    PeerDropped { peer: String, reason: String },
+    PeerDropped {
+        peer: String,
+        reason: String,
+    },
 }
 
 /// Per-peer reader thread bookkeeping (Multi mode only).
@@ -343,17 +350,9 @@ impl WebSocketVariant {
     /// Reader threads have already decoded frames; this is a near-free
     /// `try_recv` on the driver thread.
     fn poll_peers_once_multi(&mut self) -> Option<ReceivedUpdate> {
-        if self.recv_rx.is_none() {
-            return None;
-        }
+        self.recv_rx.as_ref()?;
         loop {
-            let next = {
-                let rx = match self.recv_rx.as_ref() {
-                    Some(rx) => rx,
-                    None => return None,
-                };
-                rx.try_recv()
-            };
+            let next = self.recv_rx.as_ref()?.try_recv();
             match next {
                 Ok(ReaderItem::Data(update)) => return Some(update),
                 Ok(ReaderItem::Eot { writer, eot_id }) => {
@@ -379,23 +378,33 @@ impl WebSocketVariant {
         for peer in self.peers.iter_mut() {
             let result = match &mut peer.io {
                 PeerIo::Single(ws) => ws.send(Message::Binary(payload.clone())).map_err(|e| {
-                    anyhow::anyhow!("WS write error to peer {} ({}): {}", peer.name, peer.addr, e)
+                    anyhow::anyhow!(
+                        "WS write error to peer {} ({}): {}",
+                        peer.name,
+                        peer.addr,
+                        e
+                    )
                 }),
                 PeerIo::Multi { writer } => {
                     let mut guard = writer
                         .lock()
                         .map_err(|_| anyhow::anyhow!("WS Multi writer mutex poisoned"))?;
                     let MultiWriter { ctx, stream } = &mut *guard;
-                    ctx.write(stream, Message::Binary(payload.clone()))
-                        .and_then(|()| ctx.flush(stream))
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "WS write error to peer {} ({}): {}",
-                                peer.name,
-                                peer.addr,
-                                e
-                            )
-                        })
+                    // Suppress clippy::result_large_err here:
+                    // tungstenite::Error is intentionally large; we
+                    // immediately convert into anyhow::Error.
+                    #[allow(clippy::result_large_err)]
+                    let write_result = ctx
+                        .write(stream, Message::Binary(payload.clone()))
+                        .and_then(|()| ctx.flush(stream));
+                    write_result.map_err(|e| {
+                        anyhow::anyhow!(
+                            "WS write error to peer {} ({}): {}",
+                            peer.name,
+                            peer.addr,
+                            e
+                        )
+                    })
                 }
             };
             match result {
@@ -517,8 +526,7 @@ fn reader_thread_main(
             }
             Ok(_other) => {}
             Err(tungstenite::Error::Io(e)) if is_transient_io_error(&e) => {}
-            Err(tungstenite::Error::ConnectionClosed)
-            | Err(tungstenite::Error::AlreadyClosed) => {
+            Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
                 let _ = tx.send(ReaderItem::PeerDropped {
                     peer: peer_name.clone(),
                     reason: format!("peer {peer_addr} connection closed"),
@@ -934,9 +942,7 @@ impl Variant for WebSocketVariant {
                     }
                 },
                 Err(e) => {
-                    eprintln!(
-                        "warning: failed to spawn join-watcher for peer {peer_name}: {e}"
-                    );
+                    eprintln!("warning: failed to spawn join-watcher for peer {peer_name}: {e}");
                 }
             }
         }
@@ -1056,12 +1062,7 @@ fn is_transient_io_error(e: &std::io::Error) -> bool {
     if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
         return true;
     }
-    match e.raw_os_error() {
-        Some(997) => true,
-        Some(10035) => true,
-        Some(10060) => true,
-        _ => false,
-    }
+    matches!(e.raw_os_error(), Some(997) | Some(10035) | Some(10060))
 }
 
 #[cfg(test)]

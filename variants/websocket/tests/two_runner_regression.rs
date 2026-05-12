@@ -470,8 +470,7 @@ fn two_runner_websocket_both_modes_qos3_smoke() {
 
     let (alice_status, _alice_stdout, alice_stderr, alice_wall) =
         wait_with_timeout(alice, "alice", deadline);
-    let (bob_status, _bob_stdout, bob_stderr, bob_wall) =
-        wait_with_timeout(bob, "bob", deadline);
+    let (bob_status, _bob_stdout, bob_stderr, bob_wall) = wait_with_timeout(bob, "bob", deadline);
 
     let alice_stderr_s = String::from_utf8_lossy(&alice_stderr).into_owned();
     let bob_stderr_s = String::from_utf8_lossy(&bob_stderr).into_owned();
@@ -506,10 +505,8 @@ fn two_runner_websocket_both_modes_qos3_smoke() {
         let bob_parsed = parse_jsonl(&bob_log);
         let alice_writes = alice_parsed.writes_in_window();
         let bob_writes = bob_parsed.writes_in_window();
-        let alice_recv_from_bob =
-            alice_parsed.receives_from_in_writer_window("bob", &bob_parsed);
-        let bob_recv_from_alice =
-            bob_parsed.receives_from_in_writer_window("alice", &alice_parsed);
+        let alice_recv_from_bob = alice_parsed.receives_from_in_writer_window("bob", &bob_parsed);
+        let bob_recv_from_alice = bob_parsed.receives_from_in_writer_window("alice", &alice_parsed);
 
         eprintln!(
             "[T14.2-ws/{mode}] alice <- bob: {alice_recv_from_bob}/{bob_writes} \
@@ -522,8 +519,14 @@ fn two_runner_websocket_both_modes_qos3_smoke() {
 
         assert!(alice_writes > 0, "T14.2/{mode}: alice zero writes");
         assert!(bob_writes > 0, "T14.2/{mode}: bob zero writes");
-        assert!(alice_recv_from_bob > 0, "T14.2/{mode}: alice zero recv from bob");
-        assert!(bob_recv_from_alice > 0, "T14.2/{mode}: bob zero recv from alice");
+        assert!(
+            alice_recv_from_bob > 0,
+            "T14.2/{mode}: alice zero recv from bob"
+        );
+        assert!(
+            bob_recv_from_alice > 0,
+            "T14.2/{mode}: bob zero recv from alice"
+        );
     }
 
     drop(tmpdir);
@@ -566,8 +569,7 @@ fn two_runner_websocket_1000x100hz_multi_high_rate() {
 
     let (alice_status, _alice_stdout, alice_stderr, alice_wall) =
         wait_with_timeout(alice, "alice", deadline);
-    let (bob_status, _bob_stdout, bob_stderr, bob_wall) =
-        wait_with_timeout(bob, "bob", deadline);
+    let (bob_status, _bob_stdout, bob_stderr, bob_wall) = wait_with_timeout(bob, "bob", deadline);
 
     let alice_stderr_s = String::from_utf8_lossy(&alice_stderr).into_owned();
     let bob_stderr_s = String::from_utf8_lossy(&bob_stderr).into_owned();
@@ -622,8 +624,14 @@ fn two_runner_websocket_1000x100hz_multi_high_rate() {
 
     drop(tmpdir);
 
-    assert!(alice_writes > 0, "alice writes == 0; spawn did not reach operate");
-    assert!(bob_writes > 0, "bob writes == 0; spawn did not reach operate");
+    assert!(
+        alice_writes > 0,
+        "alice writes == 0; spawn did not reach operate"
+    );
+    assert!(
+        bob_writes > 0,
+        "bob writes == 0; spawn did not reach operate"
+    );
     assert!(
         a_delivery >= 99.0,
         "T14.2 Multi-mode delivery alice <- bob = {a_delivery:.2}% < 99% threshold"
