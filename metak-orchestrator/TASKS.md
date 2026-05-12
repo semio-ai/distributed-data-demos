@@ -5752,6 +5752,87 @@ From workspace root:
 
 ---
 
+### T14.19: characterise TCP-single-mode deadlock at high symmetric rates
+
+**Repos**: `variants/custom-udp/`, `variants/websocket/` (data gathering);
+possibly `variants/hybrid/` (comparison study).
+**Status**: pending, filed 2026-05-12 by orchestrator after the
+stress-e14 run (`logs/stress-e14-20260512_122xxx/`).
+
+#### Background
+
+The 2026-05-12 stress run at 1000 vpt x 100 Hz (100K msg/s symmetric)
+revealed a new failure mode that the T14.18 control-channel fix does
+NOT address:
+
+- `custom-udp-1000x100hz-qos4-single`: status=timeout, classified
+  **deadlock**. 172K writes, 180 receives, both sides killed by
+  runner timeout.
+- `websocket-1000x100hz-qos3-single` and `qos4-single`: same
+  pattern, both deadlock.
+
+Mechanism: in Single mode, `publish` and `poll_receive` share one
+thread. At 100K msg/s symmetric TCP, the inline `publish` eventually
+blocks on TCP send back-pressure (peer's recv buffer full). While
+blocked, the thread can't call `poll_receive`, so the variant's own
+recv buffer fills. Peer's writes start blocking too. Both sides
+permanently wedge inside a blocking syscall. T14.18's TCP control
+channel can't help because the variant thread is stuck in `send` --
+EOT is never sent over the control channel.
+
+#### Curious asymmetry
+
+`hybrid-1000x100hz-qos4-single` SURVIVED (status=success,
+classification=`completed`, 309K writes, 373 receives = 0.12 %
+delivery). Hybrid handles the same TCP symmetric flood without
+deadlocking; deliveries are catastrophically low, but the variant
+exits cleanly. This is the user's "log everything with bad latency"
+intent working AS DESIGNED.
+
+Difference in implementation must explain this. Candidates:
+- Hybrid uses a shorter TCP write timeout (or non-blocking writes
+  with retry).
+- Hybrid's `poll_receive` interleaves differently with `publish`.
+- Hybrid's TCP send buffer is sized differently.
+
+#### Scope
+
+This is an **investigative task** first; the fix (if any) follows.
+
+1. Audit how hybrid Single mode handles TCP write+read interleaving
+   vs custom-udp Single mode vs websocket Single mode.
+2. Identify the specific code-level difference that lets hybrid
+   survive.
+3. Decide: (a) port the hybrid pattern to the other two variants, or
+   (b) document the architectural limit and accept that TCP Single
+   mode is restricted to lower throughput regimes.
+4. If (a): produce a small focused fix per variant (likely
+   non-blocking write + retry with short SO_SNDTIMEO).
+5. If (b): document the limit in each variant's CUSTOM.md and adjust
+   the all-variants config's `default_timeout_secs` or remove
+   high-rate Single mode from canonical fixtures.
+
+#### Acceptance criteria
+
+- [ ] Audit findings posted to STATUS.md identifying the
+      hybrid-vs-others code difference.
+- [ ] Decision: (a) implement, or (b) document.
+- [ ] If (a): high-rate stress smoke shows custom-udp + websocket
+      Single mode `completed` (delivery may be ~0% but no deadlock).
+- [ ] If (b): each affected variant's CUSTOM.md documents the
+      throughput cliff for Single mode.
+
+#### Out of scope
+
+- Improving high-rate Single mode delivery PERCENTAGES. The user's
+  stated intent ("log all messages received with bad latency")
+  doesn't promise high delivery; it promises that what arrives is
+  logged. Achieving "completed" status is the only goal here.
+- Zenoh and webrtc asymmetric timeouts. Different root causes.
+- Multi mode behaviour. Unchanged in this task.
+
+---
+
 ### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (DEFERRED)
 
 **Repo**: `variants/zenoh/`, plus a small runner-side sidecar-spawn

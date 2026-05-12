@@ -8980,3 +8980,85 @@ trade-offs to consider rather than guesses.
 `logs/smoke-e14-20260512_120517/` (or latest smoke-e14-* dir).
 `configs/two-runner-smoke-e14.toml` updated with `control_base_port`
 fields per T14.18.
+
+---
+
+## 2026-05-12 — Post-T14.18 high-rate stress (orchestrator)
+
+Ran `configs/two-runner-stress-e14.toml` (1000 vpt x 100 Hz = 100K msg/s
+symmetric across all variants × all qos × both modes where supported,
+32 spawns total).
+
+### T14.18 verification on the originally-failing fixture
+
+The cases that were `eot_lost` or `deadlock` in
+`logs/all-variants-01-20260512_093124/` (pre-T14.18) now classify
+`completed`:
+
+```
+custom-udp-1000x100hz-qos1-single   completed     (was eot_lost)
+custom-udp-1000x100hz-qos2-single   completed     (was eot_lost)
+custom-udp-1000x100hz-qos3-multi    completed     (was eot_lost on one side)
+custom-udp-1000x100hz-qos3-single   completed     (was eot_lost)
+hybrid-1000x100hz-qos1-2-3-4        completed     (all variants of each)
+```
+
+T14.18's TCP side-channel for EOT is working as designed: even at
+catastrophic UDP saturation where delivery cratered to 0.1-30 %,
+both runners reach `eot_sent`/`eot_received` and exit cleanly. EOT
+is never lost.
+
+### New failure mode surfaced: TCP single-mode deadlock at 100K msg/s
+
+Three previously-untested cases deadlock at the new scale:
+
+```
+custom-udp-1000x100hz-qos4-single   deadlock      (172K writes, 180 recv)
+websocket-1000x100hz-qos3-single    deadlock
+websocket-1000x100hz-qos4-single    deadlock
+```
+
+Mechanism: strict single-threaded TCP at 100K msg/s symmetric --
+`publish` blocks on TCP back-pressure, inline `poll_receive` can't
+run, both sides wedge. T14.18's control channel can't help because
+the variant thread is stuck in the data-path `send` syscall.
+
+**Curious asymmetry**: `hybrid-1000x100hz-qos4-single` SURVIVED
+(`completed`, 0.12 % delivery, 309K writes). Hybrid's TCP-single
+implementation handles the same workload without deadlocking. Worth
+investigating what hybrid does differently. Filed as T14.19.
+
+### Zenoh asymmetric timeouts remain
+
+`zenoh-1000x100hz-qos2/3/4-multi` shows the same asymmetric-timeout
+pattern as the pre-T14.18 run -- one side completes, the other times
+out. T14.18 doesn't apply to Zenoh (out of scope). T14.17 classifier
+correctly types these as `eot_timeout_internal` / `deadlock` / `unknown`.
+
+### WebRTC ordering at qos2
+
+`webrtc-1000x100hz-qos2-multi` shows 2462-2603 out-of-order receives.
+Expected for unreliable datagrams; the integrity ordering check
+fires because qos2 logically should be "latest-value" not "purely
+unordered". Worth a separate analysis-side adjustment: the check
+should be QoS-aware (qos1-2 = no ordering guarantee).
+
+### Net wins this cycle
+
+- T14.18 verified on the original failure pattern: zero `eot_lost`,
+  zero deadlocks attributable to EOT routing.
+- T14.13 ordering fix verified on QUIC: zero out-of-order at qos 3-4
+  reliable.
+- The integration of T14.16 + T14.17 + T14.18 + T11.5 produces a
+  complete cross-variant table where every cell is honestly
+  characterised (success/cliff/failure) with a clear classification.
+
+### Open issues filed as follow-ups
+
+- **T14.19**: investigate why hybrid Single mode survives TCP
+  symmetric flood when custom-udp + websocket Single deadlock.
+  Audit + decide port-the-pattern vs document-the-limit.
+- Zenoh's asymmetric timeouts at high rate remain unaddressed; the
+  T14.9 Zenoh-router-RPC path would help here but is still deferred.
+
+Stress logs: `logs/stress-e14-20260512_*`.
