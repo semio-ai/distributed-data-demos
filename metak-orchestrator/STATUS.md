@@ -9062,3 +9062,77 @@ should be QoS-aware (qos1-2 = no ordering guarantee).
   T14.9 Zenoh-router-RPC path would help here but is still deferred.
 
 Stress logs: `logs/stress-e14-20260512_*`.
+
+## T14.19 -- TCP Single-mode deadlock audit + fix (2026-05-12, IN PROGRESS)
+
+### Audit table
+
+Comparison of Single-mode TCP qos4 write + read paths across the
+three TCP-bearing variants. file:line citations refer to the HEAD
+state at the time of audit (commit `5d2f375` and worktree).
+
+| Axis | hybrid | custom-udp | websocket |
+| --- | --- | --- | --- |
+| **TCP write call** | `write_with_retry` calls `Write::write` in a loop, retrying on `WouldBlock` with `yield_now()` until a **10 s budget** is exhausted. Socket is blocking (`set_nonblocking(false)`), no `SO_SNDTIMEO`. `variants/hybrid/src/tcp.rs:476-509` (loop), `:51` (`TCP_WRITE_RETRY_BUDGET = 10 s`), `:253-258` (`set_nonblocking(false)` on outbound). | `stream.write_all(encoded)` on a blocking socket. No `SO_SNDTIMEO`, no `WouldBlock` handling, no budget. Errors drop the peer. `variants/custom-udp/src/udp.rs:870-877` (qos4 broadcast), `:535` (`set_nonblocking(false)` on outbound). | `ws.send(Message::Binary(...))` (tungstenite) on a blocking TCP socket. Single-mode setup **explicitly clears** the write timeout (`set_write_timeout(None)`). No `SO_SNDTIMEO`, no budget. `variants/websocket/src/websocket.rs:410` (single-mode write), `:670`, `:738` (`set_write_timeout(None)` after handshake on both client and accepted streams). |
+| **TCP read call** | Read clone with `SO_RCVTIMEO = 1 ms`. `try_recv_framed` does `read(&mut tmp[..65536])` — drains up to **64 KiB per call**, accumulates in `read_buf`, extracts framed messages from the buffer. `variants/hybrid/src/tcp.rs:58` (`READ_POLL_TIMEOUT = 1 ms`), `:106-108` (set on read clone), `:144-200` (`try_recv_framed`). | Inbound streams set to `set_nonblocking(true)` after accept. `read_framed_message` does `read_exact(len_buf)` (4 B) + `read_exact(body)` — reads **exactly one frame** per call, in two separate syscalls. `variants/custom-udp/src/udp.rs:622` (inbound non-blocking), `:282-312` (`read_framed_message`). | Read side has `SO_RCVTIMEO = READ_POLL_TIMEOUT = 1 ms` after the handshake. `ws.read()` returns one tungstenite `Message` per call. `variants/websocket/src/websocket.rs:72` (`READ_POLL_TIMEOUT = 1 ms`), `:672`, `:740` (`set_read_timeout(READ_POLL_TIMEOUT)`), `:301` (`ws.read()` in `poll_peers_once_single`). |
+| **Write/read interleaving in publish** | None inside `publish`; pure write. But `try_publish` (qos3/4) just delegates to `tcp.broadcast` and returns. `variants/hybrid/src/hybrid.rs:617-666`. | None inside `publish`; pure write. `try_publish` delegates to `publish_encoded`. `variants/custom-udp/src/udp.rs:1530-1557`. | None inside `publish`; pure write. `broadcast_binary` writes per-peer sequentially. `variants/websocket/src/websocket.rs:1001-1012`, `:404-468`. |
+| **`poll_receive` strategy** | Up to **256 internal iterations** per call; each iteration probes UDP + every TCP peer. Per TCP peer per iteration: one 64 KiB `read` syscall, then framed extraction. Returns on first Data. `variants/hybrid/src/hybrid.rs:668-701`, `variants/hybrid/src/tcp.rs:347-361`, `:515-554`. | One call drives `recv_udp` + `recv_tcp`. `recv_tcp` reads **one frame per inbound stream**. Returns whatever's in `self.pending` (zero or more updates). `variants/custom-udp/src/udp.rs:1559-1590`, `:616-700`. | Up to **256 internal iterations**, but each iteration only walks each peer once and reads **one tungstenite frame** per peer. Returns on first Data. `variants/websocket/src/websocket.rs:1014-1029`, `:284-371`. |
+| **Buffer sizing** | `SO_RCVBUF = recv_buffer_kb * 1024` applied on every TCP outbound + every accepted inbound socket. No explicit `SO_SNDBUF` tune; OS default. `variants/hybrid/src/tcp.rs:436-453`, `:262-264`, `:284-286`. | Same: `apply_recv_buffer_kb_tcp` on outbound + accepted. No explicit `SO_SNDBUF`. `variants/custom-udp/src/udp.rs:541`, `:626`. | Same: `apply_recv_buffer_kb` on inbound + outbound. No explicit `SO_SNDBUF`. `variants/websocket/src/websocket.rs:475-...`. |
+| **Stuck-detection** | **YES** -- `write_with_retry` has a 10 s wall-clock budget; on budget exhaustion the write returns a typed error and the peer is dropped from the broadcast set. In practice this only fires when the socket is non-blocking, which it never is in normal operation; but the code path exists. `variants/hybrid/src/tcp.rs:476-509`. | **NO** -- `write_all` blocks forever in the kernel under back-pressure. No timeout, no budget, no watchdog. | **NO** -- `set_write_timeout(None)` is deliberate (`websocket.rs:670, :738`); tungstenite's `write` blocks the underlying TCP until the kernel drains. |
+
+### Smallest concrete difference
+
+Hybrid's `try_recv_framed` **drains up to 64 KiB per `read` syscall**
+(`tcp.rs:152: let mut tmp = [0u8; 65536]; ... read.read(&mut tmp)`)
+whereas custom-udp's `read_framed_message` reads exactly one frame
+per call (`udp.rs:287, :307`). With ~80 B framed payloads at 100K
+msg/s = ~8 MB/s, hybrid drains its 4 MiB kernel recv buffer in
+~64 read syscalls; custom-udp would need ~50K read syscalls/s to
+keep up. Each `poll_receive` call drains markedly more from the
+kernel buffer in hybrid than in custom-udp / websocket. **This is
+the survival mechanism**: hybrid's receiver-side drain keeps pace
+better, which keeps the peer's kernel TCP send buffer flowing,
+which keeps the peer's `write_all` returning, which keeps both
+sides advancing toward EOT. The deadlock cliff in custom-udp /
+websocket is where receiver-side drain throughput falls below the
+peer's offered load, both sides' send buffers fill, both
+`write_all` calls wedge in the kernel, EOT is never reached.
+
+The empirical evidence is consistent: at 100K msg/s symmetric,
+hybrid sustained ~38.6K writes/s before timeout (309K writes in 8 s
+operate), while custom-udp sustained only ~19K writes/s before
+wedging (172K writes in ~9 s before kernel-blocking write_all
+stopped returning).
+
+### Path decision: A (port a small portable change)
+
+The smallest portable change that converts a permanent wedge into
+a clean `completed` exit is **install `SO_SNDTIMEO` on outbound TCP
+sockets** in custom-udp Single qos4 and websocket Single. When the
+kernel send buffer is full and stays full long enough to exceed
+`SO_SNDTIMEO`, the write returns `TimedOut` (Windows) /
+`WouldBlock` (Unix). The variant treats this as a fatal-for-this-
+peer write error: log + drop the peer + continue. With the peer
+dropped, the broadcast set is empty, the operate phase exits its
+publish loop on the next iteration, EOT phase runs, both sides
+exit with `status=success`. Delivery will be near-zero (matching
+hybrid's 0.12 %), but `completed` is the bar per task spec ("log
+everything with bad latency").
+
+This is portable to both variants in <30 LoC each, and does not
+restructure publish or poll_receive. It is also robust: a 5 s
+timeout is far longer than any realistic transient back-pressure on
+a healthy LAN, so it only fires in true wedge conditions.
+
+(Note: a "bigger reads per call" fix in the recv path was also
+considered to mimic hybrid's full survival mechanism more closely;
+deferred because it requires per-stream buffer state and is a
+larger change. The write-timeout path achieves the required
+`completed` outcome by itself.)
+
+### Implementation in progress
+
+Tests, builds, and end-to-end repro to follow.
+
+Stress logs (audit basis): `logs/stress-e14-20260512_111017/`.
+
