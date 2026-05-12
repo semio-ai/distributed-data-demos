@@ -133,3 +133,60 @@ as a separate field, for offline reproducibility.
 
 See also `jsonl-log-schema.md` DRAFT section (T14.1 will write that
 update).
+
+---
+
+## E15 additions: stdout progress emission
+
+One new common CLI arg, added by T15.1 (approved 2026-05-11):
+
+### `--progress-stdout-interval-ms <u32>`
+
+Optional, default `1000` (one progress line per second). `0` disables
+emission entirely -- the back-compat path for callers that pre-date
+E15. Range is `0..=u32::MAX`; sane runner-side values sit in
+`100..=5000`.
+
+When `> 0`, the variant emits one JSON line to **stdout** per interval
+with the schema below. The line is the **only** stdout output the
+variant produces: all banners, warnings, and other diagnostic text go
+to stderr. This invariant is what makes the runner's stdout reader
+(T15.2) able to parse the stream as line-delimited JSON.
+
+### Stdout JSON schema (one line per interval)
+
+```
+{"event":"progress","ts":"<RFC 3339 with ns>","phase":"<phase>","sent":<u64>,"received":<u64>,"eot_sent":<bool>,"eot_received":<bool>}
+```
+
+Field semantics:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `event` | string | Always the literal `"progress"`. |
+| `ts` | RFC 3339 with nanoseconds | Wall-clock timestamp at which the line was emitted (UTC). |
+| `phase` | string | One of `"connect"`, `"stabilize"`, `"operate"`, `"eot"`, `"silent"`, `"done"`. Reflects the variant-side protocol driver phase at emission time; `"done"` is the terminal label the variant uses after the driver has torn the transport down and the binary is about to exit. |
+| `sent` | u64 | Monotonic per-spawn aggregate count of successful `try_publish` outcomes (`Ok(true)`). Aggregated across all peers; per-peer breakdown remains in the JSONL `write` events. |
+| `received` | u64 | Monotonic per-spawn aggregate count of `receive` events observed via the driver's `poll_receive` drain loops. Aggregated across all peers; per-peer breakdown remains in the JSONL `receive` events. |
+| `eot_sent` | bool | Sticky: flips to `true` after the variant emits its `eot_sent` JSONL event. |
+| `eot_received` | bool | Sticky: flips to `true` once every expected peer EOT has been observed (or immediately, if the expected-peer set is empty -- e.g. single-runner self-loopback). |
+
+Atomicity: the variant writes one complete JSON object followed by a
+single `'\n'` per emission, then flushes stdout. Line splitters on the
+runner side may rely on `'\n'` as the record separator.
+
+Terminal line: the variant emits one final line synchronously during
+driver shutdown so the runner observes the `done` transition exactly
+once even if the interval boundary has not yet fired. The thread is
+joined before the binary exits, so no further stdout output can be
+generated past the last `done` line.
+
+### Disabled path
+
+`--progress-stdout-interval-ms 0` results in **zero** stdout writes
+from the variant. The variant-base driver still maintains the
+in-memory counters (so tests and future hooks have access) but the
+emitter thread is not spawned. Pre-E15 runner integration tests work
+unchanged because they do not pass the new flag, and clap's default
+for the arg is `1000` -- which is a no-op for tests that never read
+the child's stdout.
