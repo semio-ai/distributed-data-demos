@@ -13,7 +13,7 @@ use zenoh::pubsub::{Publisher, Subscriber};
 use zenoh::qos::CongestionControl;
 use zenoh::sample::Sample;
 
-use variant_base::types::{Qos, ReceivedUpdate};
+use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::variant_trait::{PeerEot, Variant};
 
 /// Helper: emit a `[zenoh-trace]` line on stderr if debug-trace is enabled.
@@ -873,12 +873,29 @@ impl Variant for ZenohVariant {
         "zenoh"
     }
 
-    fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
-        // T14.1 compile-fix only -- the trait signature gained the
-        // threading-mode argument so every variant accepts it now.
-        // Real Multi-mode handling for Zenoh is filed under T14.7
-        // (declare `[Multi]` capability + reject Single at connect).
-        let _ = threading_mode;
+    fn supported_threading_modes(&self) -> &'static [ThreadingMode] {
+        // T14.7: the zenoh crate runs an internal multi-threaded
+        // runtime (route resolution, transport TX/RX, sessions) that
+        // we cannot disable from the client. Declaring Single would
+        // be dishonest. A genuinely single-threaded zenoh client is
+        // possible via a sidecar `zenohd` router process speaking
+        // RPC -- filed as deferred T14.9, not part of E14.
+        //
+        // See `variants/zenoh/CUSTOM.md` "Threading modes (T14.7)".
+        &[ThreadingMode::Multi]
+    }
+
+    fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()> {
+        // T14.7: reject Single mode BEFORE any I/O. Capability is
+        // declared via `supported_threading_modes()`; this is the
+        // belt-and-braces guard for the case the runner asks anyway.
+        if threading_mode == ThreadingMode::Single {
+            anyhow::bail!(
+                "variant-zenoh does not currently support single-threaded mode \
+                 (Zenoh has internal threads we cannot disable); see T14.9 for \
+                 the deferred router-RPC path. Spawn with --threading-mode multi"
+            );
+        }
         let trace = self.zenoh_args.debug_trace;
         let t0 = Instant::now();
         trace_if!(
@@ -1504,6 +1521,55 @@ mod tests {
         assert_eq!(v.name(), "zenoh");
     }
 
+    /// T14.7: Zenoh declares Multi-only support. The zenoh crate runs
+    /// internal threads we cannot disable from the client; declaring
+    /// Single would be dishonest. T14.9 covers the deferred sidecar
+    /// router-RPC path that gives Zenoh a genuinely single-threaded
+    /// client surface.
+    #[test]
+    fn test_supported_threading_modes_is_multi_only() {
+        let v = ZenohVariant::new("a", &[]).unwrap();
+        let modes = v.supported_threading_modes();
+        assert_eq!(modes, &[ThreadingMode::Multi]);
+    }
+
+    /// T14.7: `connect(Single)` must error BEFORE any I/O. If the
+    /// guard failed to short-circuit, the variant would attempt to
+    /// build a multi-thread tokio runtime and open a Zenoh session,
+    /// which is observably slow and noisy. We assert both the Err
+    /// outcome and that the variant remains in its pre-connect state.
+    /// We also cross-reference T14.9 in the error message so operators
+    /// have a discoverable path to the deferred router-RPC follow-up.
+    #[test]
+    fn test_connect_single_mode_errors_before_io() {
+        let mut v = ZenohVariant::new("a", &[]).expect("construct ZenohVariant");
+        let err = v
+            .connect(variant_base::ThreadingMode::Single)
+            .expect_err("connect(Single) must error for variant-zenoh");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not currently support single-threaded mode"),
+            "error message should explain Single is unsupported, got: {msg}",
+        );
+        assert!(
+            msg.contains("T14.9"),
+            "error message should cross-reference T14.9 router-RPC path, got: {msg}",
+        );
+        assert!(
+            msg.contains("--threading-mode multi"),
+            "error message should point at the multi flag, got: {msg}",
+        );
+        // Structural assertion that no I/O happened: every owned
+        // bridge handle is still None (no tokio runtime, no session,
+        // no subscribers, no publishers, no EOT channel).
+        assert!(v.runtime.is_none(), "no tokio runtime should be set up");
+        assert!(v.send_tx.is_none(), "no publish channel should exist");
+        assert!(v.recv_rx.is_none(), "no receive channel should exist");
+        assert!(v.shutdown_tx.is_none());
+        assert!(v.eot_shutdown_tx.is_none());
+        assert!(v.eot_rx.is_none());
+    }
+
     #[test]
     fn test_path_to_key_strips_leading_slash() {
         // Workload paths arrive as `/bench/N`; the derived key must be
@@ -1687,7 +1753,7 @@ mod tests {
 
         let mut variant = ZenohVariant::new("stress-runner", &[]).expect("construct variant");
         variant
-            .connect(variant_base::ThreadingMode::Single)
+            .connect(variant_base::ThreadingMode::Multi)
             .expect("connect");
 
         // Give Zenoh a moment to warm up its loopback discovery before we

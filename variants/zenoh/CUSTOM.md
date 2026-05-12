@@ -273,3 +273,63 @@ Tests covering this contract live in `src/zenoh.rs` `tests` mod:
 - `test_try_publish_qos1_default_path_returns_ok_true` -- single-write
   sanity case verifying the message is enqueued with the right `qos`
   tag for downstream cache routing.
+
+## Threading modes (T14.7)
+
+The Zenoh variant declares `supported_threading_modes() -> &[Multi]`. It
+does not support `ThreadingMode::Single` and `connect(Single)` returns
+an `Err` before any runtime, session, or subscriber setup. The runner
+consults this declaration (per T14.8) and silently skips any
+`<name>-qos<n>-single` spawn the matrix expansion would otherwise
+produce.
+
+### Why no Single mode (today)
+
+The zenoh crate runs its own internal multi-threaded engine:
+route resolution, transport TX/RX, session management, scouting, and
+the storage backend all run as tokio tasks on a runtime the crate
+owns. The public `zenoh::Session` API is async and there is no
+client-side hook to disable any of that. Even when we open exactly
+one Session and one Subscriber on a small fixed key-expression set,
+Zenoh's own tasks are still alive in the background -- declaring the
+variant single-threaded would be measurably untrue.
+
+This is fundamentally different from QUIC and WebRTC, where the
+crate is async but the boundary is sharper (one tokio runtime we
+build, one set of tasks we spawn). Zenoh's threading is internal to
+the crate and not under our control.
+
+### Future: T14.9 (deferred, NOT part of E14)
+
+Although the in-process zenoh client is multi-threaded, Zenoh's
+architecture naturally supports an **out-of-process router**
+(`zenohd`). A genuinely single-threaded, WASM-friendly Zenoh client
+would talk RPC to a sidecar `zenohd` process that absorbs all the
+concurrency, leaving the client surface sync and free of tokio.
+
+That work is filed as **T14.9** in `metak-orchestrator/TASKS.md`. It
+is **deferred**: not scheduled, not part of the E14 sprint, and
+spawning is gated on E14 (T14.1 - T14.8) landing AND the team
+confirming a real WASM use case for Zenoh. When T14.9 implements,
+this variant's capability declaration becomes
+`[ThreadingMode::Single, ThreadingMode::Multi]` and this section
+gets revised accordingly.
+
+T14.9 also requires a small runner-side mechanism to spawn a
+sidecar process per variant and tear it down after the spawn. That
+mechanism would be reusable for any other future variant that
+benefits from a sidecar (none on the current backlog).
+
+### `--recv-buffer-kb`
+
+The zenoh crate hides its transport sockets behind the public
+`zenoh::Session` API. There is no documented hook to set `SO_RCVBUF`
+on the underlying transports, and reaching into the crate's internal
+`Transport` types to grab raw sockets is out of contract. The
+`--recv-buffer-kb` injected arg is therefore **advisory** for this
+variant: the value is recorded in the `connected` JSONL event
+(driver-side, per the E14 contract) but the variant cannot honour
+per-spawn overrides. Operators tuning kernel buffers for Zenoh need
+to use OS-level sysctl knobs outside the benchmark, or wait for the
+T14.9 router-sidecar topology which exposes the router's TCP/UDP
+listeners directly.

@@ -38,6 +38,12 @@ fn loopback_full_protocol() {
             "test-runner",
             "--run",
             "run01",
+            // T14.7: Zenoh requires Multi mode; CLI default is `single`
+            // for backwards-compat across the E14 rollout, so this test
+            // injects the mode explicitly until T14.8 makes the runner
+            // do so for every spawn.
+            "--threading-mode",
+            "multi",
             "--",
             "--zenoh-mode",
             "peer",
