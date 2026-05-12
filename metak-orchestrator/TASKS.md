@@ -5008,6 +5008,58 @@ to exist). Can spawn in parallel with T14.2-T14.7.
 
 ---
 
+### T11.6: analysis -- revisit cache rebuild RSS after T11.5 schema bump
+
+**Repo**: `analysis/`.
+**Status**: pending, low priority. Filed as a skeleton 2026-05-12 by the
+orchestrator after T11.5 worker flagged the issue.
+
+#### Background
+
+T11.5 (receive-headline pivot) bumped `analysis/schema.py` `SCHEMA_VERSION`
+from `"2"` to `"3"` to force a one-time full cache rebuild on existing
+datasets, since the new `threading_mode`, `recv_buffer_kb`, late-tail
+fields could not be back-filled from old shards. On the ~80 GB regression
+dataset the rebuild took **~30 min wall-time with peak RSS ~8.5 GB**.
+
+This exceeds the original Phase 1.5 (E11) acceptance gate of **<4 GB peak**
+on the canonical 40 GB acceptance dataset
+(`inter-machine-all-variants-01-20260501_150858`).
+
+Steady-state subsequent runs (no JSONL changes) should be fine, since the
+cache is on-disk Parquet shards. Only the **one-time** rebuild on each
+existing dataset spikes RSS.
+
+#### Scope
+
+- Reproduce the RSS spike against the E11 acceptance dataset
+  (`logs/inter-machine-all-variants-01-20260501_150858/`).
+- Decide whether the spike is acceptable as a documented one-time cost,
+  or whether the rebuild pipeline needs per-shard memory caps (e.g.
+  process shards sequentially rather than in a polars lazy plan that
+  loads several into memory).
+- If a fix is needed: bounded per-shard processing, smaller in-flight
+  group sets, or polars streaming mode.
+- Update E11 acceptance to acknowledge the one-time cost, or restore
+  the <4 GB gate after a fix.
+
+#### Acceptance criteria (rough)
+
+- [ ] Reproduction documented with peak RSS measured on the E11
+  acceptance dataset.
+- [ ] Either (a) the rebuild fits in <4 GB peak RSS, or (b) E11
+  acceptance is updated to document the one-time cost with a clear
+  rationale.
+
+#### Out of scope
+
+- Reverting T11.5's schema bump. The new fields are needed for E14
+  data; the bump is unavoidable.
+- Optimising steady-state analysis runtime. That is a separate
+  concern.
+
+---
+
 ### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (DEFERRED)
 
 **Repo**: `variants/zenoh/`, plus a small runner-side sidecar-spawn

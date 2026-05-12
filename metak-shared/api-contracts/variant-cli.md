@@ -75,9 +75,11 @@ Two new runner-injected CLI args, added by T14.1 + T14.8 (approved 2026-05-12):
 
 ### `--threading-mode <single|multi>`
 
-Required. Set by the runner from the expanded `threading_modes` dimension
-in TOML config (see `toml-config-schema.md` DRAFT section). Tells the
-variant which execution model to use:
+Required from T14.8 onward (the runner-side change that injects the arg
+unconditionally). During the T14.1 -> T14.8 rollout window the arg is
+optional with default `single` so existing runner integration tests that
+spawn variants directly continue to work. Tells the variant which
+execution model to use:
 
 - `single` -- single-threaded, fully synchronous. No tokio. Variants
   that fundamentally rely on async runtimes (QUIC, WebRTC, Zenoh)
