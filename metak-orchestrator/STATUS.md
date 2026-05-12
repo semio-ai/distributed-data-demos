@@ -8635,3 +8635,87 @@ This will:
   `publish`, returns `Ok(true)`) — the writes still go through the
   send_loop mpsc and are serialised onto the stream there.
 
+
+### T14.13 completion report (2026-05-11)
+
+**Status**: done. Out-of-order receives on `quic-100x100hz-multi` dropped
+from ~42 K per direction to **0**. All workspace tests + clippy + fmt
+clean.
+
+#### Audit findings recap (Outcome A)
+
+QUIC qos3/4 was opening a fresh unidirectional stream per message *and*
+`tokio::spawn`-ing the write on the send side, plus spawning a fresh
+per-stream `read_to_end` task on the receive side. QUIC only guarantees
+per-stream ordering; the cross-stream interleave on the wire and the
+mpsc-send race on the receiver together destroyed end-to-end order.
+Datagram qos1/2 path was unaffected and stayed untouched.
+
+#### Implementation (Outcome A)
+
+`variants/quic/src/quic.rs`:
+- `send_loop` now owns `Vec<Option<quinn::SendStream>>` parallel to
+  `connections`. Each reliable send lazily opens the slot via
+  `conn.open_uni().await`, then writes `[u32 BE length][frame bytes]`
+  serially with `write_all`. On error the slot is cleared and the next
+  reliable message re-opens. Shutdown `finish()`-es every still-open
+  stream.
+- Receive side: `handle_connection` still spawns one task per accepted
+  uni-stream, but that task now runs `read_reliable_stream` (a new
+  function) — a SINGLE read loop per stream that peels off the u32 BE
+  length prefix then `read_exact`-s the frame body and dispatches it
+  before reading the next length prefix. No per-frame `tokio::spawn`.
+- EOT trailer is the final length-delimited frame on the same stream.
+- Defensive cap `RELIABLE_FRAME_MAX_BYTES = 64 MiB` on the length
+  prefix to refuse misbehaving peers.
+
+#### Validation results
+
+| Step | Result |
+|---|---|
+| `cargo build --release -p variant-quic` | clean |
+| `cargo test --release -p variant-quic` (default) | 36/36 pass |
+| `cargo test --release -p variant-quic -- --ignored` | 1/1 pass (`two_runner_t14_13_qos4_ordering`) |
+| `cargo test --release --workspace` | all green, no FAILED entries |
+| `cargo clippy --release -p variant-quic --all-targets -- -D warnings` | clean |
+| `cargo fmt --check` | clean |
+
+#### End-to-end repro on `configs/two-runner-smoke-e14.toml`
+
+Re-ran the E14 smoke; QUIC line of the T11.5 integrity report:
+
+```
+quic-100x100hz-multi  smoke-e14  alice->bob  4 100,100 100,100  100.00%   0 out-of-order   0 BP-skip  completed
+quic-100x100hz-multi  smoke-e14  bob->alice  4 100,100 100,100  100.00%   0 out-of-order   0 BP-skip  completed
+```
+
+Before T14.13: 41,911 / 41,471 out-of-order. After: 0 / 0. No
+`[FAIL: ordering]` flag. Delivery stayed at 100.00 % in both directions
+(reliable streams, as expected). Latency profile is a separate concern
+(p99 842 ms reflects head-of-line blocking on a single reliable stream
+at 10 K msg/s); this is the inherent tradeoff of QUIC's per-stream
+in-order delivery and is the correct behaviour for qos4 reliable
+ordered.
+
+No other variant regressed in the smoke (hybrid-single's 5.73 % is
+the known T14.15 issue, websocket's `late_tail_present` is the known
+in-flight-tail diagnostic, zenoh's 199.90 % is the known same-host
+peer self-receive doubling).
+
+#### Open concerns / deviations
+
+- **Wire-format incompat**: pre- and post-T14.13 `variant-quic`
+  binaries cannot interoperate on the reliable path (the receiver
+  now requires length-prefixed framing on uni-streams). Documented
+  in `variants/quic/CUSTOM.md`. No version negotiation is
+  implemented; the benchmark fixtures always rebuild both sides
+  from HEAD so this matches existing practice.
+- **Latency tail**: consolidating to one stream per connection
+  raises p99 to 842 ms on the loopback smoke (vs the previous
+  per-message-stream layout's higher parallelism). That is the
+  expected behaviour for qos4 = "reliable, ordered" — head-of-line
+  blocking on a single stream is the price of strict order. If a
+  future task wants lower-latency qos3 (reliable but not strictly
+  ordered), it could either keep the old per-message strategy for
+  qos3 only, or split into multiple streams sharded by key path so
+  ordering is preserved per-path. Out of scope for T14.13.
