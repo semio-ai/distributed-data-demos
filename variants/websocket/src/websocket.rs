@@ -58,6 +58,7 @@ use tungstenite::{
     Message, ServerHandshake, WebSocket,
 };
 
+use variant_base::logger::LoggerHandle;
 use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::{PeerEot, Variant};
 
@@ -83,10 +84,16 @@ const DISCONNECT_GRACE: Duration = Duration::from_millis(200);
 /// and abandon it -- Rust will tear down on process exit. See T14.2.
 const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Minimum per-peer mpsc capacity. The formula `4 * values_per_tick *
-/// peer_count` may yield a tiny number (or zero) for unit tests with
-/// no peers; floor at 16 so the channel always has breathing room.
-const MIN_CHANNEL_CAPACITY: usize = 16;
+/// Capacity of the Multi-mode lifecycle-only mpsc.
+///
+/// As of T14.10 the channel only carries lifecycle items (`Eot`,
+/// `PeerDropped`) -- data `receive` events are written to JSONL
+/// directly from the reader thread via the shared [`LoggerHandle`].
+/// A small fixed bound is therefore sufficient: peers emit at most one
+/// `Eot` per spawn plus an optional `PeerDropped`, so the channel can
+/// never grow large in steady state. 256 leaves comfortable headroom
+/// for many-peer fixtures and tests.
+const LIFECYCLE_CHANNEL_CAPACITY: usize = 256;
 
 /// Multi-mode write side: tungstenite framing context + the dedicated
 /// write-only `TcpStream` clone. Held behind a Mutex to serialize
@@ -141,8 +148,12 @@ pub struct WebSocketConfig {
     /// Applied via `SO_RCVBUF` on every underlying TCP socket
     /// immediately after the WS handshake completes; see T14.2.
     pub recv_buffer_kb: u32,
-    /// Driver `values_per_tick` -- used to size the Multi-mode bounded
-    /// mpsc channel (`4 * values_per_tick * peer_count`, floored at 16).
+    /// Driver `values_per_tick`. Retained for compatibility with
+    /// upstream callers (`from_derived`) and for potential future
+    /// per-tick sizing; the Multi-mode mpsc was a function of this
+    /// value pre-T14.10 but is now a fixed lifecycle-only bound. See
+    /// `LIFECYCLE_CHANNEL_CAPACITY`.
+    #[allow(dead_code)]
     pub values_per_tick: u32,
 }
 
@@ -164,11 +175,15 @@ impl WebSocketConfig {
 }
 
 /// Item pushed by a Multi-mode reader thread into the shared channel.
-/// Frames are decoded by the reader (CPU work moves off the driver
-/// thread); EOT markers and data updates take separate paths inside
-/// `poll_receive`.
+///
+/// As of T14.10 this is **lifecycle-only**: the reader thread writes
+/// `receive` events for decoded data frames directly to JSONL via the
+/// shared `LoggerHandle` and never queues them through the channel.
+/// The channel therefore only carries end-of-test markers and per-peer
+/// drop notifications, both of which must remain visible to the driver
+/// thread (the driver logs `eot_received` itself and updates its peer
+/// set on a drop).
 enum ReaderItem {
-    Data(ReceivedUpdate),
     Eot {
         writer: String,
         eot_id: u64,
@@ -212,6 +227,14 @@ pub struct WebSocketVariant {
     recv_rx: Option<Receiver<ReaderItem>>,
     /// Reader thread join handles (Multi mode only).
     reader_threads: Vec<ReaderThread>,
+    /// Thread-safe handle to the driver's JSONL logger, attached by the
+    /// driver between `connect` and `start_reader_threads` (T14.10).
+    /// Cloned into each reader thread so it can write `receive` events
+    /// directly off the driver thread. `None` until `attach_logger`
+    /// runs; reader threads spawned before the handle arrives would
+    /// fail to log, but the driver-side ordering guarantees this never
+    /// happens.
+    logger: Option<LoggerHandle>,
 }
 
 impl WebSocketVariant {
@@ -226,6 +249,7 @@ impl WebSocketVariant {
             recv_tx: None,
             recv_rx: None,
             reader_threads: Vec::new(),
+            logger: None,
         }
     }
 
@@ -346,15 +370,21 @@ impl WebSocketVariant {
         hit
     }
 
-    /// Multi-mode poll: drain one item from the shared receiver channel.
-    /// Reader threads have already decoded frames; this is a near-free
-    /// `try_recv` on the driver thread.
+    /// Multi-mode poll: drain lifecycle items from the shared receiver
+    /// channel.
+    ///
+    /// As of T14.10 the channel is lifecycle-only: reader threads write
+    /// `receive` events directly to JSONL via the shared `LoggerHandle`
+    /// and never queue data frames here. This call therefore drains
+    /// every available `Eot` / `PeerDropped` item and returns `None`.
+    /// The driver still invokes `poll_receive` on every operate-phase
+    /// iteration; that's what keeps lifecycle items flowing without
+    /// requiring a separate driver hook.
     fn poll_peers_once_multi(&mut self) -> Option<ReceivedUpdate> {
         self.recv_rx.as_ref()?;
         loop {
             let next = self.recv_rx.as_ref()?.try_recv();
             match next {
-                Ok(ReaderItem::Data(update)) => return Some(update),
                 Ok(ReaderItem::Eot { writer, eot_id }) => {
                     self.record_eot(writer, eot_id);
                 }
@@ -482,25 +512,44 @@ fn apply_recv_buffer_kb(stream: &TcpStream, recv_buffer_kb: u32, peer_addr: Sock
 /// Owns the per-peer `WebSocket<TcpStream>` exclusively. Loops on
 /// `WebSocket::read` with the short SO_RCVTIMEO previously installed
 /// by `ws_client_connect` / `ws_server_accept` so the shutdown flag is
-/// checked roughly every `READ_POLL_TIMEOUT`. Each decoded Data frame
-/// is **dropped on full** so the reader NEVER blocks on the channel
-/// (this is what breaks the T-impl.10 symmetric-flood deadlock).
-/// EOT frames are pushed with a blocking-send fallback so the
-/// synchronization marker is not silently lost when the channel is
-/// briefly busy.
+/// checked roughly every `READ_POLL_TIMEOUT`.
+///
+/// As of T14.10 the reader thread writes `receive` events for decoded
+/// data frames **directly to JSONL** via the shared `LoggerHandle`.
+/// The bounded mpsc is reserved for lifecycle items only (`Eot`,
+/// `PeerDropped`). This lifts the high-rate delivery cliff that T14.2's
+/// drop-on-full design imposed: every frame the reader parses off the
+/// wire makes it into JSONL regardless of the driver's per-tick drain
+/// cadence. Logger-mutex contention becomes the new bottleneck, but a
+/// single line write is microseconds-cheap so the cliff moves far above
+/// the 100 K msg/s symmetric workload that motivated T14.10.
 fn reader_thread_main(
     peer_name: String,
     peer_addr: SocketAddr,
     mut ws: WebSocket<TcpStream>,
     tx: SyncSender<ReaderItem>,
     shutdown: Arc<AtomicBool>,
+    logger: LoggerHandle,
 ) {
     while !shutdown.load(Ordering::Acquire) {
         match ws.read() {
             Ok(Message::Binary(bytes)) => match protocol::decode_frame(&bytes) {
                 Ok(Frame::Data(update)) => {
-                    if !push_data_drop_on_full(&tx, ReaderItem::Data(update)) {
-                        return;
+                    // T14.10: write the `receive` event directly to
+                    // JSONL from the reader thread. The bounded mpsc
+                    // no longer carries Data items, so the historical
+                    // drop-on-full path is gone.
+                    if let Err(e) = logger.log_receive(
+                        &update.writer,
+                        update.seq,
+                        &update.path,
+                        update.qos,
+                        update.payload.len(),
+                    ) {
+                        eprintln!(
+                            "warning: WS reader thread for peer {peer_name} failed to log \
+                             receive event: {e:#}; continuing"
+                        );
                     }
                 }
                 Ok(Frame::Eot { writer, eot_id }) => {
@@ -541,26 +590,6 @@ fn reader_thread_main(
                 return;
             }
         }
-    }
-}
-
-/// Push a `Data` item into the shared channel, dropping on full.
-///
-/// On `TrySendError::Full` we drop the item and keep going. This is
-/// the critical Multi-mode property that breaks the T-impl.10
-/// symmetric-flood deadlock: the reader thread NEVER blocks on the
-/// channel for data, so the kernel TCP recv buffer keeps draining,
-/// which keeps the peer's writer from blocking on its end-of-test
-/// broadcast. The bounded channel still acts as a useful OOM bound for
-/// memory growth.
-///
-/// Returns `false` if the receiver was dropped (variant torn down).
-fn push_data_drop_on_full(tx: &SyncSender<ReaderItem>, item: ReaderItem) -> bool {
-    use std::sync::mpsc::TrySendError;
-    match tx.try_send(item) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_dropped)) => true,
-        Err(TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -837,18 +866,33 @@ impl Variant for WebSocketVariant {
         Ok(())
     }
 
+    fn attach_logger(&mut self, logger: LoggerHandle) {
+        self.logger = Some(logger);
+    }
+
     fn start_reader_threads(&mut self, mode: ThreadingMode) -> Result<()> {
         if mode == ThreadingMode::Single {
             return Ok(());
         }
-        let peer_count = self.peers.len().max(1);
-        let bound = (self.config.values_per_tick as usize)
-            .saturating_mul(4)
-            .saturating_mul(peer_count)
-            .max(MIN_CHANNEL_CAPACITY);
-        let (tx, rx) = sync_channel::<ReaderItem>(bound);
+        // T14.10: the mpsc carries lifecycle items only -- a small
+        // fixed bound is sufficient. Receive events flow directly to
+        // JSONL from the reader thread via the shared LoggerHandle.
+        let (tx, rx) = sync_channel::<ReaderItem>(LIFECYCLE_CHANNEL_CAPACITY);
         self.recv_tx = Some(tx.clone());
         self.recv_rx = Some(rx);
+
+        // The logger is only required when there are peers to spawn
+        // reader threads for -- the zero-peers smoke path is exercised
+        // by unit tests that drive `start_reader_threads` without
+        // routing through `run_protocol`.
+        let logger_handle = if self.peers.is_empty() {
+            None
+        } else {
+            Some(self.logger.clone().context(
+                "websocket variant has no LoggerHandle; driver must call attach_logger \
+                 before start_reader_threads when peers are present",
+            )?)
+        };
 
         let old_peers = std::mem::take(&mut self.peers);
         for peer in old_peers {
@@ -882,6 +926,10 @@ impl Variant for WebSocketVariant {
             let tx_for_reader = tx.clone();
             let shutdown_for_reader = Arc::clone(&shutdown);
             let peer_name_for_thread = peer_name.clone();
+            let logger_for_reader = logger_handle
+                .as_ref()
+                .expect("logger_handle is set whenever there are peers")
+                .clone();
             let handle = std::thread::Builder::new()
                 .name(format!("ws-reader-{peer_name}"))
                 .spawn(move || {
@@ -891,6 +939,7 @@ impl Variant for WebSocketVariant {
                         ws,
                         tx_for_reader,
                         shutdown_for_reader,
+                        logger_for_reader,
                     );
                 })
                 .with_context(|| format!("spawn reader thread for peer {peer_name}"))?;
@@ -1069,6 +1118,7 @@ fn is_transient_io_error(e: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use variant_base::Logger;
 
     fn dummy_config(qos: Qos) -> WebSocketConfig {
         WebSocketConfig {
@@ -1078,6 +1128,22 @@ mod tests {
             recv_buffer_kb: 4096,
             values_per_tick: 100,
         }
+    }
+
+    /// Build a temporary `LoggerHandle` backed by a tmpdir-scoped JSONL
+    /// file. Used by tests that exercise the Multi-mode reader-thread
+    /// path post-T14.10 (the reader needs a logger handle to write
+    /// `receive` events directly).
+    fn temp_logger_handle() -> (LoggerHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = Logger::new(
+            dir.path().to_str().expect("tmp path utf8"),
+            "websocket-test",
+            "self",
+            "run01",
+        )
+        .expect("logger ok");
+        (LoggerHandle::new(logger), dir)
     }
 
     #[test]
@@ -1236,6 +1302,11 @@ mod tests {
             io: PeerIo::Single(ws),
         });
         v.threading_mode = ThreadingMode::Multi;
+        // T14.10: reader threads need a LoggerHandle so they can write
+        // receive events directly to JSONL. Provide one backed by a
+        // tmpdir-scoped file.
+        let (logger_handle, _tmp_log_dir) = temp_logger_handle();
+        v.attach_logger(logger_handle);
 
         v.start_reader_threads(ThreadingMode::Multi)
             .expect("start_reader_threads ok");
@@ -1251,5 +1322,107 @@ mod tests {
         assert_eq!(v.reader_thread_count(), 0);
 
         let _ = server_thread.join();
+    }
+
+    /// T14.10: `poll_peers_once_multi` must drain lifecycle items
+    /// (`Eot`, `PeerDropped`) from the shared channel and return `None`.
+    /// Data items never appear on the channel post-T14.10 -- the
+    /// reader thread writes them directly to JSONL via the logger
+    /// handle. This test feeds an `Eot` straight into the channel via
+    /// a synthesised sender and verifies the side effect (an EOT marker
+    /// surfaced through `poll_peer_eots`) without spinning up a real
+    /// reader thread.
+    #[test]
+    fn t14_10_poll_multi_drains_lifecycle_items_only() {
+        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableTcp));
+        v.threading_mode = ThreadingMode::Multi;
+        let (tx, rx) = sync_channel::<ReaderItem>(LIFECYCLE_CHANNEL_CAPACITY);
+        v.recv_tx = Some(tx.clone());
+        v.recv_rx = Some(rx);
+
+        // Push an Eot item -- this is what reader threads still emit
+        // through the channel after T14.10.
+        tx.send(ReaderItem::Eot {
+            writer: "alice".to_string(),
+            eot_id: 7,
+        })
+        .expect("send eot");
+
+        // Drain the channel via poll_peers_once_multi. It must return
+        // None (no data items pass through the channel any more) and
+        // the EOT must surface through poll_peer_eots.
+        let data_hit = v.poll_peers_once_multi();
+        assert!(
+            data_hit.is_none(),
+            "poll_peers_once_multi must NOT return Data items post-T14.10"
+        );
+        let drained = v.poll_peer_eots().expect("poll_peer_eots");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].writer, "alice");
+        assert_eq!(drained[0].eot_id, 7);
+    }
+
+    /// T14.10: `poll_peers_once_multi` must process a `PeerDropped`
+    /// lifecycle item by removing the named peer from the active set.
+    /// We bind a localhost listener + auto-accept thread to produce a
+    /// connected `TcpStream` for the synthetic Multi-mode peer; the
+    /// stream's IO is irrelevant here -- the test only verifies the
+    /// `peers.retain` side effect.
+    #[test]
+    fn t14_10_poll_multi_processes_peer_dropped() {
+        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableTcp));
+        v.threading_mode = ThreadingMode::Multi;
+        let (tx, rx) = sync_channel::<ReaderItem>(LIFECYCLE_CHANNEL_CAPACITY);
+        v.recv_tx = Some(tx.clone());
+        v.recv_rx = Some(rx);
+
+        // Cheap connected TcpStream for the synthetic peer's writer.
+        // The stream is never read or written through; we just need to
+        // satisfy the `MultiWriter::stream` field.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let local_addr = listener.local_addr().expect("local_addr");
+        let accept_handle = std::thread::spawn(move || listener.accept());
+        let stream = TcpStream::connect(local_addr).expect("loopback connect");
+        let _ = accept_handle.join();
+
+        v.peers.push(WsPeer {
+            name: "alice".to_string(),
+            addr: local_addr,
+            io: PeerIo::Multi {
+                writer: Arc::new(Mutex::new(MultiWriter {
+                    ctx: WebSocketContext::new(Role::Client, None),
+                    stream,
+                })),
+            },
+        });
+
+        tx.send(ReaderItem::PeerDropped {
+            peer: "alice".to_string(),
+            reason: "test-induced".to_string(),
+        })
+        .expect("send peer_dropped");
+
+        let data_hit = v.poll_peers_once_multi();
+        assert!(data_hit.is_none());
+        assert!(
+            v.peers.iter().all(|p| p.name != "alice"),
+            "PeerDropped lifecycle item must remove the peer from the active set"
+        );
+    }
+
+    /// T14.10: the variant's `attach_logger` hook stores the handle so
+    /// subsequent `start_reader_threads` calls can clone it into
+    /// spawned reader threads. Verified observationally via the
+    /// internal `logger` field after the hook runs.
+    #[test]
+    fn t14_10_attach_logger_stores_handle() {
+        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableTcp));
+        assert!(v.logger.is_none(), "logger starts empty");
+        let (handle, _tmp) = temp_logger_handle();
+        v.attach_logger(handle);
+        assert!(
+            v.logger.is_some(),
+            "attach_logger must persist the handle for use by reader threads"
+        );
     }
 }

@@ -246,13 +246,20 @@ After implementation:
   has the expected `connected` / `phase` / `eot_sent` / `eot_received`
   events and that delivery is ≥ 99% over the operate window.
 
-## Threading modes (T14.2)
+## Threading modes (T14.2 + T14.10)
 
 The variant declares `supported_threading_modes() = &[Single, Multi]`
 and branches its IO model based on the `--threading-mode` CLI flag
 captured at `connect` time. `start_reader_threads(mode)` /
 `stop_reader_threads()` are the per-spawn lifecycle hooks called by
 `variant-base`'s driver around connect/disconnect.
+
+T14.10 reorganises the Multi-mode receive path: reader threads now
+write `receive` JSONL events directly via a shared `LoggerHandle`
+attached by the driver before reader-thread spawn. The bounded mpsc
+that previously carried decoded `Data` frames is now a fixed-size
+lifecycle-only channel (`Eot`, `PeerDropped`); data frames bypass it
+entirely. See "T14.10 data flow" below for the rationale.
 
 ### When each mode is chosen
 
@@ -294,28 +301,70 @@ publish-bytes -- only tungstenite-internal auto-pong responses go
 through the read-side socket, which is the same kernel TCP connection
 as the write-side clone so pongs reach the peer correctly.
 
-### Bounded-channel rationale and drop-on-full
+### T14.10 data flow -- log-from-reader
 
-The shared mpsc is sized `4 * values_per_tick * peer_count`, floored
-at 16 for tiny tests. The bound prevents OOM if the driver thread
-stalls. To break the T-impl.10 deadlock at high symmetric rates we
-take an explicit position:
+Pre-T14.10 the reader thread pushed decoded `Data` frames into the
+shared bounded mpsc and the driver thread popped them off to call
+`Logger::log_receive`. At high symmetric rates (1000 vpt at 100 Hz,
+i.e. 100 K msg/s per direction) the driver's publish path consumed
+nearly the entire 10 ms per-tick budget, leaving microseconds to
+drain the channel. The bound filled, the reader dropped data items
+(drop-on-full), and JSONL `receive` counts collapsed to ~28 % even
+though every frame had been parsed off the wire. This violates the
+project's stated goal that **every received message must be logged**
+(`metak-shared/overview.md` "Cross-cutting goals").
 
-- **Data items use drop-on-full.** When the channel is full, the
-  reader thread drops the decoded frame and continues reading the
-  next byte off the TCP socket. This is the critical property that
-  prevents the symmetric-flood deadlock: the reader thread NEVER
-  blocks on the channel, so the kernel TCP recv buffer keeps
-  draining, so the peer's writer never blocks indefinitely on its
-  end-of-test broadcast. Dropping a data item undercounts JSONL
-  `receive` events for that peer but does not affect on-wire
-  transport (QoS 3/4 reliability is provided by kernel TCP, not by
-  the variant's logging path).
+T14.10 moves `receive` logging onto the reader thread:
+
+- `variant-base` introduces a `LoggerHandle` type
+  (`Arc<Mutex<Logger>>` wrapper) and a `Variant::attach_logger` trait
+  hook. The driver wraps its `Logger` in a `LoggerHandle` and calls
+  `variant.attach_logger(handle.clone())` between `connect` and
+  `start_reader_threads`.
+- The websocket variant stores the handle and clones it into each
+  reader thread at spawn time.
+- Inside `reader_thread_main`, after `protocol::decode_frame(...)`
+  produces a `Frame::Data(update)`, the reader calls
+  `logger.log_receive(...)` directly. The frame is then forgotten;
+  it never touches the mpsc.
+- The mpsc is now **lifecycle-only**: it carries `ReaderItem::Eot`
+  and `ReaderItem::PeerDropped`. A fixed `LIFECYCLE_CHANNEL_CAPACITY`
+  of 256 is comfortably larger than the worst-case lifecycle event
+  count per spawn (`peer_count` Eot markers + optional drops).
+
+Logger mutex contention is the new bottleneck cliff. Each
+`log_receive` call serialises one JSONL line write (microseconds on
+the buffered file path) under the shared mutex. Empirically this
+moves the cliff far above 100 K msg/s symmetric -- the workload
+that originally exposed T-impl.10.
+
+### Bounded-channel rationale (lifecycle-only, post-T14.10)
+
+The shared mpsc is sized to a fixed `LIFECYCLE_CHANNEL_CAPACITY`
+(256). Drop-on-full is no longer relevant: the channel never sees
+high-rate data items.
+
 - **EOT items use blocking-send with shutdown escape.** EOT markers
   are critical for the end-of-test synchronization; dropping one
-  forces the peer's driver to wait the full `eot_timeout`. By EOT
-  time the data flood has stopped and the channel is draining, so
-  blocking briefly (1 ms retry loop) is safe.
+  forces the peer's driver to wait the full `eot_timeout`. The
+  channel has more than enough headroom that blocking would never
+  fire in practice, but the safety remains for malformed inputs.
+- **PeerDropped items use blocking-send.** Best-effort delivery is
+  fine; if the variant is being torn down the driver no longer cares.
+
+### Ordering and observability under T14.10
+
+Receive events from N reader threads now interleave in the JSONL
+file. The downstream analysis groups events by `(variant, run,
+writer, seq, path)`, so wall-clock ordering across writers does not
+matter (it was already non-deterministic on a multicore machine).
+Within a single writer's stream the reader thread processes frames
+sequentially, so per-writer JSONL ordering is preserved.
+
+Driver-side events (`phase`, `write`, `eot_sent`, `eot_received`,
+`resource`, `eot_timeout`) interleave with reader-side `receive`
+events under the same shared mutex. The lock is held only for the
+duration of one `write_line` call, so contention is minimal.
 
 ### `stop_reader_threads` semantics
 

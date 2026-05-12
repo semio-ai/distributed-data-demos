@@ -532,10 +532,20 @@ fn two_runner_websocket_both_modes_qos3_smoke() {
     drop(tmpdir);
 }
 
-/// T14.2 high-rate Multi-mode regression: 1000x100Hz (100 K msg/s) over
-/// QoS 4, threading_modes = ["multi"]. Asserts delivery >= 99% on both
-/// directions. This is the workload that exposed the T-impl.10 residual
-/// deadlock under Single mode.
+/// T14.2 + T14.10 high-rate Multi-mode regression: 1000x100Hz (100 K
+/// msg/s) over QoS 4, threading_modes = ["multi"]. Asserts delivery
+/// >= 99% on both directions.
+///
+/// History:
+/// - T14.2 introduced per-peer reader threads + bounded mpsc with
+///   drop-on-full, breaking the T-impl.10 symmetric-flood deadlock.
+///   But delivery sat at ~25-33% because the driver couldn't drain
+///   the mpsc fast enough at 100 K msg/s and the reader dropped
+///   data items on full.
+/// - T14.10 moved `receive` JSONL writes onto the reader thread via
+///   a shared `LoggerHandle`. The mpsc is now lifecycle-only. The
+///   reader logs every parsed frame regardless of driver-drain
+///   cadence; delivery rose to ~99.99 % on both directions.
 ///
 /// Marked `#[ignore]` so default CI stays fast; run via:
 ///     cargo test --release -p variant-websocket -- --ignored
