@@ -5584,6 +5584,174 @@ Synthetic-fixture-driven unit tests:
 
 ---
 
+### T14.18: variants/custom-udp + variants/hybrid -- TCP side-channel for EOT control
+
+**Repos**: `variants/custom-udp/`, `variants/hybrid/`. Plus a small
+contract addition in `metak-shared/api-contracts/eot-protocol.md`
+documenting the side-channel pattern.
+
+**Status**: pending, filed 2026-05-12 by orchestrator after the
+all-variants run (`logs/all-variants-01-20260512_093124/`) showed
+`custom-udp` Single mode losing EOT under symmetric UDP saturation
+across all QoS levels (qos1-3 classified as `eot_lost`; qos4 as
+`deadlock`).
+
+#### Background
+
+The user's run surfaced a real architectural failure mode in Single
+mode: at 100K msg/s symmetric on a single host, the kernel UDP recv
+buffer (default 8 MiB via T-impl.2 `tune_udp_buffers`) fills faster
+than the inline `poll_receive` can drain it. New datagrams -- including
+the EOT marker that's sent over the same multicast socket -- are dropped
+at the **kernel** level before the application sees them. The driver
+times out waiting for an EOT that was dropped before it ever reached
+userspace. T11.5/T14.17 classified the asymmetric outcomes as
+`eot_lost` exactly as designed.
+
+Multi mode avoids this because the dedicated reader thread drains the
+kernel buffer continuously. But Single mode is a first-class WASM
+requirement (see `metak-shared/overview.md` cross-cutting goals), so
+we can't just say "use Multi mode" -- the user explicitly needs Single
+to work.
+
+User clarification 2026-05-12 (recorded in conversation transcript):
+*"single vs multi applies only to the message exchange per se ... we'd
+be able to at least handle the control flow separately and solidly,
+even if we need to runners to exchange control messages using tcp or
+another thread."*
+
+So the design space is wider than I'd been treating it: the data path
+remains constrained by `threading_mode`, but control plane (EOT and
+similar) can use any reliable transport regardless of QoS or threading.
+
+#### Scope
+
+Add a per-peer-pair **TCP control connection** to both `custom-udp` and
+`hybrid` Multi+Single. The connection is QoS-independent, established
+once at `connect()` time, and carries ONLY control messages (currently
+just `eot_sent` / `eot_received`; future control bus point if needed).
+
+Concrete design for the worker:
+
+1. **Control port derivation**: each variant adds a new `--control-base-port`
+   CLI arg (or reuses an existing `*_base_port` field with a fixed offset
+   -- worker decides, but document the choice in CUSTOM.md). Same
+   per-runner stride (`runner_stride = 1`) as Hybrid/QUIC/WebSocket so
+   two same-host runners get different listen ports. **No qos stride**
+   -- one control port per (runner, variant binary), not per (runner,
+   variant, qos).
+
+2. **Connection lifecycle**:
+   - At `connect()`: lower-sorted-name peer is server (binds, listens),
+     higher-sorted is client (connects). Same pairing convention as
+     Hybrid TCP. Set `TCP_NODELAY` immediately.
+   - One bidirectional control connection per peer pair. NOT per QoS.
+   - At `disconnect()`: send a length-prefixed `bye` frame, half-close
+     the write side, drain the read side until peer closes or
+     `--eot-timeout-secs` elapses, then close. Same shape as websocket's
+     EOT drain.
+
+3. **EOT routing**: replace the current `signal_end_of_test` /
+   `wait_for_peer_eots` paths so that:
+   - The local `eot_sent` JSONL event is unchanged (still emitted by
+     the variant when it signals).
+   - The on-wire EOT marker is sent as a length-prefixed binary frame
+     over the **control TCP connection** to each peer, NOT over the
+     data transport.
+   - Incoming EOTs are read from the control connection and surfaced
+     via the existing `poll_peer_eots` trait method or its equivalent
+     in `variant-base`. No more EOT-on-multicast or EOT-on-data-stream.
+
+4. **Threading**:
+   - Multi mode: a dedicated OS thread per peer's control connection
+     reads incoming EOT frames and pushes them onto the existing
+     `lifecycle_tx` channel (T14.16). The Data path is unchanged.
+   - Single mode: control connection is non-blocking with a short
+     `SO_RCVTIMEO` (~1 ms); the variant's inline `poll_receive` polls
+     the control fd in addition to the data path. **No new threads in
+     Single mode unless absolutely necessary** -- the per-tick budget
+     for polling one extra socket is microseconds. Worker MAY use a
+     dedicated control-only thread in Single mode too if non-blocking
+     polling is too awkward; **document the choice** and confirm it
+     doesn't make the variant's WASM-compatibility story worse for
+     the Single mode (the user explicitly OK'd one aux thread for
+     control plane regardless of data threading mode, per the
+     2026-05-12 transcript).
+
+5. **Per-variant adjustments**:
+   - **custom-udp**: removes EOT-over-multicast for qos1-3 and the
+     current EOT-on-TCP-stream marker for qos4 (or keeps qos4
+     unchanged if the existing per-pair TCP is convenient -- worker
+     decides). EOT path is now the control connection regardless of
+     QoS.
+   - **hybrid**: same change. Removes EOT-over-multicast for qos1-2,
+     keeps qos3-4's reliable behaviour (or unifies it via the control
+     connection -- preferred for cleanliness).
+
+6. **Contract update**: `metak-shared/api-contracts/eot-protocol.md`
+   gains a new section "Control side-channel (T14.18)" documenting
+   that variants MAY use a dedicated TCP control connection for EOT.
+   No change to the on-wire EOT semantics or the JSONL event types.
+
+#### Tests
+
+- Unit: control-connection pairing logic (which side connects vs
+  accepts; port derivation).
+- Unit: stub-variant scenario where the data path is fully saturated
+  (multicast drops all data); EOT MUST still be observed via the
+  control channel.
+- Integration regression: existing two-runner same-host fixtures
+  unchanged in delivery numbers, EOT exchange unchanged in success.
+- New integration: a high-rate symmetric fixture at qos2 multi/single
+  that previously caused `eot_lost`. Both runners must complete
+  `status=success`, both sides must have `eot_sent` AND `eot_received`,
+  T14.17 classifier must mark all rows `completed`.
+
+#### Validation (MANDATORY)
+
+From workspace root:
+1. `cargo build --release -p variant-custom-udp -p variant-hybrid` clean.
+2. `cargo test --release -p variant-custom-udp -p variant-hybrid` all-green.
+3. `cargo test --release -p variant-custom-udp -p variant-hybrid -- --ignored`
+   all-green (existing + new T14.18 regression).
+4. `cargo test --release --workspace` all-green.
+5. Clippy + fmt clean for both crates.
+6. **End-to-end repro (MANDATORY)**: re-run the original failing
+   case. Use `configs/two-runner-t1416-repro.toml` (qos2 multi 100K
+   msg/s symmetric) as the smoke fixture, OR construct a fresh
+   single-spawn fixture at qos2 single that previously classified
+   `eot_lost`. Both sides must complete with `Timeout=completed` per
+   the T14.17 classifier. Capture both runners' stdouts + per-side
+   write/receive + EOT events in the completion report.
+
+#### Acceptance criteria
+
+- [ ] Control TCP connection landed in custom-udp.
+- [ ] Control TCP connection landed in hybrid.
+- [ ] EOT now uses the control channel for both variants regardless of QoS.
+- [ ] Single-mode Single-thread-data-path constraint preserved (no new
+      threads in Single mode unless explicitly documented and approved).
+- [ ] Eot-protocol contract addition for the side-channel pattern.
+- [ ] T14.17 classifier reports `completed` on previously-`eot_lost` fixtures.
+- [ ] Existing tests pass; clippy / fmt clean.
+- [ ] CUSTOM.md updates for both variants.
+
+#### Out of scope
+
+- Generalising to WebRTC (whose DataChannel uses SCTP; would need
+  separate investigation of whether EOT loss is a real issue there).
+- Generalising to WebSocket (already TCP-based, no EOT loss issue).
+- Generalising to QUIC (post-T14.13 it has reliable streams that don't
+  lose).
+- Generalising to Zenoh (already declared Multi-only; T14.9 has its
+  own path).
+- Changing the on-wire EOT semantics or JSONL event types.
+- The qos4 deadlock case observed in `logs/all-variants-01-20260512_093124/`
+  -- different failure mode (alice JSONL truncated mid-record, likely
+  TCP send wedge). File separately if needed.
+
+---
+
 ### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (DEFERRED)
 
 **Repo**: `variants/zenoh/`, plus a small runner-side sidecar-spawn
