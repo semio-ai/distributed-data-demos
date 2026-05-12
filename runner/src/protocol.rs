@@ -1,11 +1,12 @@
 use crate::clock_sync::{respond_to_probe, ClockSyncEngine};
 use crate::local_addrs::canonical_peer_host;
 use crate::message::Message;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,6 +14,40 @@ use std::time::{Duration, Instant};
 const BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_MSG_SIZE: usize = 4096;
+
+/// Offset added to a runner's UDP coordination port to derive its TCP
+/// listener port for the Phase 1.25 resume-manifest exchange (T14.24).
+///
+/// The UDP coordination range occupies `[port .. port + runners.len())`.
+/// We place the TCP manifest range at `[port + RESUME_MANIFEST_TCP_OFFSET ..
+/// port + RESUME_MANIFEST_TCP_OFFSET + runners.len())` to avoid any chance
+/// of collision with the UDP range or with adjacent variant ports used by
+/// the test fixtures. 32 is large enough to leave headroom even for
+/// many-runner experiments and small enough that operators do not need
+/// extra firewall rules beyond the existing UDP coordination port range
+/// (the TCP port is `port + 32 + index`, well inside the same low-numbered
+/// ephemeral region).
+const RESUME_MANIFEST_TCP_OFFSET: u16 = 32;
+
+/// Per-pair connect / accept poll timeout for the resume-manifest TCP
+/// exchange. Short enough to retry every few hundred ms when the peer's
+/// listener has not bound yet (process startup skew), long enough that
+/// the runner does not spin in a tight loop. The overall barrier timeout
+/// (default 120 s) bounds the retry loop.
+const RESUME_MANIFEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// I/O read/write timeout once a peer pair has connected. Manifests are
+/// small (kilobytes), so a few seconds is enough for any reasonable
+/// payload over loopback or a healthy LAN; the overall barrier deadline
+/// is still authoritative.
+const RESUME_MANIFEST_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hard cap on a single received manifest payload. Manifests grow with
+/// the spawn-job count; full-matrix runs produce several kilobytes of
+/// JSON. 4 MiB is comfortably above any plausible benchmark scale while
+/// still bounding worst-case memory if a peer lies about its length
+/// prefix.
+const RESUME_MANIFEST_MAX_BYTES: u32 = 4 * 1024 * 1024;
 
 /// Error returned when a coordination barrier (ready / done / resume manifest)
 /// fails to reach quorum within its configured timeout.
@@ -148,6 +183,12 @@ pub struct Coordinator {
     /// design: bob only ever asks for the immediately preceding variant.
     /// Wrapped in a Mutex because `Coordinator` exposes `&self` methods.
     last_completed: Mutex<Option<(String, String, String, i32)>>,
+    /// Base UDP coordination port from CLI (`--port`). Used to derive the
+    /// per-runner TCP listener port for the Phase 1.25 manifest exchange
+    /// (T14.24): each peer listens on `base_port +
+    /// RESUME_MANIFEST_TCP_OFFSET + peer_index`. UDP coordination remains
+    /// on the original `base_port + peer_index` range.
+    base_port: u16,
     /// Whether this is single-runner mode.
     single_runner: bool,
 }
@@ -235,6 +276,7 @@ impl Coordinator {
             peer_hosts: Mutex::new(peer_hosts),
             last_log_subdir: Mutex::new(last_log_subdir),
             last_completed: Mutex::new(None),
+            base_port: port,
             single_runner,
         })
     }
@@ -790,20 +832,50 @@ impl Coordinator {
         }
     }
 
-    /// Exchange `ResumeManifest` messages with all peers (Phase 1.25).
+    /// Exchange `ResumeManifest` payloads with all peers (Phase 1.25).
     ///
-    /// Each runner has already computed its local `complete_jobs` list
-    /// (effective_names whose log file exists locally and is non-empty).
-    /// This method broadcasts the local manifest, listens for one from
-    /// every peer in `runners`, and returns a `HashMap<runner_name,
-    /// complete_jobs>` containing every peer's report keyed by name.
-    /// This runner's own manifest is also included in the returned map.
+    /// **T14.24:** This barrier moved from UDP multicast to per-peer-pair
+    /// TCP after the 2026-05-12 all-variants resume failure. The earlier
+    /// UDP implementation was vulnerable to two issues at scale:
     ///
-    /// Periodic re-broadcast every 500 ms mirrors the discovery loss-
-    /// recovery pattern. Probe requests addressed to this runner are still
-    /// answered while waiting (the always-respond rule). In single-runner
-    /// mode this method is a no-op and returns a map containing only the
-    /// caller's own manifest.
+    /// 1. The recv buffer was capped at `MAX_MSG_SIZE = 4096` bytes, while
+    ///    a full-matrix manifest serialises to several kilobytes of JSON.
+    ///    Truncated datagrams failed `Message::from_bytes` silently and
+    ///    each 500 ms re-broadcast sent the same over-sized payload.
+    /// 2. Same-host UDP-coord pressure (TIME_WAIT pollution from prior
+    ///    spawns, kernel-buffer saturation right after the discovery
+    ///    linger) made it easy for both peers to wait 120 s for a
+    ///    datagram that the kernel had already dropped.
+    ///
+    /// The TCP version applies the T14.18 reliable-control-channel lesson
+    /// at the runner layer:
+    ///
+    /// - **Pairing.** For each unordered peer pair `(a, b)` with `a < b`
+    ///   lexicographically, `a` accepts on `base_port +
+    ///   RESUME_MANIFEST_TCP_OFFSET + index(a)` and `b` connects. The
+    ///   single TCP connection per pair carries both manifests via
+    ///   length-prefixed framing, then closes. This matches the
+    ///   variant-EOT side-channel pairing convention so the rule is
+    ///   familiar.
+    /// - **Framing.** Each direction sends `[u32 BE length][JSON bytes]`.
+    ///   The length is the manifest payload size in bytes; the JSON is the
+    ///   serialised `Message::ResumeManifest`. No multi-message framing,
+    ///   no keepalive — one manifest each way and we are done.
+    /// - **Reliability.** TCP retransmit handles loss without an
+    ///   application-level retry. We retry the *connect* loop until the
+    ///   peer's listener is bound (process-startup skew tolerance), but
+    ///   once connected the manifest exchange either succeeds or fails
+    ///   per the OS error.
+    /// - **Bounds.** A peer's per-pair attempt is bounded by the overall
+    ///   barrier deadline; manifests above `RESUME_MANIFEST_MAX_BYTES`
+    ///   (4 MiB) are rejected defensively.
+    ///
+    /// Returns a `HashMap<runner_name, complete_jobs>` containing this
+    /// runner's own manifest plus every peer's. In single-runner mode the
+    /// method is a no-op and returns the local manifest only. On overall
+    /// timeout the call returns a `BarrierTimeoutError` (kind
+    /// `"resume_manifest"`) wrapped in `anyhow::Error`; main detects it
+    /// via `Error::downcast_ref` and exits 75.
     pub fn exchange_resume_manifest(
         &self,
         local_complete_jobs: Vec<String>,
@@ -816,91 +888,172 @@ impl Coordinator {
             return Ok(all);
         }
 
-        let socket = self.socket.as_deref().unwrap();
         let started = Instant::now();
         let overall_deadline = started + timeout;
-        let msg = Message::ResumeManifest {
-            name: self.name.clone(),
-            run: self.run.clone(),
-            complete_jobs: local_complete_jobs,
-        };
+
+        // Peers other than self, sorted for stable behaviour and to make
+        // the per-pair "lower-sorted accepts" rule unambiguous.
+        let mut peers: Vec<String> = self
+            .expected
+            .iter()
+            .filter(|n| **n != self.name)
+            .cloned()
+            .collect();
+        peers.sort();
+
+        // Determine whether we accept or connect with each peer.
+        // Lower-sorted-name in the pair accepts; higher connects.
+        // This avoids both sides trying to bind the same listener or both
+        // sides trying to connect to a non-listening port at the same time.
+        let mut to_accept: Vec<String> = Vec::new();
+        let mut to_connect: Vec<String> = Vec::new();
+        for peer in &peers {
+            if self.name.as_str() < peer.as_str() {
+                to_accept.push(peer.clone());
+            } else {
+                to_connect.push(peer.clone());
+            }
+        }
+
+        // Bind our listener up front. We bind even if `to_accept` is empty
+        // (i.e. we are the highest-sorted name) so that the listener is
+        // always available; the cost of an unused listener is one fd.
+        // INADDR_ANY so the OS routes from any source IP.
+        let my_index = self
+            .runners_order
+            .iter()
+            .position(|r| r == &self.name)
+            .unwrap_or(0);
+        let my_listener_port = self
+            .base_port
+            .checked_add(RESUME_MANIFEST_TCP_OFFSET)
+            .and_then(|p| p.checked_add(my_index as u16))
+            .ok_or_else(|| {
+                anyhow!(
+                    "base port {} + offset {} + index {} overflows u16",
+                    self.base_port,
+                    RESUME_MANIFEST_TCP_OFFSET,
+                    my_index
+                )
+            })?;
+        let listener_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, my_listener_port);
+        let listener = TcpListener::bind(listener_addr).map_err(|e| {
+            anyhow!(
+                "resume_manifest: failed to bind TCP listener on {}: {}",
+                listener_addr,
+                e
+            )
+        })?;
+        // Non-blocking accept so we can interleave with connect attempts
+        // and respect the overall deadline.
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| anyhow!("resume_manifest: set_nonblocking failed: {}", e))?;
+
+        // Peers we still need to exchange with.
+        let mut accept_pending: HashSet<String> = to_accept.iter().cloned().collect();
+        let mut connect_pending: HashSet<String> = to_connect.iter().cloned().collect();
+
+        let peer_hosts_snapshot = self.peer_hosts.lock().unwrap().clone();
 
         loop {
-            self.send(socket, &msg)?;
+            // 1. Try one outbound connect per pending peer this tick.
+            //    The connect_to_peer helper times out quickly so we can
+            //    cycle if the peer's listener has not bound yet.
+            let connect_targets: Vec<String> = connect_pending.iter().cloned().collect();
+            for peer in connect_targets {
+                if Instant::now() >= overall_deadline {
+                    break;
+                }
+                let peer_index =
+                    match self.runners_order.iter().position(|r| r == &peer) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                let peer_tcp_port = match self
+                    .base_port
+                    .checked_add(RESUME_MANIFEST_TCP_OFFSET)
+                    .and_then(|p| p.checked_add(peer_index as u16))
+                {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let peer_host = match peer_hosts_snapshot.get(&peer) {
+                    Some(h) => h.clone(),
+                    None => continue,
+                };
+                let addr = format!("{}:{}", peer_host, peer_tcp_port);
 
-            let next_tick = std::time::Instant::now() + BROADCAST_INTERVAL;
-            let recv_deadline = next_tick.min(overall_deadline);
-            while std::time::Instant::now() < recv_deadline {
-                match self.recv(socket) {
-                    Some(Message::ResumeManifest {
-                        name,
-                        run,
-                        complete_jobs,
-                    }) => {
-                        // Defensive: drop messages from a different run id.
-                        // After discovery agreement these should not exist,
-                        // but a stale broadcast from a previous run could
-                        // theoretically arrive on the wire.
-                        if run == self.run && self.expected.contains(&name) {
-                            all.entry(name).or_insert(complete_jobs);
+                match exchange_with_peer_via_connect(
+                    &addr,
+                    &self.name,
+                    &self.run,
+                    &local_complete_jobs,
+                ) {
+                    Ok((peer_name, peer_jobs)) => {
+                        if peer_name == peer && self.expected.contains(&peer_name) {
+                            all.entry(peer_name).or_insert(peer_jobs);
+                            connect_pending.remove(&peer);
                         }
                     }
-                    Some(Message::ProbeRequest { from, to, id, t1 }) => {
-                        if to == self.name {
-                            let _ = respond_to_probe(
-                                socket,
-                                &self.peer_addrs,
-                                &self.name,
-                                &from,
-                                id,
-                                &t1,
-                            );
-                        }
+                    Err(_) => {
+                        // Most common case: peer's listener not bound yet.
+                        // Keep this peer pending and retry on the next
+                        // outer loop iteration.
                     }
-                    Some(Message::Discover { name, .. }) => {
-                        // T-coord.3: a late-joining peer is still in its
-                        // discovery phase. Re-emit our own Discover so it
-                        // can populate its leader_log_subdir.
-                        if self.expected.contains(&name) {
-                            self.maybe_reemit_discover(socket);
-                        }
-                    }
-                    Some(Message::Done {
-                        name, variant, run, ..
-                    }) => {
-                        // T-coord.1b: a peer might still be in the
-                        // done_barrier of the previous run's last variant
-                        // (relevant in resume mode where the manifest phase
-                        // immediately precedes Phase 2). Re-emit our cached
-                        // Done if it matches; the helper is gated internally
-                        // by the cache contents.
-                        if self.expected.contains(&name) {
-                            self.maybe_reemit_stale_done(socket, &variant, &run);
-                        }
-                    }
-                    _ => {}
                 }
             }
 
-            if all.len() == self.expected.len() {
-                // Linger: keep broadcasting so slower peers can collect
-                // ours after they finish their own waits.
-                let linger_end = std::time::Instant::now() + Duration::from_secs(2);
-                while std::time::Instant::now() < linger_end {
-                    self.send(socket, &msg)?;
-                    self.drain_and_answer_probe(socket);
-                    std::thread::sleep(BROADCAST_INTERVAL);
+            // 2. Try to accept any pending inbound connection.
+            //    Non-blocking; one accept per tick is fine because the
+            //    other side will retry-connect until success.
+            for _ in 0..peers.len() {
+                if accept_pending.is_empty() {
+                    break;
                 }
+                if Instant::now() >= overall_deadline {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _peer_addr)) => {
+                        match exchange_with_peer_via_accept(
+                            stream,
+                            &self.name,
+                            &self.run,
+                            &local_complete_jobs,
+                        ) {
+                            Ok((peer_name, peer_jobs)) => {
+                                if self.expected.contains(&peer_name) {
+                                    all.entry(peer_name.clone()).or_insert(peer_jobs);
+                                    accept_pending.remove(&peer_name);
+                                }
+                            }
+                            Err(_e) => {
+                                // Stream-level error: connection closed
+                                // mid-handshake or unparsable manifest.
+                                // The peer will retry-connect on its
+                                // next tick.
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+
+            // 3. Done?
+            if accept_pending.is_empty() && connect_pending.is_empty() {
                 return Ok(all);
             }
 
-            if std::time::Instant::now() >= overall_deadline {
-                let missing: Vec<String> = self
-                    .expected
-                    .iter()
-                    .filter(|n| !all.contains_key(*n))
-                    .cloned()
+            // 4. Deadline reached?
+            if Instant::now() >= overall_deadline {
+                let mut missing: Vec<String> = accept_pending
+                    .into_iter()
+                    .chain(connect_pending)
                     .collect();
+                missing.sort();
+                missing.dedup();
                 return Err(BarrierTimeoutError {
                     kind: "resume_manifest",
                     variant: String::new(),
@@ -909,6 +1062,9 @@ impl Coordinator {
                 }
                 .into());
             }
+
+            // 5. Brief sleep to avoid hot-spinning when no peer is ready.
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -1033,6 +1189,171 @@ impl Coordinator {
 /// Extract an `IpAddr` from a socket2 `SockAddr`.
 fn sockaddr_to_ip(sa: &SockAddr) -> Option<IpAddr> {
     sa.as_socket().map(|sock| sock.ip())
+}
+
+/// Length-prefixed write of a serialised `ResumeManifest` payload over a
+/// connected `TcpStream`. Format: `[u32 BE length][JSON bytes]`.
+///
+/// Used by both the connecting and accepting side of the T14.24 manifest
+/// exchange.
+fn write_manifest_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    let len: u32 = payload.len() as u32;
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(payload)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Read one length-prefixed `ResumeManifest` payload from a connected
+/// `TcpStream`. Mirrors `write_manifest_frame` and validates the length
+/// against `RESUME_MANIFEST_MAX_BYTES` so a malicious or buggy peer cannot
+/// drive the receiver into a multi-GiB allocation.
+fn read_manifest_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut len_bytes = [0u8; 4];
+    stream.read_exact(&mut len_bytes)?;
+    let len = u32::from_be_bytes(len_bytes);
+    if len > RESUME_MANIFEST_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "resume_manifest frame length {} exceeds cap {}",
+                len, RESUME_MANIFEST_MAX_BYTES
+            ),
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
+    stream.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Perform a length-prefixed manifest exchange over a stream we just
+/// accepted from a peer. Reads the peer's manifest first, then writes
+/// ours. Returns `(peer_name, peer_complete_jobs)` on success.
+///
+/// Both sides agree on the order: the accepting side reads first because
+/// the connecting side writes immediately after `connect` returns
+/// (see `exchange_with_peer_via_connect`). This avoids a write-write
+/// deadlock if either side's send buffer ever fills, which is
+/// vanishingly unlikely at manifest scale but eliminated by design.
+fn exchange_with_peer_via_accept(
+    mut stream: TcpStream,
+    self_name: &str,
+    run_id: &str,
+    local_complete_jobs: &[String],
+) -> Result<(String, Vec<String>)> {
+    stream
+        .set_read_timeout(Some(RESUME_MANIFEST_IO_TIMEOUT))
+        .map_err(|e| anyhow!("resume_manifest accept: set_read_timeout failed: {}", e))?;
+    stream
+        .set_write_timeout(Some(RESUME_MANIFEST_IO_TIMEOUT))
+        .map_err(|e| anyhow!("resume_manifest accept: set_write_timeout failed: {}", e))?;
+
+    // 1. Read peer's manifest first.
+    let peer_bytes = read_manifest_frame(&mut stream)
+        .map_err(|e| anyhow!("resume_manifest accept: read frame failed: {}", e))?;
+    let peer_msg = Message::from_bytes(&peer_bytes).ok_or_else(|| {
+        anyhow!("resume_manifest accept: peer frame is not a valid Message")
+    })?;
+    let (peer_name, peer_jobs) = match peer_msg {
+        Message::ResumeManifest {
+            name,
+            run,
+            complete_jobs,
+        } => {
+            if run != run_id {
+                return Err(anyhow!(
+                    "resume_manifest accept: peer '{}' reported run='{}', expected '{}'",
+                    name,
+                    run,
+                    run_id
+                ));
+            }
+            (name, complete_jobs)
+        }
+        other => {
+            return Err(anyhow!(
+                "resume_manifest accept: peer sent unexpected message type: {:?}",
+                other
+            ));
+        }
+    };
+
+    // 2. Send our manifest back.
+    let our_msg = Message::ResumeManifest {
+        name: self_name.to_string(),
+        run: run_id.to_string(),
+        complete_jobs: local_complete_jobs.to_vec(),
+    };
+    let our_bytes = our_msg.to_bytes();
+    write_manifest_frame(&mut stream, &our_bytes)
+        .map_err(|e| anyhow!("resume_manifest accept: write frame failed: {}", e))?;
+
+    Ok((peer_name, peer_jobs))
+}
+
+/// Connect to a peer's TCP listener and exchange manifests.
+///
+/// On success returns `(peer_name, peer_complete_jobs)`. On any failure
+/// (peer not yet listening, manifest parse error, run mismatch) returns
+/// `Err(_)` and the caller will retry on the next outer-loop tick.
+///
+/// Order of operations matches `exchange_with_peer_via_accept`: we write
+/// first, then read the peer's reply.
+fn exchange_with_peer_via_connect(
+    addr: &str,
+    self_name: &str,
+    run_id: &str,
+    local_complete_jobs: &[String],
+) -> Result<(String, Vec<String>)> {
+    let socket_addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow!("resume_manifest connect: bad address '{}': {}", addr, e))?;
+    let mut stream = TcpStream::connect_timeout(&socket_addr, RESUME_MANIFEST_CONNECT_TIMEOUT)
+        .map_err(|e| anyhow!("resume_manifest connect: {} not reachable: {}", addr, e))?;
+    stream
+        .set_read_timeout(Some(RESUME_MANIFEST_IO_TIMEOUT))
+        .map_err(|e| anyhow!("resume_manifest connect: set_read_timeout failed: {}", e))?;
+    stream
+        .set_write_timeout(Some(RESUME_MANIFEST_IO_TIMEOUT))
+        .map_err(|e| anyhow!("resume_manifest connect: set_write_timeout failed: {}", e))?;
+
+    // 1. Send our manifest first.
+    let our_msg = Message::ResumeManifest {
+        name: self_name.to_string(),
+        run: run_id.to_string(),
+        complete_jobs: local_complete_jobs.to_vec(),
+    };
+    let our_bytes = our_msg.to_bytes();
+    write_manifest_frame(&mut stream, &our_bytes)
+        .map_err(|e| anyhow!("resume_manifest connect: write frame failed: {}", e))?;
+
+    // 2. Read peer's manifest back.
+    let peer_bytes = read_manifest_frame(&mut stream)
+        .map_err(|e| anyhow!("resume_manifest connect: read frame failed: {}", e))?;
+    let peer_msg = Message::from_bytes(&peer_bytes).ok_or_else(|| {
+        anyhow!("resume_manifest connect: peer frame is not a valid Message")
+    })?;
+    match peer_msg {
+        Message::ResumeManifest {
+            name,
+            run,
+            complete_jobs,
+        } => {
+            if run != run_id {
+                return Err(anyhow!(
+                    "resume_manifest connect: peer '{}' reported run='{}', expected '{}'",
+                    name,
+                    run,
+                    run_id
+                ));
+            }
+            Ok((name, complete_jobs))
+        }
+        other => Err(anyhow!(
+            "resume_manifest connect: peer sent unexpected message type: {:?}",
+            other
+        )),
+    }
 }
 
 /// Create a UDP socket for runner coordination.
