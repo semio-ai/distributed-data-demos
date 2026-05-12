@@ -391,6 +391,49 @@ additions: `--recv-buffer-kb`":
   moves to readers.
 - Per-thread CPU affinity. The OS scheduler decides.
 
+### Startup retry (T14.22)
+
+Same-host two-runner startup is a known TCP race: both runners hit
+the ready barrier and call `connect()` to each other's QoS-4 TCP
+listen port near simultaneously; the peer's `listen()` may not yet
+be accepting and the kernel returns `ConnectionRefused` on the first
+attempt. Pre-T14.22, custom-udp's `setup_tcp` made a single
+non-retrying `TcpStream::connect` call: a single refusal silently
+dropped that peer from the broadcast set, and the spawn proceeded in
+asymmetric disconnected state (the listening side timed out waiting
+for the inbound TCP peer; the dialing side accumulated writes into
+the void). Reproduced in `logs/all-variants-01-20260512_152156/`
+for the `custom-udp-100x1000hz-qos4-multi` spawn.
+
+`src/udp.rs::connect_qos4_with_retry` ports the
+`variants/hybrid/src/tcp.rs::connect_with_retry` pattern (the T14.4
+prior art) to custom-udp's qos4 outbound TCP setup. Same shape:
+
+- Bounded retry budget: `TCP_CONNECT_RETRY_BUDGET = 30 s`
+  (matches hybrid's budget and `controltcp::CONTROL_CONNECT_BUDGET`).
+- Per-attempt sleep: `TCP_CONNECT_RETRY_SLEEP = 50 ms`.
+- Retry on `ConnectionRefused` ONLY. Every other error kind
+  (including `TimedOut`) propagates IMMEDIATELY so we don't paper
+  over real connectivity problems behind a 30 s delay.
+- Uses the blocking `TcpStream::connect` (no per-attempt timeout)
+  -- a successful connect on a healthy LAN returns within
+  milliseconds. Wrapping with `connect_timeout` would risk falsely
+  tripping on slow SYN-ACK scheduling at higher QoS levels (see
+  hybrid CUSTOM.md "Bounded connect retry").
+
+The retry loop is generic over a connector closure
+(`connect_qos4_with_retry_inner`) so the unit tests in
+`src/udp.rs::tests` (`connect_with_retry_*`) can exercise the loop
+deterministically without a real TCP listener. The integration
+regression
+`tests/two_runner_t14_22_qos4_startup_race.rs` exercises the actual
+same-host race and asserts both runners reach `status=success`.
+
+The control-channel TCP path (`controltcp::connect_with_budget`)
+already has an equivalent retry loop (it pre-dates T14.22 because
+T14.18 was wired up with the retry in place). T14.22 only restores
+the same property to the qos=4 data-path connect.
+
 ### Single-mode TCP wedge safety net (T14.19)
 
 At catastrophic symmetric load on QoS 4 (the 2026-05-12 stress run
