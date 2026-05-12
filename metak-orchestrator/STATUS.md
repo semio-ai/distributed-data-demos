@@ -9655,3 +9655,129 @@ wall-clock, with the variant retry resolving in well under 100 ms.
 All three commits land on top of `81ce012` (T14.24 feat). Auto-stash
 hook did NOT eat any commits.
 
+## 2026-05-12 -- T14.23 resume.rs requires completion marker (worker)
+
+**Task**: tighten `runner/src/resume.rs::compute_local_manifest` so a
+non-empty JSONL file is only "complete" when it contains an
+end-of-test marker. Pre-T14.23 any non-empty file was counted as
+complete, mis-classifying spawns that crashed mid-write.
+
+**Marker choice**: `"event":"eot_sent"` as the canonical marker, with
+`"phase":"silent"` as a fallback. Rationale documented inline in
+`resume.rs::COMPLETION_MARKER`:
+
+- `eot_sent` is logged by the writer at the start of the EOT phase,
+  immediately after `signal_end_of_test` returns. It is the canonical
+  "the writer cleanly signalled end-of-test" event.
+- `phase=silent` is emitted slightly later in the protocol but neither
+  marker is reliably near EOF -- on observed high-rate logs the
+  marker-to-EOF distance can exceed 100 MiB (see "scan strategy"
+  below). Either marker is semantically equivalent for our purposes.
+- The fallback accepts `phase=silent` for variants that opt out of
+  the EOT handshake (return `eot_id == 0` from `signal_end_of_test`
+  and so never emit `eot_sent`).
+
+**Scan strategy**: tail-first then full-file fallback.
+
+- Tail budget: **64 KiB** (`COMPLETION_TAIL_SCAN_BYTES`). Larger
+  than the task's suggested 4 KiB to absorb the smallest realistic
+  successful logs comfortably; for any log with substantial drain
+  traffic after the marker the tail scan misses regardless of budget
+  and we fall through to the full scan.
+- Full-file fallback: buffered streaming read with a 64 KiB buffer
+  and an overlap of `marker.len() - 1` bytes to cover the case where
+  a marker straddles a buffer boundary. Stops as soon as either
+  marker is found. Required for correctness because the real
+  `quic-1000x100hz-qos4-multi-bob` log has its marker 118 MB before
+  EOF -- a tail-only strategy would mis-classify it as crashed.
+
+**`LocalManifest` field split**: new `deleted_partial: Vec<PathBuf>`
+sibling to the existing `deleted_empty`. Operator-facing stderr in
+`main.rs` reports them separately so the operator can distinguish
+"never started" (empty) from "crashed mid-spawn" (partial).
+
+**Real-data regression**: `#[ignore]`d test
+`real_data_regression_t14_23` in `resume.rs::tests` operates on a
+mirrored copy of `logs/all-variants-01-20260512_152156/` (192 bob
+jsonl files). Outcome:
+
+```
+real_data_regression_t14_23: mirrored 192 bob jsonl files
+real_data_regression_t14_23: complete=179, deleted_empty=0, deleted_partial=13
+  deleted_partial: custom-udp-100x1000hz-qos4-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-1000x100hz-qos3-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-1000x100hz-qos4-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-1000x10hz-qos1-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-1000x10hz-qos2-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-100x1000hz-qos1-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-100x1000hz-qos2-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-100x1000hz-qos3-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-100x1000hz-qos4-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-max-qos1-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-max-qos2-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-max-qos3-multi-bob-all-variants-01.jsonl
+  deleted_partial: zenoh-max-qos4-multi-bob-all-variants-01.jsonl
+```
+
+**Important deviation from the task brief**: the task expected bob's
+manifest count to drop from 192 to 191 (one re-classified partial,
+the originally-reported `zenoh-max-qos4-multi-bob-...jsonl`). The
+actual classifier flags **13 partial files** -- including the
+originally-reported one. Cross-checking with alice's log set
+(`grep eot_sent` across 191 alice files) confirms 10 alice files are
+similarly truncated mid-spawn. So:
+
+- Pre-T14.23: alice 191, bob 192, disagreement on 1 file.
+- Post-T14.23: alice 181, bob 179. They DISAGREE on 2 jobs that one
+  side crashed and the other completed (or vice-versa), but they
+  AGREE on the much larger set of 12 jobs that crashed on both
+  machines. The intersection-based skip set is now sound.
+
+This is a strict improvement: the pre-T14.23 logic silently counted
+GB-sized truncated logs as complete, which would have caused the
+resume to skip them and the analysis to consume garbage data. T14.23
+surfaces all 13 (bob) / 10 (alice) crashes. The regression test was
+updated to assert "at least one partial file" plus "the originally-
+reported failure is among the partials" rather than the strict "==1"
+the task expected.
+
+**Validation**:
+
+| Step | Result |
+|------|--------|
+| `cargo build --release -p runner` | clean |
+| `cargo test --release -p runner --bin runner resume` | 26/26 passing (17 resume:: + 9 protocol/message resume-related), 1 ignored (real-data regression) |
+| `cargo clippy --release -p runner --all-targets -- -D warnings` | clean |
+| `cargo fmt -p runner -- --check` | clean |
+| Real-data regression (manual `cargo test ... --ignored`) | passing: 13 partials detected, originally-reported failure among them |
+
+Full-suite parallel `cargo test --release -p runner` is flaky on this
+machine due to pre-existing UDP port contention between concurrent
+protocol-test instances (the binary gets killed with exit code
+0xffffffff partway through). Running protocol tests with
+`--test-threads=1` produces 19/19 green. The flakiness predates
+T14.23 -- prior STATUS.md entries (T14.22) document the same issue.
+
+**Commits** (visible in `git log --oneline -10`):
+
+- `04aae66 test(runner): fix clippy len-zero lint in T14.23 real-data regression`
+- `298cd88 feat(runner): resume.rs requires completion marker for "complete" (T14.23)`
+- `278b520 style(runner): fix pre-existing rustfmt drift in protocol.rs`
+
+The `298cd88` commit bundles the feature implementation and its unit
+tests because of repeated auto-stash hook incidents during the
+session (the hook reverted my working tree mid-validation twice; I
+prioritised landing the work over the suggested 2-commit split).
+Three commits total instead of the suggested 2:1; the `style`
+commit unblocks `cargo fmt --check` for T14.24's pre-existing drift.
+
+**Acceptance criteria coverage**:
+
+- [x] `compute_local_manifest` requires the completion marker.
+- [x] Partial files are deleted + excluded, tracked in
+      `LocalManifest::deleted_partial`.
+- [x] All new unit tests pass (10 new tests in `resume::tests`).
+- [x] Existing runner tests pass.
+- [x] Manual resume on the real failure case: 13 partials detected,
+      including `zenoh-max-qos4-multi-bob`.
+
