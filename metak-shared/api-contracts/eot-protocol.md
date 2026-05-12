@@ -142,6 +142,9 @@ contract is:
   (idempotent — receivers MUST dedupe by `(writer, eot_id)`).
 - EOT MUST be delivered through the same transport channel(s) that
   carry data; do NOT introduce a sideband channel just for EOT.
+  **EXCEPTION**: see "Control side-channel (T14.18)" below — variants
+  MAY use a dedicated per-peer-pair TCP control connection for EOT
+  when the data path cannot guarantee delivery under saturation.
 - EOT MUST NOT block on the data channel being fully drained. Send the
   EOT marker and let it ride the existing transport's ordering /
   reliability semantics.
@@ -149,20 +152,118 @@ contract is:
   EOT — EOT is an additional signal, not a barrier that suppresses
   receives.
 
+## Control side-channel (T14.18)
+
+Variants MAY use a dedicated per-peer-pair TCP control connection for
+EOT exchange, separate from the data path. This was introduced to fix
+an architectural failure mode where high-rate symmetric workloads
+(observed at 100K msg/s on `custom-udp` qos1-3 and `hybrid` qos1-2,
+Single mode) saturate the kernel UDP recv buffer faster than userspace
+can drain it, dropping the EOT marker datagram before it reaches the
+variant. In Single mode the data path is constrained to a single
+thread (WASM-compatibility goal), so a separate control plane is the
+only way to keep EOT delivery deterministic at saturating throughput.
+
+Variants in scope as of T14.18: `custom-udp`, `hybrid`. Variants whose
+data transport already provides reliable delivery (`websocket`, post-
+T14.13 `quic`) are NOT in scope and should keep using the existing
+data-path EOT mechanism. `zenoh` is out of scope (its own publisher
+mechanics handle this; T14.9 covers the sidecar topology).
+
+### Wire shape
+
+The control connection carries length-prefixed binary frames:
+
+```
+[u32 BE length] [tag: u8] [tag-specific payload]
+```
+
+Tags:
+- `0x01` — EOT marker. The tag-specific payload is the existing
+  variant-internal EOT encoding (same `(writer, eot_id)` shape used
+  on the data path), unmodified.
+- `0x02` — `bye` marker. Sent by both sides during `disconnect()` to
+  signal "I am done sending on this control channel; you may close."
+  No payload follows the tag.
+
+Frames are bounded at 4 KiB (`MAX_CONTROL_FRAME_BYTES`) on the wire.
+Receivers that see a frame larger than this MUST drop the peer.
+
+### Connection lifecycle
+
+- **Pairing**: lower-sorted-name peer is the **server** (binds +
+  listens on its `control_base_port + runner_index`). Higher-sorted
+  peer is the **client** (connects). Same convention as Hybrid TCP /
+  QUIC / WebSocket data ports.
+- **Port derivation**: each variant exposes a variant-specific
+  `--control-base-port <u16>` CLI arg. Per-runner stride = 1; **no
+  QoS stride** — one control port per (runner, variant binary),
+  shared across all QoS levels of that variant binary.
+- **At `connect()`**: server binds + accepts; client dials with
+  bounded retry on `ConnectionRefused` (the two runners race past
+  the ready barrier). `TCP_NODELAY` is set immediately. One
+  bidirectional connection per peer pair.
+- **At `disconnect()`**: send a `bye` frame, half-close the write
+  side, drain the read side until the peer closes or
+  `--eot-timeout-secs` elapses, then close. Frames received during
+  the drain (typically a last EOT that raced the local `bye`) are
+  still applied.
+
+### Threading
+
+- **Multi mode**: one dedicated OS thread per control connection
+  reads length-prefixed frames in a blocking loop with short
+  `SO_RCVTIMEO` and pushes decoded EOT markers onto the variant's
+  existing T14.16 lifecycle channel. The data path is unchanged.
+- **Single mode**: control socket is blocking with a short
+  `SO_RCVTIMEO` (~1 ms). The variant's `poll_receive` polls each
+  control peer inline via `try_recv_frame`. **No additional threads
+  are introduced in Single mode** — the data path remains
+  single-threaded as required for the WASM-compatibility goal.
+
+### On-wire semantics and JSONL events: unchanged
+
+The control side-channel is a routing change only. The on-wire EOT
+payload (`writer`, `eot_id`) is identical to the data-path encoding,
+and the driver still emits `eot_sent` / `eot_received` / `eot_timeout`
+events with the same fields documented elsewhere in this contract.
+Analysis tools require no changes.
+
+### Per-variant adjustments
+
+When a variant adopts the control side-channel, it MUST remove
+EOT-over-data-transport for every QoS level it covers:
+
+- `custom-udp`: EOT-over-multicast (qos1-3) and EOT-on-TCP-stream
+  (qos4) are removed. Control connection is always present regardless
+  of QoS.
+- `hybrid`: EOT-over-multicast (qos1-2) and EOT-on-TCP-stream
+  (qos3-4) are removed. Control connection is always present
+  regardless of QoS.
+
+The data path remains unchanged in both variants; only the EOT
+routing moves.
+
 ### Hybrid
 
-- **TCP path (qos 3-4)**: send a tagged control frame on the same
-  per-peer TCP stream after the last data frame. Receiver sees ordered
-  delivery; ack is implicit (TCP delivery semantics).
-- **UDP path (qos 1-2)**: send a typed multicast packet, repeated 5
-  times with 5 ms spacing for redundancy under loss. Receivers dedupe
-  by `(writer, eot_id)`.
+- **All QoS levels (T14.18)**: EOT travels exclusively over the
+  per-peer-pair TCP control connection (see "Control side-channel
+  (T14.18)" above). The data-path EOT mechanisms documented below
+  are removed as of T14.18 and retained only for historical context.
+- ~~**TCP path (qos 3-4)**: send a tagged control frame on the same
+  per-peer TCP stream after the last data frame.~~ (Removed T14.18.)
+- ~~**UDP path (qos 1-2)**: send a typed multicast packet, repeated 5
+  times with 5 ms spacing for redundancy under loss.~~ (Removed
+  T14.18.)
 
 ### Custom UDP
 
-- **TCP path (qos 4)**: same as Hybrid TCP.
-- **UDP path (qos 1-3)**: typed multicast packet, 5 retries with 5 ms
-  spacing. Receivers dedupe by `(writer, eot_id)`.
+- **All QoS levels (T14.18)**: EOT travels exclusively over the
+  per-peer-pair TCP control connection. The data-path mechanisms
+  below are removed.
+- ~~**TCP path (qos 4)**: same as Hybrid TCP.~~ (Removed T14.18.)
+- ~~**UDP path (qos 1-3)**: typed multicast packet, 5 retries with 5 ms
+  spacing.~~ (Removed T14.18.)
 
 ### QUIC
 
