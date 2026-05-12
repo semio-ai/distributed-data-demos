@@ -9305,3 +9305,139 @@ either Zenoh-specific (T14.9 deferred) or polish (T14.20, webrtc
 ordering check QoS-awareness).
 
 Logs: `logs/stress-e14-20260512_125438/`.
+
+---
+
+## 2026-05-12 -- T14.21 incomplete-samples warnings (analysis worker)
+
+**Status**: DONE. Tests pass, real-logs validation captured, ruff clean.
+
+### What was implemented
+
+- New module `analysis/incomplete_warnings.py` exposing
+  `collect_incomplete_warnings`, `format_incomplete_warnings`, and
+  `emit_incomplete_warnings`. The public collector returns a frozen
+  `IncompleteWarnings` dataclass with three lists
+  (`not_completed`, `delivery_shortfall`, `late_tail`) and a
+  `total_cases` accessor.
+- Wired the emitter into `analysis/analyze.py::main()` so it runs
+  AFTER the integrity + performance tables print (still under
+  `do_summary`) and BEFORE the diagram-saved messages. Exit code
+  unchanged.
+- Per-line format:
+  - rule 1: `WARN: [<variant> / <run>] spawn '<writer>' not completed (classification=<class>)`
+  - rule 2: `WARN: [<variant> / <run>] <writer>-><receiver> qos<N> delivery <pct>.<d>% (<100.0%)`
+  - rule 3: `WARN: [<variant> / <run>] late-tail <pct>.<dd>% of receives beyond 10x p99`
+  - aggregate: `WARN: <N> job-run case(s) with incomplete samples (<n1> not-completed, <n2> delivery shortfall, <n3> late tail).`
+- Warning ordering: sorted by `(variant, run)` group, then within
+  each group rule 1 lines first (writer-sorted), then rule 2 (sorted
+  by writer/receiver/qos), then rule 3 (late-tail desc). Aggregate
+  line last.
+- Rule 1 dedupes per `(variant, run, writer)` spawn even when the
+  integrity table has multiple `(writer -> receiver)` rows for the
+  same spawn (per spec).
+- Rule 2 explicitly includes loss-tolerant QoS 1 and 2 (per spec --
+  even though the variants treat loss as acceptable for those tiers,
+  the operator wants visibility).
+- Output goes to stderr only; stdout tables untouched.
+- New test module `analysis/tests/test_incomplete_warnings.py` (15
+  tests across 7 test classes) covering clean run, single-trigger
+  per rule (incl. all QoS levels for rule 2), spawn-with-two-
+  receivers dedup, two-receiver shortfall (no dedup), combined case
+  (all three rules on one group), multi-group sorted clustering,
+  stdout-stays-silent, and direct collector unit. Uses `capsys` for
+  stderr capture, substring + line-count assertions only.
+- Lightly extended `analysis/tests/test_integration.py` with a new
+  `TestIncompleteWarningsSmoke` class that invokes `analyze.py
+  --summary` as a subprocess against real top-level logs and asserts
+  `returncode == 0` plus presence of the report headers on stdout.
+  Skipped on machines without top-level `logs/*.jsonl` (same
+  pattern as the existing real-log integration classes).
+
+### Test results
+
+```
+$ python -m pytest tests/ -v
+================== 196 passed, 6 skipped in 71.76s (0:01:11) ==================
+```
+
+The 6 skipped tests are pre-existing real-log-required suites
+(`TestRealLogParsing`, `TestRealLogPipeline`, `TestPhase1Regression`,
+plus the new `TestIncompleteWarningsSmoke`), gated on top-level
+`logs/*.jsonl`. The 15 new T14.21 unit tests are in the 196 pass
+count.
+
+```
+$ ruff format --check .
+28 files already formatted
+$ ruff check .
+All checks passed!
+```
+
+### Real-logs validation
+
+Ran the analyse script against the same dataset cited in the spec:
+
+```
+python analyze.py ../logs/same-machine-all-variants-01-20260511_104934 --summary
+```
+
+- Exit code 0.
+- 326 case-level `WARN:` lines + 1 aggregate line on stderr.
+- Stdout still contains the Integrity Report and Performance Report
+  tables unmodified.
+- Aggregate: `WARN: 326 job-run case(s) with incomplete samples
+  (108 not-completed, 207 delivery shortfall, 11 late tail).`
+
+Sample of the first warnings emitted (grouped by `(variant, run)`):
+
+```
+WARN: [custom-udp-1000x100hz-qos1 / all-variants-01] spawn 'alice' not completed (classification=eot_lost)
+WARN: [custom-udp-1000x100hz-qos1 / all-variants-01] spawn 'bob' not completed (classification=eot_lost)
+WARN: [custom-udp-1000x100hz-qos1 / all-variants-01] alice->bob qos1 delivery 60.3% (<100.0%)
+WARN: [custom-udp-1000x100hz-qos1 / all-variants-01] bob->alice qos1 delivery 68.0% (<100.0%)
+WARN: [custom-udp-1000x100hz-qos2 / all-variants-01] spawn 'alice' not completed (classification=eot_lost)
+WARN: [custom-udp-1000x100hz-qos2 / all-variants-01] spawn 'bob' not completed (classification=eot_lost)
+WARN: [custom-udp-1000x100hz-qos2 / all-variants-01] alice->bob qos2 delivery 67.5% (<100.0%)
+WARN: [custom-udp-1000x100hz-qos2 / all-variants-01] bob->alice qos2 delivery 68.0% (<100.0%)
+```
+
+#### Cross-check vs the integrity table
+
+`WARN: [custom-udp-1000x100hz-qos1 / all-variants-01] alice->bob
+qos1 delivery 60.3%` matches the integrity-table cell:
+
+```
+custom-udp-1000x100hz-qos1  all-variants-01  alice->bob  1  458,000  276,297  60.33%  ...  eot_lost
+```
+
+Delivery `60.33%` rounds to `60.3%` on the WARN line. Classification
+`eot_lost` on the table cell matches the rule-1 line for the same
+spawn. Confirmed.
+
+### Deviations from spec
+
+None. All acceptance criteria covered:
+
+- [x] Clean dataset -> no `WARN:` lines (`TestCleanRun`).
+- [x] Trigger dataset -> per-case lines + aggregate.
+- [x] Warnings on stderr only; stdout tables unchanged.
+- [x] Loss-tolerant QoS (1, 2) included
+      (`TestDeliveryShortfall::test_shortfall_each_qos[1]` and
+      `[2]` + `test_shortfall_includes_loss_tolerant_qos1`).
+- [x] Rule 1 dedupes across receivers
+      (`test_spawn_with_two_receivers_dedupes`).
+- [x] Exit code unchanged (real-logs run returned 0).
+- [x] `tests/test_incomplete_warnings.py` covers all spec cases.
+- [x] `pytest -v` passes.
+- [x] `ruff format --check .` and `ruff check .` clean.
+
+### Open concerns
+
+None. The integration smoke test in `test_integration.py` is gated
+by the same `TWO_RUNNER_LOGS` `*.jsonl`-present check the other
+real-log suites use, so it currently skips on this machine where the
+top-level `logs/` only holds timestamped sub-directories. The
+real-logs validation above (against the `same-machine-all-
+variants-01-20260511_104934` sub-run) is the stronger evidence the
+spec asked for.
