@@ -12,7 +12,7 @@ use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::{PeerEot, Variant};
 
 use crate::protocol::{self, Frame};
-use crate::reader::{self, HubMessage, ReaderHub};
+use crate::reader::{self, HubDataMessage, HubLifecycleMessage, ReaderHub};
 use crate::tcp::TcpTransport;
 use crate::udp::UdpTransport;
 
@@ -184,14 +184,39 @@ impl HybridVariant {
         }
     }
 
-    /// Multi-mode `poll_receive` (T14.4): drain the reader-thread mpsc
-    /// until the first data update appears (or the channel is empty).
-    /// EOT messages are recorded internally; stale QoS-2 duplicates
-    /// are filtered exactly as in the inline path.
+    /// Multi-mode `poll_receive` (T14.4 + T14.16): drain the reader-
+    /// thread mpsc channels.
+    ///
+    /// T14.16: drain the unbounded lifecycle channel FIRST so EOT
+    /// observations are never starved by a saturated data channel.
+    /// Lifecycle items are infrequent (O(peers) per spawn) so we
+    /// always drain them to empty before touching data. Then drain
+    /// the bounded data channel until the first non-stale data
+    /// update or the channel is empty / the per-call budget is hit.
+    /// Stale QoS-2 duplicates are filtered exactly as in the inline
+    /// path.
     fn poll_receive_multi(&mut self) -> Result<Option<ReceivedUpdate>> {
         if self.reader_hub.is_none() {
             return Ok(None);
         }
+
+        // Lifecycle drain first -- never starved.
+        loop {
+            let recv_result = {
+                let hub = self.reader_hub.as_ref().unwrap();
+                hub.lifecycle_rx.try_recv()
+            };
+            match recv_result {
+                Ok(HubLifecycleMessage::Eot { writer, eot_id }) => {
+                    self.record_eot(writer, eot_id);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // Data drain second, bounded by POLL_BUDGET to keep
+        // `poll_receive` responsive.
         const POLL_BUDGET: u32 = 256;
         for _ in 0..POLL_BUDGET {
             let recv_result = {
@@ -199,17 +224,13 @@ impl HybridVariant {
                 hub.rx.try_recv()
             };
             match recv_result {
-                Ok(HubMessage::Data(update)) => {
+                Ok(HubDataMessage::Data(update)) => {
                     if update.qos == Qos::LatestValue
                         && self.is_stale_qos2(&update.writer, &update.path, update.seq)
                     {
                         continue;
                     }
                     return Ok(Some(update));
-                }
-                Ok(HubMessage::Eot { writer, eot_id }) => {
-                    self.record_eot(writer, eot_id);
-                    continue;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(None),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(None),
@@ -223,10 +244,15 @@ impl HybridVariant {
 /// to `reader::TCP_READER_TIMEOUT`, keep a shutdown-side clone so
 /// `ReaderHub::stop_and_join` can wake the blocked reader, and spawn
 /// the per-peer reader thread.
+///
+/// T14.16: both sender clones (`data_tx`, `lifecycle_tx`) are passed
+/// to the spawned thread so it can route Data frames to the bounded
+/// data channel and EOT frames to the unbounded lifecycle channel.
 fn spawn_tcp_reader_for(
     peer: &mut crate::tcp::TcpPeer,
     label_prefix: &str,
-    tx: &std::sync::mpsc::SyncSender<HubMessage>,
+    data_tx: &std::sync::mpsc::SyncSender<HubDataMessage>,
+    lifecycle_tx: &std::sync::mpsc::Sender<HubLifecycleMessage>,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     hub: &mut ReaderHub,
 ) -> Result<()> {
@@ -240,7 +266,13 @@ fn spawn_tcp_reader_for(
         .with_context(|| format!("clone TCP read for shutdown {}", peer.addr))?;
     hub.tcp_shutdown_handles.push(shutdown_handle);
     let label = format!("{label_prefix}-{}", peer.addr);
-    let handle = reader::spawn_tcp_reader(read, label, tx.clone(), shutdown.clone());
+    let handle = reader::spawn_tcp_reader(
+        read,
+        label,
+        data_tx.clone(),
+        lifecycle_tx.clone(),
+        shutdown.clone(),
+    );
     hub.handles.push(handle);
     Ok(())
 }
@@ -318,7 +350,7 @@ impl Variant for HybridVariant {
             }
         }
 
-        let (mut hub, tx) = ReaderHub::new();
+        let (mut hub, data_tx, lifecycle_tx) = ReaderHub::new();
         let shutdown = hub.shutdown.clone();
 
         // UDP recv thread: dedicated blocking recv socket sharing the
@@ -337,20 +369,28 @@ impl Variant for HybridVariant {
             .try_clone()
             .context("failed to clone UDP recv socket for shutdown signalling")?;
         hub.udp_shutdown_handle = Some(udp_shutdown);
-        let udp_handle = reader::spawn_udp_reader(udp_recv, tx.clone(), shutdown.clone());
+        let udp_handle = reader::spawn_udp_reader(
+            udp_recv,
+            data_tx.clone(),
+            lifecycle_tx.clone(),
+            shutdown.clone(),
+        );
         hub.handles.push(udp_handle);
 
         // Per-peer TCP reader threads.
         {
             let tcp = self.tcp.as_mut().context("TCP transport not connected")?;
             for peer in tcp.outbound_peers_mut() {
-                spawn_tcp_reader_for(peer, "out", &tx, &shutdown, &mut hub)?;
+                spawn_tcp_reader_for(peer, "out", &data_tx, &lifecycle_tx, &shutdown, &mut hub)?;
             }
             for peer in tcp.inbound_peers_mut() {
-                spawn_tcp_reader_for(peer, "in", &tx, &shutdown, &mut hub)?;
+                spawn_tcp_reader_for(peer, "in", &data_tx, &lifecycle_tx, &shutdown, &mut hub)?;
             }
         }
-        drop(tx);
+        // Drop the variant-held senders so the channels correctly
+        // report `Disconnected` after every reader thread exits.
+        drop(data_tx);
+        drop(lifecycle_tx);
 
         self.reader_hub = Some(hub);
         Ok(())
@@ -913,5 +953,152 @@ mod tests {
             .expect("happy-path try_publish must succeed");
         assert!(result, "expected Ok(true) on idle transport");
         v.disconnect().ok();
+    }
+
+    // ---- T14.16: EOT survives reader-channel saturation ----
+
+    /// Build a minimal `ReaderHub` whose data channel has the
+    /// requested tiny capacity, and an unbounded lifecycle channel.
+    /// Returns the hub plus matching data + lifecycle sender pairs.
+    /// Mirrors `ReaderHub::new` but uses a custom data capacity so the
+    /// test can saturate it deterministically.
+    fn small_hub(
+        data_capacity: usize,
+    ) -> (
+        ReaderHub,
+        std::sync::mpsc::SyncSender<HubDataMessage>,
+        std::sync::mpsc::Sender<HubLifecycleMessage>,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let (data_tx, data_rx) = std::sync::mpsc::sync_channel(data_capacity);
+        let (lifecycle_tx, lifecycle_rx) = std::sync::mpsc::channel();
+        let hub = ReaderHub {
+            rx: data_rx,
+            lifecycle_rx,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            handles: Vec::new(),
+            tcp_shutdown_handles: Vec::new(),
+            udp_shutdown_handle: None,
+        };
+        (hub, data_tx, lifecycle_tx)
+    }
+
+    /// T14.16: EOT must survive reader-channel saturation.
+    ///
+    /// Push 1000 data frames into a TINY (8-slot) data channel so most
+    /// of them drop on `try_send` Full, interleaved with N Eot
+    /// lifecycle items into the unbounded lifecycle channel. Then
+    /// drive `poll_receive_multi` and assert that every Eot pushed by
+    /// the stub reader is observed via `poll_peer_eots`, regardless
+    /// of how many data frames were dropped.
+    #[test]
+    fn t14_16_eot_survives_data_channel_saturation() {
+        use std::sync::mpsc::TrySendError;
+
+        let mut v = HybridVariant::new("self", dummy_config());
+        v.threading_mode = ThreadingMode::Multi;
+
+        let (hub, data_tx, lifecycle_tx) = small_hub(8);
+        v.reader_hub = Some(hub);
+
+        let total_data = 1000u64;
+        let eot_writers = 16u64;
+        let eot_stride = total_data / eot_writers;
+        let mut drops = 0u64;
+        let mut eots_sent = 0u64;
+
+        for i in 0..total_data {
+            let update = ReceivedUpdate {
+                writer: format!("peer{}", i % eot_writers),
+                seq: i,
+                path: "/p".to_string(),
+                qos: Qos::BestEffort,
+                payload: vec![0xAA; 8],
+            };
+            match data_tx.try_send(HubDataMessage::Data(update)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => drops += 1,
+                Err(TrySendError::Disconnected(_)) => panic!("data channel disconnected"),
+            }
+            if eots_sent < eot_writers && i.is_multiple_of(eot_stride) {
+                lifecycle_tx
+                    .send(HubLifecycleMessage::Eot {
+                        writer: format!("eot-writer-{eots_sent}"),
+                        eot_id: 0x1000 + eots_sent,
+                    })
+                    .expect("lifecycle channel must not drop");
+                eots_sent += 1;
+            }
+        }
+        assert!(
+            drops > 0,
+            "test premise: at least one Data frame must have been dropped on Full"
+        );
+        assert_eq!(eots_sent, eot_writers, "test pushed every EOT");
+
+        drop(data_tx);
+        drop(lifecycle_tx);
+
+        // Drive poll_receive_multi until it reports no more data. The
+        // first call drains all lifecycle items (T14.16 priority), so
+        // poll_peer_eots after a single call must already have every
+        // EOT.
+        while v.poll_receive_multi().unwrap().is_some() {}
+        let drained = v.poll_peer_eots().expect("poll_peer_eots");
+        assert_eq!(
+            drained.len() as u64,
+            eot_writers,
+            "every Eot pushed onto the lifecycle channel must survive data-channel saturation \
+             (drops={}, eots_sent={}, eots_observed={})",
+            drops,
+            eots_sent,
+            drained.len()
+        );
+    }
+
+    /// T14.16: lifecycle drain runs FIRST, before any data. A single
+    /// `poll_receive_multi` call should surface every queued EOT via
+    /// `record_eot` even when the data channel has items waiting too.
+    #[test]
+    fn t14_16_lifecycle_drained_before_data() {
+        let mut v = HybridVariant::new("self", dummy_config());
+        v.threading_mode = ThreadingMode::Multi;
+
+        let (hub, data_tx, lifecycle_tx) = small_hub(8);
+        v.reader_hub = Some(hub);
+
+        // Queue 3 EOTs and 5 data items.
+        for i in 0..3u64 {
+            lifecycle_tx
+                .send(HubLifecycleMessage::Eot {
+                    writer: format!("peer{i}"),
+                    eot_id: i,
+                })
+                .unwrap();
+        }
+        for i in 0..5u64 {
+            data_tx
+                .try_send(HubDataMessage::Data(ReceivedUpdate {
+                    writer: "peer0".to_string(),
+                    seq: i,
+                    path: "/p".to_string(),
+                    qos: Qos::BestEffort,
+                    payload: vec![0; 8],
+                }))
+                .unwrap();
+        }
+
+        // First poll returns the first data update -- but lifecycle
+        // items must already be drained as a side effect.
+        let first = v.poll_receive_multi().unwrap();
+        assert!(first.is_some(), "first poll surfaces a data update");
+
+        let drained = v.poll_peer_eots().unwrap();
+        assert_eq!(
+            drained.len(),
+            3,
+            "lifecycle drain runs before data drain, so all 3 EOTs surface on the first poll"
+        );
     }
 }

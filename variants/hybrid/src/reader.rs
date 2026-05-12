@@ -1,20 +1,32 @@
-//! T14.4: Multi-mode reader-thread machinery for the Hybrid variant.
+//! T14.4 + T14.16: Multi-mode reader-thread machinery for the Hybrid
+//! variant.
 //!
 //! In `ThreadingMode::Multi`, `HybridVariant::start_reader_threads`
 //! spawns:
 //!
 //! - one UDP recv thread that does blocking `recv_from` on a dedicated
-//!   recv-side `UdpSocket` and pushes decoded `HubMessage`s onto a
-//!   shared bounded `mpsc::SyncSender`;
+//!   recv-side `UdpSocket` and routes decoded items into one of two
+//!   channels (see below);
 //! - one TCP reader thread per peer (inbound and outbound) that does
-//!   blocking `read` on the peer's read-clone `TcpStream` and pushes
-//!   decoded `HubMessage`s onto the same channel.
+//!   blocking `read` on the peer's read-clone `TcpStream` and routes
+//!   decoded items into the same pair of channels.
 //!
-//! The driver thread drains the channel via `try_recv` inside
-//! `HybridVariant::poll_receive`. The channel is bounded so a slow
-//! consumer can't OOM us; pushers `try_send` and drop on full-channel
-//! rather than blocking the reader (the variant is benchmark-grade,
-//! not a buffered queue).
+//! T14.16: two-channel architecture.
+//!
+//! - `data_tx` / `rx` — bounded `mpsc::sync_channel` (capacity
+//!   `READER_CHANNEL_CAPACITY = 4096`) carrying decoded
+//!   `HubDataMessage::Data` frames. Drop-on-full is acceptable: QoS
+//!   1/2 tolerate loss by definition; QoS 3/4 (TCP) receivers depend
+//!   on kernel TCP, which applies its own back-pressure before the
+//!   recv buffer can fill pathologically.
+//! - `lifecycle_tx` / `lifecycle_rx` — unbounded `mpsc::channel`
+//!   carrying `HubLifecycleMessage::Eot` markers. Must NEVER drop:
+//!   losing an EOT forces the peer's driver to wait the full
+//!   `eot_timeout`, defeating the EOT contract.
+//!
+//! The driver thread drains both channels via `try_recv` inside
+//! `HybridVariant::poll_receive_multi`, lifecycle first (so EOT is
+//! never starved by a saturated data channel) then data.
 //!
 //! Lifecycle:
 //!
@@ -28,7 +40,7 @@
 use std::io::Read;
 use std::net::{Shutdown, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -37,12 +49,16 @@ use anyhow::Result;
 
 use crate::protocol::{self, Frame};
 
-/// Capacity of the shared bounded `mpsc::sync_channel` between the
-/// reader threads and the driver. Slightly oversized for the high-rate
-/// fixture (4 * 1000 vpt = 4000 working set) so backpressure on the
-/// driver side doesn't immediately cause drops -- but bounded, so a
-/// runaway accumulation can't OOM the process. See T14.4 audit notes
-/// in `metak-orchestrator/STATUS.md`.
+/// Capacity of the shared bounded `mpsc::sync_channel` carrying DATA
+/// frames between the reader threads and the driver. Slightly oversized
+/// for the high-rate fixture (4 * 1000 vpt = 4000 working set) so
+/// backpressure on the driver side doesn't immediately cause drops --
+/// but bounded, so a runaway accumulation can't OOM the process. See
+/// T14.4 audit notes in `metak-orchestrator/STATUS.md`.
+///
+/// T14.16: lifecycle items (EOT, PeerDropped) ride a separate
+/// `std::sync::mpsc::channel` that is unbounded and never drops -- the
+/// "data may drop, EOT must not" invariant.
 pub const READER_CHANNEL_CAPACITY: usize = 4096;
 
 /// `SO_RCVTIMEO` applied to per-peer TCP read clones when handed to a
@@ -61,19 +77,38 @@ pub const UDP_READER_TIMEOUT: Duration = Duration::from_millis(200);
 /// this budget is leaked rather than blocking the driver indefinitely.
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Pre-decoded frame pushed by a reader thread to the driver.
+/// Pre-decoded DATA frame pushed by a reader thread onto the bounded
+/// data channel. Drop-on-full is acceptable here -- QoS 1/2 tolerate
+/// loss by definition; QoS 3/4 receivers depend on kernel TCP, which
+/// already applies its own back-pressure before the read buffer can
+/// fill pathologically.
 #[derive(Debug, Clone)]
-pub enum HubMessage {
+pub enum HubDataMessage {
     /// A `Frame::Data` decoded into a `ReceivedUpdate`.
     Data(variant_base::types::ReceivedUpdate),
+}
+
+/// Pre-decoded LIFECYCLE item pushed by a reader thread onto the
+/// unbounded lifecycle channel. Must NEVER drop: an EOT loss forces
+/// the peer's driver to wait the full `eot_timeout`, defeating the
+/// EOT contract.
+#[derive(Debug, Clone)]
+pub enum HubLifecycleMessage {
     /// A `Frame::Eot` -- writer name + eot_id.
     Eot { writer: String, eot_id: u64 },
 }
 
-/// Holds the receive end of the channel + handles + the shutdown flag.
-/// Owned by `HybridVariant` in Multi mode; dropped in `disconnect`.
+/// Holds the receive ends of both channels + handles + the shutdown
+/// flag. Owned by `HybridVariant` in Multi mode; dropped in
+/// `disconnect`.
+///
+/// T14.16: `rx` (bounded data) and `lifecycle_rx` (unbounded lifecycle)
+/// replace the single shared `Receiver<HubMessage>` used pre-T14.16.
+/// `poll_receive_multi` drains lifecycle first, then data, so EOT
+/// observations are never starved by a saturated data channel.
 pub struct ReaderHub {
-    pub rx: Receiver<HubMessage>,
+    pub rx: Receiver<HubDataMessage>,
+    pub lifecycle_rx: Receiver<HubLifecycleMessage>,
     pub shutdown: Arc<AtomicBool>,
     pub handles: Vec<JoinHandle<()>>,
     /// Cloned TCP read-side handles kept around so
@@ -88,18 +123,26 @@ pub struct ReaderHub {
 }
 
 impl ReaderHub {
-    /// Build a new hub with the standard channel capacity.
-    pub fn new() -> (Self, SyncSender<HubMessage>) {
-        let (tx, rx) = mpsc::sync_channel(READER_CHANNEL_CAPACITY);
+    /// Build a new hub. Returns the hub plus matching sender pairs:
+    /// `(data_tx, lifecycle_tx)`. Reader threads receive clones of both
+    /// senders and route per-frame.
+    pub fn new() -> (
+        Self,
+        SyncSender<HubDataMessage>,
+        Sender<HubLifecycleMessage>,
+    ) {
+        let (data_tx, data_rx) = mpsc::sync_channel(READER_CHANNEL_CAPACITY);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let hub = Self {
-            rx,
+            rx: data_rx,
+            lifecycle_rx,
             shutdown,
             handles: Vec::new(),
             tcp_shutdown_handles: Vec::new(),
             udp_shutdown_handle: None,
         };
-        (hub, tx)
+        (hub, data_tx, lifecycle_tx)
     }
 
     /// Signal every reader thread to exit and join with `JOIN_TIMEOUT`.
@@ -153,23 +196,31 @@ impl ReaderHub {
 /// Spawn the UDP recv thread.
 pub fn spawn_udp_reader(
     socket: UdpSocket,
-    tx: SyncSender<HubMessage>,
+    data_tx: SyncSender<HubDataMessage>,
+    lifecycle_tx: Sender<HubLifecycleMessage>,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("hybrid-udp-reader".to_string())
-        .spawn(move || udp_reader_loop(socket, tx, shutdown))
+        .spawn(move || udp_reader_loop(socket, data_tx, lifecycle_tx, shutdown))
         .expect("failed to spawn UDP reader thread")
 }
 
-fn udp_reader_loop(socket: UdpSocket, tx: SyncSender<HubMessage>, shutdown: Arc<AtomicBool>) {
+fn udp_reader_loop(
+    socket: UdpSocket,
+    data_tx: SyncSender<HubDataMessage>,
+    lifecycle_tx: Sender<HubLifecycleMessage>,
+    shutdown: Arc<AtomicBool>,
+) {
     let mut buf = [0u8; 65536];
     while !shutdown.load(Ordering::SeqCst) {
         match socket.recv_from(&mut buf) {
             Ok((n, _addr)) => match protocol::decode_frame(&buf[..n]) {
-                Ok(Frame::Data(update)) => push_or_drop(&tx, HubMessage::Data(update)),
+                Ok(Frame::Data(update)) => {
+                    push_data_or_drop(&data_tx, HubDataMessage::Data(update))
+                }
                 Ok(Frame::Eot { writer, eot_id }) => {
-                    push_or_drop(&tx, HubMessage::Eot { writer, eot_id })
+                    push_lifecycle(&lifecycle_tx, HubLifecycleMessage::Eot { writer, eot_id })
                 }
                 Err(e) => {
                     eprintln!("[variant-hybrid] UDP reader: decode error: {e:#}; dropping");
@@ -196,19 +247,21 @@ fn udp_reader_loop(socket: UdpSocket, tx: SyncSender<HubMessage>, shutdown: Arc<
 pub fn spawn_tcp_reader(
     stream: TcpStream,
     label: String,
-    tx: SyncSender<HubMessage>,
+    data_tx: SyncSender<HubDataMessage>,
+    lifecycle_tx: Sender<HubLifecycleMessage>,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name(format!("hybrid-tcp-reader-{label}"))
-        .spawn(move || tcp_reader_loop(stream, label, tx, shutdown))
+        .spawn(move || tcp_reader_loop(stream, label, data_tx, lifecycle_tx, shutdown))
         .expect("failed to spawn TCP reader thread")
 }
 
 fn tcp_reader_loop(
     mut stream: TcpStream,
     label: String,
-    tx: SyncSender<HubMessage>,
+    data_tx: SyncSender<HubDataMessage>,
+    lifecycle_tx: Sender<HubLifecycleMessage>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(65536);
@@ -253,9 +306,11 @@ fn tcp_reader_loop(
             let payload: Vec<u8> = buf[4..total].to_vec();
             buf.drain(..total);
             match protocol::decode_frame(&payload) {
-                Ok(Frame::Data(update)) => push_or_drop(&tx, HubMessage::Data(update)),
+                Ok(Frame::Data(update)) => {
+                    push_data_or_drop(&data_tx, HubDataMessage::Data(update))
+                }
                 Ok(Frame::Eot { writer, eot_id }) => {
-                    push_or_drop(&tx, HubMessage::Eot { writer, eot_id })
+                    push_lifecycle(&lifecycle_tx, HubLifecycleMessage::Eot { writer, eot_id })
                 }
                 Err(e) => {
                     eprintln!("[variant-hybrid] TCP reader {label}: decode error: {e:#}; dropping");
@@ -265,16 +320,18 @@ fn tcp_reader_loop(
     }
 }
 
-/// Push `msg` onto `tx`, dropping it if the channel is full or the
-/// receiver has hung up. Logs a single warning on full so the operator
-/// notices runaway accumulation, but does NOT block the reader -- in
-/// a benchmark a blocking reader is worse than a missed frame.
-fn push_or_drop(tx: &SyncSender<HubMessage>, msg: HubMessage) {
+/// Push `msg` onto the bounded DATA channel, dropping it if the channel
+/// is full or the receiver has hung up. Logs a disambiguated warning on
+/// full so the operator can be sure that lifecycle items (EOT) were
+/// NOT lost when this line appears in stderr -- those ride the separate
+/// unbounded `lifecycle_tx`. Does NOT block the reader -- in a
+/// benchmark a blocking reader is worse than a missed Data frame.
+fn push_data_or_drop(tx: &SyncSender<HubDataMessage>, msg: HubDataMessage) {
     match tx.try_send(msg) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             eprintln!(
-                "[variant-hybrid] reader channel full ({} slots); dropping frame",
+                "[variant-hybrid] data channel full ({} slots) -- dropping Data frame (receiver saturated)",
                 READER_CHANNEL_CAPACITY
             );
         }
@@ -284,67 +341,132 @@ fn push_or_drop(tx: &SyncSender<HubMessage>, msg: HubMessage) {
     }
 }
 
+/// Push `msg` onto the unbounded LIFECYCLE channel. Because the channel
+/// is unbounded, sends never block and never drop; the only failure
+/// mode is the receiver having been dropped (driver tearing down), in
+/// which case we silently swallow the result.
+fn push_lifecycle(tx: &Sender<HubLifecycleMessage>, msg: HubLifecycleMessage) {
+    let _ = tx.send(msg);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use variant_base::types::{Qos, ReceivedUpdate};
+
+    fn dummy_update(seq: u64) -> ReceivedUpdate {
+        ReceivedUpdate {
+            writer: "alice".to_string(),
+            seq,
+            path: "/p".to_string(),
+            qos: Qos::BestEffort,
+            payload: vec![0u8; 8],
+        }
+    }
 
     #[test]
-    fn reader_hub_new_returns_paired_sender() {
-        let (hub, tx) = ReaderHub::new();
+    fn reader_hub_new_returns_paired_senders() {
+        let (hub, data_tx, lifecycle_tx) = ReaderHub::new();
         assert!(hub.handles.is_empty());
-        tx.try_send(HubMessage::Eot {
-            writer: "self".to_string(),
-            eot_id: 1,
-        })
-        .expect("fresh channel must accept a send");
-        let received = hub.rx.try_recv().expect("fresh channel must yield a recv");
+
+        // Lifecycle send routes onto lifecycle_rx.
+        lifecycle_tx
+            .send(HubLifecycleMessage::Eot {
+                writer: "self".to_string(),
+                eot_id: 1,
+            })
+            .expect("fresh lifecycle channel must accept a send");
+        let received = hub
+            .lifecycle_rx
+            .try_recv()
+            .expect("fresh lifecycle channel must yield a recv");
         match received {
-            HubMessage::Eot { writer, eot_id } => {
+            HubLifecycleMessage::Eot { writer, eot_id } => {
                 assert_eq!(writer, "self");
                 assert_eq!(eot_id, 1);
             }
-            HubMessage::Data(_) => panic!("expected Eot"),
+        }
+
+        // Data send routes onto rx (data channel).
+        data_tx
+            .try_send(HubDataMessage::Data(dummy_update(7)))
+            .expect("fresh data channel must accept a send");
+        let received = hub
+            .rx
+            .try_recv()
+            .expect("fresh data channel must yield a recv");
+        match received {
+            HubDataMessage::Data(u) => {
+                assert_eq!(u.seq, 7);
+            }
         }
     }
 
     #[test]
     fn stop_and_join_on_empty_hub_is_ok() {
-        let (hub, _tx) = ReaderHub::new();
+        let (hub, _data_tx, _lifecycle_tx) = ReaderHub::new();
         hub.stop_and_join().expect("empty hub stop must succeed");
     }
 
     #[test]
-    fn push_or_drop_handles_disconnected() {
+    fn push_data_or_drop_handles_disconnected() {
         let (tx, rx) = mpsc::sync_channel(1);
         drop(rx);
-        push_or_drop(
-            &tx,
-            HubMessage::Eot {
-                writer: "x".to_string(),
-                eot_id: 0,
-            },
-        );
+        push_data_or_drop(&tx, HubDataMessage::Data(dummy_update(0)));
     }
 
     #[test]
-    fn push_or_drop_handles_full_channel() {
-        let (tx, _rx) = mpsc::sync_channel::<HubMessage>(1);
-        tx.try_send(HubMessage::Eot {
-            writer: "a".to_string(),
-            eot_id: 1,
-        })
-        .expect("first send must fit");
+    fn push_data_or_drop_handles_full_channel() {
+        let (tx, _rx) = mpsc::sync_channel::<HubDataMessage>(1);
+        tx.try_send(HubDataMessage::Data(dummy_update(1)))
+            .expect("first send must fit");
         let before = std::time::Instant::now();
-        push_or_drop(
-            &tx,
-            HubMessage::Eot {
-                writer: "b".to_string(),
-                eot_id: 2,
-            },
-        );
+        push_data_or_drop(&tx, HubDataMessage::Data(dummy_update(2)));
         assert!(
             before.elapsed() < Duration::from_millis(50),
-            "push_or_drop on a full channel must not block"
+            "push_data_or_drop on a full channel must not block"
+        );
+    }
+
+    /// T14.16: lifecycle channel is unbounded -- many sends in a row
+    /// must never drop and never block.
+    #[test]
+    fn push_lifecycle_never_drops_under_burst() {
+        let (tx, rx) = mpsc::channel::<HubLifecycleMessage>();
+        let before = std::time::Instant::now();
+        for i in 0..10_000u64 {
+            push_lifecycle(
+                &tx,
+                HubLifecycleMessage::Eot {
+                    writer: "alice".to_string(),
+                    eot_id: i,
+                },
+            );
+        }
+        assert!(
+            before.elapsed() < Duration::from_millis(500),
+            "push_lifecycle burst must not block"
+        );
+        // Every send made it through.
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 10_000, "unbounded lifecycle channel must not drop");
+    }
+
+    /// T14.16: lifecycle send on a disconnected channel is silently
+    /// absorbed (driver tearing down).
+    #[test]
+    fn push_lifecycle_handles_disconnected() {
+        let (tx, rx) = mpsc::channel::<HubLifecycleMessage>();
+        drop(rx);
+        push_lifecycle(
+            &tx,
+            HubLifecycleMessage::Eot {
+                writer: "x".to_string(),
+                eot_id: 0,
+            },
         );
     }
 }
