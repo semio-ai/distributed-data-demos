@@ -72,6 +72,40 @@ class TestRealLogParsing:
 
 
 @_real_logs_skip
+class TestIncompleteWarningsSmoke:
+    """T14.21: end-to-end run must exercise the incomplete-warnings path.
+
+    No behaviour assertion -- just ensure ``analyze.py --summary``
+    against real logs runs the new emitter without crashing. Any
+    ``WARN:`` lines on stderr are acceptable (they may or may not
+    appear depending on the dataset health).
+    """
+
+    def test_end_to_end_does_not_crash(self, tmp_path: Path) -> None:
+        for f in TWO_RUNNER_LOGS.glob("*.jsonl"):
+            shutil.copy2(f, tmp_path / f.name)
+
+        analysis_dir = Path(__file__).resolve().parent.parent
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(analysis_dir / "analyze.py"),
+                str(tmp_path),
+                "--summary",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(analysis_dir),
+        )
+        assert proc.returncode == 0, proc.stderr
+        # Any WARN: lines (or none) on stderr is fine; we just want to
+        # know the code path was exercised. Stdout must still hold the
+        # report headers.
+        assert "Integrity Report" in proc.stdout
+        assert "Performance Report" in proc.stdout
+
+
+@_real_logs_skip
 class TestRealLogPipeline:
     def test_correlation_produces_records(self, tmp_path: Path) -> None:
         for f in TWO_RUNNER_LOGS.glob("*.jsonl"):
