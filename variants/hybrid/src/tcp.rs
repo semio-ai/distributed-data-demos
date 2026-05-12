@@ -40,6 +40,7 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use socket2::SockRef;
 
 /// Wall-clock budget for the TCP write `WouldBlock` retry loop. Used as
 /// a safety net in case the socket *is* somehow non-blocking — under
@@ -69,8 +70,10 @@ const READ_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 pub struct TcpPeer {
     pub addr: SocketAddr,
     write_stream: TcpStream,
-    read_stream: TcpStream,
-    /// Buffer for accumulating partial reads.
+    /// Read half. Held as `Option` so Multi mode can `take()`
+    /// ownership and hand the handle to a per-peer reader thread.
+    read_stream: Option<TcpStream>,
+    /// Buffer for accumulating partial reads (Single mode only).
     read_buf: Vec<u8>,
 }
 
@@ -107,9 +110,15 @@ impl TcpPeer {
         Ok(Self {
             addr,
             write_stream,
-            read_stream,
+            read_stream: Some(read_stream),
             read_buf: Vec::new(),
         })
+    }
+
+    /// Take ownership of the read half so a Multi-mode reader thread
+    /// can own it. Returns `None` if it has already been taken.
+    pub fn take_read_stream(&mut self) -> Option<TcpStream> {
+        self.read_stream.take()
     }
 
     /// Write a length-prefixed framed message to this peer.
@@ -133,9 +142,15 @@ impl TcpPeer {
     /// is expected to drop this peer and continue with the others rather
     /// than failing the whole spawn.
     pub fn try_recv_framed(&mut self) -> Result<Option<Vec<u8>>> {
+        // Multi mode `take_read_stream()`s the read clone, so polling
+        // is only valid when we still own it (Single mode).
+        let read = match self.read_stream.as_mut() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
         // Read whatever is available into the buffer.
         let mut tmp = [0u8; 65536];
-        match self.read_stream.read(&mut tmp) {
+        match read.read(&mut tmp) {
             Ok(0) => {
                 // Clean EOF from the peer's side. Not necessarily wrong
                 // (e.g. peer finished and closed) but treat as fatal-for-
@@ -217,40 +232,50 @@ impl TcpTransport {
     }
 
     /// Connect to a peer at the given address. Sets `TCP_NODELAY` and
-    /// arranges blocking writes plus a short read timeout for polled reads.
-    pub fn connect_to_peer(&mut self, addr: SocketAddr) -> Result<()> {
-        let stream = TcpStream::connect(addr)
+    /// arranges blocking writes plus a short read timeout for polled
+    /// reads.
+    ///
+    /// `recv_buffer_kb` is the T14.1 `--recv-buffer-kb` value, applied
+    /// via `SO_RCVBUF` to the underlying socket before the read clone
+    /// is made. `None` skips the tune (used by unit tests).
+    ///
+    /// Connect uses a bounded retry on `ConnectionRefused` so both
+    /// runners can race past the ready barrier without one's `connect`
+    /// failing before the other's listener is bound.
+    pub fn connect_to_peer(&mut self, addr: SocketAddr, recv_buffer_kb: Option<u32>) -> Result<()> {
+        let stream = connect_with_retry(addr, Duration::from_secs(5))
             .with_context(|| format!("failed to connect TCP to peer {}", addr))?;
-        // `TcpStream::connect` returns a blocking socket by default, but
-        // be explicit so the back-pressure semantics don't depend on
-        // upstream defaults.
         stream
             .set_nonblocking(false)
             .context("failed to make outbound TCP stream blocking")?;
         stream
             .set_nodelay(true)
             .context("failed to set TCP_NODELAY on outbound")?;
+        if let Some(kb) = recv_buffer_kb {
+            apply_tcp_recv_buffer(&stream, kb, addr)?;
+        }
         let peer = TcpPeer::from_stream(stream, addr)?;
         self.outbound.push(peer);
         Ok(())
     }
 
     /// Accept any pending inbound connections (non-blocking).
-    pub fn accept_pending(&mut self) -> Result<()> {
+    ///
+    /// `recv_buffer_kb`, when supplied, is applied as `SO_RCVBUF` on
+    /// each newly accepted socket before the read clone is made.
+    pub fn accept_pending(&mut self, recv_buffer_kb: Option<u32>) -> Result<()> {
         loop {
             match self.listener.accept() {
                 Ok((stream, addr)) => {
-                    // The listener is non-blocking. Per-platform behaviour
-                    // varies on whether `accept` inherits that flag — make
-                    // the new per-peer stream blocking explicitly so writes
-                    // really do block on back-pressure. `from_stream` then
-                    // installs `set_read_timeout` for the read side.
                     stream
                         .set_nonblocking(false)
                         .context("failed to make accepted TCP stream blocking")?;
                     stream
                         .set_nodelay(true)
                         .context("failed to set TCP_NODELAY on inbound")?;
+                    if let Some(kb) = recv_buffer_kb {
+                        apply_tcp_recv_buffer(&stream, kb, addr)?;
+                    }
                     let peer = TcpPeer::from_stream(stream, addr)?;
                     self.inbound.push(peer);
                 }
@@ -312,8 +337,10 @@ impl TcpTransport {
     /// One peer disconnecting must NOT fail the whole spawn — see module
     /// docs.
     pub fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
-        // Accept any new inbound connections first.
-        self.accept_pending()?;
+        // Accept any new inbound connections first. Single-mode call
+        // path passes `None` here; Multi mode never calls `try_recv`
+        // (the reader-thread hub bypasses this path).
+        self.accept_pending(None)?;
 
         if let Some(msg) = poll_peer_set(&mut self.inbound, "inbound") {
             return Ok(Some(msg));
@@ -331,6 +358,25 @@ impl TcpTransport {
         self.outbound.len()
     }
 
+    /// Mutable access to outbound peers (used by Multi-mode reader
+    /// setup to drain the read clones via `TcpPeer::take_read_stream`).
+    pub fn outbound_peers_mut(&mut self) -> &mut [TcpPeer] {
+        &mut self.outbound
+    }
+
+    /// Mutable access to inbound peers (used by Multi-mode reader
+    /// setup to drain the read clones via `TcpPeer::take_read_stream`).
+    pub fn inbound_peers_mut(&mut self) -> &mut [TcpPeer] {
+        &mut self.inbound
+    }
+
+    /// Drain any inbound TCP connections that have arrived since the
+    /// last call AND apply `SO_RCVBUF` from `recv_buffer_kb` on each.
+    /// Used by Multi mode in `start_reader_threads`.
+    pub fn accept_pending_with_buffer(&mut self, recv_buffer_kb: Option<u32>) -> Result<()> {
+        self.accept_pending(recv_buffer_kb)
+    }
+
     /// Close all connections.
     pub fn close(self) -> Result<()> {
         // Streams and the listener are dropped when self goes out of scope.
@@ -345,6 +391,52 @@ impl TcpTransport {
         drop(self.inbound);
         Ok(())
     }
+}
+
+/// Connect to `addr` with a bounded retry on `ConnectionRefused`,
+/// `TimedOut`, or `WouldBlock`. The two-runner startup is a known
+/// race: both sides hit the ready barrier and call `connect` near
+/// simultaneously; either side's listener may not be bound yet. Same
+/// pattern the websocket variant uses (`ws_client_connect`).
+fn connect_with_retry(addr: SocketAddr, budget: Duration) -> Result<TcpStream> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+            Ok(s) => return Ok(s),
+            Err(e)
+                if e.kind() == io::ErrorKind::ConnectionRefused
+                    || e.kind() == io::ErrorKind::TimedOut
+                    || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "TCP connect to {addr} timed out after {budget:?}: {e}"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(anyhow::anyhow!("TCP connect to {addr} failed: {e}")),
+        }
+    }
+}
+
+/// Apply `SO_RCVBUF = kb * 1024` to a `TcpStream` (T14.1 / T14.4).
+/// Emits a single `eprintln!` warning when the achieved size lands
+/// below the requested value (e.g. Windows silently clamping).
+fn apply_tcp_recv_buffer(stream: &TcpStream, kb: u32, addr: SocketAddr) -> Result<()> {
+    let bytes = (kb as usize).saturating_mul(1024);
+    let sock = SockRef::from(stream);
+    sock.set_recv_buffer_size(bytes)
+        .with_context(|| format!("set_recv_buffer_size on TCP socket to peer {addr}"))?;
+    let achieved = sock
+        .recv_buffer_size()
+        .with_context(|| format!("read SO_RCVBUF on TCP socket to peer {addr}"))?;
+    if achieved < bytes {
+        eprintln!(
+            "[variant-hybrid] warning: TCP SO_RCVBUF to peer {addr} achieved only {achieved} bytes, requested {bytes} ({kb} KiB)"
+        );
+    }
+    Ok(())
 }
 
 /// Trait abstracting the per-call `write` so the retry loop can be
@@ -469,8 +561,8 @@ mod tests {
         // The TcpTransport under test owns its own listener (which we won't
         // use in this test) and dials `listener_a` and `listener_b`.
         let mut transport = TcpTransport::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        transport.connect_to_peer(addr_a).unwrap();
-        transport.connect_to_peer(addr_b).unwrap();
+        transport.connect_to_peer(addr_a, None).unwrap();
+        transport.connect_to_peer(addr_b, None).unwrap();
 
         // Accept the inbound side of each connection on the test listeners.
         let (peer_a_stream, _) = listener_a.accept().unwrap();
@@ -529,7 +621,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let mut transport = TcpTransport::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        transport.connect_to_peer(addr).unwrap();
+        transport.connect_to_peer(addr, None).unwrap();
 
         let (peer_stream, _) = listener.accept().unwrap();
         // Clean shutdown produces EOF on the variant's read side; our code

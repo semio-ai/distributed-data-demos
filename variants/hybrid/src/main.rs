@@ -1,5 +1,6 @@
 mod hybrid;
 mod protocol;
+mod reader;
 mod tcp;
 mod udp;
 
@@ -58,6 +59,7 @@ fn run() -> Result<()> {
         tcp_listen_addr: derived.tcp_listen_addr,
         tcp_peers: derived.tcp_peers,
         qos,
+        recv_buffer_kb: args.recv_buffer_kb,
     };
     let mut variant = HybridVariant::new(&args.runner, config);
     run_protocol(&mut variant, &args)?;

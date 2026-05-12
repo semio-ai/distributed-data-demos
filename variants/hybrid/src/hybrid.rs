@@ -12,6 +12,7 @@ use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::{PeerEot, Variant};
 
 use crate::protocol::{self, Frame};
+use crate::reader::{self, HubMessage, ReaderHub};
 use crate::tcp::TcpTransport;
 use crate::udp::UdpTransport;
 
@@ -57,6 +58,10 @@ pub struct HybridConfig {
     /// Active QoS for this spawn. Determines which path is used by
     /// `signal_end_of_test`.
     pub qos: Qos,
+    /// `--recv-buffer-kb` from the runner-injected CLI (T14.1).
+    /// Applied to the UDP socket via `SO_RCVBUF` and to each TCP
+    /// peer's underlying socket on connect / accept.
+    pub recv_buffer_kb: u32,
 }
 
 /// Hybrid UDP/TCP variant implementing the Variant trait.
@@ -74,6 +79,12 @@ pub struct HybridVariant {
     /// EOTs observed since the last `poll_peer_eots` call. Drained on every
     /// call.
     pending_eots: VecDeque<PeerEot>,
+    /// Threading mode chosen by the driver at `connect` time. Stashed
+    /// so `start_reader_threads` and `poll_receive` can branch on it.
+    threading_mode: ThreadingMode,
+    /// Reader-thread hub. `Some` in Multi mode after
+    /// `start_reader_threads`; `None` in Single mode.
+    reader_hub: Option<ReaderHub>,
 }
 
 impl HybridVariant {
@@ -87,6 +98,8 @@ impl HybridVariant {
             latest_seq: HashMap::new(),
             seen_eots: HashSet::new(),
             pending_eots: VecDeque::new(),
+            threading_mode: ThreadingMode::Single,
+            reader_hub: None,
         }
     }
 
@@ -170,6 +183,66 @@ impl HybridVariant {
             }
         }
     }
+
+    /// Multi-mode `poll_receive` (T14.4): drain the reader-thread mpsc
+    /// until the first data update appears (or the channel is empty).
+    /// EOT messages are recorded internally; stale QoS-2 duplicates
+    /// are filtered exactly as in the inline path.
+    fn poll_receive_multi(&mut self) -> Result<Option<ReceivedUpdate>> {
+        if self.reader_hub.is_none() {
+            return Ok(None);
+        }
+        const POLL_BUDGET: u32 = 256;
+        for _ in 0..POLL_BUDGET {
+            let recv_result = {
+                let hub = self.reader_hub.as_ref().unwrap();
+                hub.rx.try_recv()
+            };
+            match recv_result {
+                Ok(HubMessage::Data(update)) => {
+                    if update.qos == Qos::LatestValue
+                        && self.is_stale_qos2(&update.writer, &update.path, update.seq)
+                    {
+                        continue;
+                    }
+                    return Ok(Some(update));
+                }
+                Ok(HubMessage::Eot { writer, eot_id }) => {
+                    self.record_eot(writer, eot_id);
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(None),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Helper: take a single peer's read clone, raise its `SO_RCVTIMEO`
+/// to `reader::TCP_READER_TIMEOUT`, keep a shutdown-side clone so
+/// `ReaderHub::stop_and_join` can wake the blocked reader, and spawn
+/// the per-peer reader thread.
+fn spawn_tcp_reader_for(
+    peer: &mut crate::tcp::TcpPeer,
+    label_prefix: &str,
+    tx: &std::sync::mpsc::SyncSender<HubMessage>,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hub: &mut ReaderHub,
+) -> Result<()> {
+    let read = peer
+        .take_read_stream()
+        .with_context(|| format!("TCP read stream already taken for {}", peer.addr))?;
+    read.set_read_timeout(Some(reader::TCP_READER_TIMEOUT))
+        .with_context(|| format!("set TCP read timeout for {}", peer.addr))?;
+    let shutdown_handle = read
+        .try_clone()
+        .with_context(|| format!("clone TCP read for shutdown {}", peer.addr))?;
+    hub.tcp_shutdown_handles.push(shutdown_handle);
+    let label = format!("{label_prefix}-{}", peer.addr);
+    let handle = reader::spawn_tcp_reader(read, label, tx.clone(), shutdown.clone());
+    hub.handles.push(handle);
+    Ok(())
 }
 
 impl Variant for HybridVariant {
@@ -188,26 +261,106 @@ impl Variant for HybridVariant {
     }
 
     fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
-        // T14.1 compile-fix only -- the trait signature gained the
-        // threading-mode argument. Real Multi-mode handling for Hybrid
-        // is filed under T14.4.
-        let _ = threading_mode;
+        // Stash for `start_reader_threads` and `poll_receive`.
+        self.threading_mode = threading_mode;
+
         // Set up UDP multicast for QoS 1-2.
         let udp = UdpTransport::new(self.config.bind_addr, self.config.multicast_group)
             .context("failed to set up UDP multicast transport")?;
+        // T14.1 / T14.4: apply the user-tunable SO_RCVBUF. Overrides
+        // the implicit 8 MiB target from `tune_udp_buffers`. In Multi
+        // mode the dedicated recv socket (created in
+        // `start_reader_threads`) applies its own SO_RCVBUF from the
+        // same value.
+        udp.apply_recv_buffer_kb(self.config.recv_buffer_kb)
+            .context("failed to apply --recv-buffer-kb on UDP socket")?;
         self.udp = Some(udp);
 
-        // Set up TCP listener for QoS 3-4 on the runner-/qos-derived port.
+        // Set up TCP listener for QoS 3-4 on the runner-/qos-derived
+        // port.
         let mut tcp = TcpTransport::new(self.config.tcp_listen_addr)
             .context("failed to set up TCP transport")?;
 
         // Connect to each peer (excluding self -- already filtered in main).
+        // T14.1 / T14.4: apply --recv-buffer-kb on every outbound TCP
+        // socket before the read clone is made. `connect_to_peer` now
+        // retries on `ConnectionRefused` for a bounded budget so the
+        // two-runner startup race past the ready barrier is absorbed.
         for peer_addr in &self.config.tcp_peers {
-            tcp.connect_to_peer(*peer_addr)
+            tcp.connect_to_peer(*peer_addr, Some(self.config.recv_buffer_kb))
                 .with_context(|| format!("failed to connect to TCP peer {}", peer_addr))?;
         }
 
         self.tcp = Some(tcp);
+        Ok(())
+    }
+
+    fn start_reader_threads(&mut self, mode: variant_base::ThreadingMode) -> Result<()> {
+        if mode != ThreadingMode::Multi {
+            return Ok(());
+        }
+        // Wait briefly for inbound TCP peers to dial in, so each
+        // accepted stream gets a reader thread at startup. The
+        // driver's stabilize phase gives the other side time to dial.
+        let expected_inbound = self.config.tcp_peers.len();
+        let recv_kb = Some(self.config.recv_buffer_kb);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        {
+            let tcp = self.tcp.as_mut().context("TCP transport not connected")?;
+            loop {
+                tcp.accept_pending_with_buffer(recv_kb)?;
+                if tcp.inbound_peers_mut().len() >= expected_inbound
+                    || std::time::Instant::now() >= deadline
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let (mut hub, tx) = ReaderHub::new();
+        let shutdown = hub.shutdown.clone();
+
+        // UDP recv thread: dedicated blocking recv socket sharing the
+        // multicast group with the primary (send) socket. The primary
+        // stays non-blocking for `try_send_nonblocking`; this one is
+        // blocking with a short `SO_RCVTIMEO` so the reader thread
+        // can poll the shutdown flag between attempts.
+        let udp_recv = UdpTransport::make_blocking_recv_socket(
+            self.config.bind_addr,
+            self.config.multicast_group,
+            self.config.recv_buffer_kb,
+            reader::UDP_READER_TIMEOUT,
+        )
+        .context("failed to build Multi-mode UDP recv socket")?;
+        let udp_shutdown = udp_recv
+            .try_clone()
+            .context("failed to clone UDP recv socket for shutdown signalling")?;
+        hub.udp_shutdown_handle = Some(udp_shutdown);
+        let udp_handle = reader::spawn_udp_reader(udp_recv, tx.clone(), shutdown.clone());
+        hub.handles.push(udp_handle);
+
+        // Per-peer TCP reader threads.
+        {
+            let tcp = self.tcp.as_mut().context("TCP transport not connected")?;
+            for peer in tcp.outbound_peers_mut() {
+                spawn_tcp_reader_for(peer, "out", &tx, &shutdown, &mut hub)?;
+            }
+            for peer in tcp.inbound_peers_mut() {
+                spawn_tcp_reader_for(peer, "in", &tx, &shutdown, &mut hub)?;
+            }
+        }
+        drop(tx);
+
+        self.reader_hub = Some(hub);
+        Ok(())
+    }
+
+    fn stop_reader_threads(&mut self) -> Result<()> {
+        if let Some(hub) = self.reader_hub.take() {
+            hub.stop_and_join()
+                .context("failed to stop hybrid reader threads")?;
+        }
         Ok(())
     }
 
@@ -263,17 +416,12 @@ impl Variant for HybridVariant {
     }
 
     fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
-        // Each iteration probes both paths once. If either returns a data
-        // update we return it immediately. If at least one path consumed a
-        // non-data frame (stale QoS-2 duplicate, or an EOT marker queued
-        // internally), we loop -- the in-flight data behind it must not be
-        // masked. If neither path consumed anything this iteration the
-        // sockets are idle and we return None so the driver can yield.
-        //
-        // Each `try_recv_*` call consumes at most one frame, so the loop
-        // makes forward progress: every iteration either returns Data,
-        // returns None (idle), or strictly drains a buffered frame. A
-        // bounded budget guards against pathological burst-of-EOT inputs.
+        // T14.4: Multi mode pulls from the reader-thread hub.
+        if self.threading_mode == ThreadingMode::Multi && self.reader_hub.is_some() {
+            return self.poll_receive_multi();
+        }
+
+        // Single-mode inline polling (existing behaviour).
         const POLL_BUDGET: u32 = 256;
         for _ in 0..POLL_BUDGET {
             let udp_outcome = self.try_recv_udp()?;
@@ -362,6 +510,7 @@ mod tests {
             tcp_listen_addr: "0.0.0.0:0".parse().unwrap(),
             tcp_peers: Vec::new(),
             qos: Qos::BestEffort,
+            recv_buffer_kb: 4096,
         }
     }
 
@@ -541,6 +690,7 @@ mod tests {
             tcp_listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             tcp_peers: vec![peer_addr],
             qos: Qos::ReliableTcp,
+            recv_buffer_kb: 4096,
         };
         // Borrow checker convenience: ensure we drop config so the
         // variant fully owns it.
