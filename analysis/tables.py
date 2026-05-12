@@ -61,8 +61,10 @@ def format_integrity_table(
     lines: list[str] = []
     lines.append("Integrity Report")
     # Wider table to accommodate the ``BP-skip`` column added in
-    # T-impl.6 (per-writer count of ``backpressure_skipped`` events).
-    sep = "-" * 138
+    # T-impl.6 (per-writer count of ``backpressure_skipped`` events)
+    # and the ``Timeout`` column added in T14.17 (per-spawn failure-
+    # cause classification).
+    sep = "-" * 164
     lines.append(sep)
 
     # Column widths
@@ -77,6 +79,9 @@ def format_integrity_table(
     w_dupes = 7
     w_gaps = 16
     w_bpskip = 12
+    # T14.17: ``Timeout`` column holds the longest enum value
+    # (``eot_timeout_internal`` = 20 chars) plus a little padding.
+    w_timeout = 24
 
     header = (
         _pad("Variant", w_variant)
@@ -90,6 +95,8 @@ def format_integrity_table(
         + _rpad("Dupes", w_dupes)
         + _rpad("Unresolved gaps", w_gaps)
         + _rpad("BP-skip", w_bpskip)
+        + "  "
+        + _pad("Timeout", w_timeout)
     )
     lines.append(header)
     lines.append(sep)
@@ -109,6 +116,15 @@ def format_integrity_table(
         if r.gap_error:
             errors.append("gaps")
 
+        # T14.17: build the timeout-classification cell. The base
+        # enum value is left-aligned in the narrow column. Any
+        # sub-tags are appended after the row's FAIL/late-tail
+        # annotations so the column stays narrow.
+        if r.timeout_sub_tags:
+            sub_tag_suffix = " [" + ", ".join(r.timeout_sub_tags) + "]"
+        else:
+            sub_tag_suffix = ""
+
         row = (
             _pad(r.variant, w_variant)
             + _pad(r.run, w_run)
@@ -121,9 +137,13 @@ def format_integrity_table(
             + _rpad(str(r.duplicates), w_dupes)
             + _rpad(gaps_str, w_gaps)
             + _rpad(f"{r.backpressure_skipped_count:,}", w_bpskip)
+            + "  "
+            + _pad(r.timeout_classification, w_timeout)
         )
         if errors:
             row += "  [FAIL: " + ", ".join(errors) + "]"
+        if sub_tag_suffix:
+            row += sub_tag_suffix
         # T11.5: flag rows whose (variant, run) carries a non-zero
         # late_receives_tail_pct from the performance side. This is
         # a notice, not an error -- it just calls out the latency-tail

@@ -8,9 +8,15 @@ change.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import polars as pl
+
+from timeout_classification import (
+    SpawnClassification,
+    classify_group,
+)
 
 
 @dataclass
@@ -24,6 +30,14 @@ class IntegrityResult:
     writer's count is replicated onto every (writer -> receiver) row in
     the report. Defaults to 0 when no ``backpressure_skipped`` events
     are present (e.g. legacy logs from before T-impl.6 / T-impl.7).
+
+    ``timeout_classification`` (T14.17) is the per-spawn failure-cause
+    bucket for the WRITER side of this row -- one of ``completed``,
+    ``deadlock``, ``eot_lost``, ``variant_rejected``,
+    ``eot_timeout_internal``, ``unknown``. Defaults to ``"unknown"``
+    when classification was skipped (e.g. ``logs_dir`` was not passed
+    to ``integrity_for_group``). ``timeout_sub_tags`` carries
+    refinements such as ``("eot_lost_likely_saturation",)``.
     """
 
     variant: str
@@ -42,6 +56,8 @@ class IntegrityResult:
     ordering_error: bool
     duplicate_error: bool
     gap_error: bool
+    timeout_classification: str = "unknown"
+    timeout_sub_tags: tuple[str, ...] = field(default_factory=tuple)
 
 
 def _count_writes_per_writer(group: pl.LazyFrame) -> pl.DataFrame:
@@ -266,16 +282,36 @@ def _gap_counts(group: pl.LazyFrame) -> pl.DataFrame:
 def integrity_for_group(
     group: pl.LazyFrame,
     deliveries: pl.DataFrame,
+    *,
+    logs_dir: Path | None = None,
+    variant: str | None = None,
+    run: str | None = None,
 ) -> list[IntegrityResult]:
     """Compute integrity results for a single ``(variant, run)`` group.
 
     ``group`` is the per-group lazy frame over the cache. ``deliveries``
     is the materialized delivery-records DataFrame for that group.
+
+    ``logs_dir``, ``variant`` and ``run`` are required to populate the
+    T14.17 ``timeout_classification`` column. When ``logs_dir`` is
+    ``None`` (legacy callers, tests that don't care about the column)
+    classification falls back to ``"unknown"`` on every row.
     """
     write_counts = _count_writes_per_writer(group)
     skip_counts = _count_backpressure_skipped_per_writer(group)
     pair_stats = _check_per_pair(deliveries)
     gaps = _gap_counts(group)
+
+    # T14.17: classify every spawn (per writer side) in this group up
+    # front so the per-row attachment below is a dict lookup.
+    classifications: dict[str, SpawnClassification] = {}
+    if variant is not None and run is not None:
+        classifications = classify_group(
+            group,
+            variant=variant,
+            run=run,
+            logs_dir=logs_dir,
+        )
 
     # Pull writers' receivers from deliveries; also add pairs from
     # write_counts that have no deliveries (writer wrote but nothing
@@ -363,6 +399,19 @@ def integrity_for_group(
         if qos == 3 and unresolved_gaps is not None:
             gap_error = unresolved_gaps > 0
 
+        # T14.17: attach the per-spawn timeout-classification for the
+        # writer side of this row. Same classification value appears on
+        # every (writer -> receiver) row that shares the writer, since
+        # classification is a property of the writer's spawn, not the
+        # writer/receiver pair.
+        cls = classifications.get(row["writer"])
+        if cls is not None:
+            t_class = cls.classification
+            t_sub = cls.sub_tags
+        else:
+            t_class = "unknown"
+            t_sub = ()
+
         results.append(
             IntegrityResult(
                 variant=row["variant"],
@@ -381,6 +430,8 @@ def integrity_for_group(
                 ordering_error=ordering_error,
                 duplicate_error=duplicate_error,
                 gap_error=gap_error,
+                timeout_classification=t_class,
+                timeout_sub_tags=t_sub,
             )
         )
 

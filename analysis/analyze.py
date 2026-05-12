@@ -205,7 +205,18 @@ def run_analysis(
         deliveries = correlate_lazy(group).collect()
 
         if do_summary:
-            integrity_results.extend(integrity_for_group(group, deliveries))
+            # T14.17: pass logs_dir/variant/run so integrity_for_group
+            # can attach the per-spawn timeout_classification field
+            # to each IntegrityResult row.
+            integrity_results.extend(
+                integrity_for_group(
+                    group,
+                    deliveries,
+                    logs_dir=logs_dir,
+                    variant=variant,
+                    run=run,
+                )
+            )
 
         performance_results.append(
             performance_for_group(group, deliveries, variant, run)
