@@ -5833,6 +5833,54 @@ This is an **investigative task** first; the fix (if any) follows.
 
 ---
 
+### T14.20: variants/websocket -- T14.18-style TCP control side-channel for EOT
+
+**Repo**: `variants/websocket/`.
+**Status**: pending, filed 2026-05-12 by orchestrator after the
+2nd stress-e14 run.
+
+#### Background
+
+Post-T14.19 the websocket Single-mode at 100K msg/s symmetric no
+longer deadlocks (SO_SNDTIMEO breaks the wedge), but its EOT still
+can't get through the saturated TCP/WS stream. T14.17 classifies as
+`eot_timeout_internal` -- the variant correctly notices it can't
+deliver EOT, gives up on its own timeout, and exits cleanly. This
+is much better than deadlock, but it's not as clean as the
+`completed` outcome that custom-udp Single qos4 achieves via T14.18's
+TCP control side-channel.
+
+#### Scope
+
+Apply the T14.18 pattern to websocket: add a dedicated per-peer-pair
+TCP control connection at `connect()` time, route EOT markers over
+it, leave the data WebSocket untouched. Same shape as T14.18 in
+custom-udp and hybrid.
+
+Post-T14.20 the websocket Single qos3-4 spawns should classify
+`completed` rather than `eot_timeout_internal` at 100K msg/s
+symmetric.
+
+#### Acceptance criteria
+
+- [ ] WebSocket has a TCP control connection per peer pair,
+      QoS-independent.
+- [ ] EOT routes over the control connection in both Single and
+      Multi modes.
+- [ ] Post-T14.20 stress fixture run: websocket-1000x100hz-qos3-single
+      and qos4-single classify `completed` (delivery may remain
+      ~17%, that's not the bar).
+- [ ] Existing tests pass; clippy / fmt clean.
+
+#### Out of scope
+
+- Changing the data path (WS frame format unchanged).
+- Generalising further. T14.18 already covers custom-udp + hybrid;
+  T14.20 covers websocket. WebRTC and Zenoh out of scope.
+- T14.9 (Zenoh router-RPC) is its own deferred path.
+
+---
+
 ### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (DEFERRED)
 
 **Repo**: `variants/zenoh/`, plus a small runner-side sidecar-spawn

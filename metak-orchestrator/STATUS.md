@@ -9237,3 +9237,71 @@ Stress logs (T14.19 repro): `logs_t14_19_repro/` (gitignored;
 re-run via `target/release/runner --name {alice,bob} --config
 configs/two-runner-stress-e14.toml`).
 
+
+---
+
+## 2026-05-12 — Post-T14.19 stress validation (orchestrator)
+
+Re-ran `configs/two-runner-stress-e14.toml` to confirm T14.19's
+SO_SNDTIMEO fix in the integrated state. 32 spawns, ~12 min wall-time.
+
+### Net result of the E14 + T14.13-19 fix stack
+
+```
+Variant        Mode    QoS    Status            Classification        Notes
+custom-udp     single  1      success           completed             T14.18 verified
+custom-udp     single  2      success           completed             T14.18 verified
+custom-udp     single  3      success           completed             T14.18 verified
+custom-udp     single  4      success           completed             T14.18 + T14.19 (was deadlock)
+custom-udp     multi   1-4    success           completed             T14.16 verified
+hybrid         single  1-4    success           completed             0.12% delivery on UDP -- intentional
+hybrid         multi   1-4    success           completed             T14.16 verified
+websocket      multi   3-4    success           completed             T14.10 log-from-reader
+websocket      single  3      success           eot_timeout_internal  T14.19 broke the wedge but EOT can't pass saturated TCP
+websocket      single  4      success           eot_timeout_internal  same -- T14.20 follow-up filed
+quic           multi   1-4    success           completed             T14.13 ordering verified
+webrtc         multi   1      success           completed
+webrtc         multi   2      success           [FAIL: ordering]      Datagram QoS, expected behaviour
+webrtc         multi   3-4    success           completed
+zenoh          multi   1      asymmetric        eot_timeout_internal / deadlock     T14.18 doesn't apply
+zenoh          multi   2      success           completed             Lucky
+zenoh          multi   3      asymmetric        same shape
+zenoh          multi   4      asymmetric        same shape
+```
+
+### What the integrated stack achieves
+
+- **Every TCP-family variant** (custom-udp, hybrid, websocket) survives
+  100K msg/s symmetric in both Single and Multi modes without
+  deadlocking. Delivery cratering on Single mode is the kernel-level
+  cliff and is honestly characterised by T11.5 (high Loss%, multi-
+  second tail latency, late_tail counts).
+- **EOT preservation works** end-to-end for custom-udp + hybrid via
+  T14.18's TCP control channel. The websocket case (T14.20) is the
+  one remaining cleanup -- its current `eot_timeout_internal` outcome
+  is a graceful give-up, not a deadlock.
+- **QUIC ordering** holds at 100% in-order across all QoS levels per
+  T14.13.
+- **WebRTC** delivers 91-95% at 100K symmetric across qos1-4; the
+  qos2 `[FAIL: ordering]` is correct behaviour for unreliable
+  datagrams (worth filing a small analysis polish to make the ordering
+  check QoS-aware).
+- **Zenoh** is the one remaining structural gap. T14.9 (router-RPC
+  sidecar) is the parked fix.
+
+### Net failure-mode arc
+
+Across the 2026-05-11 / 2026-05-12 session, every observed failure
+has been either:
+- Fixed (T-impl.10, T14.2, T14.10, T14.13, T14.16, T14.18, T14.19)
+- Honestly classified and characterised (T11.5, T14.17)
+- Filed as a single remaining task (T14.20 for websocket EOT control
+  channel, T14.9 for Zenoh router-RPC)
+
+The benchmark now produces meaningful, comparable cross-variant data
+at workload regimes the team actually cares about. The architectural
+phase of the project is functionally complete; remaining work is
+either Zenoh-specific (T14.9 deferred) or polish (T14.20, webrtc
+ordering check QoS-awareness).
+
+Logs: `logs/stress-e14-20260512_125438/`.
