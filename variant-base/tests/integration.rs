@@ -32,6 +32,10 @@ fn test_args_with_mode(log_dir: &str, threading_mode: ThreadingMode) -> CliArgs 
         run: "run01".to_string(),
         threading_mode,
         recv_buffer_kb: DEFAULT_RECV_BUFFER_KB,
+        // Disable stdout progress in the in-process integration test
+        // path -- the smoke test below covers the enabled path via the
+        // child-binary spawn.
+        progress_stdout_interval_ms: 0,
         // Single-runner self-loopback peers list -> empty expected set
         // -> EOT phase terminates immediately with no `eot_timeout`.
         extra: vec!["--peers".to_string(), "test-runner=127.0.0.1".to_string()],

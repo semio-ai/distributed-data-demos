@@ -6,6 +6,7 @@ use chrono::DateTime;
 
 use crate::cli::{parse_peer_names_from_extra, CliArgs};
 use crate::logger::{Logger, LoggerHandle};
+use crate::progress_emitter::ProgressEmitter;
 use crate::resource::ResourceMonitor;
 use crate::seq::SeqGenerator;
 use crate::types::{Phase, Qos, ThreadingMode};
@@ -191,6 +192,21 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     let mut resource_monitor = ResourceMonitor::new();
     let mut workload = create_workload(&config.workload)?;
 
+    // Stdout progress emitter (E15 / T15.1).
+    //
+    // The emitter spawns a background thread that writes one JSON
+    // progress line to stdout every `progress_stdout_interval_ms`. When
+    // the CLI arg is `0` the emitter is fully disabled: no thread is
+    // spawned and no stdout writes happen. The driver still calls the
+    // setter methods unconditionally so the in-process counter state
+    // remains correct (the setters short-circuit to atomic updates on
+    // the disabled path).
+    //
+    // The initial phase is `Connect`, matching the very first
+    // `log_phase` call a few lines below; any background tick that
+    // fires before the driver advances the phase will see `connect`.
+    let mut progress = ProgressEmitter::new(config.progress_stdout_interval_ms, Phase::Connect);
+
     // -- Phase 1: Connect --
     //
     // The threading mode is passed through to the variant so it can
@@ -199,6 +215,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // reader threads the variant declared support for; the default
     // impl is a no-op for Single-only variants. See E14 / T14.1.
     logger.log_phase(Phase::Connect, None)?;
+    progress.set_phase(Phase::Connect);
     variant.connect(config.threading_mode)?;
     // Hand the variant a thread-safe logger handle BEFORE reader
     // threads are spawned so they capture it at spawn time. The default
@@ -222,10 +239,12 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
 
     // -- Phase 2: Stabilize --
     logger.log_phase(Phase::Stabilize, None)?;
+    progress.set_phase(Phase::Stabilize);
     std::thread::sleep(Duration::from_secs(config.stabilize_secs));
 
     // -- Phase 3: Operate --
     logger.log_phase(Phase::Operate, Some(&config.workload))?;
+    progress.set_phase(Phase::Operate);
 
     let max_throughput = config.workload == "max-throughput";
     let tick_interval = Duration::from_secs_f64(1.0 / f64::from(config.tick_rate_hz));
@@ -300,6 +319,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
             let seq = seq_gen.next_seq();
             if variant.try_publish(&op.path, &op.payload, qos, seq)? {
                 logger.log_write(seq, &op.path, qos, op.payload.len())?;
+                progress.inc_sent();
                 if max_throughput {
                     consecutive_skipped = 0;
                 }
@@ -349,6 +369,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
                         update.qos,
                         update.payload.len(),
                     )?;
+                    progress.inc_received();
                     drained += 1;
                     if drain_start.elapsed() >= drain_time_budget {
                         break;
@@ -376,11 +397,20 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // `eot_timeout` event after the timeout (with the full peer set
     // as `missing`) but the spawn does NOT abort.
     logger.log_phase(Phase::Eot, None)?;
+    progress.set_phase(Phase::Eot);
 
     let expected: HashSet<String> = parse_peer_names_from_extra(&config.extra)
         .into_iter()
         .filter(|name| name != &config.runner)
         .collect();
+    // If there are no expected peers (single-runner self-loopback or
+    // a misconfigured peer list), the variant has effectively
+    // "received" every expected EOT before the wait loop starts. Set
+    // the flag eagerly so the first progress tick in EOT phase
+    // reflects that.
+    if expected.is_empty() {
+        progress.mark_eot_received();
+    }
 
     let eot_timeout_secs = config
         .eot_timeout_secs
@@ -389,6 +419,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
 
     let my_eot_id = variant.signal_end_of_test()?;
     logger.log_eot_sent(my_eot_id)?;
+    progress.mark_eot_sent();
 
     let eot_start = Instant::now();
     let deadline = eot_start + eot_timeout;
@@ -404,6 +435,11 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
                 logger.log_eot_received(&eot.writer, eot.eot_id)?;
                 got_any_new = true;
             }
+        }
+        // Flip the progress flag once the expected-peer set has been
+        // fully observed. Sticky for the remainder of the spawn.
+        if !expected.is_empty() && expected.is_subset(&seen) {
+            progress.mark_eot_received();
         }
 
         // Drain any in-flight data updates while waiting. Bound each
@@ -427,6 +463,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
                         update.qos,
                         update.payload.len(),
                     )?;
+                    progress.inc_received();
                     drained += 1;
                     if drain_start.elapsed() >= eot_drain_time_budget {
                         break;
@@ -450,6 +487,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
 
     // -- Phase 5: Silent (drain + flush) --
     logger.log_phase(Phase::Silent, None)?;
+    progress.set_phase(Phase::Silent);
 
     let silent_duration = Duration::from_secs(config.silent_secs);
     let silent_start = Instant::now();
@@ -463,6 +501,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
                     update.qos,
                     update.payload.len(),
                 )?;
+                progress.inc_received();
             }
             None => {
                 // No pending updates; sleep briefly to avoid busy-waiting.
@@ -478,6 +517,13 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     variant.stop_reader_threads()?;
     variant.disconnect()?;
     logger.flush()?;
+
+    // Final progress transition: `done`. The emitter thread may emit
+    // one more line in this state before we join it on `stop()`. We
+    // explicitly stop here so the thread is joined before `Ok(())`
+    // propagates out and the binary exits.
+    progress.set_done();
+    progress.stop();
 
     Ok(())
 }
@@ -653,6 +699,9 @@ mod tests {
             run: "run01".to_string(),
             threading_mode: ThreadingMode::Single,
             recv_buffer_kb: DEFAULT_RECV_BUFFER_KB,
+            // Disable stdout progress in driver unit tests so they
+            // never touch the real process stdout.
+            progress_stdout_interval_ms: 0,
             extra: vec!["--peers".to_string(), peers.to_string()],
         }
     }

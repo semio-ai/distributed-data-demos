@@ -18,6 +18,12 @@ pub const MIN_RECV_BUFFER_KB: u32 = 64;
 /// well above what any sane variant would actually need.
 pub const MAX_RECV_BUFFER_KB: u32 = 65_536;
 
+/// Default value for `--progress-stdout-interval-ms` when the runner
+/// does not inject one. Matches the E15 design (one progress line per
+/// second per variant). See
+/// `metak-shared/api-contracts/variant-cli.md` (E15 additions).
+pub const DEFAULT_PROGRESS_STDOUT_INTERVAL_MS: u32 = 1000;
+
 /// Validate that `kb` falls within the documented `--recv-buffer-kb`
 /// range. Returned by clap's `value_parser`.
 fn parse_recv_buffer_kb(s: &str) -> Result<u32, String> {
@@ -134,6 +140,19 @@ pub struct CliArgs {
     /// JSONL event.
     #[arg(long, value_parser = parse_recv_buffer_kb, default_value_t = DEFAULT_RECV_BUFFER_KB)]
     pub recv_buffer_kb: u32,
+
+    /// Cadence in milliseconds at which the variant emits its
+    /// stdout progress line (see E15 / T15.1). `0` disables emission
+    /// entirely -- the back-compat behaviour for callers that pre-date
+    /// E15 (no runner-side stdout reader). Default `1000` (one line
+    /// per second) matches the E15 design.
+    ///
+    /// The emitted line shape is documented in
+    /// `metak-shared/api-contracts/variant-cli.md` (E15 additions).
+    /// Variant code is responsible for keeping stdout otherwise empty
+    /// so the runner can parse the stream as line-delimited JSON.
+    #[arg(long, default_value_t = DEFAULT_PROGRESS_STDOUT_INTERVAL_MS)]
+    pub progress_stdout_interval_ms: u32,
 
     // -- Variant-specific pass-through arguments --
     /// Additional variant-specific arguments (collected as trailing args).
