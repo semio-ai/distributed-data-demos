@@ -105,10 +105,23 @@ the variant does not support.
 
 Optional, default `4096` (4 MiB). Range `64..=65536` (64 KiB to 64 MiB).
 Sized to be safe on a Raspberry Pi 4 with 4 GB RAM under a 2-peer
-benchmark. Variants must call `setsockopt(SO_RCVBUF, recv_buffer_kb * 1024)`
-on every recv-side socket they own. Variants whose transport library
-does not expose the underlying socket (Zenoh, webrtc-rs) must document
-why and may treat this arg as advisory.
+benchmark.
+
+**Semantics (clarified 2026-05-12 after T14.3 + T14.4 implementation
+discovery):** `--recv-buffer-kb` is a **minimum floor**, not an
+absolute value. Variants must ensure each recv-side socket they own
+has `SO_RCVBUF` at least as large as `recv_buffer_kb * 1024`; if the
+variant has its own tuning logic that sets a larger value (e.g.
+custom-udp's T-impl.2 8 MiB `tune_udp_buffers`, hybrid's same pattern),
+that larger value is preserved. The original strict-`setsockopt(SO_RCVBUF,
+recv_buffer_kb * 1024)` wording would have *shrunk* the existing T-impl.2
+buffer to 4 MiB on default and regressed the qos1 100 K msg/s same-host
+fixture; treating the arg as a floor rather than a setter keeps the
+contract's intent ("at least this large") while preserving variant-side
+tuning.
+
+Variants whose transport library does not expose the underlying socket
+(Zenoh, webrtc-rs) must document why and may treat this arg as advisory.
 
 ### JSONL log impact
 

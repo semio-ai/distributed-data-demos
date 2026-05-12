@@ -5060,6 +5060,136 @@ existing dataset spikes RSS.
 
 ---
 
+### T14.10: variants/websocket -- log-from-reader to lift delivery cliff
+
+**Repo**: `variants/websocket/` (may generalise to other Multi-mode variants).
+**Status**: pending. Filed 2026-05-12 after T14.2 end-to-end repro.
+
+#### Background
+
+T14.2 closed the T-impl.10 deadlock by introducing per-peer reader
+threads + bounded mpsc + drop-on-full. End-to-end smoke on the original
+`websocket-1000x100hz` symmetric flood (100 K msg/s × 2 peers, qos 4)
+runs deadlock-free, but **delivery is ~25-33%** in each direction.
+The dropped frames are silently discarded by the reader (drop-on-full
+when the channel is at its `4 * vpt * peer_count` cap).
+
+The user's stated intent (recorded in `metak-shared/overview.md`
+"Cross-cutting goals") is: *"if a single threaded op cant handle a
+certain throughput we should just ensure we configure receive buffers
+to be as large as possible so that we can then just log all the
+messages being received with a very bad latency whenever the
+throughput couldn't be atchieved... it's especially important to
+present the receive throughput because that's what really matters"*.
+
+T14.2's drop-on-full violates the "log all the messages being received"
+half of that intent. The reader thread parses every frame off the wire,
+but only those that fit in the channel before the driver drains them
+get logged; the rest never reach JSONL.
+
+#### Root cause
+
+Per-tick budget (10 ms at 100 Hz) is dominated by the variant's publish
+path. At 1000 vpt = 1 publish per ~10 us; the driver spends almost all
+its budget publishing and has microseconds left to drain the mpsc. The
+reader produces messages faster than the driver can consume them, the
+bounded channel fills, and the reader drops.
+
+#### Scope (option-3 path from T14.2's STATUS.md)
+
+Move JSONL `receive` logging **out of the driver thread** and into the
+reader thread(s). The driver's `poll_receive` becomes purely an
+in-process state-update mechanism for callers who need the
+`ReceivedUpdate` (e.g. variants doing app-layer NACK in Multi mode),
+not the logging mechanism.
+
+Concrete shape:
+- The websocket reader thread, after decoding each frame, writes the
+  `receive` event directly to JSONL via a thread-safe logger handle
+  (the existing `Logger` is already `Arc<Mutex<...>>`-friendly or
+  needs a thin shim).
+- The reader still pushes to the mpsc for the driver to observe
+  EOT-related items (`Eot`, `PeerDropped`) and any future protocol
+  logic, but `Data` items can be log-then-forget.
+- Channel bound can be smaller now -- it only needs to hold lifecycle
+  items, not data.
+- This changes the architecture from "single-writer JSONL via driver"
+  to "multi-writer JSONL with logger as the synchronisation point".
+  Logger mutex contention becomes the new bottleneck, but writes are
+  microseconds-cheap so the cliff moves far above 100 K msg/s.
+
+#### Considerations and risks
+
+- **Ordering**: receives logged from N reader threads may interleave
+  in JSONL by writer. Existing analysis groups by (writer, seq) so
+  the offline ordering is unchanged. The wall-clock-ordering across
+  writers is already non-deterministic on a multicore machine.
+- **Generalisation**: if this works for websocket, the same pattern
+  applies to custom-udp and hybrid in Multi mode. Both currently
+  rely on the driver-side drain of their mpsc. T14.10 should land
+  for websocket first, validate on the high-rate fixture, then
+  generalise.
+- **Out of scope**: removing the mpsc entirely. Lifecycle items
+  (`Eot`, `PeerDropped`) still need driver visibility.
+
+#### Acceptance criteria
+
+- [ ] Reader thread writes `receive` events directly to JSONL.
+- [ ] Driver `poll_receive` in Multi mode no longer consumes `Data`
+      items from the mpsc (only lifecycle items).
+- [ ] End-to-end repro of `websocket-1000x100hz-qos4-multi` on
+      `configs/two-runner-websocket-qos4-multi-1000x100hz.toml`
+      shows **delivery >= 99 %** -- not because frames magically
+      arrive faster, but because the reader logs all parsed frames
+      regardless of driver-drain cadence.
+- [ ] Existing tests still pass (`cargo test --release -p
+      variant-websocket`).
+- [ ] No regression on the lower-rate `two_runner_websocket_both_modes_qos3_smoke`.
+
+#### Out of scope
+
+- Per-direction loss budgets, latency targets, or fairness guarantees.
+  Just "log everything that came off the wire".
+- Generalising to custom-udp / hybrid as part of THIS task; file a
+  follow-up T14.11 if websocket result motivates it.
+- Receiver-driven flow control (would push back on the writer; not
+  what the user wants).
+
+---
+
+### T14.11: flaky test -- variant-quic try_publish_qos1_reports_backpressure_under_burst
+
+**Repo**: `variants/quic/`.
+**Status**: pending, low priority. Filed 2026-05-12.
+
+#### Background
+
+`variants/quic/src/quic.rs::tests::test_try_publish_qos1_reports_backpressure_under_burst`
+is timing-sensitive. The T14.5+6+7 worker and the T14.3 worker both
+independently observed it failing under CPU contention from concurrent
+sibling workers but passing in isolation. Not a regression introduced
+by E14; a pre-existing flakiness surfaced by parallel worker execution.
+
+#### Scope
+
+- Reproduce under load and identify the timing assumption (likely a
+  spin-loop bound or sleep duration that's too tight on a contended host).
+- Make the test deterministic OR mark `#[ignore]` and rely on
+  manual-run validation.
+
+#### Acceptance criteria
+
+- [ ] Test passes 10/10 runs under `cargo test --release --workspace`
+      with all other workspace tests running concurrently.
+- [ ] If made `#[ignore]`, document why in the test's rustdoc and
+      provide a one-line manual-run command.
+
+#### Out of scope
+
+- Other flaky tests in the workspace.
+
+---
+
 ### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (DEFERRED)
 
 **Repo**: `variants/zenoh/`, plus a small runner-side sidecar-spawn
