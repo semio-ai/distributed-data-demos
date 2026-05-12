@@ -388,6 +388,62 @@ and continues with the kernel default. `recv_buffer_kb` is plumbed
 through from `variant-base`'s `--recv-buffer-kb` CLI arg (default
 4096 / 4 MiB).
 
+### Single-mode TCP wedge safety net (T14.19)
+
+At catastrophic symmetric load on QoS 3/4 (the 2026-05-12 stress
+run at 1000 vpt x 100 Hz = 100K msg/s symmetric on localhost),
+Single mode can mutually deadlock: both runners spend the publish
+phase inside tungstenite's blocking `write` while neither calls
+`poll_receive` to drain the peer's recv buffer, the kernel TCP send
+buffers fill on both sides, and both writes wedge in the kernel.
+Pre-fix the runner timed the spawn out at `default_timeout_secs`.
+
+The fix is a 5 s `SO_SNDTIMEO`
+(`TcpStream::set_write_timeout(Some(...))`) installed on every
+outbound TCP stream in Single mode -- and ONLY in Single mode.
+Multi mode runs a dedicated reader thread per peer that drains the
+recv buffer in parallel; the wedge does not occur and installing
+`SO_SNDTIMEO` in Multi would only invite spurious peer-drops under
+transient back-pressure. The `start_reader_threads` path explicitly
+clears the timeout on the write-clone (`set_write_timeout(None)`)
+to keep Multi mode's behaviour identical.
+
+Installation lives in the `apply_single_mode_write_timeout` helper
+in `src/websocket.rs`, called from `connect` after both
+`ws_client_connect` and `ws_server_accept` complete. The
+`SINGLE_WRITE_TIMEOUT` constant is 5 s.
+
+When the timeout fires:
+
+- the write returns `TimedOut` (Windows) / `WouldBlock` (Unix)
+  wrapped in `tungstenite::Error::Io`,
+- `broadcast_binary` drops the offending peer with a `warning:
+  dropping WS peer ... after write error` log line,
+- subsequent broadcasts have nothing to send (empty `self.peers`)
+  but `broadcast_binary` returns `Ok(())` rather than the pre-fix
+  "all WS peers dropped after write errors" Err that would have
+  cascaded into a failed spawn.
+
+The "Ok with no peers" relaxation matters because websocket has no
+separate control side-channel for EOT (unlike custom-udp and
+hybrid post-T14.18); once the data peer is dropped, EOT cannot
+route. The driver's EOT phase will time out waiting for the peer's
+EOT and log `eot_timeout`, the silent phase passes, and the spawn
+exits `status=success`. Delivery is near-zero -- matching the
+"log everything with bad latency" intent. The T14.17 classifier
+marks the spawn `completed` (the eot_timeout entry tells operators
+exactly what happened).
+
+5 s is far longer than any realistic transient on a healthy LAN
+(TCP_NODELAY + 4 MiB recv buffers); a timeout firing means the
+peer is genuinely stuck. The integration regression
+`tests/two_runner_t14_19_tcp_single_no_deadlock.rs` exercises the
+deadlock workload and asserts both runners exit `status=success`
+(delivery threshold deliberately NOT asserted). The unit test
+`t14_19_broadcast_drops_peer_on_write_timeout_and_returns_ok` in
+`src/websocket.rs` is the same property tested at the broadcast
+function level.
+
 ## Historical notes
 
 ### Backpressure semantics (T-impl.7) -- superseded by T14.2 for high-rate workloads

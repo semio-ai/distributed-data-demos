@@ -391,6 +391,53 @@ additions: `--recv-buffer-kb`":
   moves to readers.
 - Per-thread CPU affinity. The OS scheduler decides.
 
+### Single-mode TCP wedge safety net (T14.19)
+
+At catastrophic symmetric load on QoS 4 (the 2026-05-12 stress run
+at 1000 vpt x 100 Hz = 100K msg/s symmetric on localhost), Single
+mode can mutually deadlock: both runners spend the publish phase
+inside `write_all` on their outbound TCP stream while neither calls
+`poll_receive` to drain the peer's recv buffer, the kernel TCP send
+buffers fill on both sides, and both writes wedge in the kernel.
+The T14.18 control channel cannot help because the variant thread
+is stuck in the data-path syscall before reaching the EOT phase.
+
+The fix is a 5 s `SO_SNDTIMEO` (`set_write_timeout(Some(...))`)
+installed on every **outbound** TCP stream in Single mode -- and
+ONLY in Single mode. Multi mode runs a dedicated reader thread per
+peer that drains the recv buffer in parallel with the publisher, so
+the wedge does not occur; installing `SO_SNDTIMEO` in Multi mode
+would only introduce spurious peer-drops under transient back-
+pressure. The Single-mode branch is gated on
+`self.threading_mode == ThreadingMode::Single` in `setup_tcp`.
+
+When the timeout fires:
+
+- the write returns `TimedOut` (Windows) / `WouldBlock` (Unix),
+- the existing per-write error branch in `publish_encoded` drops the
+  peer from `tcp_out_streams` with a `[custom-udp] T14.19: dropping
+  outbound TCP peer ... after write error` log line,
+- subsequent writes have nothing to broadcast to (no peers) but
+  `try_publish` still returns `Ok(true)` per the QoS 4 contract,
+- the operate phase's time-bounded outer loop exits naturally,
+- the T14.18 control side-channel (a SEPARATE socket from the data
+  path) routes EOT cleanly, both sides observe `eot_received` on
+  the other side, both exit `status=success`.
+
+Delivery in this scenario is near-zero (matching hybrid's empirical
+0.12 % at the same workload). The T14.17 classifier marks the
+spawn `completed`. This is honest "log everything with bad latency"
+behaviour, not a hidden failure: operators see the peer-drop log
+in stderr and the catastrophic delivery in the analysis table.
+
+5 s is far longer than any realistic transient on a healthy LAN
+(TCP_NODELAY + 4 MiB recv buffers); a timeout firing means the peer
+is genuinely stuck. The constant is `TCP_SINGLE_WRITE_TIMEOUT` in
+`src/udp.rs`. The integration regression
+`tests/two_runner_t14_19_tcp_single_no_deadlock.rs` exercises the
+deadlock workload and asserts both runners exit `status=success`
+(delivery threshold deliberately NOT asserted).
+
 ### UDP buffer tuning (T-impl.2)
 
 Every UDP socket the variant creates (today: the multicast socket in

@@ -1434,7 +1434,8 @@ mod tests {
             tungstenite::client::client(url.as_str(), stream).expect("client upgrade");
         let s = ws.get_ref();
         s.set_read_timeout(Some(READ_POLL_TIMEOUT)).unwrap();
-        s.set_write_timeout(Some(Duration::from_millis(100))).unwrap();
+        s.set_write_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
         // Shrink the kernel send buffer so the wedge is reached
         // quickly. The default ~64 KiB would need a lot of writes
         // to fill.
