@@ -6428,3 +6428,394 @@ documents the same root-cause family for ready/done.
 - T14.14's broader same-host coord investigation.
 
 ---
+### T15.1: variant-base -- progress emission to stdout
+
+**Repo**: `variant-base/`.
+**Status**: pending. Foundational; gates T15.2-T15.9.
+
+#### Background
+
+E15 introduces stdout-based progress emission so the runner can
+observe variant state without reaching inside the variant.
+
+#### Scope
+
+- New CLI arg: `--progress-stdout-interval-ms <u32>` (default `1000`;
+  `0` disables emission entirely for back-compat).
+- New stdout protocol: variant emits one JSON line per interval,
+  flushed immediately, shape:
+  ```
+  {"event":"progress","ts":"RFC3339-with-ns","phase":"connect|stabilize|operate|eot|silent|done","sent":<u64>,"received":<u64>,"eot_sent":<bool>,"eot_received":<bool>}
+  ```
+  - `phase` reflects the current protocol-driver phase.
+  - `sent` / `received` are monotonic per-spawn aggregates across all
+    peers. Per-peer breakdown stays in JSONL (`writer` field on
+    `receive` events).
+  - `eot_sent` flips to `true` once the variant has emitted the
+    `eot_sent` event to its JSONL (per T15.5 -- when local idle
+    fires).
+  - `eot_received` flips to `true` once the variant has observed all
+    expected peer EOTs. Under E15 the variant-base default behaviour
+    is that this flag is set when the runner-coord channel tells the
+    variant (or when the variant infers it from its own
+    received-counter idling). T15.4 / T15.5 finalize the exact
+    trigger.
+- Thread-safe emission: stdout writes from the protocol driver MUST
+  NOT interleave with anything else printed to stdout. Variant-base
+  emits all progress; no concrete variant prints to stdout.
+- Existing stderr output (variant build banner, T-impl.1 stderr
+  capture) is unchanged.
+- The JSON line is the ONLY stdout output from a variant. Any other
+  diagnostic that variants emit today via `println!` should be
+  ported to `eprintln!` (variant code audit). This guarantees the
+  runner can parse stdout line-by-line as JSON.
+
+#### Tests
+
+- Unit: `progress_emitter` (or wherever the emitter lives) produces
+  exactly one line per interval, well-formed JSON, monotonic ts.
+- Unit: counters increment when expected (stub publisher driving
+  fake writes/receives).
+- Unit: `--progress-stdout-interval-ms 0` disables emission.
+- Integration: `variant-dummy` smoke -- run with the arg, capture
+  stdout, assert ~N lines per second, each parses as JSON, phase
+  field transitions through `connect -> stabilize -> operate -> ...`.
+
+#### Validation (MANDATORY)
+
+- `cargo build --release -p variant-base` clean.
+- `cargo test --release -p variant-base` all-green.
+- `cargo test --release --workspace` all-green (no other variants
+  should break -- they don't print to stdout in normal operation;
+  if they do, audit + fix).
+- Clippy + fmt clean.
+
+#### Acceptance criteria
+
+- [ ] `--progress-stdout-interval-ms` CLI arg added with default 1000.
+- [ ] Progress JSON emission per interval implemented.
+- [ ] Phase field correctly reflects driver state.
+- [ ] Counters are accurate.
+- [ ] Unit tests pass.
+- [ ] Workspace tests pass.
+- [ ] `metak-shared/api-contracts/variant-cli.md` documents the new
+      arg and the stdout JSON schema (worker writes the contract
+      update).
+
+#### Out of scope
+
+- Per-peer counter breakdown in the stdout (stays in JSONL only).
+- Runner-side parsing (T15.2).
+- Variant-side idle detection (T15.5).
+- Removing the on-wire EOT exchange (T15.8 cleanup).
+
+---
+
+### T15.2: runner -- read child stdout, parse progress events
+
+**Repo**: `runner/`.
+**Status**: pending. Depends on T15.1.
+
+#### Scope
+
+- Per-spawn: capture child stdout via `Stdio::piped()` (mirror of
+  T-impl.1's stderr-piped approach but for stdout).
+- Read line-by-line on a dedicated thread per child. Parse each line
+  as JSON (the T15.1 progress schema). Non-JSON lines are surfaced
+  as a warning but do NOT abort the spawn.
+- Maintain `LocalProgressTracker { runner, spawn, phase, sent,
+  received, eot_sent, eot_received, last_sent_change_ts,
+  last_received_change_ts }`. Update on each parsed progress event.
+- Expose a snapshot API for T15.3 (runner-coord) to broadcast.
+- Persist nothing to disk (the JSONL log is the source of truth for
+  analysis; the stdout stream is for live runner control only).
+- Graceful shutdown: when the child exits, the stdout reader thread
+  joins cleanly.
+
+#### Tests
+
+- Unit: a stub child binary that emits a known sequence of progress
+  events; assert the tracker state matches.
+- Unit: malformed JSON line is ignored (with a warning) and does
+  not break the reader.
+- Integration: spawn `variant-dummy` (post-T15.1) with progress
+  emission; assert the runner's tracker reflects the emitted state.
+
+#### Validation
+
+- Standard cargo gates.
+- Integration test with real `variant-dummy` produces the expected
+  tracker state.
+
+#### Acceptance criteria
+
+- [ ] Child stdout captured per spawn.
+- [ ] Progress events parsed and tracked.
+- [ ] Malformed-line tolerance.
+- [ ] Unit + integration tests pass.
+
+---
+
+### T15.3: runner-coord -- exchange RemoteProgressSnapshot every ~1s
+
+**Repo**: `runner/`. Contract touch: `runner-coordination.md`.
+**Status**: pending. Depends on T15.2.
+
+#### Scope
+
+- Extend the runner-runner coord channel to exchange per-spawn
+  progress snapshots between runners.
+- Use the **same TCP-per-peer transport that T14.24 introduced for
+  resume_manifest**. Long-lived; one connection per peer pair;
+  reliable; large-payload friendly.
+- New protocol message: `ProgressUpdate { runner, spawn,
+  sent, received, eot_sent, eot_received, phase, ts }`.
+- Cadence: ~1 second per active spawn. Buffer / batch ok.
+- Worker decides whether to reuse the resume_manifest TCP port or
+  open a new long-lived connection. Reusing is simpler if the
+  connection can be kept open across spawns; otherwise a new
+  dedicated port (e.g. `base + offset`) per pair.
+- Update `metak-shared/api-contracts/runner-coordination.md` with
+  the new message + the cadence.
+
+#### Tests
+
+- Unit: serialization roundtrip.
+- Integration: two runner subprocesses; one's tracker becomes visible
+  to the other within `2 * interval` seconds.
+
+#### Acceptance criteria
+
+- [ ] `ProgressUpdate` message defined + serialized.
+- [ ] Cross-runner exchange implemented over TCP per peer pair.
+- [ ] Each runner has a `RemoteProgressView { peer -> spawn -> snapshot }`.
+- [ ] Contract updated.
+- [ ] Tests pass.
+
+---
+
+### T15.4: runner -- phase-aware termination state machine
+
+**Repo**: `runner/`.
+**Status**: pending. Depends on T15.2 + T15.3.
+
+#### Scope
+
+- Replace the current per-spawn wall-clock timeout as the PRIMARY
+  termination signal with phase-aware activity detection. Keep a
+  high `max_spawn_secs` (default 300) as a fallback safety net.
+- Per-spawn state machine driven by `LocalProgressTracker` +
+  `RemoteProgressView`:
+  - **`stabilize`**: variant transitions naturally after
+    `stabilize_secs` (its own clock); runner just observes.
+  - **`operate`**: when local AND every remote runner reports its
+    variant's `(sent, received)` counters have not advanced for
+    `operate_idle_secs` (default 5), runner notes "operate done
+    locally". When ALL runners agree (via T15.3's coord exchange),
+    the runner does not need to do anything explicit -- the variant
+    is independently observing the same idle condition (T15.5) and
+    will transition itself.
+  - **`silent`**: short drain; variant transitions to `done`
+    naturally.
+  - **`done`**: variant exits.
+  - At any phase: if `max_spawn_secs` elapses without `done`, kill
+    the child (existing behaviour, just a fallback).
+- New CLI / config args: `operate_idle_secs` (default 5),
+  `max_spawn_secs` (default 300), `progress_stdout_interval_ms`
+  (default 1000, passed through to the variant).
+
+#### Tests
+
+- Unit: state-machine transitions given synthetic progress streams.
+- Unit: safety net kills the spawn after `max_spawn_secs`.
+- Unit: `operate_idle_secs` actually fires when idle.
+- Integration: two-runner localhost run shows activity-based
+  termination of variant-dummy with no wall-clock timeout fires.
+
+#### Acceptance criteria
+
+- [ ] State machine implemented per scope.
+- [ ] Tests pass.
+- [ ] Existing `default_timeout_secs` remains as the
+      `max_spawn_secs` fallback (with the new name or kept as alias).
+
+---
+
+### T15.5: variant-base -- variant-side idle detection + JSONL eot_sent emission
+
+**Repo**: `variant-base/`.
+**Status**: pending. Depends on T15.1.
+
+#### Scope
+
+- In the protocol driver's operate phase, observe the variant's own
+  `sent` and `received` counters. When both have not advanced for
+  `operate_idle_secs` (default 5; same as runner's), emit
+  `eot_sent` to the JSONL log (the marker analysis needs) and
+  transition internally to `silent` phase.
+- Progress stdout emission continues; `eot_sent` flips to `true` on
+  the next progress event after the transition.
+- `eot_received` flag: simplified. Variant doesn't need to know
+  whether peers have stopped -- the runner observes that and
+  terminates the spawn naturally. Variant can set `eot_received`
+  optimistically once its OWN `eot_sent` fires (the runner is the
+  authoritative observer of cross-peer agreement).
+- No on-wire EOT exchange. The transport carries data only.
+- Reuse of the existing `eot_sent` JSONL event type for backwards
+  compatibility with analysis (T11.5 / T14.17).
+
+#### Tests
+
+- Unit: stub variant whose received counter idles for >5s in
+  operate; assert `eot_sent` event emitted to logger and phase
+  transitions to silent.
+- Unit: variant whose received counter keeps incrementing; assert
+  NO premature `eot_sent`.
+- Integration: variant-dummy lifecycle exits cleanly via
+  idle-detection path, no on-wire EOT involved.
+
+#### Acceptance criteria
+
+- [ ] Variant-side idle detection implemented.
+- [ ] `eot_sent` JSONL event emitted on idle transition.
+- [ ] Phase transitions to `silent` on idle.
+- [ ] No on-wire EOT messages sent (variants stop calling
+      `signal_end_of_test` / `wait_for_peer_eots` -- the methods
+      may remain on the trait until T15.8 cleanup; default impls
+      become no-op).
+
+---
+
+### T15.6: analysis -- adapt T11.5 + T14.17 to the new architecture
+
+**Repo**: `analysis/`.
+**Status**: pending. Depends on T15.5 (variants must emit `eot_sent`
+to JSONL on idle for analysis to keep working).
+
+#### Scope
+
+- T11.5 receive-headline pivot: already uses `eot_sent.ts` to bound
+  the operate window. With T15.5 the variant still emits `eot_sent`
+  on its own idle transition, so this keeps working unchanged.
+- T14.17 timeout classifier: most current classifications (`eot_lost`,
+  `eot_timeout_internal`, `deadlock` via JSONL truncation) become
+  rare or impossible because the runner terminates spawns cleanly via
+  T15.4. Add a new classification `runner_idle_terminated` for the
+  common clean-exit case in the new architecture.
+- Keep all existing classifications -- they're still useful for
+  pre-E15 datasets and for the rare safety-net `max_spawn_secs`
+  kill in the new architecture.
+- Add a small test on a synthetic dataset matching the new
+  JSONL shape (idle-detection emitted eot_sent, no eot_received
+  from peer).
+
+#### Acceptance criteria
+
+- [ ] `runner_idle_terminated` classification added with rule:
+      writer's JSONL has `eot_sent`, peer's JSONL has matching
+      `eot_received` or its own `eot_sent`, both exit cleanly.
+- [ ] Synthetic-fixture tests pass.
+- [ ] Existing classifications still work on pre-E15 datasets
+      (backwards compat).
+
+---
+
+### T15.7: contracts -- variant-cli, runner-coord, jsonl-log-schema, architecture
+
+**Repo**: `metak-shared/`.
+**Status**: pending. Should land alongside T15.1 - T15.5 as those
+implementations stabilise.
+
+#### Scope
+
+- `metak-shared/api-contracts/variant-cli.md`:
+  - Document `--progress-stdout-interval-ms` arg.
+  - Document the stdout JSON schema.
+- `metak-shared/api-contracts/runner-coordination.md`:
+  - Document the new `ProgressUpdate` message + cadence.
+- `metak-shared/api-contracts/jsonl-log-schema.md`:
+  - Clarify that `eot_sent` is now emitted by the variant on its
+    own idle detection (not via on-wire EOT exchange).
+- `metak-shared/architecture.md`:
+  - Retract the "No IPC between runner and variant" sentence.
+  - Update the data-flow section to note that the runner reads
+    one-way progress events from the variant's stdout.
+  - Rationale update: one-way variant->runner stdout is
+    observational only; the runner does NOT direct the variant.
+
+#### Acceptance criteria
+
+- [ ] All four contract docs updated.
+- [ ] Changes are consistent with the implementation that landed
+      in T15.1-T15.5.
+
+---
+
+### T15.8: cleanup -- remove EOT control channels + on-wire EOT after E15 stabilises
+
+**Repo**: `variant-base/`, all `variants/*/`, plus contract retractions
+in `metak-shared/api-contracts/eot-protocol.md` (mark historical).
+**Status**: pending. **DEFERRED until T15.1 - T15.7 land and prove
+stable in the stress fixture.** Do NOT start until orchestrator
+greenlights.
+
+#### Scope
+
+- Remove `signal_end_of_test` / `wait_for_peer_eots` from the
+  `Variant` trait (and from all six variants' implementations).
+- Remove the per-variant TCP control connections introduced by:
+  - **T14.18** (custom-udp's `controltcp.rs`, hybrid's `controltcp.rs`).
+  - T14.20 was cancelled before landing so no code to remove.
+- Remove `--control-base-port` CLI arg from custom-udp + hybrid.
+- Remove `--eot-timeout-secs` CLI arg from variant-base.
+- Mark `eot-protocol.md` "Control side-channel (T14.18)" section as
+  historical.
+- Remove or simplify the per-variant CUSTOM.md "Threading modes"
+  EOT-routing subsections.
+
+#### Acceptance criteria
+
+- [ ] Trait surface cleaned.
+- [ ] Control TCP connections removed.
+- [ ] CLI args removed.
+- [ ] Contract docs updated (historical markers).
+- [ ] All tests pass after removal.
+- [ ] Stress fixture re-run confirms no regression.
+
+#### Out of scope
+
+- Anything outside the "remove now-redundant code" theme. New
+  features go in their own tasks.
+
+---
+
+### T15.9: test adaptation -- existing tests under the new architecture
+
+**Repo**: cross-cutting.
+**Status**: pending. Should be incremental as T15.1-T15.5 land.
+
+#### Scope
+
+- Audit existing integration tests across `runner/`, `variant-base/`,
+  and `variants/*/` for any that assume:
+  - On-wire EOT exchange happens (some tests may assert EOT marker
+    is observed by the receiver via the transport).
+  - Per-spawn wall-clock timeout fires under specific conditions.
+  - Variant control TCP connection is established at connect time.
+- Update each affected test to either:
+  - Assert the equivalent E15-architecture state (progress events
+    received; runner-coord agreement reached; idle detection fires).
+  - Or be removed if it tested behaviour that no longer exists.
+- New tests required at the state-machine level (T15.4) -- those
+  are filed inside T15.4 itself.
+
+#### Acceptance criteria
+
+- [ ] Workspace tests pass post-E15.
+- [ ] No test is silently skipped or muted to accommodate the new
+      architecture.
+- [ ] Test inventory documented in STATUS.md (which tests were
+      updated vs removed).
+
+---
+

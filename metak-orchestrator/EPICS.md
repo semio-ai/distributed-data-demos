@@ -844,3 +844,216 @@ from a sidecar.
 Out of scope for E14: the router-spawning mechanism, the RPC protocol
 between client and router, and any analysis-side changes to report
 router resource usage separately from variant resource usage.
+
+---
+
+## E15: Stdout Progress + Runner-Coordinated Termination
+
+**Repos**: `variant-base/`, `runner/`, every concrete variant
+(`variants/*/`), `analysis/`. Plus contract changes to
+`metak-shared/api-contracts/variant-cli.md`,
+`metak-shared/api-contracts/jsonl-log-schema.md`,
+`metak-shared/api-contracts/runner-coordination.md`,
+`metak-shared/architecture.md`.
+
+**Status**: filed 2026-05-12 by orchestrator after the user's
+architectural feedback on the recurring resume / EOT / asymmetric-
+timeout failure modes that E14 closed reactively. E15 is the
+proactive simplification.
+
+### Motivation
+
+E14 fixed many specific failures (T14.13 QUIC ordering; T14.16
+Data/Lifecycle channel split; T14.17 timeout classifier; T14.18 EOT
+TCP control channel for UDP-family; T14.19 SO_SNDTIMEO for TCP
+single-mode; T14.22 startup retry; T14.23 resume manifest classifier;
+T14.24 resume_manifest TCP barrier). Most of these existed to work
+around a single core architectural choice: **EOT is signaled by the
+variant over the data transport (or a side-channel parallel to it),
+and the runner times out the spawn on a wall-clock budget**.
+
+User observation (2026-05-12): this architecture has accumulated more
+complexity than the underlying problem warrants. There is a simpler
+model:
+
+1. The **variant** emits a one-line-per-second JSON progress event to
+   stdout: `{"event":"progress","ts":...,"phase":"operate","sent":N,
+   "received":M,"eot_sent":bool,"eot_received":bool}`. It still writes
+   its full JSONL event log to disk (unchanged). It still writes
+   `eot_sent` to the JSONL when applicable (analysis needs the marker
+   to bound the operate window).
+2. The **runner** reads the child's stdout line-by-line, parses the
+   progress events, tracks per-spawn state.
+3. The **two (or N) runners** coordinate over their existing
+   runner-runner channel to exchange per-runner aggregate progress
+   every ~1 second. Each runner knows the OTHER runner's variant's
+   progress.
+4. Termination decision is **activity-based + phase-aware**:
+   - Stabilize phase: silence is expected; only the phase clock
+     advances spawn state.
+   - Operate phase: when EVERY runner reports its variant has been
+     idle (no new sends AND no new receives) for >= 5 seconds, all
+     runners agree the operate phase is naturally done.
+   - Silent phase: short drain window before disconnect, same as
+     today.
+5. Per-spawn wall-clock timeout disappears as the primary control
+   signal. It remains as a fallback safety net (e.g. an absolute
+   max of `max_spawn_secs = 5 minutes` per spawn) only.
+
+### What this unifies and removes
+
+After E15 lands, the following becomes redundant and can be removed
+or simplified:
+
+- **T14.18** (custom-udp + hybrid TCP control side-channel for EOT):
+  the data transport no longer carries EOT; the runner-coord channel
+  does. Variants no longer need the dedicated TCP control connection.
+- **T14.20** (websocket TCP control side-channel for EOT, in flight
+  but cancelled in favour of E15): the same logic. Never lands.
+- **The per-variant EOT trait surface** (`signal_end_of_test`,
+  `wait_for_peer_eots`, `eot_timeout_internal` classification path in
+  T14.17): unwound because the variant doesn't run an EOT phase any
+  more. The variant's JSONL still emits an `eot_sent` event when the
+  WRITER finishes its operate window (i.e. when it observes its own
+  idle condition), so analysis (T11.5) keeps the marker. But the
+  on-wire EOT exchange is gone.
+- Most of the **runner's wall-clock-timeout machinery** for the
+  per-spawn case: the runner still kills a spawn that exceeds the
+  hard safety budget, but the common case is activity-driven
+  termination.
+- Various per-variant CUSTOM.md sections documenting EOT routing
+  (T14.18, T14.20 historical notes).
+
+### Scaling notes
+
+N>2 runners scale naturally: each runner publishes its aggregate
+progress; each runner consumes every peer runner's progress. The
+"all idle for 5s" predicate generalises trivially. Wait times can
+scale with N (e.g. `idle_threshold_secs = 5 + N * 0.5`) if
+benchmark variance grows with peer count -- experiment when needed.
+No per-peer breakdown needed at the variant level; per-peer analysis
+is downstream (T11.5 already does it from JSONL `writer` fields).
+
+### Scope (T15.x sub-tasks)
+
+- **T15.1** -- `variant-base`: progress emission to stdout. New CLI
+  arg `--progress-stdout-interval-ms` (default 1000; 0 disables for
+  back-compat). Stable JSON schema. Atomic line writes (one
+  `println!` per event). Phase-aware: `phase` field reflects current
+  protocol-driver phase (`connect | stabilize | operate | eot |
+  silent | done`). Counters (`sent`, `received`) are monotonic
+  per-spawn aggregates across all peers; per-peer breakdown stays
+  in JSONL only.
+- **T15.2** -- `runner`: read each child's stdout line-by-line.
+  Parse progress events. Maintain per-spawn `LocalProgressTracker`
+  with `last_sent_change_ts`, `last_received_change_ts`, `phase`,
+  raw counter snapshots. Existing T-impl.1 stderr capture path
+  stays; stdout becomes a parallel stream.
+- **T15.3** -- `runner-coord`: extend the runner-runner channel to
+  exchange `RemoteProgressSnapshot` every ~1 second per active
+  spawn. Use the same TCP-per-peer transport that T14.24 introduced
+  for resume_manifest (reliable, large-payload friendly). New
+  protocol message `ProgressUpdate { runner, spawn, ts, phase,
+  sent, received, eot_sent, eot_received }`. Reuse port from T14.24
+  if convenient; otherwise its own offset.
+- **T15.4** -- `runner`: phase-aware termination state machine.
+  - During `stabilize`: spawn termination is driven by
+    `stabilize_secs` elapsing on the variant's side (it transitions
+    to operate naturally via its existing phase logic and the
+    runner just observes via progress events).
+  - During `operate`: when local AND every remote runner reports
+    its variant's `(sent, received)` counters have not advanced for
+    >= `operate_idle_secs` (default 5), the runner notes "operate
+    done locally". When all runners have noted "operate done", they
+    agree (via the coord channel) and the next progress tick will
+    show the variant having advanced its own phase to `silent` via
+    its own phase logic. The runner does NOT push state TO the
+    variant -- the variant's protocol driver advances its own
+    phase via the same mechanism it uses today (just earlier, when
+    its own idle-detection fires; see T15.5).
+  - During `silent`: `silent_secs` elapses, variant exits, runner
+    collects exit code as today.
+  - Safety net: per-spawn `max_spawn_secs` (default 300) -- if the
+    activity-based path doesn't fire after this absolute deadline,
+    runner kills the child as today. Should rarely fire.
+- **T15.5** -- `variant-base`: variant-side idle detection. Same
+  threshold logic as the runner uses, but observed locally inside
+  the variant's protocol driver: when both local `sent` and
+  `received` counters haven't moved for `operate_idle_secs`,
+  variant emits `eot_sent` to its JSONL (the marker analysis needs)
+  and transitions internally to `silent` phase. No on-wire EOT
+  exchange. Progress events emitted from `silent` then `done` so
+  the runner sees the transitions.
+- **T15.6** -- `analysis`: integrate the new state. The T11.5
+  receive-headline pivot already uses `eot_sent.ts` to bound the
+  operate window. That continues to work because variants keep
+  emitting `eot_sent` to JSONL. T14.17 classifications adapt:
+  `eot_timeout_internal` and `eot_lost` become much rarer (only the
+  `max_spawn_secs` safety-net case). New classification:
+  `runner_idle_terminated` (clean exit by activity detection).
+- **T15.7** -- contract updates: `variant-cli.md` documents
+  `--progress-stdout-interval-ms` and the stdout JSON schema.
+  `runner-coordination.md` documents the new `ProgressUpdate` message
+  and the cross-runner idle-agreement protocol. `architecture.md`
+  retracts the "No IPC between runner and variant" sentence; the
+  rationale is updated: one-way stdout from variant to runner is
+  observational, not directive, so the original "runner must not
+  interfere with measurements" principle is preserved.
+- **T15.8** -- cleanup (DEFERRED until T15.1-7 are stable):
+  - Remove `signal_end_of_test` / `wait_for_peer_eots` from the
+    `Variant` trait. Each variant's implementation removed.
+  - Remove the per-variant control TCP connections (T14.18 in
+    custom-udp + hybrid; T14.20 was cancelled before landing).
+  - Remove `--eot-timeout-secs` arg (no on-wire EOT phase to time
+    out anymore).
+  - Update each variant's `CUSTOM.md` to retract the EOT-routing
+    sections.
+  - Remove `eot_timeout_internal` classification path in T14.17 if
+    it has no real triggers left.
+- **T15.9** -- test adaptation: existing variant integration tests,
+  runner integration tests, and the T11.5 / T14.17 analysis tests
+  must be updated to the new architecture. **Unit-test coverage of
+  the new state machine** (T15.4 + T15.5) is mandatory; each new
+  T15.x task ships its own unit tests.
+
+### Out of scope
+
+- Runtime tuning of `operate_idle_secs`, `max_spawn_secs` beyond
+  reasonable defaults. Tune later if real workloads demand.
+- Changing what the variant emits to JSONL (other than removing the
+  on-wire EOT events that no longer exist). Analysis stays compatible.
+- Killing the existing E14 follow-ups that are deferred separately
+  (T14.9 Zenoh router-RPC stays deferred; the new architecture
+  doesn't require it but doesn't preclude it either).
+- WebRTC / Zenoh internal threading. E15 doesn't ask the variants to
+  change their threading mode; it just changes what the runner
+  observes and how it decides termination.
+
+### Acceptance gates
+
+- Existing stress smoke `configs/two-runner-stress-e14.toml` runs
+  end-to-end without per-spawn wall-clock timeouts firing. Every
+  spawn either reaches activity-based termination cleanly or hits
+  the safety-net `max_spawn_secs` (which should be rare).
+- Zenoh asymmetric timeouts no longer manifest as `eot_timeout_internal`
+  or `eot_lost` -- they manifest only as `runner_idle_terminated` or
+  the safety-net kill, both of which are clean classifications.
+- WebSocket Single mode at high rate classifies `runner_idle_terminated`
+  instead of `eot_timeout_internal` (closes the T14.20 motivation
+  permanently).
+- Analysis re-runs on existing datasets produce identical numerical
+  output (modulo the new classification labels).
+- Each new T15.x task ships unit tests; the runner gains state-machine
+  tests for the phase-aware idle detector.
+
+### Dependencies
+
+- E1 (Variant trait + protocol driver): touched.
+- E2 (runner): touched.
+- E3a/b/d/e/f/g (all six active variants): touched lightly (the
+  variant trait gains a per-variant idle-detection hook, but each
+  variant's transport code is unchanged).
+- E11 (analysis): touched lightly at T11.5 / T14.17.
+- T14.18, T14.20: invalidated. T14.20 cancelled in favour of E15;
+  T14.18 stays landed but its code is targeted for removal in T15.8.
+
