@@ -8919,3 +8919,64 @@ bb9af36 configs: wire --control-base-port into hybrid + repro fixtures (T14.18)
 - The `done_barrier_hang_repro_when_peer_already_advanced` runner
   test is a pre-existing flake under workspace-parallel execution
   unrelated to this change (passes in isolation).
+
+---
+
+## 2026-05-12 — Post-T14.18 E14 smoke (orchestrator): complete cross-variant integration
+
+After T14.13 (QUIC ordering) + T14.16 (Data/Lifecycle channel split) +
+T14.17 (timeout classification) + T14.18 (EOT TCP side-channel) all
+landed, ran `configs/two-runner-smoke-e14.toml` end-to-end with all
+fixes integrated. **Every spawn completed `status=success`.**
+
+### Cross-variant performance at 10K msg/s qos 4 (T11.5 + T14.17 output)
+
+```
+Variant      Mode     Receives/s  Delivery   Lat p50      Lat p99       Timeout
+custom-udp   multi    19,973      99.91%     4.87 ms      10.83 ms      completed
+custom-udp   single      126.2     1.00%     7,002 ms     11,915 ms     completed (acceptable -- intentional UDP saturation)
+hybrid       multi    19,957      99.91%     1.15 ms      10.30 ms      completed
+hybrid       single      125.9     1.00%     5,473 ms     11,736 ms     completed (same UDP saturation behaviour)
+quic         multi    20,001      100.00%    0.61 ms      11.49 ms      completed   (T14.13 ordering verified: 0 out-of-order)
+webrtc       multi    19,999      99.91%     0.82 ms      11.54 ms      completed
+websocket    multi    20,014      100.00%    < 0.01 ms    0.14 ms       completed   (log-from-reader; near-zero latency)
+websocket    single   14,247      99.90%     1.05 ms      12.54 ms      completed
+zenoh        multi    39,989*     199.91%*   0.91 ms      19.68 ms      completed   (* = multicast loopback artifact, not a real number)
+```
+
+### What this validates
+
+- **T14.13**: QUIC qos 4 reliable-stream out-of-order count is 0 / 0
+  (was 41,911 / 41,471 pre-fix).
+- **T14.16**: custom-udp + hybrid Multi mode reach `eot_sent`/`eot_received`
+  even when Data channel saturates (zero saturation in this smoke since
+  rate is moderate, but architecturally the EOT path is no longer at risk).
+- **T14.17**: every row classifies `completed`; no FAIL flags except the
+  expected `[late_tail_present]` on websocket Multi from log-from-reader.
+- **T14.18**: zero `eot_lost` classifications anywhere. The previously
+  failing UDP qos1-3 Single-mode cases no longer time out on EOT. Even
+  catastrophic Single-mode UDP delivery (1% throughput due to kernel
+  buffer overflow) completes cleanly via the TCP side-channel.
+
+### The architectural story is now coherent
+
+- **Multi mode** = high throughput, low latency, full delivery. Every
+  variant ~20K rcv/s at the target rate. Latency varies by transport
+  but all under 20 ms p99 in this smoke.
+- **Single mode** = strict single-threaded data path (WASM-friendly).
+  TCP-based variants (websocket) sustain near-target throughput. UDP-
+  based variants (custom-udp, hybrid) crater under symmetric load --
+  the kernel UDP buffer fills faster than inline `poll_receive` can
+  drain -- but they complete cleanly via the T14.18 control channel
+  and the variant logs every receive that actually made it through
+  the kernel (the user's "log everything with bad latency" intent).
+
+The two regimes are honestly characterised. Operators picking a
+transport for a WASM-targeted single-threaded host now have measurable
+trade-offs to consider rather than guesses.
+
+### Logs
+
+`logs/smoke-e14-20260512_120517/` (or latest smoke-e14-* dir).
+`configs/two-runner-smoke-e14.toml` updated with `control_base_port`
+fields per T14.18.
