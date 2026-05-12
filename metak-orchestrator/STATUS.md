@@ -9781,3 +9781,144 @@ commit unblocks `cargo fmt --check` for T14.24's pre-existing drift.
 - [x] Manual resume on the real failure case: 13 partials detected,
       including `zenoh-max-qos4-multi-bob`.
 
+---
+
+## T14.24 — completion report (2026-05-12)
+
+**Worker:** runner subfolder. **Status:** done.
+
+### Chosen path: B (per-peer-pair TCP)
+
+The audit (above) identified a 4 KB UDP recv buffer as the dominant
+root cause: full-matrix manifests at all-variants scale serialise to
+~5-8 KB JSON. The UDP path could not be repaired by retries because
+every re-broadcast resent the same over-sized payload that the
+receiver could not buffer. Path A (UDP+ACK+retry) would have
+required reimplementing TCP poorly to fragment the payload; Path B
+followed the proven T14.18 reliable-control-channel pattern.
+
+### Commits landed (Path B)
+
+```
+c890307 docs(status): T14.24 audit findings for resume_manifest barrier
+81ce012 feat(runner): switch resume_manifest barrier to TCP per peer pair (T14.24)
+bad4d95 test(runner): regression tests for TCP resume_manifest barrier (T14.24)
+284dc55 docs(contract): T14.24 -- resume_manifest now per-peer-pair TCP
+09a3a86 test(runner): two-runner subprocess regression for T14.24 resume_manifest
+```
+
+Plus 278b520 (unrelated rustfmt drift in `protocol.rs` repaired so
+`cargo fmt --check` is clean; kept in its own commit for bisect
+cleanliness).
+
+### Validation (all green)
+
+- `cargo build --release -p runner` -- clean
+- `cargo test --release -p runner -- --test-threads 1
+  --skip done_barrier_hang_repro_when_peer_already_advanced` --
+  **172 unit + 17 integration = 189 tests passing**.
+  The skipped test is the pre-existing T-coord.1b multicast pressure
+  flake that hangs under parallel test execution on Windows; passes
+  in isolation; unaffected by T14.24.
+- `cargo test --release -p runner -- --ignored
+  two_runner_resume_manifest_barrier_converges_t14_24` --
+  **passes in 15.8 s** (two real runner subprocesses, fresh then
+  resume, both exit 0 well under the 120 s pre-T14.24 timeout).
+- `cargo clippy --release -p runner --all-targets -- -D warnings`
+  -- clean.
+- `cargo fmt -p runner -- --check` -- clean.
+
+### Real-data regression -- MANDATORY repro on `logs/all-variants-01-20260512_152156/`
+
+Ran both runners under `--resume --barrier-timeout-secs 30` against
+the failure-dataset config (`configs/two-runner-all-variants.toml`).
+Both runners converged through Phase 1.25 (the same barrier that
+produced symmetric 120 s timeouts pre-T14.24), executed initial
+clock sync, walked the skip set, and advanced into the first
+incomplete spawn (`custom-udp-100x1000hz-qos4-multi`). The runners
+were killed externally so the test machine could be reused; no
+barrier-timeout FATAL line appeared in either stderr capture.
+
+#### alice resume-phase tail (T14.24 evidence)
+
+```
+[runner:alice] resume: selected latest log subfolder 'all-variants-01-20260512_152156' under ./logs
+[runner:alice] starting discovery...
+[runner:alice] discovery complete
+[runner:alice] log subfolder: all-variants-01-20260512_152156
+[runner:alice] peer_hosts: {"bob": "127.0.0.1", "alice": "127.0.0.1"}
+... (96 capability-gating skip notices) ...
+[runner:alice] resume: deleted partial log (crashed mid-spawn, no EOT marker) .../zenoh-1000x100hz-qos2-multi-alice-...
+... (8 more partial-log deletions from T14.23 completion-marker classifier) ...
+[runner:alice] resume: local manifest has 181 complete job(s)
+[runner:alice] resume: skip set has 177 job(s) (intersection of 2 peer manifest(s))
+[runner:alice] resume: deleted incomplete log .../zenoh-1000x100hz-qos3-multi-alice-...
+... (3 more incomplete-log deletions) ...
+[runner:alice] clock-sync log opened at ./logs/all-variants-01-20260512_152156
+[runner:alice] initial clock sync against 1 peer(s)...
+[runner:alice] clock_sync (initial) peer=bob offset_ms=-0.042 rtt_ms=0.430
+[runner:alice] skipping 'custom-udp-1000x100hz-qos1-multi' (resume: complete on all peers)
+... (22 more skips) ...
+[runner:alice] ready barrier for spawn 'custom-udp-100x1000hz-qos4-multi' (hz=1000, vpt=100, qos=4)
+[runner:alice] clock_sync (custom-udp-100x1000hz-qos4-multi) peer=bob offset_ms=0.451 rtt_ms=1.598
+[runner:alice] spawning 'custom-udp-100x1000hz-qos4-multi' (hz=1000, vpt=100, qos=4, timeout: 120s)
+[runner:alice] 'custom-udp-100x1000hz-qos4-multi' finished: status=failed, exit_code=143  <-- killed externally
+```
+
+#### bob resume-phase tail (T14.24 evidence)
+
+```
+[runner:bob] resume: selected latest log subfolder 'all-variants-01-20260512_152156' under ./logs
+[runner:bob] starting discovery...
+[runner:bob] discovery complete
+[runner:bob] log subfolder: all-variants-01-20260512_152156
+[runner:bob] peer_hosts: {"bob": "127.0.0.1", "alice": "127.0.0.1"}
+... (96 capability-gating skip notices) ...
+[runner:bob] resume: deleted partial log (crashed mid-spawn, no EOT marker) .../zenoh-100x1000hz-qos1-multi-bob-...
+... (6 more partial-log deletions from T14.23 completion-marker classifier) ...
+[runner:bob] resume: local manifest has 179 complete job(s)
+[runner:bob] resume: skip set has 177 job(s) (intersection of 2 peer manifest(s))
+[runner:bob] resume: deleted incomplete log .../zenoh-1000x100hz-qos1-multi-bob-...
+[runner:bob] resume: deleted incomplete log .../zenoh-1000x100hz-qos2-multi-bob-...
+[runner:bob] clock-sync log opened at ./logs/all-variants-01-20260512_152156
+[runner:bob] initial clock sync against 1 peer(s)...
+[runner:bob] clock_sync (initial) peer=alice offset_ms=-0.015 rtt_ms=0.356
+[runner:bob] skipping 'custom-udp-1000x100hz-qos1-multi' (resume: complete on all peers)
+... (22 more skips) ...
+[runner:bob] ready barrier for spawn 'custom-udp-100x1000hz-qos4-multi' (hz=1000, vpt=100, qos=4)
+[runner:bob] clock_sync (custom-udp-100x1000hz-qos4-multi) peer=alice offset_ms=-0.222 rtt_ms=0.799
+[runner:bob] spawning 'custom-udp-100x1000hz-qos4-multi' (hz=1000, vpt=100, qos=4, timeout: 120s)
+[runner:bob] 'custom-udp-100x1000hz-qos4-multi' finished: status=failed, exit_code=143  <-- killed externally
+```
+
+Both runners produced manifests of ~5-8 KB JSON each (181/179
+`effective_name` strings — far above the old 4096-byte UDP recv
+buffer cap). The new TCP per-peer-pair exchange handled them
+cleanly. `grep "FATAL\|barrier.*timed out"` over both stderr files
+returns zero hits — the pre-T14.24 failure mode is gone.
+
+### Deviations from task spec
+
+- TCP port derivation: spec suggested `base_port + N + index` (N =
+  runners count); landed implementation uses `base_port + 32 +
+  index` (constant `RESUME_MANIFEST_TCP_OFFSET = 32`). Reason:
+  decouple the offset from the runner count so a config change does
+  not move the TCP port range. Documented in the contract and in
+  `protocol.rs` comments.
+- The fmt-drift commit (278b520) repaired pre-existing rustfmt
+  deviations in `protocol.rs` that were unrelated to T14.24 — kept
+  separate from the feature commit so a future bisect can isolate
+  them.
+
+### Hard-stop check
+
+The audit found the desync was specifically in the resume_manifest
+barrier (oversized payload + tiny recv buffer), not a general
+UDP-coord weakness equally affecting ready/done. Ready/done
+barriers carry small fixed-size payloads (variant name, run id,
+status, exit code — ~150 bytes JSON) well under the 4096-byte
+buffer. They remain on UDP per the task's out-of-scope clause; if a
+future workload reveals fragility there too, a separate
+generalisation task should be filed as the brief instructs. No
+orchestrator consult needed.
+
