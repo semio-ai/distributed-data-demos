@@ -31,6 +31,7 @@ binary = "target/release/variant-custom-udp.exe"
   multicast_group = "239.0.0.1:19601"
   buffer_size = 65536
   tcp_base_port = 19610
+  control_base_port = 19720
 
 # ─── Hybrid UDP/TCP ──────────────────────────────────────────────────────────
 
@@ -50,6 +51,7 @@ binary = "target/release/variant-hybrid.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19603"
   tcp_base_port = 19640
+  control_base_port = 19740
 
 # ─── WebSocket ───────────────────────────────────────────────────────────────
 
