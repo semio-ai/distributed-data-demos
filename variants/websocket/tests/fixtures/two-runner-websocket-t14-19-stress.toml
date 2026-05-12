@@ -1,0 +1,40 @@
+# T14.19 regression fixture: high-rate symmetric WebSocket qos4 in
+# Single mode at the workload that previously deadlocked websocket
+# Single (1000 vpt x 100 Hz = 100K msg/s symmetric).
+#
+# Pre-T14.19: both runners wedged inside tungstenite's blocking
+# `write` on the qos4 stream because neither could call `poll_receive`
+# between writes to drain the peer's recv buffer; runner killed by
+# `default_timeout_secs`.
+#
+# Post-T14.19: `SO_SNDTIMEO = 5 s` on outbound TCP in Single mode
+# turns the wedge into a typed `TimedOut` error -> peer dropped ->
+# publish loop continues -> operate phase exits naturally -> EOT
+# phase logs `eot_timeout` (websocket has no separate control
+# channel; once the data peer is dropped the EOT cannot route) ->
+# silent phase passes -> spawn exits with status=success.
+#
+# Delivery is expected to be near zero; we ONLY assert `success`.
+
+run = "websocket-t14-19"
+runners = ["alice", "bob"]
+default_timeout_secs = 30
+
+[[variant]]
+name = "websocket-t14-19-stress"
+supported_modes = ["single"]
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 8
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 4
+  log_dir = "./logs"
+  threading_modes = ["single"]
+
+  [variant.specific]
+  ws_base_port = 19970

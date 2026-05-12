@@ -71,6 +71,37 @@ use crate::protocol::{self, Frame};
 /// flight.
 const READ_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 
+/// T14.19: write-side timeout for Single-mode outbound WebSocket
+/// streams. At catastrophic symmetric load (100K msg/s) Single mode
+/// can wedge: both peers spend the publish phase inside tungstenite's
+/// blocking `write` while neither calls `poll_receive` to drain the
+/// kernel recv buffer, and the kernel TCP send buffers fill on both
+/// sides. Without a write timeout the variant deadlocks until the
+/// runner kills it.
+///
+/// Installing `SO_SNDTIMEO` here turns the wedge into a typed
+/// `TimedOut` (Windows) / `WouldBlock` (Unix) error wrapped in
+/// `tungstenite::Error::Io`. `broadcast_binary` already drops the
+/// offending peer on any write error (mirrors hybrid's per-peer
+/// fault-tolerance rule). With the peer gone, the operate phase
+/// exits its publish loop naturally, and the spawn completes with
+/// `status=success`. Delivery is near zero -- the user's "log
+/// everything with bad latency" intent accepts this; T14.17's
+/// classifier marks the spawn 'completed'.
+///
+/// Applied to Single mode only. Multi mode runs a per-peer reader
+/// thread that drains in parallel with the publisher; the wedge
+/// does not occur and `SO_SNDTIMEO` would only invite spurious
+/// peer-drops under transient back-pressure. The `start_reader_threads`
+/// path explicitly clears the timeout on the write clone (see
+/// `set_write_timeout(None)` in `start_reader_threads`) to keep Multi
+/// mode's contract unchanged.
+///
+/// 5 s is far longer than any realistic transient on a healthy LAN
+/// (TCP_NODELAY + 4 MiB recv buffers); a timeout firing means the
+/// peer is genuinely stuck.
+const SINGLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Discovery / handshake timeout. If a peer never appears after this
 /// duration, `connect` fails loudly rather than deadlocking the whole spawn.
 const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -401,9 +432,23 @@ impl WebSocketVariant {
     /// Send a binary frame to every active peer. Drops a peer on a fatal
     /// write error; mirrors Hybrid TCP's broadcast behaviour. Routes to
     /// the mode-appropriate write path.
+    ///
+    /// **T14.19**: a write error -- including a `SO_SNDTIMEO`-driven
+    /// `TimedOut` / `WouldBlock` from the Single-mode write-timeout
+    /// installed by `apply_single_mode_write_timeout` -- drops the
+    /// offending peer with a single warning. After all peers have
+    /// been dropped (the "self.peers is empty" steady-state),
+    /// `broadcast_binary` returns `Ok(())` as a no-op: subsequent
+    /// `publish` / `signal_end_of_test` calls log a `write` /
+    /// attempt to send an EOT frame but emit no bytes. This is the
+    /// pattern that lets a wedged Single-mode spawn exit cleanly
+    /// (the driver's EOT phase will time out waiting for the peer's
+    /// EOT, log `eot_timeout`, and proceed to the silent phase).
+    /// Returning `Err` here would propagate up through `try_publish`
+    /// /// `signal_end_of_test` and fail the spawn even though both
+    /// runners had progressed past the wedge.
     fn broadcast_binary(&mut self, payload: Vec<u8>) -> Result<()> {
         let mut keep: Vec<bool> = Vec::with_capacity(self.peers.len());
-        let mut last_err: Option<anyhow::Error> = None;
 
         for peer in self.peers.iter_mut() {
             let result = match &mut peer.io {
@@ -445,7 +490,6 @@ impl WebSocketVariant {
                         peer.name, peer.addr, e
                     );
                     keep.push(false);
-                    last_err = Some(e);
                 }
             }
         }
@@ -459,11 +503,9 @@ impl WebSocketVariant {
             });
         }
 
-        if self.peers.is_empty() {
-            if let Some(e) = last_err {
-                return Err(e.context("all WS peers dropped after write errors"));
-            }
-        }
+        // T14.19: no longer fail when self.peers is empty -- see
+        // function docs. A wedged Single-mode spawn relies on this
+        // to exit cleanly via the EOT-timeout / silent-phase path.
         Ok(())
     }
 }
@@ -504,6 +546,30 @@ fn apply_recv_buffer_kb(stream: &TcpStream, recv_buffer_kb: u32, peer_addr: Sock
         Err(e) => {
             eprintln!("warning: SO_RCVBUF readback failed for {peer_addr}: {e}");
         }
+    }
+}
+
+/// T14.19: install `SO_SNDTIMEO = SINGLE_WRITE_TIMEOUT` on a
+/// post-handshake WebSocket TCP stream when running in Single mode.
+/// Multi mode leaves the write timeout unset (the reader thread
+/// drains in parallel and the wedge does not occur). Failure is
+/// logged but never fatal: a missing timeout reverts to the
+/// pre-T14.19 behaviour (potentially deadlock under extreme load)
+/// but does not break the spawn.
+fn apply_single_mode_write_timeout(
+    stream: &TcpStream,
+    threading_mode: ThreadingMode,
+    peer_addr: SocketAddr,
+) {
+    if threading_mode != ThreadingMode::Single {
+        return;
+    }
+    if let Err(e) = stream.set_write_timeout(Some(SINGLE_WRITE_TIMEOUT)) {
+        eprintln!(
+            "[variant-websocket] T14.19: set_write_timeout({:?}) failed for {peer_addr}: {e}; \
+             continuing without write-side timeout (Single mode may deadlock under extreme load)",
+            SINGLE_WRITE_TIMEOUT
+        );
     }
 }
 
@@ -816,6 +882,7 @@ impl Variant for WebSocketVariant {
             let ws = ws_client_connect(peer.addr)
                 .with_context(|| format!("failed WS client connect to {}", peer.addr))?;
             apply_recv_buffer_kb(ws.get_ref(), recv_buffer_kb, peer.addr);
+            apply_single_mode_write_timeout(ws.get_ref(), threading_mode, peer.addr);
             self.peers.push(WsPeer {
                 name: peer.name.clone(),
                 addr: peer.addr,
@@ -840,6 +907,7 @@ impl Variant for WebSocketVariant {
                             format!("WS server handshake failed for inbound {addr}")
                         })?;
                         apply_recv_buffer_kb(ws.get_ref(), recv_buffer_kb, addr);
+                        apply_single_mode_write_timeout(ws.get_ref(), threading_mode, addr);
                         let name = server_pairs
                             .iter()
                             .filter(|p| p.addr.ip() == addr.ip())
@@ -1321,6 +1389,92 @@ mod tests {
         );
         assert_eq!(v.reader_thread_count(), 0);
 
+        let _ = server_thread.join();
+    }
+
+    /// T14.19: a Single-mode peer whose write hits the installed
+    /// `SO_SNDTIMEO` is dropped from the active set, and subsequent
+    /// `broadcast_binary` calls return `Ok(())` as a no-op (rather
+    /// than the pre-T14.19 "all peers dropped after write errors"
+    /// `Err` that would have cascaded into a failed spawn).
+    #[test]
+    fn t14_19_broadcast_drops_peer_on_write_timeout_and_returns_ok() {
+        use socket2::SockRef;
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicU16;
+
+        static PORT: AtomicU16 = AtomicU16::new(30801);
+        let port = PORT.fetch_add(1, Ordering::SeqCst);
+        let listen_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let listener = TcpListener::bind(listen_addr).expect("bind ok");
+        listener.set_nonblocking(false).unwrap();
+
+        // Server thread: accept and upgrade, then go idle (never read
+        // anything off the socket). The variant under test fills the
+        // peer's recv buffer / its own send buffer and trips the
+        // SO_SNDTIMEO on subsequent writes.
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let ws = tungstenite::accept(stream).expect("server upgrade");
+            std::thread::sleep(Duration::from_secs(3));
+            drop(ws);
+        });
+
+        // Client: connect, upgrade, then shrink SO_SNDBUF and install
+        // a very short write timeout (100 ms — production uses 5 s;
+        // the test uses a short value for fast feedback).
+        let stream =
+            TcpStream::connect(listen_addr).expect("client connect to localhost test port");
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let url = format!("ws://{listen_addr}/bench");
+        let (ws, _resp) =
+            tungstenite::client::client(url.as_str(), stream).expect("client upgrade");
+        let s = ws.get_ref();
+        s.set_read_timeout(Some(READ_POLL_TIMEOUT)).unwrap();
+        s.set_write_timeout(Some(Duration::from_millis(100))).unwrap();
+        // Shrink the kernel send buffer so the wedge is reached
+        // quickly. The default ~64 KiB would need a lot of writes
+        // to fill.
+        let sock = SockRef::from(s);
+        sock.set_send_buffer_size(1024).unwrap();
+
+        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableTcp));
+        v.config.peers.push(PeerDesc {
+            name: "peer".to_string(),
+            addr: listen_addr,
+            role: PairRole::Client,
+        });
+        v.peers.push(WsPeer {
+            name: "peer".to_string(),
+            addr: listen_addr,
+            io: PeerIo::Single(ws),
+        });
+        v.threading_mode = ThreadingMode::Single;
+
+        // Hammer broadcast_binary with large payloads until the peer
+        // is dropped from the active set OR we exhaust a generous
+        // bound. Each call must return `Ok(())` regardless of whether
+        // the underlying tungstenite write timed out or succeeded.
+        let payload = vec![0xAAu8; 8192];
+        let mut iters = 0;
+        while !v.peers.is_empty() && iters < 2000 {
+            v.broadcast_binary(payload.clone())
+                .expect("T14.19: broadcast_binary must return Ok even when the peer is dropped");
+            iters += 1;
+        }
+        assert!(
+            v.peers.is_empty(),
+            "T14.19: peer should be dropped after SO_SNDTIMEO fires; iters={iters}"
+        );
+
+        // Subsequent broadcasts on an empty peer set must still be Ok.
+        v.broadcast_binary(payload.clone())
+            .expect("T14.19: broadcast_binary with empty peer set must return Ok");
+
+        // Tear the test server thread down.
         let _ = server_thread.join();
     }
 
