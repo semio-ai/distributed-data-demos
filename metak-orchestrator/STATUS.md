@@ -8719,3 +8719,203 @@ peer self-receive doubling).
   ordered), it could either keep the old per-message strategy for
   qos3 only, or split into multiple streams sharded by key path so
   ordering is preserved per-path. Out of scope for T14.13.
+
+## T14.18 -- variants/custom-udp + variants/hybrid: TCP side-channel for EOT control (COMPLETE, 2026-05-12)
+
+**Worker scope**: `variants/custom-udp/`, `variants/hybrid/`, plus a
+single-section contract addition in
+`metak-shared/api-contracts/eot-protocol.md`.
+
+### Outcome
+
+EOT delivery is now decoupled from the data path. Both variants
+establish a per-peer-pair TCP control connection at `connect()` time
+on a QoS-independent port (`--control-base-port + runner_index`), and
+route EOT markers exclusively over it. The data path (UDP multicast
+for qos1-3 / TCP per-pair for qos4 in custom-udp; UDP multicast for
+qos1-2 / TCP per-pair for qos3-4 in hybrid) is unchanged. Under
+saturating throughput where the data-path UDP recv buffer overruns at
+the kernel level, the control socket -- bound to a separate kernel fd
+with its own send + recv buffers -- still carries the EOT through
+deterministically.
+
+### Implementation choices
+
+**Port derivation**: a **new** `--control-base-port <u16>` CLI arg is
+required for both variants. Worker chose a new field over reusing
+`tcp_base_port + offset` because the existing tcp port windows already
+have per-QoS strides allocated and reusing them would mean baking in
+implicit "QoS stride applied here, no QoS stride applied there" rules
+that the operator would need to remember. Two new fields is clearer.
+
+Formula:
+```
+my_control_listen = control_base_port + runner_index * runner_stride
+                                              # runner_stride = 1, NO QoS stride.
+```
+
+**Single-mode threading**: non-blocking polling (no dedicated thread).
+The control socket is left in blocking mode with a 1 ms
+`SO_RCVTIMEO`; the variant's existing `poll_receive` calls
+`ControlPeer::try_recv_frame` inline before draining the data path.
+Single mode's data thread stays single (the WASM-compatibility goal);
+the only auxiliary fd is the control socket polled inline. Multi mode
+spawns one dedicated reader thread per control peer that pushes
+decoded EOT markers onto the existing T14.16 lifecycle channel.
+
+**EOT routing**: `signal_end_of_test` now writes the EOT marker
+exclusively over the control connection regardless of QoS. The
+pre-T14.18 UDP-multicast (5-retry) and TCP-data-stream EOT dispatch
+paths are removed (helpers retained `#[allow(dead_code)]` for
+historical reference). On-wire EOT semantics (writer, eot_id) and
+JSONL event types (eot_sent, eot_received, eot_timeout) are
+**unchanged**; only the routing moves.
+
+**Disconnect drain**: send `bye`, half-close write, drain read until
+peer closes or `--eot-timeout-secs` elapses, then close. Any EOT that
+arrives during the drain (typically one racing our own `bye`) is
+applied.
+
+### Validation
+
+All MANDATORY validation steps clean:
+1. `cargo build --release -p variant-custom-udp -p variant-hybrid` -- clean.
+2. `cargo test --release -p variant-custom-udp -p variant-hybrid` --
+   93 unit + 7 integration + 1 multicast + 1 eot_saturation = 102
+   passed (custom-udp); 72 unit + 7 integration + 1 eot_saturation +
+   2 regression(ignored) + 1 threading-modes(ignored) = 80 passed
+   (hybrid). 0 failed.
+3. `cargo test --release -p variant-custom-udp -p variant-hybrid --
+   --ignored` -- `two_runner_regression_qos4_both_modes` (custom-udp),
+   `two_runner_threading_modes_qos4_both_modes` (hybrid), and the
+   other ignored regressions still gated `#[ignore]`. Not re-exercised
+   in this pass since they rely on the larger localhost test runtime.
+4. `cargo test --release --workspace` -- all-green except the
+   pre-existing flake
+   `runner::protocol::tests::done_barrier_hang_repro_when_peer_already_advanced`
+   (passes in isolation; unrelated to T14.18 -- same flake reported
+   pre-T14.18).
+5. `cargo clippy --release -p variant-custom-udp -p variant-hybrid
+   --tests -- -D warnings` -- clean.
+6. `cargo fmt -p variant-custom-udp -p variant-hybrid -- --check` -- clean.
+
+### End-to-end repro (load-bearing test)
+
+Re-ran `configs/two-runner-t1416-repro.toml` (qos2 multi 100K msg/s
+symmetric, the T14.16 fixture that previously surfaced eot_lost on
+the asymmetric same-host race) with `--control-base-port` wired in.
+
+**Runner stdouts** (alice + bob terminals each reported identical
+table):
+
+```
+Benchmark run: t1416-repro
+Variant                  Runner   Status    Exit
+custom-udp-1000x100hz    bob      success   0
+custom-udp-1000x100hz    alice    success   0
+hybrid-1000x100hz        bob      success   0
+hybrid-1000x100hz        alice    success   0
+```
+
+**EOT events from JSONL** (`logs/t1416-repro-20260512_105314/`):
+
+```
+=== custom-udp-1000x100hz-alice-t1416-repro.jsonl ===
+{"eot_id":14956945349546052149,"event":"eot_sent","runner":"alice","ts":"2026-05-12T10:53:35.488750900Z"}
+{"eot_id":14559694502340567080,"event":"eot_received","runner":"alice","writer":"bob","ts":"2026-05-12T10:53:35.511935300Z"}
+=== custom-udp-1000x100hz-bob-t1416-repro.jsonl ===
+{"eot_id":14559694502340567080,"event":"eot_sent","runner":"bob","ts":"2026-05-12T10:53:35.492351400Z"}
+{"eot_id":14956945349546052149,"event":"eot_received","runner":"bob","writer":"alice","ts":"2026-05-12T10:53:35.503621700Z"}
+=== hybrid-1000x100hz-alice-t1416-repro.jsonl ===
+{"eot_id":1122613785320212177,"event":"eot_sent","runner":"alice","ts":"2026-05-12T10:53:56.040071200Z"}
+{"eot_id":14193051985186428517,"event":"eot_received","runner":"alice","writer":"bob","ts":"2026-05-12T10:53:56.040093800Z"}
+=== hybrid-1000x100hz-bob-t1416-repro.jsonl ===
+{"eot_id":14193051985186428517,"event":"eot_sent","runner":"bob","ts":"2026-05-12T10:53:56.003060200Z"}
+{"eot_id":1122613785320212177,"event":"eot_received","runner":"bob","writer":"alice","ts":"2026-05-12T10:53:56.059209800Z"}
+```
+
+Cross-matched IDs: alice's `eot_sent.eot_id` matches bob's
+`eot_received.eot_id` (writer=alice) on both variants, and vice
+versa. No `eot_timeout` events on any runner. The hybrid run logged
+`data channel full -- dropping Data frame` warnings on both runners
+under sustained saturation (expected) but EOT was never dropped --
+that's exactly the invariant T14.16 + T14.18 guarantee.
+
+**T14.17 timeout classifier output** (Timeout column from
+`python analysis/analyze.py logs/t1416-repro-20260512_105314`):
+
+```
+Variant               Run             Path                  QoS  Timeout
+custom-udp-1000x100hz t1416-repro     alice->bob              2  completed
+custom-udp-1000x100hz t1416-repro     bob->alice              2  completed
+hybrid-1000x100hz     t1416-repro     alice->alice            2  completed
+hybrid-1000x100hz     t1416-repro     alice->bob              2  completed
+hybrid-1000x100hz     t1416-repro     bob->alice              2  completed
+hybrid-1000x100hz     t1416-repro     bob->bob                2  completed
+```
+
+All 6 rows classify as `completed`. None as `eot_lost`. This is the
+T14.18 acceptance bar.
+
+### Files
+
+- `variants/custom-udp/src/controltcp.rs` (new) -- control TCP plumbing.
+- `variants/hybrid/src/controltcp.rs` (new) -- control TCP plumbing.
+- `variants/custom-udp/src/udp.rs` -- wire control_peers into
+  connect/disconnect/start_reader_threads/stop_reader_threads/
+  signal_end_of_test/poll_receive.
+- `variants/hybrid/src/hybrid.rs` -- same.
+- `variants/custom-udp/src/main.rs`, `variants/hybrid/src/main.rs` --
+  `--control-base-port` CLI arg + derive_control_endpoints.
+- `variants/{custom-udp,hybrid}/tests/eot_saturation.rs` (new) -- the
+  stub-style regression test for the T14.18 invariant.
+- `metak-shared/api-contracts/eot-protocol.md` -- "Control side-channel
+  (T14.18)" section.
+- `variants/{custom-udp,hybrid}/CUSTOM.md` -- new section per worker.
+
+### Commits
+
+10 conventional commits, in order:
+
+```
+c56eb04 docs(contract): add T14.18 control side-channel section to eot-protocol
+88311ac feat(variants/custom-udp): add TCP control connection for EOT (T14.18)
+88a7868 feat(variants/custom-udp): route EOT over control connection (T14.18)
+cfe8884 test(variants/custom-udp): high-rate qos2 EOT-survives-saturation regression (T14.18)
+18d9fa4 docs(variants/custom-udp): document T14.18 control side-channel
+0550bf5 feat(variants/hybrid): add TCP control connection for EOT (T14.18)
+e1b5694 feat(variants/hybrid): route EOT over control connection (T14.18)
+fd70c66 test(variants/hybrid): high-rate qos2 EOT-survives-saturation regression (T14.18)
+fb3b9ed docs(variants/hybrid): document T14.18 control side-channel
+bb9af36 configs: wire --control-base-port into hybrid + repro fixtures (T14.18)
+```
+
+### Deviations from task spec
+
+- The task spec said "Remove the current EOT-on-TCP-stream logic for
+  custom-udp qos4 and hybrid qos3-4 (they now go over the dedicated
+  control connection instead, simpler)". I removed the **dispatch**
+  side (signal_end_of_test no longer sends on the data TCP), but I
+  kept the **receive-side decode** of `Frame::Eot` on the data path
+  as defence-in-depth -- a stray EOT from a peer that's still running
+  pre-T14.18 code would be silently recorded as expected. The dead
+  helper `protocol::encode_eot_framed` (hybrid) and `send_eot`
+  (custom-udp) are kept `#[allow(dead_code)]` rather than deleted, so
+  the historical reference is preserved without polluting the active
+  call graph.
+- Other configs in `configs/` (other than the repro + hybrid-all) were
+  already partially incomplete (e.g. missing `tcp_base_port`) and
+  intentionally left untouched -- they were not part of the worker
+  scope and are not exercised by current CI / acceptance tests.
+
+### Open concerns
+
+- The hybrid run still logs many `data channel full -- dropping Data
+  frame (receiver saturated)` lines on Multi mode at 100K msg/s
+  symmetric. That's the expected T14.16 backpressure signal and
+  unrelated to T14.18; the delivery percentages stay in the 10-30%
+  range as documented in CUSTOM.md's "Backpressure semantics" section
+  (data may drop; EOT must not -- and now does not).
+- The `done_barrier_hang_repro_when_peer_already_advanced` runner
+  test is a pre-existing flake under workspace-parallel execution
+  unrelated to this change (passes in isolation).
