@@ -1580,3 +1580,225 @@ fn t9_success_stays_quiet_no_tail() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+/// T14.24 regression: two real runner subprocesses must complete the
+/// Phase 1.25 resume_manifest barrier and proceed into Phase 2 when
+/// resuming against an existing log dir.
+///
+/// The test:
+///
+/// 1. Runs a fresh two-runner session producing one spawn each side.
+///    (variant-dummy with no operate window so the run finishes fast.)
+/// 2. Re-runs both sides with `--resume`. The Phase 1.25 manifest
+///    exchange must converge over the new per-peer-pair TCP path; if
+///    the pre-T14.24 UDP path regressed back in, both peers would time
+///    out at 120 s waiting for each other.
+///
+/// Marked `#[ignore]` because it spawns four real `runner` subprocesses
+/// (two per phase) and binds UDP / TCP ports — CI machines may rebel.
+/// Run locally via `cargo test --release -p runner -- --ignored`.
+#[test]
+#[ignore]
+fn two_runner_resume_manifest_barrier_converges_t14_24() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    // Pick a port range well above the unit-test pool and above the
+    // single-runner-resume integration test's port pool.
+    let base_port: u16 = 33200;
+
+    let tmp_dir = std::env::temp_dir().join("runner-t14-24-resume-it");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let log_dir = tmp_dir.join("logs");
+    let log_dir_escaped = log_dir.to_string_lossy().replace('\\', "/");
+
+    // Two-runner config so the manifest barrier is actually exercised
+    // (single-runner short-circuits). `alice` and `bob` are the
+    // conventional names and also sort consistently (alice < bob) which
+    // exercises the lower-sorted-name-accepts pairing rule.
+    // Note: variant-dummy has no real peer transport, so its EOT phase
+    // never receives a peer EOT in two-runner mode. Set
+    // `eot_timeout_secs = 2` so the spawn exits cleanly via the
+    // eot-timeout fast-path (it logs `eot_timeout` and proceeds to the
+    // silent / disconnect phases) instead of running until the runner's
+    // 30 s timeout. The status row will be `success` because the variant
+    // process exit code is 0 — `eot_timeout` is a soft event, not a
+    // failure.
+    let config_content = format!(
+        r#"run = "t14_24_resume"
+runners = ["alice", "bob"]
+default_timeout_secs = 30
+inter_qos_grace_ms = 0
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+  [variant.common]
+  tick_rate_hz = 5
+  stabilize_secs = 0
+  operate_secs = 1
+  silent_secs = 0
+  eot_timeout_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  log_dir = "{log_dir_escaped}"
+  [variant.specific]
+"#
+    );
+    let config_path = tmp_dir.join("t14_24_resume.toml");
+    std::fs::write(&config_path, &config_content).unwrap();
+
+    // Phase 1: fresh two-runner run. Spawn both in parallel so they can
+    // discover each other; collect outputs at the end.
+    let runner = runner_binary();
+    let config_str = config_path.to_str().unwrap().to_string();
+    let runner_a = runner.clone();
+    let config_a = config_str.clone();
+    let phase1_a = std::thread::spawn(move || {
+        Command::new(runner_a)
+            .arg("--name")
+            .arg("alice")
+            .arg("--config")
+            .arg(&config_a)
+            .arg("--port")
+            .arg(base_port.to_string())
+            .arg("--barrier-timeout-secs")
+            .arg("30")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("failed to run alice (phase 1)")
+    });
+    let runner_b = runner.clone();
+    let config_b = config_str.clone();
+    let phase1_b = std::thread::spawn(move || {
+        Command::new(runner_b)
+            .arg("--name")
+            .arg("bob")
+            .arg("--config")
+            .arg(&config_b)
+            .arg("--port")
+            .arg(base_port.to_string())
+            .arg("--barrier-timeout-secs")
+            .arg("30")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("failed to run bob (phase 1)")
+    });
+    let out1a = phase1_a.join().expect("alice phase 1 thread panicked");
+    let out1b = phase1_b.join().expect("bob phase 1 thread panicked");
+    let stdout1a = String::from_utf8_lossy(&out1a.stdout);
+    let stderr1a = String::from_utf8_lossy(&out1a.stderr);
+    let stdout1b = String::from_utf8_lossy(&out1b.stdout);
+    let stderr1b = String::from_utf8_lossy(&out1b.stderr);
+    eprintln!("--- phase 1 alice stdout ---\n{stdout1a}");
+    eprintln!("--- phase 1 alice stderr ---\n{stderr1a}");
+    eprintln!("--- phase 1 bob   stdout ---\n{stdout1b}");
+    eprintln!("--- phase 1 bob   stderr ---\n{stderr1b}");
+    assert!(
+        out1a.status.success(),
+        "phase 1 alice should exit 0, got: {:?}",
+        out1a.status.code()
+    );
+    assert!(
+        out1b.status.success(),
+        "phase 1 bob should exit 0, got: {:?}",
+        out1b.status.code()
+    );
+
+    // Phase 2: resume. Both runners must complete the manifest barrier
+    // and proceed (all spawns will be in the skip set since they ran
+    // successfully above).
+    let phase2_started = std::time::Instant::now();
+    let runner_a2 = runner.clone();
+    let config_a2 = config_str.clone();
+    let phase2_a = std::thread::spawn(move || {
+        Command::new(runner_a2)
+            .arg("--name")
+            .arg("alice")
+            .arg("--config")
+            .arg(&config_a2)
+            .arg("--port")
+            .arg((base_port + 100).to_string())
+            .arg("--barrier-timeout-secs")
+            .arg("30")
+            .arg("--resume")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("failed to run alice (phase 2 resume)")
+    });
+    let runner_b2 = runner.clone();
+    let config_b2 = config_str.clone();
+    let phase2_b = std::thread::spawn(move || {
+        Command::new(runner_b2)
+            .arg("--name")
+            .arg("bob")
+            .arg("--config")
+            .arg(&config_b2)
+            .arg("--port")
+            .arg((base_port + 100).to_string())
+            .arg("--barrier-timeout-secs")
+            .arg("30")
+            .arg("--resume")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("failed to run bob (phase 2 resume)")
+    });
+    let out2a = phase2_a.join().expect("alice phase 2 thread panicked");
+    let out2b = phase2_b.join().expect("bob phase 2 thread panicked");
+    let phase2_elapsed = phase2_started.elapsed();
+    let stdout2a = String::from_utf8_lossy(&out2a.stdout);
+    let stderr2a = String::from_utf8_lossy(&out2a.stderr);
+    let stdout2b = String::from_utf8_lossy(&out2b.stdout);
+    let stderr2b = String::from_utf8_lossy(&out2b.stderr);
+    eprintln!("--- phase 2 (resume) alice stdout ---\n{stdout2a}");
+    eprintln!("--- phase 2 (resume) alice stderr ---\n{stderr2a}");
+    eprintln!("--- phase 2 (resume) bob   stdout ---\n{stdout2b}");
+    eprintln!("--- phase 2 (resume) bob   stderr ---\n{stderr2b}");
+    eprintln!("--- phase 2 wall-clock: {phase2_elapsed:?} ---");
+
+    assert!(
+        out2a.status.success(),
+        "phase 2 alice (resume) must exit 0 (not 75 EX_TEMPFAIL), got: {:?}",
+        out2a.status.code()
+    );
+    assert!(
+        out2b.status.success(),
+        "phase 2 bob (resume) must exit 0 (not 75 EX_TEMPFAIL), got: {:?}",
+        out2b.status.code()
+    );
+    // Sanity: the resume should be much faster than the pre-T14.24
+    // 120 s barrier timeout. We allow a generous 60 s upper bound to
+    // cover slow CI machines while still catching a regression where
+    // both runners wait the full 120 s.
+    assert!(
+        phase2_elapsed < std::time::Duration::from_secs(60),
+        "phase 2 (resume) should complete well under the 120s barrier \
+         timeout, but took {phase2_elapsed:?} — T14.24 fix may have \
+         regressed"
+    );
+    // Both runners must report the manifest barrier ran (i.e. resume
+    // mode reached Phase 1.25).
+    assert!(
+        stderr2a.contains("resume: local manifest"),
+        "alice resume output should mention the local manifest step, got:\n{stderr2a}"
+    );
+    assert!(
+        stderr2b.contains("resume: local manifest"),
+        "bob resume output should mention the local manifest step, got:\n{stderr2b}"
+    );
+    // Neither runner should have hit a barrier timeout.
+    assert!(
+        !stderr2a.contains("barrier 'resume_manifest' timed out"),
+        "alice must NOT have hit the resume_manifest barrier timeout, got:\n{stderr2a}"
+    );
+    assert!(
+        !stderr2b.contains("barrier 'resume_manifest' timed out"),
+        "bob must NOT have hit the resume_manifest barrier timeout, got:\n{stderr2b}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
