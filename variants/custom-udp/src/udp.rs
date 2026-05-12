@@ -34,6 +34,34 @@ const EOT_UDP_SPACING: Duration = Duration::from_millis(5);
 /// reads use a real OS-level `SO_RCVTIMEO`; writes are unaffected.
 const READER_RCVTIMEO: Duration = Duration::from_millis(50);
 
+/// T14.19: write-side timeout for Single-mode outbound QoS 4 TCP
+/// streams. At catastrophic symmetric load (100K msg/s) Single mode
+/// can wedge: both peers spend the publish phase inside `write_all`
+/// while neither calls `poll_receive` to drain the kernel recv
+/// buffer, and the kernel TCP send buffers fill on both sides. Without
+/// a write timeout the variant deadlocks until the runner kills it.
+///
+/// Installing `SO_SNDTIMEO` here turns the wedge into a typed
+/// `TimedOut` (Windows) / `WouldBlock` (Unix) error. The publish
+/// path drops the offending peer from the broadcast set (same fault-
+/// tolerance branch already used for any TCP write error) and the
+/// operate phase exits its publish loop on the next iteration. The
+/// T14.18 control channel — a SEPARATE socket — still routes EOT
+/// cleanly, so the spawn completes with `status=success` (delivery
+/// near zero, matching hybrid's empirical 0.12 %). Path A in
+/// `metak-orchestrator/STATUS.md` "T14.19 audit".
+///
+/// Applied to Single mode only. Multi mode runs a reader thread that
+/// drains the recv buffer in parallel with the writer's publish loop;
+/// the wedge does not occur and `SO_SNDTIMEO` would only introduce
+/// unnecessary risk of spurious peer-drops under transient
+/// back-pressure.
+///
+/// 5 s is far longer than any realistic transient on a healthy LAN
+/// (TCP_NODELAY + 4 MiB recv buffers); a timeout firing means the
+/// peer is genuinely stuck.
+const TCP_SINGLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Maximum wall-clock time the variant waits for all expected inbound TCP
 /// peer connections to be accepted before `start_reader_threads` proceeds.
 /// Matches the pre-existing connect-time tolerance used by other variants.
@@ -533,6 +561,20 @@ impl UdpVariant {
                     // it again so the back-pressure contract doesn't
                     // depend on upstream defaults.
                     stream.set_nonblocking(false)?;
+                    // T14.19: install a write-side timeout in Single mode
+                    // so a wedged peer surfaces as a typed error instead
+                    // of deadlocking the publish path forever. See
+                    // TCP_SINGLE_WRITE_TIMEOUT docs.
+                    if self.threading_mode == ThreadingMode::Single {
+                        stream
+                            .set_write_timeout(Some(TCP_SINGLE_WRITE_TIMEOUT))
+                            .with_context(|| {
+                                format!(
+                                    "T14.19: set_write_timeout on outbound TCP to {}",
+                                    peer_addr
+                                )
+                            })?;
+                    }
                     // T14.3: apply SO_RCVBUF on the outbound stream too.
                     // The kernel reserves recv-side buffer per socket
                     // regardless of direction-of-use; honouring the
@@ -866,9 +908,28 @@ impl UdpVariant {
                 // QoS 4: blocking TCP write. Strictly contiguous seqs;
                 // never report backpressure (the kernel send buffer
                 // fills and `write_all` blocks until it drains).
+                //
+                // T14.19: in Single mode an `SO_SNDTIMEO` is installed
+                // on outbound streams so a wedge surfaces as a typed
+                // error rather than a forever-block. Any write error
+                // — timeout, connection reset, partial-write-aborted,
+                // anything — drops the offending peer and the
+                // operate phase advances naturally. See
+                // `TCP_SINGLE_WRITE_TIMEOUT` docs.
                 let mut failed_indices = Vec::new();
                 for (i, stream) in self.tcp_out_streams.iter_mut().enumerate() {
-                    if stream.write_all(encoded).is_err() {
+                    if let Err(e) = stream.write_all(encoded) {
+                        let peer_addr = stream
+                            .peer_addr()
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|_| "<unknown>".to_string());
+                        eprintln!(
+                            "[custom-udp] T14.19: dropping outbound TCP peer #{} ({}) after write error: {} ({:?})",
+                            i,
+                            peer_addr,
+                            e,
+                            e.kind()
+                        );
                         failed_indices.push(i);
                     }
                 }
@@ -2172,6 +2233,63 @@ mod tests {
                 "QoS 4 must never return Ok(false) — TCP receivers expect contiguous seqs"
             );
         }
+    }
+
+    /// T14.19: when an outbound TCP write hits the Single-mode
+    /// `SO_SNDTIMEO`, the publish path drops the peer cleanly
+    /// instead of wedging in `write_all`. Simulated with a tiny
+    /// `SO_SNDBUF` + a peer that never reads — the kernel fills the
+    /// send buffer almost immediately and subsequent writes return
+    /// `TimedOut` once the (very short) `SO_SNDTIMEO` we install
+    /// elapses.
+    #[test]
+    fn publish_qos4_drops_peer_on_write_timeout() {
+        use socket2::SockRef;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Synthetic outbound stream that will wedge: connect, then
+        // shrink SO_SNDBUF, then install a 100 ms SO_SNDTIMEO (the
+        // production path uses 5 s; we use 100 ms to keep the test
+        // fast). The accepted peer is intentionally never read from
+        // so the send-buffer fills and stays full.
+        let writer = TcpStream::connect(addr).unwrap();
+        writer.set_nonblocking(false).unwrap();
+        let _accepted = listener.accept().unwrap(); // hold it open, never read
+        let sock = SockRef::from(&writer);
+        sock.set_send_buffer_size(1024).unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        // Build a minimal variant with the wedge-stream pre-installed
+        // and exercise the QoS 4 publish path.
+        let mut cfg = default_config(Qos::ReliableTcp);
+        cfg.multicast_group = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 19941);
+        let mut v = UdpVariant::new(cfg);
+        v.tcp_out_streams.push(writer);
+
+        let payload = vec![0xAAu8; 8192];
+        // Hammer publish until either the peer is dropped or we hit
+        // a generous bound. The first write may fill the buffer
+        // happily; subsequent writes time out and drop the peer.
+        let mut iterations = 0;
+        while v.tcp_out_streams.len() == 1 && iterations < 2000 {
+            // Direct write through the publish-encoded path on QoS 4.
+            // Always returns `Ok(true)` per the QoS 4 contract; the
+            // side-effect is the peer-drop on timeout.
+            v.publish_encoded(&payload, Qos::ReliableTcp, iterations as u64, true)
+                .expect("QoS 4 publish_encoded should not propagate write errors");
+            iterations += 1;
+        }
+        assert_eq!(
+            v.tcp_out_streams.len(),
+            0,
+            "T14.19: peer should be dropped after the write hits SO_SNDTIMEO; \
+             iterations spent={iterations}"
+        );
     }
 
     /// Happy path: when nothing is backpressured, `try_publish`
