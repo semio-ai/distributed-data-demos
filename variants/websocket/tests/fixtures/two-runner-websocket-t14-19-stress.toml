@@ -18,7 +18,12 @@
 
 run = "websocket-t14-19"
 runners = ["alice", "bob"]
-default_timeout_secs = 30
+# Generous to allow operate (8s) + EOT (5s, set below) + silent (1s) +
+# disconnect/teardown overhead. The fast EOT timeout is the lever that
+# keeps total wall time short -- without it the default
+# `max(3 * operate_secs, 30) = 30s` EOT wait would push total runtime
+# past 40 s on its own.
+default_timeout_secs = 45
 
 [[variant]]
 name = "websocket-t14-19-stress"
@@ -35,6 +40,11 @@ binary = "target/release/variant-websocket.exe"
   qos = 4
   log_dir = "./logs"
   threading_modes = ["single"]
+  # Websocket has no T14.18-style control channel: once the data peer
+  # is dropped, EOT cannot route and the EOT phase will wait the full
+  # window for nothing. Cap it short so the spawn exits within the
+  # runner's default_timeout_secs budget.
+  eot_timeout_secs = 5
 
   [variant.specific]
   ws_base_port = 19970

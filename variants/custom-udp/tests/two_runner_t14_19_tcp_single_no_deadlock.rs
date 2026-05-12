@@ -32,7 +32,11 @@ static T14_19_LOCK: Mutex<()> = Mutex::new(());
 
 const FIXTURE_PATH: &str = "tests/fixtures/two-runner-custom-udp-t14-19-stress.toml";
 const RUN_NAME: &str = "custom-udp-t14-19";
-const SPAWN_NAME: &str = "custom-udp-t14-19-stress-single";
+// No `-single` suffix: the runner only appends `-<mode>` when more than
+// one threading mode is configured. Our fixture uses
+// `threading_modes = ["single"]` (one element) so the spawn name stays
+// equal to the variant's `name` field.
+const SPAWN_NAME: &str = "custom-udp-t14-19-stress";
 
 /// 60 s budget: with `default_timeout_secs = 30` per fixture, even the
 /// worst-case (one side wedged the full 30 s before its SO_SNDTIMEO

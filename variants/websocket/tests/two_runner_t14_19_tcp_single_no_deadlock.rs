@@ -30,9 +30,15 @@ static T14_19_LOCK: Mutex<()> = Mutex::new(());
 
 const FIXTURE_PATH: &str = "tests/fixtures/two-runner-websocket-t14-19-stress.toml";
 const RUN_NAME: &str = "websocket-t14-19";
-const SPAWN_NAME: &str = "websocket-t14-19-stress-single";
+// No `-single` suffix: the runner only appends `-<mode>` when more than
+// one threading mode is configured. Our fixture uses
+// `threading_modes = ["single"]` (one element) so the spawn name stays
+// equal to the variant's `name` field.
+const SPAWN_NAME: &str = "websocket-t14-19-stress";
 
-const TEST_BUDGET: Duration = Duration::from_secs(60);
+/// 90 s budget: fixture's `default_timeout_secs = 45` plus generous
+/// margin for stdout/stderr drain on the parent side.
+const TEST_BUDGET: Duration = Duration::from_secs(90);
 
 #[test]
 #[ignore]
