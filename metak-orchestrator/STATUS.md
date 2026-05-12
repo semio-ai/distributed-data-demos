@@ -7365,3 +7365,191 @@ ignored. No regressions caused by my changes.
 - `test(variants/custom-udp): two-runner regression in both threading modes`
 - `docs(variants/custom-udp): document T14.3 threading modes`
 
+## T14.8 -- runner threading_modes expansion + capability gating + recv_buffer_kb (2026-05-12, complete)
+
+T14.8 extends the TOML schema with `threading_modes` and
+`recv_buffer_kb`, expands the spawn cross-product to include the
+threading-mode dimension, applies static-TOML capability gating per
+`[[variant]] supported_modes`, and unconditionally injects
+`--threading-mode` and `--recv-buffer-kb` into every spawned variant.
+
+### Capability mechanism: Option A (static TOML) -- and why
+
+Chose **Option A** (per-entry `supported_modes = [...]`) over
+Option B (`--print-capabilities` probe). Rationale:
+
+- **Simpler.** No per-binary startup probe, no JSON-shape contract
+  for the probe response, no caching of probe results in the
+  runner. The runner stays unaware of how variants implement
+  threading; it just reads a list of strings from the config.
+- **Faster.** No process spawn per variant binary at startup. Saves
+  N forks per runner on multi-host benchmarks.
+- **Smaller surface.** Option B would have required T14.1 plus
+  every T14.5/T14.6/T14.7 worker to emit the probe response,
+  serialising work that is in flight in parallel with T14.8.
+  Option A's per-entry TOML declaration is config-side responsibility
+  -- the orchestrator can add it to each `[[variant]]` block
+  independently as variant capabilities land.
+
+The known trade-off: declarations CAN drift from the variant's
+actual trait impl. Treated as acceptable because (a) variants that
+declare wrong will fail at `connect` time with a clear error, and
+(b) the trait-level `supported_threading_modes()` is the single
+source of truth on the variant side -- declarations in the TOML
+are an advisory layer the runner consults, NOT the contract a
+variant must honour.
+
+### Permissive default for entries without `supported_modes`
+
+When a `[[variant]]` entry omits `supported_modes`, the runner
+treats EVERY requested threading mode as supported and emits a
+single stderr note per source entry (not per spawn):
+
+```
+[runner:<name>] note: variant '<name>' has no supported_modes declared;
+                     treating every requested threading_mode as supported
+```
+
+Reasoning: T14.8 lands ahead of every T14.2-T14.7 variant
+capability declaration in fixtures and configs. A strict default
+(e.g. "supports only single") would force the orchestrator to land
+every variant's declaration before any T14.8 run could exercise
+its Multi mode -- serialising work that is supposed to run in
+parallel. The permissive default keeps T14.8 forward-compatible.
+
+If a variant lies and the requested mode causes `connect` to
+fail, the existing failure-diagnostics block (T-impl.9) surfaces
+the stderr capture in the runner's terminal. The operator sees
+the failure immediately and can either fix the variant's trait
+impl or pin the variant's `supported_modes` in the config.
+
+### End-to-end smoke output
+
+Single-runner end-to-end via `variant-dummy` (which T14.1 made
+support both modes) -- the load-bearing T14.8 smoke. Both spawns
+complete successfully and both `connected` events record the
+matching `threading_mode` + `recv_buffer_kb`:
+
+```
+Benchmark run: tmod
+Variant                  Runner   Status    Exit
+dummy-multi              local    success   0
+dummy-single             local    success   0
+
+[runner:local] ready barrier for spawn 'dummy-multi' (hz=10, vpt=1, qos=1)
+[runner:local] spawning 'dummy-multi' (hz=10, vpt=1, qos=1, timeout: 30s)
+[runner:local] 'dummy-multi' finished: status=success, exit_code=0
+[runner:local] ready barrier for spawn 'dummy-single' (hz=10, vpt=1, qos=1)
+[runner:local] spawning 'dummy-single' (hz=10, vpt=1, qos=1, timeout: 30s)
+[runner:local] 'dummy-single' finished: status=success, exit_code=0
+```
+
+Sample `connected` event from `dummy-tmod-multi-alice-smoke-t148.jsonl`
+(two-runner localhost config, captured during smoke verification):
+
+```
+{"event":"connected","launch_ts":"...","recv_buffer_kb":4096,
+ "run":"smoke-t148","runner":"alice","threading_mode":"multi",
+ "ts":"2026-05-12T01:36:29.825369800Z","variant":"dummy-tmod-multi"}
+```
+
+Capability-gating smoke (variant declares only `["single"]`,
+config requests both modes):
+
+```
+[runner:local] skipping dummy-multi: variant does not support threading_mode=multi
+[runner:local] ready barrier for spawn 'dummy-single' (hz=10, vpt=1, qos=1)
+[runner:local] spawning 'dummy-single' (hz=10, vpt=1, qos=1, timeout: 30s)
+[runner:local] 'dummy-single' finished: status=success, exit_code=0
+
+Benchmark run: tmodg
+Variant                  Runner   Status    Exit
+dummy-single             local    success   0
+```
+
+The exact contract-pin notice
+(`skipping <effective_name>: variant does not support threading_mode=<mode>`)
+is present and the gated spawn does not appear in the summary.
+
+### Tests
+
+- **Unit (runner crate)**: 163 passing, including the new T14.8
+  tests: `threading_modes_*`, `recv_buffer_kb_*`,
+  `supported_modes_*`, `four_spawn_cross_product_*`, `gating_*`
+  (3 cases). All pass under `--test-threads=1` on Windows.
+- **Integration (runner crate)**: 17 passing, including the new
+  T14.8 end-to-end tests:
+  - `threading_modes_expansion_runs_both_spawns_through_variant_dummy`
+    -- both modes run, both JSONL files emit `connected` events
+    with the matching `threading_mode` field, both `recv_buffer_kb`
+    fields are the default `4096`.
+  - `threading_modes_capability_gating_skips_unsupported_with_notice`
+    -- the multi spawn is skipped with the exact contract notice,
+    excluded from the summary, no JSONL file produced; only the
+    single spawn runs.
+- **CLI unit tests (cli_args)**: 2 new tests verify the
+  unconditional injection of `--threading-mode` + `--recv-buffer-kb`
+  and that the common-section keys (`threading_modes`,
+  `recv_buffer_kb`) do not leak through as raw kebab flags.
+- `cargo clippy --release -p runner --all-targets -- -D warnings`
+  clean.
+- `cargo fmt -p runner -- --check` clean.
+
+The full workspace `cargo test --release --workspace` run was
+attempted in an isolated `--target-dir=target-t148` because
+another worker held `target/release/runner.exe` from the shared
+`target/` directory. Within that isolated target, the runner
+binary's unit + integration tests all pass; the cross-test-binary
+collision during `cargo test --workspace` was process-level
+contention with a concurrent worker, not a code regression
+(verified by re-running the named failing test in isolation: ok).
+
+### Deviations from the task spec
+
+- **Schema location of `supported_modes`**: the task brief
+  suggested adding it to each `[[variant]]` table. Implemented
+  exactly that way -- the field is a top-level key on the variant
+  entry (alongside `name`, `binary`, etc.), not nested in
+  `[variant.common]`. Matches the brief.
+- **End-to-end smoke**: ran both the single-runner end-to-end
+  (which is the load-bearing one for T14.8 and is the integration
+  test that ships with the PR) AND the two-runner localhost
+  config. Two-runner spawns hit timeouts because variant-dummy in
+  multi-runner mode loops indefinitely without an end-of-test
+  handshake (T12 in flight). The relevant T14.8 properties were
+  all verified in the truncated mid-run JSONL files:
+  - both `effective_name` suffixes are present and correctly
+    spelled (`dummy-tmod-multi`, `dummy-tmod-single`);
+  - both `connected` events carry the matching `threading_mode`
+    and the default `recv_buffer_kb` (4096);
+  - both runners exchanged Discover messages and clock-synced
+    with the expansion suffix in the `variant=<name>` field.
+
+### Open concerns
+
+- **Variant entries that don't yet declare `supported_modes`.**
+  The permissive default treats every requested mode as supported
+  and emits a one-time stderr note. This means a user's
+  `threading_modes = ["multi"]` against a Single-only variant
+  whose entry omits `supported_modes` will reach `connect` time
+  before the variant rejects the mode -- the runner's
+  failure-diagnostics block will surface the rejection in stderr.
+  Acceptable for the rollout window; can be tightened to a strict
+  default once T14.2-T14.7 land their variant capability
+  declarations in every fixture/config.
+- **Two-runner full-cycle smoke awaits T12.** variant-dummy's EOT
+  phase is the prerequisite for a clean two-runner exit. Single-
+  runner smoke (already passing) is the load-bearing T14.8 test.
+
+### Commits
+
+- `5a6bf74 feat(runner): add threading_modes + recv_buffer_kb to TOML config schema`
+- `26bef9e feat(runner): expand cross-product over qos x threading_modes`
+- `68c4f2b feat(runner): capability gating + skip-with-notice for unsupported modes`
+- `56f4366 feat(runner): inject --threading-mode and --recv-buffer-kb into spawned variants`
+- `c60e389 test(runner): config.rs unit tests for T14.8 schema additions`
+- `fbf968b test(runner): integration test for threading_modes expansion via variant-dummy`
+- `c480a70 docs(runner): document T14.8 expansion + capability mechanism in CUSTOM.md`
+- `c0825a5 style(runner): apply cargo fmt after T14.8 edits`
+- `5b8e5ec smoke(runner): T14.8 two-runner localhost config with both threading modes`
+
