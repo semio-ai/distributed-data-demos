@@ -1,0 +1,42 @@
+# T14.22 regression fixture: same-host TCP startup race on qos=4 multi.
+#
+# Pre-T14.22: bob's `connect()` to alice's TCP listen port fired before
+# alice's `listen()` was accepting; the kernel returned
+# `ConnectionRefused` on the first attempt; custom-udp silently dropped
+# the peer; alice then timed out waiting for the inbound TCP peer.
+# Result: asymmetric failure (alice timeout, bob accumulated writes
+# with no peer).
+#
+# Post-T14.22: bounded retry on `ConnectionRefused` (30 s budget, ~50 ms
+# per attempt) absorbs the race so both runners observe each other and
+# complete `status=success` with normal cross-peer delivery.
+#
+# Reproduces the failing case from `logs/all-variants-01-20260512_152156/`
+# (100x1000hz qos4 multi). We use a shorter operate phase (3 s) to keep
+# the test fast; the race is at the START of the spawn so the operate
+# duration doesn't matter for triggering the regression.
+
+run = "custom-udp-t14-22"
+runners = ["alice", "bob"]
+default_timeout_secs = 30
+
+[[variant]]
+name = "custom-udp-t14-22-race"
+binary = "target/release/variant-custom-udp.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
+  stabilize_secs = 1
+  operate_secs = 3
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 4
+  threading_modes = ["multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19548"
+  buffer_size = 65536
+  tcp_base_port = 19880
+  control_base_port = 20280
