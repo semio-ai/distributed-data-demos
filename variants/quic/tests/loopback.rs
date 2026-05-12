@@ -44,6 +44,17 @@ fn test_binary_loopback_exits_successfully() {
             "self",
             "--run",
             "loopback01",
+            // T14.5: QUIC requires Multi mode. The CLI default is `single`
+            // for backwards-compat across the E14 rollout, so this test
+            // must inject the mode explicitly until T14.8 makes the
+            // runner do so for every spawn. Place this BEFORE `--peers`
+            // because `--peers` is an unrecognised arg (runner-injected
+            // and parsed out of `extra`) that triggers clap's trailing-
+            // var-arg collection -- once collection starts, every later
+            // arg, including recognised ones like `--threading-mode`,
+            // lands in `extra` instead of being parsed.
+            "--threading-mode",
+            "multi",
             // Runner-injected --peers (synthesized for the test).
             "--peers",
             "self=127.0.0.1",

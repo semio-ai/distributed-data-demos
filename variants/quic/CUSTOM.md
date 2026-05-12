@@ -201,3 +201,48 @@ verifies the QoS 1 path by spinning up a loopback Quinn pair and bursting
 runtime, the outgoing datagram buffer fills and `try_publish` flips to
 `Ok(false)` within seconds. `test_try_publish_qos3_and_qos4_never_backpressure`
 verifies the reliable path returns `Ok(true)` across hundreds of bursts.
+
+## Threading modes (T14.5)
+
+The QUIC variant declares `supported_threading_modes() -> &[Multi]`. It
+does not support `ThreadingMode::Single` and `connect(Single)` returns
+an `Err` before any socket I/O is attempted. The runner consults this
+declaration (per T14.8) and silently skips any
+`<name>-qos<n>-single` spawn the matrix expansion would otherwise
+produce.
+
+### Why no Single mode
+
+quinn is fundamentally async: every meaningful operation
+(`Endpoint::accept`, `Connection::open_uni`, `SendStream::write_all`,
+`Datagrams::read`) is a future that needs a runtime to drive its
+sockets and timers. Even a "single-threaded" tokio current-thread
+runtime is still an async runtime -- and that is precisely the dependency
+the E14 single-threaded mode exists to remove for WASM-friendly
+deployments (browser-WASM cannot host a multi-threaded tokio at all,
+and WASI's threading is restricted).
+
+Hand-rolling a synchronous, runtime-free QUIC client on top of `mio`
+or raw sockets would be a multi-week rewrite -- duplicating quinn's
+loss recovery, congestion control, and TLS state machines -- and would
+no longer be measuring "what does the off-the-shelf quinn stack
+cost?", which is the explicit purpose of this variant per E3d. Out
+of scope.
+
+Downstream consumers that genuinely need single-threaded QUIC in WASM
+would use a different transport (raw UDP-over-WebTransport or HTTP/3
+fetch from the browser side), or wait for a sans-IO Rust QUIC
+implementation to mature. Neither lives in this benchmark's scope.
+
+### `--recv-buffer-kb`
+
+The variant already binds its own `std::net::UdpSocket` before handing
+it to `quinn::Endpoint::new`, and calls `variant_base::tune_udp_buffers_std`
+to push both `SO_RCVBUF` and `SO_SNDBUF` to a fixed 8 MiB target
+(T-impl.2). The runner-injected `--recv-buffer-kb` arg is currently
+**advisory** for this variant: the trait method `Variant::connect`
+does not receive it (the driver consumes it for the `connected`
+event only), so the variant cannot honour a per-spawn override without
+a trait extension. Operators tuning kernel buffers for QUIC should
+edit `variant_base/src/socket.rs::TARGET_UDP_BUFFER_BYTES` rather than
+the runner config until that plumbing exists.

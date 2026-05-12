@@ -8,7 +8,7 @@ use quinn::crypto::rustls::QuicClientConfig;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use variant_base::types::{Qos, ReceivedUpdate};
+use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::variant_trait::{PeerEot, Variant};
 
 use crate::certs::generate_self_signed_cert;
@@ -453,11 +453,27 @@ impl Variant for QuicVariant {
         "quic"
     }
 
-    fn connect(&mut self, threading_mode: variant_base::ThreadingMode) -> Result<()> {
-        // T14.1 compile-fix only -- the trait signature gained the
-        // threading-mode argument. Real Multi-only capability
-        // declaration + Single-mode rejection is filed under T14.5.
-        let _ = threading_mode;
+    fn supported_threading_modes(&self) -> &'static [ThreadingMode] {
+        // T14.5: quinn is fundamentally async and requires a tokio
+        // runtime to drive its sockets and timers. A genuinely
+        // single-threaded sync QUIC client would be a major rewrite
+        // that defeats the point of benchmarking the off-the-shelf
+        // quinn stack. We declare Multi only; `connect(Single)` errors
+        // before any I/O. See `variants/quic/CUSTOM.md` "Threading
+        // modes (T14.5)".
+        &[ThreadingMode::Multi]
+    }
+
+    fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()> {
+        // T14.5: reject Single mode BEFORE any I/O. Capability is
+        // declared via `supported_threading_modes()`; this is the
+        // belt-and-braces guard for the case the runner asks anyway.
+        if threading_mode == ThreadingMode::Single {
+            anyhow::bail!(
+                "variant-quic does not support single-threaded mode \
+                 (quinn requires async); spawn with --threading-mode multi"
+            );
+        }
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
 
         let (send_tx, send_rx) = mpsc::unbounded_channel::<OutboundMessage>();
@@ -989,6 +1005,46 @@ mod tests {
         assert_eq!(v.name(), "quic");
     }
 
+    /// T14.5: QUIC declares Multi-only support. quinn is fundamentally
+    /// async; we cannot honour Single mode.
+    #[test]
+    fn test_supported_threading_modes_is_multi_only() {
+        let v = QuicVariant::new("a", "0.0.0.0:0".parse().unwrap(), vec![]);
+        let modes = v.supported_threading_modes();
+        assert_eq!(modes, &[ThreadingMode::Multi]);
+    }
+
+    /// T14.5: `connect(Single)` must error BEFORE any I/O. The variant
+    /// is constructed with a no-op bind addr; if the Single-mode guard
+    /// failed to short-circuit, this test would attempt to bind the
+    /// QUIC endpoint and observe other failure modes. We assert both
+    /// the Err outcome and that the error message names
+    /// `--threading-mode multi` so operators get an actionable hint.
+    #[test]
+    fn test_connect_single_mode_errors_before_io() {
+        let mut v = QuicVariant::new("a", "0.0.0.0:0".parse().unwrap(), vec![]);
+        let err = v
+            .connect(ThreadingMode::Single)
+            .expect_err("connect(Single) must error for variant-quic");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not support single-threaded mode"),
+            "error message should explain Single is unsupported, got: {msg}",
+        );
+        assert!(
+            msg.contains("--threading-mode multi"),
+            "error message should point at the multi flag, got: {msg}",
+        );
+        // The variant must remain in its pre-connect state: no runtime
+        // created, no channels, no connections. This is the structural
+        // assertion that no I/O happened.
+        assert!(v.runtime.is_none());
+        assert!(v.send_tx.is_none());
+        assert!(v.recv_rx.is_none());
+        assert!(v.shutdown_tx.is_none());
+        assert!(v.connections.is_empty());
+    }
+
     /// Verify the dedup primitive: a `(writer, eot_id)` pair is
     /// reported on first sight only; the second call returns false.
     #[tokio::test]
@@ -1155,7 +1211,7 @@ mod tests {
         // empty after connect(). Use a fresh ephemeral port.
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut v = QuicVariant::new("solo", bind_addr, vec![]);
-        v.connect(variant_base::ThreadingMode::Single)
+        v.connect(variant_base::ThreadingMode::Multi)
             .expect("connect with no peers");
 
         for qos in [
@@ -1208,13 +1264,13 @@ mod tests {
         // connections vec ends up empty and the burst loop returns
         // Ok(true) forever.
         variant_b
-            .connect(variant_base::ThreadingMode::Single)
+            .connect(variant_base::ThreadingMode::Multi)
             .expect("connect b");
         // A short delay so B's accept loop is definitely armed before
         // A starts its handshake.
         std::thread::sleep(Duration::from_millis(200));
         variant_a
-            .connect(variant_base::ThreadingMode::Single)
+            .connect(variant_base::ThreadingMode::Multi)
             .expect("connect a");
 
         // Wait for A's outbound connection to actually be established
@@ -1277,11 +1333,11 @@ mod tests {
         let mut variant_a = QuicVariant::new("a", addr_a, vec![addr_b]);
         let mut variant_b = QuicVariant::new("b", addr_b, vec![addr_a]);
         variant_b
-            .connect(variant_base::ThreadingMode::Single)
+            .connect(variant_base::ThreadingMode::Multi)
             .expect("connect b");
         std::thread::sleep(Duration::from_millis(200));
         variant_a
-            .connect(variant_base::ThreadingMode::Single)
+            .connect(variant_base::ThreadingMode::Multi)
             .expect("connect a");
         std::thread::sleep(Duration::from_millis(500));
 
