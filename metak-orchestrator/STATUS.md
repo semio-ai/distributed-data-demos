@@ -8249,3 +8249,180 @@ capability mismatches.
 Commit: `663cd4a` smoke config; smoke logs at
 `logs/smoke-e14-20260512_040533/` preserved for inspection.
 
+## T14.17 -- analysis: classify timeout cause (COMPLETE, 2026-05-12)
+
+**Worker**: `analysis/` (with authorised touch of
+`metak-shared/ANALYSIS.md`).
+
+Added a `timeout_classification` field on every integrity-report row
+(per writer side of each `(variant, run, writer -> receiver)` pair).
+Value is one of `completed`, `deadlock`, `eot_lost`,
+`variant_rejected`, `eot_timeout_internal`, `unknown`. An
+`eot_lost_likely_saturation` sub-tag is appended on `eot_lost` rows
+when the asymmetric (success-side) peer's stderr capture contains
+`reader channel full` lines.
+
+### Implementation
+
+New module `analysis/timeout_classification.py` builds a per-spawn
+event summary (boolean presence of `phase=operate`, `phase=silent`,
+`eot_sent`, `eot_timeout` + the set of `writer` values seen in
+`eot_received` events) from the per-group polars LazyFrame in a
+single `collect()`. Then per spawn applies the rules in precedence
+order:
+
+1. `eot_timeout_internal` if both `eot_sent` and `eot_timeout`.
+2. `completed` if `eot_sent` AND `phase=silent` AND at least one
+   peer logged `eot_received{writer=this}`.
+3. `eot_lost` if `eot_sent` AND no `phase=silent`. Sub-tag
+   `eot_lost_likely_saturation` attached when the asymmetric peer's
+   (or own, single-runner loopback) stderr has the saturation hint.
+4. `variant_rejected` if no `phase=operate` and stderr non-empty.
+5. `deadlock` if no `eot_sent`, no `phase=silent`, and JSONL ends
+   mid-record (read last 4 KiB and check final line parses).
+6. `unknown` otherwise.
+
+Stderr capture reads are lazy: only `eot_lost` (saturation sub-tag),
+`variant_rejected` (non-empty check), and `deadlock` (4 KiB JSONL
+tail) trigger any file I/O beyond the columnar shard scan.
+
+`integrity_for_group` gained optional `logs_dir`, `variant`, `run`
+keyword args; legacy callers (existing tests that don't care about
+the new column) get `"unknown"` on every row -- no behavioural break.
+
+### Validation
+
+- `pytest analysis/tests/` -- 181 passed, 5 skipped (skip reasons
+  unrelated to T14.17).
+- `ruff format --check analysis/` -- clean.
+- `ruff check analysis/` -- clean.
+
+#### Real-dataset spot-checks
+
+**Motivating dataset (`logs/all-variants-01-20260512_083021/`)** --
+`custom-udp-1000x100hz-qos2-multi alice` is the user-reported
+timed-out side; alice's stderr contains 614 832 `reader channel
+full` lines.
+
+```
+custom-udp-1000x100hz-qos2-multi all-variants-01 alice->bob  2 301,000 132,809  44.12%  0  0  -  0  eot_lost   [eot_lost_likely_saturation]
+custom-udp-1000x100hz-qos2-multi all-variants-01 bob->alice  2 437,000  79,478  18.19%  0  0  -  0  unknown
+custom-udp-1000x100hz-qos4-multi all-variants-01 alice->bob  4 1,962,000 265,003  13.51%  0  0  -  0  eot_lost  [FAIL: completeness] [eot_lost_likely_saturation]
+custom-udp-1000x100hz-qos4-multi all-variants-01 bob->alice  4 1,072,000 670,106  62.51%  0  0  -  0  eot_lost  [FAIL: completeness] [eot_lost_likely_saturation]
+custom-udp-1000x100hz-qos4-single all-variants-01 alice->bob 4   179,967   7,380   4.10% 0  0  -  0  deadlock  [FAIL: completeness]
+custom-udp-1000x100hz-qos4-single all-variants-01 bob->alice 4   189,366   6,952   3.67% 0  0  -  0  deadlock  [FAIL: completeness]
+```
+
+**Clean E14 smoke (`logs/smoke-e14-20260512_040533/`)**:
+
+```
+custom-udp-100x100hz-multi  smoke-e14 alice->bob 4 100,100 100,100 100.00% 0 0 - 0 completed
+custom-udp-100x100hz-multi  smoke-e14 bob->alice 4 100,100 100,100 100.00% 0 0 - 0 completed
+custom-udp-100x100hz-single smoke-e14 alice->bob 4 100,000 100,000 100.00% 0 0 - 0 completed
+custom-udp-100x100hz-single smoke-e14 bob->alice 4 100,100 100,100 100.00% 0 0 - 0 completed
+hybrid-100x100hz-multi      smoke-e14 alice->bob 4 100,100 100,100 100.00% 0 0 - 0 completed
+hybrid-100x100hz-multi      smoke-e14 bob->alice 4 100,100 100,100 100.00% 0 0 - 0 completed
+hybrid-100x100hz-single     smoke-e14 alice->bob 4  72,500   4,409   6.08% 0 0 - 0 eot_timeout_internal [FAIL: completeness]
+hybrid-100x100hz-single     smoke-e14 bob->alice 4  71,900   4,641   6.45% 0 0 - 0 eot_timeout_internal [FAIL: completeness]
+quic-100x100hz-multi        smoke-e14 alice->bob 4 100,100 100,100 100.00% 41911 0 - 0 completed [FAIL: ordering]
+quic-100x100hz-multi        smoke-e14 bob->alice 4 100,100 100,100 100.00% 41471 0 - 0 completed [FAIL: ordering]
+websocket-100x100hz-multi   smoke-e14 alice->bob 4 100,100 100,100 100.00% 0 0 - 0 completed [late_tail_present]
+websocket-100x100hz-multi   smoke-e14 bob->alice 4 100,100 100,100 100.00% 0 0 - 0 completed [late_tail_present]
+websocket-100x100hz-single  smoke-e14 alice->bob 4  67,000  67,000 100.00% 0 0 - 0 completed
+websocket-100x100hz-single  smoke-e14 bob->alice 4  68,000  68,000 100.00% 0 0 - 0 completed
+zenoh-100x100hz-multi       smoke-e14 bob->bob    4 100,100 100,100 100.00% 0 0 - 0 eot_timeout_internal [late_tail_present]
+```
+
+7 successful spawns classify `completed`. Two `eot_timeout_internal`
+rows (hybrid-single both sides) are the T14.15 finding where
+Single-mode at 10 K msg/s collapsed under the EOT phase; the
+variant correctly logged `eot_timeout` per the E12 protocol.
+`zenoh-multi bob->bob` (single-runner loopback) also classifies
+`eot_timeout_internal` -- alice's zenoh-multi JSONL is missing
+(orchestrator note: zenoh-multi alice didn't produce a logfile),
+so bob's solo loopback ran the EOT phase without peer confirmation
+and exited via its own timeout.
+
+**T14.10 pre-fix websocket data (`logs/websocket-first-only-20260511_214111/`)**:
+
+```
+websocket-1000x100hz websocket-first-only alice->bob 4 6,210 1,334 21.48% 0 0 - 0 deadlock [FAIL: completeness]
+websocket-1000x100hz websocket-first-only bob->alice 4 7,291 1,049 14.39% 0 0 - 0 unknown  [FAIL: completeness]
+```
+
+Alice's JSONL ended mid-record (truncated) without `eot_sent` -->
+correct `deadlock` classification. Bob's JSONL ended on a complete
+line and also has no `eot_sent`; the deadlock truncation check
+returns false, all other rules fail, so the row falls through to
+`unknown`. The spec ("`deadlock` or `eot_lost` on both sides") is
+satisfied for the alice side; the bob side is `unknown` because
+its JSONL happens to terminate on a clean newline.
+
+### Deviations
+
+- The spec talks in terms of `status=success` / `status=timeout` /
+  `status=failed` but the runner does not write a per-spawn
+  status sidecar -- those are only known inside the runner
+  process and are not recoverable from the analysis tool. I
+  inferred status from JSONL signals: `phase=silent` reached =
+  success-ish; no `phase=silent` = timeout-ish; no `phase=operate`
+  + non-empty stderr = failed-ish. The taxonomy values land
+  correctly on every spec test case I could reproduce, but a few
+  rows on real data fall to `unknown` where the spec's status
+  field would have nudged them elsewhere (see the bob->alice
+  qos2-multi case and the bob side of the T14.10 dataset).
+  Filing a follow-up below.
+
+### Open concerns
+
+1. **`unknown` over-fires on "success-side-with-unconfirmed-EOT"**.
+   In the qos2-multi motivating dataset, bob is the apparently-
+   successful side: bob reached `phase=silent`, emitted `eot_sent`,
+   but alice (the timed-out side) never logged
+   `eot_received{writer=bob}` (alice's own log was truncated
+   before her EOT-receive loop produced any output). The current
+   rules don't have a value for "I exited cleanly but the peer
+   never confirmed me" -- the closest is `completed` but that
+   requires peer-confirmation, so bob falls to `unknown`. The
+   spec implicitly treats the success side as not needing
+   classification, so this might be fine as-is, but the operator
+   reads `unknown` for what is materially a successful spawn.
+   Possible follow-up: introduce a `completed_unconfirmed` value
+   or annotate `completed` with a `peer_silent` sub-tag.
+
+2. **`unknown` on clean-tail JSONLs without `eot_sent`** (the
+   T14.10 bob side). The variant logged a complete final `write`
+   line and was killed cleanly between lines, so no truncation
+   shows up. Distinguishing this case from a still-running spawn
+   from the JSONL alone requires either a runner status sidecar
+   (out of scope) or a "wall-clock end of the run window" heuristic
+   (also out of scope). Operators reading `unknown` for a known-
+   timed-out spawn should treat it as "kill mid-operate without
+   the truncation tell".
+
+3. The deadlock check reads only the last 4 KiB of the JSONL; in
+   theory a single record larger than 4 KiB whose trailing chunk
+   happens to land cleanly inside our window could fool the
+   helper. In practice variant JSONL records are 100-300 bytes
+   each so 4 KiB always covers >10 records. Worth bumping if a
+   future variant ever emits multi-KiB events.
+
+### Commits
+
+- `ca55d27` feat(analysis): add timeout_classification to integrity
+  report (T14.17)
+- `9a84ec1` test(analysis): synthetic fixtures for T14.17
+  classification cases
+- `7d6eba6` docs: T14.17 timeout-classification semantics in
+  ANALYSIS.md
+
+`git log --oneline -10` confirms all three landed on `main` ahead
+of `origin/main`. No auto-stash hook interaction observed.
+
+I deviated from the suggested four-commit split (1: core impl, 2:
+sub-tag, 3: tests, 4: docs) and merged commits 1+2 because the
+saturation sub-tag is integral to the `eot_lost` rule -- splitting
+it out would have meant landing a working `eot_lost` first then
+"fixing" it in the next commit, which seemed worse for bisect than
+keeping the rule complete in one commit.
+
