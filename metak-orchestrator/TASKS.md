@@ -6028,3 +6028,403 @@ peers in the summary table without highlighting which one matters.
 - Re-baselining historical results.
 
 ---
+
+### T14.21: analysis -- warn on job-run cases with incomplete samples
+
+**Repo**: `analysis/`.
+**Status**: pending, filed 2026-05-12 by orchestrator from a user
+request: "when I run the analyse script I want to see a warning
+whenever there is any job run case that has incomplete samples".
+
+#### Background
+
+The analysis pipeline already classifies spawns (T14.17 -- 
+`timeout_classification`) and tracks per-`(variant, run)` late tails
+(T11.5 -- `late_receives_tail_pct`), and the integrity table already
+reports per-`(variant, run, writer, receiver)` `delivery_pct`. None of
+these surface as an explicit warning today; they sit as columns in
+the report and a tag on integrity rows. The operator has to scan the
+tables row-by-row to find offenders.
+
+This task adds an explicit, end-of-run summary of every job-run case
+that contains "incomplete samples", printed prominently to stderr so
+it cannot be missed.
+
+#### What counts as "incomplete samples"
+
+A job-run case warrants a warning when any of the following holds
+(any combination -- multiple flags should be reported together for the
+same case):
+
+1. **Spawn did not finish gracefully.** The per-spawn
+   `timeout_classification` is anything other than `"completed"`
+   (i.e. one of `deadlock`, `eot_lost`, `variant_rejected`,
+   `eot_timeout_internal`, `unknown`). Granularity: per
+   `(variant, run, runner)` writer-side spawn. Note that each integrity
+   row carries the writer-side classification today -- dedupe to one
+   warning per spawn rather than one per `(writer -> receiver)` pair.
+
+2. **Delivery shortfall.** Any integrity row with
+   `delivery_pct < 100.0` -- **all QoS levels**, including the
+   loss-tolerant ones (QoS 1 and 2). Even though the variant treats
+   loss as acceptable for those QoS tiers, the user wants visibility
+   into any case where samples are actually missing. Granularity: per
+   `(variant, run, writer, receiver)` row.
+
+3. **Late-tail present.** Any `PerformanceResult` with
+   `late_receives_tail_pct > 0`. Granularity: per `(variant, run)`.
+
+#### Scope
+
+In `analysis/analyze.py` (or a new small helper module if it keeps
+the entry point clean), after the integrity and performance tables
+are produced and before the function returns:
+
+1. Walk `integrity_results` and `performance_results` collecting all
+   offending cases under the three rules above.
+2. Aggregate by case identity:
+   - For rule 1, the case key is `(variant, run, writer)` -- the
+     spawn.
+   - For rule 2, the case key is `(variant, run, writer, receiver)`.
+   - For rule 3, the case key is `(variant, run)`.
+   When more than one rule fires for overlapping cases, render the
+   warnings adjacent (grouped by `(variant, run)`) so an operator can
+   see the full picture for a given run at a glance. Exact grouping
+   layout is the worker's call; favour readability.
+3. Print to **stderr** (not stdout -- the tables on stdout must
+   remain pipe-clean). Each offending case is one line prefixed with
+   `WARN:`. Include the case identity (variant / run / runner or
+   writer->receiver as applicable) and which rule(s) tripped, with the
+   concrete numbers (classification string, delivery pct, late-tail
+   pct).
+4. Print a final aggregate line: `WARN: <N> job-run case(s) with
+   incomplete samples (<n1> not-completed, <n2> delivery shortfall,
+   <n3> late tail).` When `N == 0`, print nothing (no noise on clean
+   runs).
+5. Do **not** change the process exit code -- a warning is not an
+   error. The user explicitly called this a "warning".
+6. Suggested ordering in the output: warnings should appear AFTER the
+   integrity + performance tables (so they're the last thing the user
+   sees on stderr) but BEFORE the diagram-saved messages, OR right
+   before the function returns. Worker's call -- whichever reads more
+   naturally.
+
+#### Tests (in `analysis/tests/`)
+
+Add a focused unit test module (e.g. `tests/test_incomplete_warnings.py`)
+covering, with synthetic `IntegrityResult` / `PerformanceResult`
+fixtures (no need to round-trip through real JSONL):
+
+- Clean run (all rows `completed`, all `delivery_pct == 100.0`, all
+  `late_receives_tail_pct == 0.0`) -> no warning output, no aggregate
+  line.
+- Single not-completed spawn -> one `WARN:` line + aggregate line
+  showing 1 not-completed.
+- Single delivery shortfall on QoS 1 -> one `WARN:` line that
+  *includes* the QoS-1 case (proving loss-tolerant QoS is not
+  filtered out).
+- Single late-tail case -> one `WARN:` line.
+- Combined case (one `(variant, run)` triggers rules 1 + 2 + 3) ->
+  warnings for that case appear grouped, and the aggregate counts all
+  three.
+- Spawn produces multiple integrity rows (one writer, two receivers)
+  with non-completed classification: rule 1 dedupes to ONE warning for
+  the spawn, not two. Rule 2 still produces one warning per
+  `(writer, receiver)` row if both have shortfalls.
+
+Use `capsys` (or `capfd`) to capture stderr in the tests. Do not
+assert on exact whitespace -- assert on substring presence and line
+counts so the tests stay robust to formatting tweaks.
+
+Also extend `tests/test_integration.py` lightly so the end-to-end
+integration run against
+`logs/same-machine-20260430_140856/` exercises the new code path
+(no behaviour assertion required beyond "does not crash and produces
+either zero or some `WARN:` lines on stderr").
+
+#### Validation against reality
+
+Run the analyse script against a real logs directory and verify the
+warnings line up with what the integrity / performance tables report:
+
+```
+# PowerShell (Windows) -- user's environment
+cd analysis
+python analyze.py ..\logs\same-machine-all-variants-01-20260511_104934 --summary 2>&1 | Select-String 'WARN:'
+```
+
+Show the captured `WARN:` lines in the completion report and
+cross-check at least one of them against the corresponding row in
+the integrity / performance tables (e.g. `WARN: ... delivery 87.3%`
+must match the `delivery_pct=87.3` cell on the cited row).
+
+If no recent logs are available locally, run the worker's own test
+suite (which exercises real fixture logs) and report the warning
+output for the integration test as the validation evidence.
+
+#### Acceptance criteria
+
+- [ ] Running `analyze.py` on a clean dataset prints no `WARN:`
+      lines.
+- [ ] Running it on a dataset with any of the three triggers prints
+      at least one `WARN:` line per offending case + a final
+      aggregate line.
+- [ ] Warnings go to stderr, not stdout. Stdout tables unchanged.
+- [ ] Loss-tolerant QoS (1, 2) is included in delivery-shortfall
+      detection.
+- [ ] One spawn = one rule-1 warning (deduped across receivers).
+- [ ] Exit code unchanged (still 0 on warnings; still 1 on the
+      pre-existing error paths).
+- [ ] New `tests/test_incomplete_warnings.py` covers the cases above.
+- [ ] `pytest -v` passes for `analysis/tests/`.
+- [ ] `ruff format --check .` and `ruff check .` clean.
+- [ ] STATUS.md updated with completion report including captured
+      `WARN:` lines from a real-logs validation run (or, fallback,
+      from the integration test).
+
+#### Out of scope
+
+- Changing the integrity / performance tables themselves.
+- Promoting any of these conditions to errors / non-zero exit codes.
+- Adding new metrics or new triggers beyond the three above.
+- Changes to other tools (runner, variants, plots).
+
+---
+### T14.22: variants/custom-udp -- port connect_with_retry to qos4 TCP setup
+
+**Repo**: `variants/custom-udp/`.
+**Status**: pending, filed 2026-05-12 by orchestrator after the
+all-variants-01-20260512_152156 run.
+
+#### Background
+
+The run's `custom-udp-100x1000hz-qos4-multi` spawn produced asymmetric
+stderr:
+
+- **alice**: `[custom-udp] error: multi: timed out waiting for 1 TCP
+  peer(s) on 0.0.0.0:19830`
+- **bob**: `[custom-udp] warning: failed to connect to peer
+  127.0.0.1:19830: ... target machine actively refused it (os
+  error 10061)` -- single attempt, no retry; 3M writes accumulated
+  in bob's JSONL but never delivered.
+
+Same-host TCP startup race: bob's `connect()` fired before alice's
+`listen()` was accepting. ECONNREFUSED on first attempt. Custom-udp
+gives up immediately and the variant proceeds in disconnected state.
+
+Hybrid handled this exact race in T14.4 via `connect_with_retry`
+(`variants/hybrid/src/tcp.rs:476-509`). Custom-udp's qos4 TCP setup
+doesn't have the equivalent retry loop. The 1000 Hz tick rate may
+exacerbate the race (variant has less time to retry naturally).
+
+#### Scope
+
+Port the `connect_with_retry` pattern from hybrid to custom-udp's
+qos4 TCP setup. Same shape:
+- Retry budget 10-30 s (T14.4 follow-up commit `c163042` bumped
+  hybrid's budget to 30 s after observing transient delays in
+  practice; pick the same).
+- Retry on `ConnectionRefused` only. Other errors propagate.
+- Short sleep between attempts (~50 ms).
+
+Update `variants/custom-udp/CUSTOM.md` with a "Startup retry (T14.22)"
+subsection.
+
+#### Tests
+
+- Unit: stub TCP setup that refuses the first N connect attempts then
+  accepts. The retry loop should succeed within the budget.
+- Integration: focused two-runner localhost fixture at qos4 multi
+  100x1000hz exercising the race. Both runners must complete
+  `status=success`.
+
+#### Validation (MANDATORY)
+
+- `cargo build --release -p variant-custom-udp` clean.
+- `cargo test --release -p variant-custom-udp` all-green.
+- Clippy + fmt clean.
+- End-to-end repro on a focused fixture at qos4 multi 100x1000hz:
+  both runners complete `status=success`.
+
+#### Acceptance criteria
+
+- [ ] `connect_with_retry`-equivalent pattern in custom-udp's qos4
+      TCP setup.
+- [ ] Existing tests pass.
+- [ ] Focused regression test passes.
+- [ ] CUSTOM.md updated.
+
+#### Out of scope
+
+- Generalising to other variants. Hybrid already has the pattern.
+- The disconnected-state behaviour where bob accumulated 3M writes
+  with no peer. Separate question (should the variant fail-fast on
+  no peers? Or keep trying?). Filed if motivated.
+
+---
+
+### T14.23: runner -- resume.rs requires completion marker for "complete" classification
+
+**Repo**: `runner/`.
+**Status**: pending, filed 2026-05-12 by orchestrator after the
+all-variants-01-20260512_152156 resume failure.
+
+#### Background
+
+The user tried `--resume` on the previous all-variants run. Both
+runners' manifests computed but disagree on the count:
+
+```
+[runner:alice] resume: local manifest has 191 complete job(s)
+[runner:bob]   resume: local manifest has 192 complete job(s)
+```
+
+The single disagreement is `zenoh-max-qos4-multi`. Bob has a
+3.4M-event JSONL (variant ran for many seconds before runner-timeout
+killed it; the file is non-empty but contains NO `eot_sent` and NO
+`phase=silent` event). Alice has no log file at all (variant exited
+before opening the log).
+
+`runner/src/resume.rs:92-104` currently classifies any **non-empty**
+file as "complete":
+
+```
+if meta.len() == 0 {
+    // crashed prior attempt -- delete and exclude
+} else {
+    complete.insert(name.clone());  // counted as complete
+}
+```
+
+This is too lenient. Bob's `zenoh-max-qos4-multi` is non-empty but
+crashed mid-spawn -- it should NOT be classified as complete.
+
+#### Scope
+
+In `runner/src/resume.rs::compute_local_manifest`, tighten the
+classification:
+
+1. **Empty file** (size == 0): delete + exclude. Unchanged.
+2. **Non-empty file** containing `"event":"eot_sent"` (or
+   `"phase":"silent"` -- worker picks one and documents): classify
+   as complete.
+3. **Non-empty file MISSING the completion marker**: classify as
+   crashed mid-spawn. Delete + exclude. Add the deleted path to
+   `LocalManifest::deleted_empty` (or a new `deleted_partial` field
+   for clarity in the operator-facing stderr message).
+
+The marker scan can be cheap: read up to the last ~4 KiB of the
+file and look for the marker substring. Avoid loading the whole file
+(can be GB at high rates).
+
+#### Tests (`runner/src/resume.rs::tests`)
+
+- Synthetic JSONL files exercising each classification:
+  - Empty: deleted + excluded.
+  - Non-empty with `eot_sent` near EOF: complete.
+  - Non-empty without `eot_sent` (partial -- e.g. just `write` events):
+    deleted + excluded.
+  - Non-empty file with `eot_sent` only in early bytes (unlikely in
+    practice but documents the tail-scan policy -- worker decides
+    whether to fall back to a full scan).
+  - Missing file: excluded (unchanged).
+
+#### Validation (MANDATORY)
+
+- `cargo test --release -p runner` all-green.
+- `cargo clippy --release -p runner --all-targets -- -D warnings` clean.
+- `cargo fmt -p runner -- --check` clean.
+- **Real-data regression**: re-run `--resume` on
+  `logs/all-variants-01-20260512_152156/` (the actual failure case).
+  Both runners should now compute the same manifest count (191 jobs
+  each, excluding the partial `zenoh-max-qos4-multi` which gets
+  deleted from bob's side). The barrier may still time out (T14.24)
+  but the manifests will agree on content.
+
+#### Acceptance criteria
+
+- [ ] `compute_local_manifest` requires the completion marker.
+- [ ] Partial files are deleted + excluded just like empty files.
+- [ ] All new unit tests pass.
+- [ ] Existing runner tests pass.
+- [ ] Manual resume on the real failure case shows alice and bob
+      agree on the manifest count.
+
+#### Out of scope
+
+- The resume barrier-timeout bug (T14.24).
+- Marker choice debate beyond "pick one and document".
+
+---
+
+### T14.24: runner -- harden resume_manifest barrier against UDP-coord desync
+
+**Repo**: `runner/`.
+**Status**: pending, filed 2026-05-12 by orchestrator after the
+all-variants-01-20260512_152156 resume failure.
+
+#### Background
+
+Even with T14.23 fixing the manifest content, the `resume_manifest`
+barrier itself is timing out:
+
+```
+[runner:alice] FATAL: barrier 'resume_manifest' timed out after 120.0s
+  waiting for peer(s): ["bob"] -- exiting 75 (EX_TEMPFAIL)
+[runner:bob]   FATAL: barrier 'resume_manifest' timed out after 120.0s
+  waiting for peer(s): ["alice"] -- exiting 75 (EX_TEMPFAIL)
+```
+
+This is the same UDP-coordination-protocol weakness that T14.14
+documents (the `ready` and `done` barriers can desync on the same
+host). The `resume_manifest` barrier is implemented on the same
+UDP-multicast-with-acks protocol and is just as vulnerable.
+
+Symptom: both runners say they're waiting for the OTHER one. Both
+have computed their manifests locally. Neither sees the other's
+manifest broadcast within the 120 s window.
+
+#### Scope
+
+INVESTIGATIVE first; the fix follows.
+
+1. Audit the resume_manifest barrier's protocol. Find it in
+   `runner/src/protocol.rs` (or wherever the barrier impl lives).
+   Compare to the ready/done barrier protocol shape. Identify
+   whether they share code, and where the desync window is.
+2. Determine the failure mode under same-host load. Lost UDP
+   datagrams (kernel buffer overflow)? TIME_WAIT pollution from
+   prior runs? Race between socket setup and broadcast? Compare
+   timing against the prior all-variants run that DID complete its
+   resume_manifest barriers (if any).
+3. Decide:
+   - **Path A**: harden the barrier with explicit per-peer ACKs +
+     retries until convergence (or a long-but-finite deadline).
+   - **Path B**: switch the resume_manifest exchange to TCP per peer
+     pair, mirroring T14.18's variant-EOT control channel. The
+     barrier is rare (once per resume invocation) so reliability >>
+     speed. Cleaner conceptually because it applies the
+     reliable-control-channel lesson at the runner layer too.
+
+Path B is recommended unless the audit finds a small UDP fix.
+
+If T14.24 finds the issue is broader than just the resume_manifest
+barrier (i.e. the ready/done barriers have the same fragility), file
+a separate generalisation task -- don't bundle. T14.14 already
+documents the same root-cause family for ready/done.
+
+#### Acceptance criteria
+
+- [ ] Audit findings posted to STATUS.md.
+- [ ] Path chosen + implemented.
+- [ ] `--resume` on the real failure dataset
+      (`logs/all-variants-01-20260512_152156/`) converges. No barrier
+      timeout.
+- [ ] Existing tests pass; clippy + fmt clean.
+
+#### Out of scope
+
+- Generalising the fix to ready/done barriers (file separately).
+- T14.14's broader same-host coord investigation.
+
+---
