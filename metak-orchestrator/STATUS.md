@@ -6864,3 +6864,185 @@ without affecting the dummy's existing semantics.
 - `56d28b1` chore(variants): add threading_mode arg to connect signatures (T14.1 compile-fix)
 - `0daad49` docs(contract): add threading_mode + recv_buffer_kb fields to connected event
 - `57d5401` docs(variant-base): document threading-mode dimension in CUSTOM.md
+
+---
+
+## T11.5 -- analysis: promote receive throughput to headline metric (DONE)
+
+**Worker**: analysis agent. **Status**: complete. All five validation
+steps green. All five planned commits landed.
+
+### What was implemented
+
+Reordered the performance summary table so receive throughput leads
+as the headline metric, with write throughput labelled as "requested
+rate" context and a derived delivery percentage following. Added a
+new `late_receives_tail_pct` metric (count + percentage of deliveries
+whose corrected latency exceeds 10x the group's p99 latency) and a
+`threading_mode` grouping dimension (read from the `connected`
+event's new field per the E14 contract addition; defaults to
+`"single"` for pre-T14.8 logs).
+
+The integrity report gains a `[late_tail_present]` notice on rows
+from groups with a non-zero late-tail percentage so the operator
+sees the outlier signal alongside delivery integrity data. The
+SHARD_SCHEMA gains `threading_mode` (Utf8) and `recv_buffer_kb`
+(UInt32) columns; SCHEMA_VERSION bumped from `"2"` to `"3"` to force
+a one-time cache rebuild on existing datasets.
+
+No metric is removed and no pre-existing numeric value changes; only
+the column ORDER and EMPHASIS shift. `metak-shared/ANALYSIS.md`
+§§ 4.1, 6.2, 6.3 and 6.7 updated to document the new ordering,
+metrics and grouping dimension.
+
+### Validation
+
+1. `pytest analysis/tests/` -- 172 passed, 5 skipped.
+2. `ruff format --check analysis/` -- clean (24 files).
+3. `ruff check analysis/` -- clean.
+4. Pre-existing dataset regression
+   (`logs/same-machine-all-variants-01-20260511_104934/`,
+   `--summary`): every pre-T11.5 numeric value byte-identical, only
+   column order changed.
+5. Aborted-run handling
+   (`logs/websocket-first-only-20260511_214111/` and
+   `logs/websocket-all-20260511_204552/`): tool produces output
+   gracefully, no crash. Aborted-run integrity rows render with the
+   usual `[FAIL: completeness]` annotation where appropriate, and
+   the new `[late_tail_present]` annotation surfaces on groups whose
+   distribution carries an outlier tail.
+
+### Pre-existing dataset regression diff
+
+Sample of the diff between pre-T11.5 baseline stdout (captured on
+`main` before any of the T11.5 commits) and the post-T11.5 output on
+the same dataset. The integrity rows differ ONLY by the new
+`[late_tail_present]` annotation; the performance table's column
+header reorders.
+
+```
+--- /tmp/baseline_summary.txt   (pre-T11.5)
++++ /tmp/new_summary.txt        (post-T11.5)
+@@ integrity rows (sample): only the late-tail annotation differs ----
+< hybrid-10x1000hz-qos2 all-variants-01 alice->alice  2 297,910 297,910 100.00% 0 0 - 0
+---
+> hybrid-10x1000hz-qos2 all-variants-01 alice->alice  2 297,910 297,910 100.00% 0 0 - 0  [late_tail_present]
+
+@@ performance header: column order reordered, NO value changes ----
+< Variant Run Connect(ms) Lat p50 p95 p99 Max Writes/s Jitter avg Jitter p95 Loss% Late
+---
+> Variant Run Thread Receives/s Writes/s(req) Delivery% Connect(ms) Lat p50 p95 p99 Max Jitter avg Jitter p95 Loss% Late LateTail%
+
+@@ sample performance row (custom-udp-1000x100hz-qos1): values move slot, none change ----
+< custom-udp-1000x100hz-qos1all-variants-01 25.6 14136.1ms 19251.1ms 19498.5ms 19625.1ms 29,225 565.1ms 2116.9ms 64.13% 251,614
+---
+> custom-udp-1000x100hz-qos1all-variants-01 single 10,483 29,225 35.87% 25.6 14136.1ms 19251.1ms 19498.5ms 19625.1ms 565.1ms 2116.9ms 64.13% 251,614 0
+```
+
+Spot-checking the sample row above: Connect (25.6), Lat p50
+(14136.1ms), p95 (19251.1ms), p99 (19498.5ms), Max (19625.1ms),
+Writes/s (29,225 -> "Writes/s(req)"), Jitter avg (565.1ms), Jitter
+p95 (2116.9ms), Loss% (64.13%) and Late (251,614) all carry over
+byte-identically. New columns: Thread="single" (default;
+pre-T14.8 logs), Receives/s=10,483 (newly headlined),
+Delivery%=35.87% (derived: 10,483 / 29,225 * 100 = 35.87%),
+LateTail%=0 (no group-level p99x10 outliers).
+
+### Aborted-run handling
+
+`logs/websocket-first-only-20260511_214111/` and
+`logs/websocket-all-20260511_204552/` are partial / aborted runs from
+the T-impl.10 diagnostic session. The tool **does not crash**: it
+produces integrity + performance tables for whatever EOT-bounded data
+is present. Missing-EOT runs render the `Late` column as `-` and
+proceed with the silent-phase fallback boundary (matching pre-T11.5
+behaviour). Sample run on `websocket-first-only`:
+
+```
+Integrity Report
+--------------------------------------------------------------------------------
+Variant               Run             Path                  QoS    Sent    Rcvd Delivery%  Out-of-order  Dupes Unresolved gaps     BP-skip
+--------------------------------------------------------------------------------
+websocket-1000x100hz  websocket-first-onlyalice->bob       4   6,210   1,334    21.48%     0  0  -  0  [FAIL: completeness]
+websocket-1000x100hz  websocket-first-onlybob->alice       4   7,291   1,049    14.39%     0  0  -  0  [FAIL: completeness]
+```
+
+### New sample row for one (writer, receiver, variant, qos) group
+
+From the post-T11.5 run on
+`logs/same-machine-all-variants-01-20260511_104934/`,
+`custom-udp-1000x100hz-qos1` is shown both in the integrity report
+(two writer->receiver rows) and the performance report (one (variant,
+run) row with the new column order).
+
+```
+Integrity Report (custom-udp-1000x100hz-qos1):
+--------------------------------------------------------------------------------
+Variant               Run             Path                  QoS    Sent    Rcvd Delivery%  Out-of-order  Dupes Unresolved gaps     BP-skip
+--------------------------------------------------------------------------------
+custom-udp-1000x100hz-qos1all-variants-01 alice->bob              1 458,000 276,297    60.33%             0      0               -           0
+custom-udp-1000x100hz-qos1all-variants-01 bob->alice              1 434,000 295,263    68.03%             0      0               -           0
+
+Performance Report (custom-udp-1000x100hz-qos1):
+--------------------------------------------------------------------------------
+Variant               Run             Thread      Receives/s Writes/s(req)  Delivery%  Connect(ms)                  Lat p50                      p95                      p99                      Max  Jitter avg  Jitter p95    Loss%     Late  LateTail%
+--------------------------------------------------------------------------------
+custom-udp-1000x100hz-qos1all-variants-01 single          10,483        29,225     35.87%         25.6                14136.1ms                19251.1ms                19498.5ms                19625.1ms     565.1ms    2116.9ms   64.13%  251,614          0
+```
+
+### Deviations from the task spec
+
+- The task spec implies a per-`(writer, receiver, variant, qos,
+  threading_mode)` performance grouping. The existing performance
+  table groups by `(variant, run)`; the integrity table already
+  breaks out the (writer, receiver, qos) sub-grouping. To satisfy
+  "no numeric value changes for pre-existing datasets" without
+  re-baselining percentile values that would shift if the grouping
+  fanned out, the worker kept the per-`(variant, run)` performance
+  grouping and added `threading_mode` as a tracked column on
+  `PerformanceResult` (sourced from connected events; constant per
+  run in practice). The integrity table's existing
+  writer/receiver/qos breakout, combined with the new `threading_mode`
+  attribute on the per-run performance row and the new
+  `[late_tail_present]` cross-link, covers the spec's grouping intent
+  without breaking numeric stability. The task spec's "values are the
+  same; columns appear in a different order" requirement is
+  preserved exactly.
+
+- `recv_buffer_kb` is projected into the shard schema for offline
+  reproducibility (per the E14 contract) but is not currently
+  surfaced as a column in either table. Out of scope for T11.5; the
+  data is now available to any future grouping or plotting work
+  without forcing another cache rebuild.
+
+### Open concerns
+
+- The SCHEMA_VERSION bump from `"2"` to `"3"` forces a one-time full
+  cache rebuild on every dataset on the operator's machine. On the
+  ~80 GB `same-machine-all-variants-01-20260511_104934/` dataset the
+  rebuild took about 30 minutes wall-time (eight parallel workers,
+  ProcessPoolExecutor) with peak RSS ~8.5 GB on the analysis process
+  during the per-group correlation step. That exceeds the original
+  Phase 1.5 target of <4 GB peak RSS on the 40 GB dataset; this run
+  is roughly 2x the dataset size, but the worker did not chase peak
+  memory in this pass. Suggest the orchestrator queue a follow-up
+  to validate the peak-RSS budget against the 40 GB acceptance
+  dataset specifically.
+
+- The pre-existing reference fixture
+  `analysis/tests/fixtures/phase1_reference_summary.txt` is the
+  pre-T11.5 captured summary; the `TestPhase1Regression` integration
+  test only compares the integrity portion byte-for-byte. With the
+  new `[late_tail_present]` annotation, that comparison still works
+  on the small `same-machine-20260430_140856/` dataset (whose
+  latency distribution does not trip the p99x10 threshold), but if
+  a future change reshapes that dataset's latency tail the test
+  will need updating. Leaving the fixture untouched for now.
+
+### Commits
+
+- `98ce20b` feat(analysis): add receive-headline column ordering to summary tables
+- `373e1a3` feat(analysis): compute and report late_receives_tail_pct
+- `200eab2` feat(analysis): threading_mode grouping dimension with single-default fallback
+- `238872c` docs: update metak-shared/ANALYSIS.md with new metric ordering
+- `bdeb40a` test(analysis): backwards-compat regression on synthetic dataset
