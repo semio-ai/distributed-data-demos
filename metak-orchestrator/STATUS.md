@@ -9556,3 +9556,102 @@ spec asked for.
     new TCP path.
   - New integration: large-manifest (>>4 KB) round-trip both ways.
 
+---
+
+## 2026-05-12 -- T14.22 custom-udp qos4 startup-race retry (worker)
+
+**Status**: done.
+
+**Scope**: port hybrid's `connect_with_retry` pattern to custom-udp's
+qos4 outbound TCP setup so a same-host startup race past the ready
+barrier no longer leaves the spawn in asymmetric disconnected state.
+
+**Implementation** (`variants/custom-udp/src/udp.rs`):
+
+- New `connect_qos4_with_retry` helper with a generic inner variant
+  (`connect_qos4_with_retry_inner<F: FnMut(SocketAddr) -> io::Result<TcpStream>>`)
+  so the retry loop is unit-testable without binding a real listener.
+- `setup_tcp` now calls `connect_qos4_with_retry(*peer_addr,
+  TCP_CONNECT_RETRY_BUDGET)` instead of the raw `TcpStream::connect`.
+- Constants at the top of the file:
+  - `TCP_CONNECT_RETRY_BUDGET = 30 s` (matches
+    `controltcp::CONTROL_CONNECT_BUDGET` and hybrid's budget).
+  - `TCP_CONNECT_RETRY_SLEEP = 50 ms` (matches hybrid).
+- Retry on `ConnectionRefused` ONLY; every other error kind (including
+  `TimedOut`) propagates immediately.
+- Warning message on final failure updated to mention the budget
+  (`"failed to connect to peer ... after 30s: ..."`).
+
+**No deviations** from hybrid's pattern. Same budget, same sleep,
+same restriction to `ConnectionRefused`. The choice of putting the
+helper in `udp.rs` (not a new module) matches the existing layout:
+custom-udp keeps its TCP path in `udp.rs` rather than a dedicated
+file like hybrid's `tcp.rs`.
+
+**Tests added**:
+
+- Unit (`src/udp.rs::tests`, 4 new):
+  - `connect_with_retry_succeeds_after_transient_refusals`
+  - `connect_with_retry_gives_up_after_budget`
+  - `connect_with_retry_does_not_retry_other_errors`
+  - `connect_with_retry_handles_late_listener` (two-thread integration
+    style: listener thread binds after a 150 ms delay; the retry
+    loop must absorb the `ConnectionRefused` window)
+- Integration (`tests/two_runner_t14_22_qos4_startup_race.rs`,
+  `#[ignore]`): drives two runner subprocesses against
+  `tests/fixtures/two-runner-custom-udp-t14-22-startup-race.toml`
+  (qos=4 multi, 1000 vpt @ 100 Hz, mirroring the failing case from
+  `logs/all-variants-01-20260512_152156/`). Asserts both runners
+  exit `status=success`, combined stderr contains no panic / no
+  "timed out waiting for ... TCP peer(s)" message, and both JSONLs
+  contain an `eot_sent` event.
+
+**Validation**:
+
+| Check | Result |
+|------|--------|
+| `cargo build --release -p variant-custom-udp` | clean |
+| `cargo test --release -p variant-custom-udp` (non-ignored) | 98 pass / 0 fail (was 94, +4 new) |
+| `cargo test --release -p variant-custom-udp -- --ignored two_runner_t14_22 --nocapture` | PASS in 13.3 s |
+| `cargo test --release -p variant-custom-udp -- --ignored two_runner_t14_19 --nocapture` | PASS in 20.7 s (no regression to T14.19) |
+| `cargo clippy --release -p variant-custom-udp --all-targets -- -D warnings` | clean |
+| `cargo fmt -p variant-custom-udp -- --check` | clean |
+| `cargo test --release --workspace` | one flake unrelated to T14.22: `variant-base::driver::tests::max_throughput_resets_on_successful_publish` (timing-sensitive). Passes on retry in isolation. |
+
+**Pre-existing failures observed (NOT caused by T14.22)**: the
+ignored `two_runner_regression_qos4_no_panic` /
+`two_runner_regression_qos4_both_modes` /
+`two_runner_regression_qos1_no_loss` tests in
+`tests/two_runner_regression.rs` produce sub-threshold delivery on
+this machine. Confirmed by stashing the T14.22 changes and rerunning
+the qos4 case at HEAD~3 — identical 10 % delivery, same panic. This
+is independent of T14.22.
+
+**End-to-end repro (MANDATORY)**:
+
+Ran the new `#[ignore]` integration test which spawns alice + bob
+against the qos4-multi 100 vpt @ 1000 Hz fixture (the workload that
+failed pre-T14.22 in `logs/all-variants-01-20260512_152156/`).
+
+Both runners completed cleanly:
+
+```
+[runner:alice] 'custom-udp-t14-22-race' finished: status=success, exit_code=0
+[runner:bob]   'custom-udp-t14-22-race' finished: status=success, exit_code=0
+```
+
+alice's stderr contains NO `multi: timed out waiting for ... TCP
+peer(s)` line. bob's stderr contains NO `failed to connect to peer`
+warning — the retry absorbed the race on the first or second sleep
+cycle. Both JSONLs contain `eot_sent`. The test passes in 13.3 s
+wall-clock, with the variant retry resolving in well under 100 ms.
+
+**Commits** (visible in `git log --oneline -10`):
+
+- `7d1222d docs(variants/custom-udp): document T14.22 startup retry`
+- `a930da3 test(variants/custom-udp): regression for qos4 startup race (T14.22)`
+- `b6c97eb feat(variants/custom-udp): port connect_with_retry pattern to qos4 TCP (T14.22)`
+
+All three commits land on top of `81ce012` (T14.24 feat). Auto-stash
+hook did NOT eat any commits.
+
