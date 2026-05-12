@@ -133,9 +133,58 @@ Quinn is async (tokio). The `Variant` trait is sync. Strategy:
 - **QoS 1-2 (best-effort / latest-value)**: Use QUIC unreliable datagrams
   (`send_datagram`). These are fire-and-forget within the QUIC connection.
   For QoS 2, include seq in header; receiver discards stale.
-- **QoS 3-4 (reliable)**: Use QUIC streams (`open_uni` or `open_bi`).
-  QUIC guarantees ordered, reliable delivery per stream. Open one stream
-  per logical path, or multiplex with a header.
+- **QoS 3-4 (reliable)**: Use **one long-lived unidirectional QUIC
+  stream per outbound connection** (T14.13). All reliable frames for
+  the spawn flow over that stream as length-delimited records
+  (`[u32 BE length][frame bytes]`). QUIC guarantees ordered, reliable
+  byte delivery per stream, and the receiver reads the stream in a
+  single task that peels off frames sequentially -- so the writer's
+  send order is preserved end-to-end through to `poll_receive`.
+
+### Reliable-stream ordering (T14.13)
+
+Prior to T14.13 the reliable path opened a **fresh** unidirectional
+stream per message (and `tokio::spawn`-ed the write) plus
+spawned a per-stream `read_to_end` task on the receive side. QUIC's
+per-stream ordering invariant therefore did *not* extend across the
+many parallel streams, and at the E14 smoke scale
+(`quic-100x100hz-multi`, 100 vpt x 100 Hz x 10 s = ~100 K msg/spawn
+per direction) the analysis tool's per-(writer, receiver) prev-seq
+scan flagged ~41 K out-of-order receives per direction. See the
+T14.13 audit subsection in `metak-orchestrator/STATUS.md` for the
+investigation log.
+
+The fix consolidates the reliable path to a single long-lived
+unidirectional stream per outbound connection. The send_loop owns
+one `Option<SendStream>` per connection, lazily opens it on first
+reliable send, writes length-delimited frames serially with
+`write_all`, and clears the slot on error to lazily re-open later.
+On `disconnect` the variant `finish()`-es every still-open stream so
+the receiver sees a clean frame-aligned end-of-stream. EOT is the
+final length-delimited frame on the same stream (no separate
+EOT-only stream).
+
+Wire format on a reliable stream:
+
+```
+repeat: [u32 BE frame_len][frame_len bytes of TAG_DATA/TAG_EOT frame]
+```
+
+Receive side: each accepted uni-stream gets *one* tokio task that
+runs `read_reliable_stream`, which loops on
+`read_exact(&mut [0u8; 4])` for the length prefix, then
+`read_exact(&mut frame)` for the payload, and dispatches each frame
+via the existing `dispatch_decoded` pipeline before the next
+`read_exact`. A clean `FinishedEarly(0)` at a frame boundary
+terminates the loop without error. The single-task ordering
+guarantee is what carries QUIC's per-stream byte order through to
+the variant's inbound mpsc and ultimately `poll_receive`.
+
+This change is invisible at the `Variant` trait surface -- callers
+still see the same `publish` / `try_publish` / `poll_receive`
+behaviour -- but it adds a wire-format change to the reliable path
+that the old variant binary cannot decode and vice-versa. Both
+sides of a benchmark run must use a post-T14.13 build.
 
 ### Certificate handling
 
