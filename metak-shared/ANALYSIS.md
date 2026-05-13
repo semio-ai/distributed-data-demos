@@ -261,7 +261,7 @@ custom-udp-replication   run01   3    100.00%    0             0      0         
 custom-udp-replication   run01   4    100.00%    0             0      -                completed
 ```
 
-### 5.6 Timeout classification (T14.17)
+### 5.6 Timeout classification (T14.17, extended in T15.6)
 
 The `Timeout` column carries a per-spawn classification of the writer
 side's exit cause. Spawns that share a `(variant, run)` group but
@@ -271,17 +271,31 @@ that shares the writer.
 
 The classifier inspects the per-spawn JSONL events plus the runner's
 stderr capture (`<log_subdir>/<variant>-<runner>-stderr.txt`, per
-`runner/src/spawn.rs::stderr_capture_path`) and emits one of six
+`runner/src/spawn.rs::stderr_capture_path`) and emits one of seven
 enum values, in the precedence below. The first matching rule wins.
 
 | Value | When | Operator reading |
 |---|---|---|
-| `eot_timeout_internal` | Writer logged both `eot_sent` and `eot_timeout` | The variant itself gave up waiting for peer EOTs per the E12 protocol -- this is a clean exit, not a kill. Look at the `missing` field on `eot_timeout` to see which peers never confirmed. |
-| `completed` | Writer logged `eot_sent`, reached `phase=silent`, and at least one peer logged `eot_received{writer=<this>}` | Healthy spawn. No action required. |
-| `eot_lost` | Writer logged `eot_sent` but no peer confirmed it | Writer reached EOT, but the EOT marker never reached (or was dropped on) the peer's reader. Suspect peer-side saturation if delivery throughput was close to the variant's headroom. |
+| `eot_timeout_internal` | Writer logged both `eot_sent` and `eot_timeout` | The variant itself gave up waiting for peer EOTs per the E12 protocol -- this is a clean exit, not a kill. Look at the `missing` field on `eot_timeout` to see which peers never confirmed. **Post-E15 this fires only for legacy code paths that still run the on-wire EOT phase** (e.g. websocket Single before T15.8 cleanup); the new architecture short-circuits the EOT-wait via variant-side idle detection (T15.5). |
+| `completed` | Writer logged `eot_sent`, reached `phase=silent`, and at least one peer logged `eot_received{writer=<this>}` | Healthy spawn with peer-confirmed E12 handshake. No action required. |
+| `runner_idle_terminated` (T15.6) | Writer logged `eot_sent`, reached `phase=silent`, did NOT log `eot_timeout`, and NO peer logged `eot_received{writer=<this>}` | Healthy spawn that exited cleanly via the E15 variant-side idle-detection path (T15.5). No on-wire EOT handshake happens in E15, so the absence of a peer `eot_received` is expected, not a failure. No action required. |
+| `eot_lost` | Writer logged `eot_sent` but never reached `phase=silent` | Legacy E12/E14 failure shape: writer published EOT but something on the other side prevented the spawn from completing cleanly. Suspect peer-side saturation if delivery throughput was close to the variant's headroom. |
 | `variant_rejected` | Writer never reached `phase=operate` and stderr capture is non-empty | The variant exited cleanly before operate, typically because the configured QoS / threading mode / port is unsupported. Substring matches against `does not support single-threaded mode`, `does not support QoS`, `port collision`, `unsupported` confirm known rejection paths. |
 | `deadlock` | No `eot_sent`, no `phase=silent`, JSONL ends mid-record | The variant was killed mid-operate (timeout kill, crash, or hang). The truncated final line is the smoking gun. |
 | `unknown` | No rule matched | Operator must inspect manually. Should be rare; if it fires repeatedly the classifier needs another rule. |
+
+Both `completed` and `runner_idle_terminated` are clean-exit
+classifications. The T14.21 incomplete-samples warning treats both
+identically and emits no `not completed` warning for either.
+
+**Precedence note (T15.6).** `completed` sits above
+`runner_idle_terminated` so that peer-confirmed handshakes (still
+observable on variants that retain on-wire EOT, e.g. websocket Multi)
+keep the more specific label. `runner_idle_terminated` and `eot_lost`
+do not overlap: the new rule requires `phase=silent`, the legacy
+`eot_lost` rule requires its absence. `eot_timeout_internal` keeps
+its top-of-list precedence so any spawn that explicitly logged a
+self-abort is never silently relabelled as a clean idle exit.
 
 Sub-tags are appended to the same row when applicable. Currently only
 one is defined:
@@ -295,8 +309,8 @@ one is defined:
 Stderr capture reads are lazy: the classifier only opens a stderr
 file when an `eot_lost` candidate needs the saturation sub-tag check
 or a `variant_rejected` candidate needs the non-empty check. Spawns
-that classify as `completed` / `eot_timeout_internal` / `deadlock` /
-`unknown` never touch stderr.
+that classify as `completed` / `runner_idle_terminated` /
+`eot_timeout_internal` / `deadlock` / `unknown` never touch stderr.
 
 The rules treat events as monotonically additive: presence of an
 event is meaningful, absence is not (a still-running spawn would
