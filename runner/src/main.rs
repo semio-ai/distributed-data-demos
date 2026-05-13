@@ -1,3 +1,4 @@
+mod barrier_coord;
 mod cli_args;
 mod clock_sync;
 mod clock_sync_log;
@@ -590,6 +591,45 @@ fn run(cli: &Cli) -> Result<()> {
         );
     }
 
+    // T15.10: start the per-peer barrier exchange. Each runner opens
+    // a long-lived TCP connection to every other runner over a
+    // dedicated port range (base + BARRIER_TCP_OFFSET + index) and
+    // exchanges `Ready` / `Done` frames during Phase 2. Replaces the
+    // pre-T15.10 UDP multicast barrier whose datagram-loss-under-
+    // pressure failure mode was the root cause of the
+    // configs/two-runner-stress-e14.toml mid-run timeouts. The UDP
+    // socket remains in use for clock-sync, probe responses,
+    // discovery, and the legacy stale-done / late-discover recovery
+    // re-emission paths. In single-runner mode `start()` is a no-op.
+    let barrier_coord = std::sync::Arc::new(barrier_coord::BarrierCoordinator::new(
+        cli.name.clone(),
+        bench_config.runners.clone(),
+        cli.port,
+    ));
+    if let Err(e) = barrier_coord.start(&peer_hosts) {
+        // Failure to bind the listener is fatal -- without the TCP
+        // barrier channel we would silently fall back to the legacy
+        // UDP path which exhibits the very loss pattern T15.10
+        // fixes. Surface the error and exit; the wrapper will not
+        // retry because this is not EX_TEMPFAIL (port collision /
+        // permission, not a transient peer condition).
+        bail!(
+            "barrier_coord: failed to start TCP barrier transport: {e:#}. \
+             T15.10 expects every runner to bind base_port + 96 + index; \
+             check for port collisions or firewall rules."
+        );
+    }
+    if !barrier_coord.is_single_runner() {
+        let connected = barrier_coord.connected_peers();
+        eprintln!(
+            "[runner:{}] barrier_coord: started ({} peer(s) connected: {:?})",
+            cli.name,
+            connected.len(),
+            connected
+        );
+    }
+    coordinator.install_barrier_coordinator(barrier_coord.clone());
+
     // Track results for summary table.
     let mut summary: Vec<SummaryRow> = Vec::new();
 
@@ -894,6 +934,9 @@ fn run(cli: &Cli) -> Result<()> {
     // terminate without lingering TCP fds. `Drop` would also call this,
     // but the explicit call surfaces any cleanup errors deterministically.
     progress_coord.shutdown();
+
+    // T15.10: shut down the barrier coordinator for the same reason.
+    barrier_coord.shutdown();
 
     // Print summary table.
     print_summary(&bench_config.run, &summary);

@@ -1,3 +1,4 @@
+use crate::barrier_coord::BarrierCoordinator;
 use crate::clock_sync::{respond_to_probe, ClockSyncEngine};
 use crate::local_addrs::canonical_peer_host;
 use crate::message::Message;
@@ -191,6 +192,21 @@ pub struct Coordinator {
     base_port: u16,
     /// Whether this is single-runner mode.
     single_runner: bool,
+    /// Optional TCP-per-peer-pair barrier transport (T15.10). When
+    /// installed (via [`Coordinator::install_barrier_coordinator`]),
+    /// `ready_barrier` and `done_barrier` exchange quorum signals over
+    /// the dedicated TCP channel instead of UDP multicast. The UDP
+    /// socket is still used for clock-sync, probe responses,
+    /// discovery, and the legacy stale-done / late-discover recovery
+    /// re-emission paths -- those carry messages the TCP barrier
+    /// channel does not.
+    ///
+    /// Wrapped in `Arc<Mutex<_>>` because the coordinator's methods
+    /// take `&self` and the field is populated after construction
+    /// (after `start()` has bound listeners and exchanged handshakes).
+    /// Single-runner mode leaves this `None`; the barrier loops
+    /// short-circuit before they would consult it.
+    barrier_tcp: Mutex<Option<Arc<BarrierCoordinator>>>,
 }
 
 impl Coordinator {
@@ -278,7 +294,32 @@ impl Coordinator {
             last_completed: Mutex::new(None),
             base_port: port,
             single_runner,
+            barrier_tcp: Mutex::new(None),
         })
+    }
+
+    /// Install a TCP-per-peer-pair barrier coordinator (T15.10). When
+    /// installed, subsequent `ready_barrier` and `done_barrier` calls
+    /// will use the TCP channel for the quorum signal instead of UDP
+    /// multicast. Callers MUST construct the `BarrierCoordinator`,
+    /// call its `start()` to bind listeners and connect to peers, and
+    /// only then install it here. The UDP socket remains in use for
+    /// clock-sync, probe responses, discovery, and the legacy
+    /// stale-done / late-discover recovery paths.
+    ///
+    /// Calling this in single-runner mode is harmless and has no
+    /// effect: the barrier loops short-circuit before consulting the
+    /// transport.
+    pub fn install_barrier_coordinator(&self, bc: Arc<BarrierCoordinator>) {
+        let mut guard = self.barrier_tcp.lock().unwrap();
+        *guard = Some(bc);
+    }
+
+    /// Take a snapshot reference to the installed barrier coordinator,
+    /// if any. Returns `None` when no TCP transport is installed (the
+    /// UDP fallback path will be used).
+    fn barrier_tcp_snapshot(&self) -> Option<Arc<BarrierCoordinator>> {
+        self.barrier_tcp.lock().unwrap().clone()
     }
 
     /// Snapshot of the peer host map captured during discovery.
@@ -577,6 +618,13 @@ impl Coordinator {
             return Ok(());
         }
 
+        // T15.10: prefer the dedicated TCP barrier channel when
+        // installed. The UDP path remains as a fallback for tests that
+        // exercise the legacy semantics in isolation.
+        if let Some(bc) = self.barrier_tcp_snapshot() {
+            return self.ready_barrier_tcp(&bc, variant_name, timeout);
+        }
+
         let socket = self.socket.as_deref().unwrap();
         let started = Instant::now();
         let overall_deadline = started + timeout;
@@ -711,6 +759,12 @@ impl Coordinator {
             return Ok(results);
         }
 
+        // T15.10: prefer the dedicated TCP barrier channel when
+        // installed.
+        if let Some(bc) = self.barrier_tcp_snapshot() {
+            return self.done_barrier_tcp(&bc, variant_name, status, exit_code, timeout);
+        }
+
         let socket = self.socket.as_deref().unwrap();
         let started = Instant::now();
         let overall_deadline = started + timeout;
@@ -836,6 +890,283 @@ impl Coordinator {
                 }
                 .into());
             }
+        }
+    }
+
+    /// T15.10 TCP path for the ready barrier. Send one `Ready` over
+    /// every connected peer's TCP stream, then poll the per-peer
+    /// inboxes for matching `Ready` frames from the peer. The UDP
+    /// fallback (`ready_barrier`'s tail) handles the single-runner and
+    /// no-transport-installed cases; this helper handles the
+    /// happy-path TCP delivery used in production runs.
+    ///
+    /// On overall timeout returns a `BarrierTimeoutError` wrapped in
+    /// `anyhow::Error`, same shape as the UDP path.
+    ///
+    /// While polling we still drain the UDP socket non-destructively
+    /// to (a) answer inbound clock-sync probes promptly (the
+    /// always-respond rule that clock-sync relies on) and (b) honour
+    /// the T-coord.3 late-discover-reemit and T-coord.1b stale-done
+    /// re-emission paths. Those messages travel on UDP because the
+    /// peer may still be in discovery (no TCP yet) or in a previous
+    /// spawn's done_barrier with a stale cache.
+    fn ready_barrier_tcp(
+        &self,
+        bc: &Arc<BarrierCoordinator>,
+        variant_name: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let socket = self.socket.as_deref().unwrap();
+        let started = Instant::now();
+        let overall_deadline = started + timeout;
+
+        // Track which peers we have observed a matching Ready from.
+        // Self is implicitly satisfied.
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(self.name.clone());
+
+        // The Ready frame we broadcast on the TCP channel. Sent once
+        // up front; TCP retransmit handles in-flight loss without a
+        // periodic re-broadcast. We still re-broadcast on every outer
+        // tick to cover the case where the connection was just
+        // installed and the peer's reader thread is not yet draining
+        // (vanishingly unlikely but a free safety net).
+        let ready_msg = Message::Ready {
+            name: self.name.clone(),
+            variant: variant_name.to_string(),
+            run: self.run.clone(),
+        };
+
+        // Initial broadcast.
+        let _ = bc.broadcast(&ready_msg);
+
+        // Poll loop: drain TCP inboxes for matching Ready, answer
+        // UDP probes, handle UDP stale-recovery paths. Outer tick is
+        // 100 ms (matches the UDP recv timeout for consistency).
+        let mut last_rebroadcast = Instant::now();
+        const REBROADCAST_INTERVAL: Duration = Duration::from_secs(1);
+        loop {
+            // 1. Drain TCP inboxes.
+            let drained = bc.drain_all_inboxes();
+            for (peer, msgs) in drained {
+                if !self.expected.contains(&peer) {
+                    continue;
+                }
+                for m in msgs {
+                    if let Message::Ready { name, variant, run } = m {
+                        let accept = variant == variant_name
+                            && run == self.run
+                            && self.expected.contains(&name);
+                        if verbose_coord_enabled() {
+                            eprintln!(
+                                "[coord verbose] {}: ready_barrier_tcp({variant_name}) recv Ready name={name} variant={variant} run={run} accepted={accept}",
+                                self.name
+                            );
+                        }
+                        if accept {
+                            seen.insert(name);
+                        }
+                    }
+                    // Done messages on the TCP barrier channel during a
+                    // ready_barrier are dropped silently. The TCP path
+                    // does not need stale-Done re-emission because TCP
+                    // delivery is reliable; the legacy UDP path keeps
+                    // the re-emission semantics for back-compat.
+                }
+            }
+
+            // 2. Drain UDP for clock-sync probes and stale recovery.
+            //    This is a bounded sub-loop -- one recv per outer
+            //    tick is enough to keep the socket buffer healthy.
+            self.drain_udp_for_recovery(socket);
+
+            // 3. Quorum reached?
+            if seen == self.expected {
+                // No linger needed -- TCP delivery is reliable, so a
+                // peer that hasn't seen our Ready yet either has the
+                // bytes already in its kernel queue or is not
+                // connected (and we will surface that as a TCP write
+                // failure rather than a silent loss). One final
+                // broadcast covers the case where a peer's reader
+                // thread was briefly slow.
+                let _ = bc.broadcast(&ready_msg);
+                return Ok(());
+            }
+
+            // 4. Deadline?
+            if Instant::now() >= overall_deadline {
+                let missing: Vec<String> = self
+                    .expected
+                    .iter()
+                    .filter(|n| !seen.contains(*n))
+                    .cloned()
+                    .collect();
+                return Err(BarrierTimeoutError {
+                    kind: "ready",
+                    variant: variant_name.to_string(),
+                    elapsed: started.elapsed(),
+                    missing_peers: missing,
+                }
+                .into());
+            }
+
+            // 5. Periodic re-broadcast (cheap safety net).
+            if last_rebroadcast.elapsed() >= REBROADCAST_INTERVAL {
+                let _ = bc.broadcast(&ready_msg);
+                last_rebroadcast = Instant::now();
+            }
+
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// T15.10 TCP path for the done barrier. Same structure as
+    /// `ready_barrier_tcp` but for `Message::Done` and with the
+    /// `last_completed` cache write at the tail of the success path.
+    fn done_barrier_tcp(
+        &self,
+        bc: &Arc<BarrierCoordinator>,
+        variant_name: &str,
+        status: &str,
+        exit_code: i32,
+        timeout: Duration,
+    ) -> Result<HashMap<String, (String, i32)>> {
+        let socket = self.socket.as_deref().unwrap();
+        let started = Instant::now();
+        let overall_deadline = started + timeout;
+
+        let mut results: HashMap<String, (String, i32)> = HashMap::new();
+        results.insert(self.name.clone(), (status.to_string(), exit_code));
+
+        let done_msg = Message::Done {
+            name: self.name.clone(),
+            variant: variant_name.to_string(),
+            run: self.run.clone(),
+            status: status.to_string(),
+            exit_code,
+        };
+
+        // Initial broadcast.
+        let _ = bc.broadcast(&done_msg);
+
+        let mut last_rebroadcast = Instant::now();
+        const REBROADCAST_INTERVAL: Duration = Duration::from_secs(1);
+        loop {
+            // 1. Drain TCP inboxes.
+            let drained = bc.drain_all_inboxes();
+            for (peer, msgs) in drained {
+                if !self.expected.contains(&peer) {
+                    continue;
+                }
+                for m in msgs {
+                    if let Message::Done {
+                        name,
+                        variant,
+                        run,
+                        status: s,
+                        exit_code: c,
+                    } = m
+                    {
+                        let accept = variant == variant_name
+                            && run == self.run
+                            && self.expected.contains(&name);
+                        if verbose_coord_enabled() {
+                            eprintln!(
+                                "[coord verbose] {}: done_barrier_tcp({variant_name}) recv Done name={name} variant={variant} run={run} status={s} accepted={accept}",
+                                self.name
+                            );
+                        }
+                        if accept {
+                            results.insert(name, (s, c));
+                        }
+                    }
+                    // Ready frames on the TCP channel during a
+                    // done_barrier are dropped silently (cross-phase
+                    // race -- the next ready_barrier will pick up the
+                    // peer's next Ready when it broadcasts again).
+                }
+            }
+
+            // 2. Drain UDP for clock-sync probes and stale recovery.
+            self.drain_udp_for_recovery(socket);
+
+            // 3. Quorum reached?
+            if results.len() == self.expected.len() {
+                let _ = bc.broadcast(&done_msg);
+                // T-coord.1b: cache the outcome so the legacy UDP
+                // re-emission paths in subsequent barriers can still
+                // help a peer that fell back to UDP for any reason.
+                // The cache is a single entry and only written on the
+                // success path, same as the UDP variant.
+                {
+                    let mut guard = self.last_completed.lock().unwrap();
+                    *guard = Some((
+                        variant_name.to_string(),
+                        self.run.clone(),
+                        status.to_string(),
+                        exit_code,
+                    ));
+                }
+                return Ok(results);
+            }
+
+            // 4. Deadline?
+            if Instant::now() >= overall_deadline {
+                let missing: Vec<String> = self
+                    .expected
+                    .iter()
+                    .filter(|n| !results.contains_key(*n))
+                    .cloned()
+                    .collect();
+                return Err(BarrierTimeoutError {
+                    kind: "done",
+                    variant: variant_name.to_string(),
+                    elapsed: started.elapsed(),
+                    missing_peers: missing,
+                }
+                .into());
+            }
+
+            // 5. Periodic re-broadcast (cheap safety net).
+            if last_rebroadcast.elapsed() >= REBROADCAST_INTERVAL {
+                let _ = bc.broadcast(&done_msg);
+                last_rebroadcast = Instant::now();
+            }
+
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Drain a single UDP coordination datagram (if any) and dispatch
+    /// it: answer probes, re-emit stale Done / late Discover via the
+    /// existing helpers. Used by the TCP barrier paths to keep the
+    /// UDP socket buffer healthy and to honour the cross-phase
+    /// recovery rules (T-coord.1b, T-coord.3) for peers that have not
+    /// yet connected on the TCP barrier channel or that are still
+    /// chasing an earlier phase. Ready/Done frames received on UDP
+    /// while a TCP barrier is in progress are NOT counted toward
+    /// quorum -- the TCP path is the only source of quorum signal
+    /// when the TCP transport is installed.
+    fn drain_udp_for_recovery(&self, socket: &Socket) {
+        match self.recv(socket) {
+            Some(Message::ProbeRequest { from, to, id, t1 }) => {
+                if to == self.name {
+                    let _ = respond_to_probe(socket, &self.peer_addrs, &self.name, &from, id, &t1);
+                }
+            }
+            Some(Message::Done {
+                name, variant, run, ..
+            }) => {
+                if self.expected.contains(&name) {
+                    self.maybe_reemit_stale_done(socket, &variant, &run);
+                }
+            }
+            Some(Message::Discover { name, .. }) => {
+                if self.expected.contains(&name) {
+                    self.maybe_reemit_discover(socket);
+                }
+            }
+            _ => {}
         }
     }
 
