@@ -98,6 +98,47 @@ struct Cli {
     /// crashed mid-run, are subject to the timeout.
     #[arg(long, default_value_t = 120)]
     barrier_timeout_secs: u64,
+
+    /// Operate-phase idle threshold in seconds (T15.4 / E15).
+    ///
+    /// During a spawn's `operate` phase the runner watches the local
+    /// `LocalProgressTracker` and every remote peer's `RemoteSpawnSnapshot`.
+    /// When local AND every remote peer's variant report no advance on
+    /// `(sent, received)` counters for this many seconds, the runner
+    /// records "operate done" -- but does NOT signal the variant. The
+    /// variant is independently observing the same idle condition (T15.5)
+    /// and will transition itself to `silent` then `done`. The runner
+    /// keeps polling until the child exits naturally.
+    ///
+    /// Default `5` matches the variant-side `--operate-idle-secs` default
+    /// in `variant-base/src/cli.rs` so cross-runner agreement on idle
+    /// fires at roughly the same time as the variant's self-transition.
+    ///
+    /// Wired into the per-spawn termination state machine in T15.4's
+    /// follow-up commit; this commit only adds the CLI surface.
+    #[arg(long, default_value_t = 5)]
+    operate_idle_secs: u32,
+
+    /// Per-spawn safety-net wall-clock deadline in seconds (T15.4 / E15).
+    ///
+    /// Replaces the role of the per-variant `timeout_secs` (and the
+    /// top-level `default_timeout_secs`) as the absolute upper bound on
+    /// any one spawn. The phase-aware termination state machine (driven
+    /// by `--operate-idle-secs` and the variant's own idle detection)
+    /// is the primary termination signal; this safety net only fires
+    /// when something has gone wrong enough that neither the variant
+    /// nor the activity detector ever advance the spawn to `done`.
+    ///
+    /// Default `300` (5 minutes) is well above the longest plausible
+    /// variant-driven phase budget (stabilize + operate + eot + silent)
+    /// for any benchmark in the existing fixture set. Operators who
+    /// want a tighter bound can shrink it; very long stress runs may
+    /// need to raise it.
+    ///
+    /// Wired into the per-spawn termination state machine in T15.4's
+    /// follow-up commit; this commit only adds the CLI surface.
+    #[arg(long, default_value_t = 300)]
+    max_spawn_secs: u32,
 }
 
 /// Exit code returned to the OS when a coordination barrier hits its timeout.
