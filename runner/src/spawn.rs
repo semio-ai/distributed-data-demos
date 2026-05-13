@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::progress::{spawn_stdout_reader, TrackerHandle};
+
 /// Maximum number of bytes read from the end of a stderr capture file when
 /// building a failure-diagnostic tail. Caps the tail at 64 KiB so a runaway
 /// child that filled its stderr with megabytes of output does not OOM the
@@ -58,11 +60,21 @@ impl ChildOutcome {
 ///
 /// The runner's own stderr (panics, FATAL lines, etc.) is never redirected
 /// by this function — only the child's stderr is routed to the file.
+///
+/// When `stdout_tracker` is `Some`, the child's stdout is captured via
+/// `Stdio::piped()` and a dedicated reader thread parses each line as
+/// a T15.1 progress event, folding the result into the tracker handle.
+/// The reader is joined before this function returns so the tracker
+/// reflects the last observed state by the time the caller inspects it.
+/// When `stdout_tracker` is `None`, the child inherits the parent's
+/// stdout (the pre-T15.2 behaviour) -- this is what runner tests that
+/// pre-date the progress channel rely on.
 pub fn spawn_and_monitor(
     binary: &str,
     args: &[String],
     timeout: Duration,
     stderr_path: Option<&Path>,
+    stdout_tracker: Option<(TrackerHandle, &str, &str)>,
 ) -> Result<ChildOutcome> {
     // Validate binary path exists.
     if !Path::new(binary).exists() {
@@ -89,14 +101,42 @@ pub fn spawn_and_monitor(
         cmd.stderr(Stdio::from(file));
     }
 
+    // T15.2: when the caller wants progress tracking, pipe stdout so a
+    // dedicated reader thread can parse line-delimited JSON. We have to
+    // configure this BEFORE `spawn()` because `Stdio::piped()` is a
+    // pre-spawn property of the Command. The reader thread is started
+    // immediately after spawn so no progress lines are dropped on the
+    // floor.
+    if stdout_tracker.is_some() {
+        cmd.stdout(Stdio::piped());
+    }
+
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn: {binary}"))?;
 
+    // Hand the piped stdout to the progress reader. We `.take()` it so
+    // ownership transfers fully to the reader thread; the parent only
+    // holds the `Child` for wait/kill semantics from here on.
+    let reader_handle = if let Some((tracker, runner_name, spawn_name)) = stdout_tracker {
+        let stdout = child
+            .stdout
+            .take()
+            .expect("piped stdout was configured but child.stdout is None");
+        Some(spawn_stdout_reader(
+            stdout,
+            tracker,
+            runner_name.to_string(),
+            spawn_name.to_string(),
+        ))
+    } else {
+        None
+    };
+
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
 
-    loop {
+    let outcome = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let outcome = match status.code() {
@@ -104,7 +144,7 @@ pub fn spawn_and_monitor(
                     Some(code) => ChildOutcome::Failed(code),
                     None => ChildOutcome::Failed(-1),
                 };
-                return Ok(outcome);
+                break outcome;
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
@@ -112,7 +152,7 @@ pub fn spawn_and_monitor(
                     let _ = child.kill();
                     // Wait for the process to actually terminate.
                     let _ = child.wait();
-                    return Ok(ChildOutcome::Timeout);
+                    break ChildOutcome::Timeout;
                 }
                 std::thread::sleep(poll_interval);
             }
@@ -120,7 +160,19 @@ pub fn spawn_and_monitor(
                 bail!("error waiting for child process: {e}");
             }
         }
+    };
+
+    // Join the stdout reader so we know the tracker reflects every line
+    // the child ever wrote. The reader exits naturally on EOF once the
+    // child closes stdout (which the OS does at process exit), so the
+    // join completes promptly after the child has finished. On a
+    // timeout-kill the kernel still closes the pipe before reaping, so
+    // the reader sees EOF and joins cleanly.
+    if let Some(h) = reader_handle {
+        let _ = h.join();
     }
+
+    Ok(outcome)
 }
 
 /// Build the per-spawn stderr capture file path.
@@ -269,7 +321,13 @@ mod tests {
 
     #[test]
     fn nonexistent_binary_returns_error() {
-        let result = spawn_and_monitor("./no-such-binary-xyz", &[], Duration::from_secs(5), None);
+        let result = spawn_and_monitor(
+            "./no-such-binary-xyz",
+            &[],
+            Duration::from_secs(5),
+            None,
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("binary not found"));
     }
@@ -318,7 +376,8 @@ mod tests {
             vec!["999".into()]
         };
 
-        let outcome = spawn_and_monitor(binary, &args, Duration::from_secs(2), None).unwrap();
+        let outcome =
+            spawn_and_monitor(binary, &args, Duration::from_secs(2), None, None).unwrap();
         assert_eq!(outcome, ChildOutcome::Timeout);
     }
 

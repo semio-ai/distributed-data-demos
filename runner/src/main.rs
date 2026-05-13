@@ -4,6 +4,7 @@ mod clock_sync_log;
 mod config;
 mod local_addrs;
 mod message;
+mod progress;
 mod protocol;
 mod resume;
 mod spawn;
@@ -667,12 +668,36 @@ fn run(cli: &Cli) -> Result<()> {
         let stderr_capture =
             spawn::stderr_capture_path(&stderr_dir, &job.effective_name, &cli.name);
 
+        // T15.2: per-spawn stdout tracker. The reader thread parses
+        // the variant's stdout-progress stream (T15.1) and folds each
+        // event into the local tracker. The tracker is dropped after
+        // the spawn completes -- T15.3 will start retaining and
+        // broadcasting it, but T15.2 only sets up the parsing channel.
+        let tracker = progress::TrackerHandle::new(job.effective_name.clone());
+
         let outcome = spawn::spawn_and_monitor(
             &variant.binary,
             &args,
             Duration::from_secs(timeout_secs),
             Some(&stderr_capture),
+            Some((tracker.clone(), cli.name.as_str(), job.effective_name.as_str())),
         )?;
+
+        // Snapshot the final tracker state to stderr so an operator can
+        // see what the variant reported on its last progress tick. The
+        // line is purely diagnostic (T15.4 will use the same snapshot
+        // for termination decisions). Costs one mutex acquisition.
+        let snap = tracker.snapshot();
+        eprintln!(
+            "[runner:{}] '{}' final progress: phase={} sent={} received={} eot_sent={} eot_received={}",
+            cli.name,
+            job.effective_name,
+            snap.phase,
+            snap.sent,
+            snap.received,
+            snap.eot_sent,
+            snap.eot_received
+        );
 
         let status = outcome.status_str();
         let exit_code = outcome.exit_code();
