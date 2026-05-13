@@ -9922,3 +9922,59 @@ future workload reveals fragility there too, a separate
 generalisation task should be filed as the brief instructs. No
 orchestrator consult needed.
 
+
+---
+
+## 2026-05-13 — E15 core integration validated end-to-end (orchestrator)
+
+After T15.1 + T15.2 + T15.3 + T15.4 + T15.5 all landed (plus T15.2 and
+T15.5 rescues), re-ran `configs/two-runner-stress-e14.toml` to validate
+the new architecture against the canonical failure cases.
+
+### Stress fixture outcomes (alice's view, 32 spawns)
+
+- 30 / 32 SUCCESS
+- 2 TIMEOUT: zenoh-1000x100hz-qos3-multi, zenoh-1000x100hz-qos4-multi
+  (the known T14.9 Zenoh internal-threading gap; T14.9 router-RPC
+  remains the deferred fix)
+
+### What E15 fixed vs the prior stress run (post-T14.19, pre-E15)
+
+| Pre-E15 outcome | Post-E15 outcome |
+|---|---|
+| custom-udp-1000x100hz-qos4-single: deadlock | **SUCCESS** |
+| websocket-1000x100hz-qos3-single: eot_timeout_internal | **SUCCESS** |
+| websocket-1000x100hz-qos4-single: eot_timeout_internal | **SUCCESS** |
+| zenoh-1000x100hz-qos1-multi: asymmetric timeout | **SUCCESS** |
+| zenoh-1000x100hz-qos2-multi: asymmetric timeout | **SUCCESS** |
+| zenoh-1000x100hz-qos3-multi: asymmetric timeout | still TIMEOUT (T14.9) |
+| zenoh-1000x100hz-qos4-multi: asymmetric timeout | still TIMEOUT (T14.9) |
+
+### Key win
+
+The T15.4 phase-aware termination state machine + T15.5 variant-side
+idle detection let variants exit cleanly when both peers idle, instead
+of getting wedged in EOT-via-transport or killed by wall-clock timeout.
+Visible in the new `final progress` diagnostic from T15.2 -- e.g.
+zenoh-qos4-multi bob: `phase=done sent=29000 received=29600 eot_sent=true
+eot_received=false` -- bob's variant gracefully transitioned through
+`done` via idle detection even though it never observed alice's EOT.
+
+The on-wire EOT path (T14.18 control channels for custom-udp/hybrid;
+WebSocket inline EOT) is now structurally unnecessary -- variants
+idle-detect locally and the runner doesn't need cross-variant
+signaling for clean termination. T15.8 cleanup remains deferred until
+this state proves stable across more datasets.
+
+### Open architectural gap
+
+Zenoh qos3/qos4 multi still time out asymmetrically. The variant gets
+stuck in operate without progress -- alice's final-progress shows
+`phase=operate sent=1624 received=714 eot_sent=false`, indicating
+Zenoh's internal async runtime is deadlocking under the symmetric
+flood. T14.9 (Zenoh router-RPC sidecar) is the parked fix.
+
+### Logs
+
+`logs/stress-e14-20260513_121009/`. T15.6 (analysis classifier
+adaptation to add `runner_idle_terminated`) is the natural next step.
