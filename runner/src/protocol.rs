@@ -419,6 +419,13 @@ impl Coordinator {
                             None
                         }
                         Message::ProbeResponse { .. } => None,
+                        // T15.3 ProgressUpdate is carried over a
+                        // dedicated TCP channel (see
+                        // `progress_coord.rs`); it must never appear on
+                        // the UDP coordination socket. Drop defensively
+                        // so a stray frame from a buggy peer cannot
+                        // perturb discovery.
+                        Message::ProgressUpdate { .. } => None,
                     };
                     if let Some(name) = peer_name {
                         if self.expected.contains(&name) {

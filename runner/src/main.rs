@@ -5,6 +5,7 @@ mod config;
 mod local_addrs;
 mod message;
 mod progress;
+mod progress_coord;
 mod protocol;
 mod resume;
 mod spawn;
@@ -512,6 +513,47 @@ fn run(cli: &Cli) -> Result<()> {
 
     let inter_qos_grace = Duration::from_millis(bench_config.inter_qos_grace_ms());
 
+    // T15.3: start the per-peer progress-update exchange. Each runner
+    // opens a long-lived TCP connection to every other runner over a
+    // dedicated port range (base + PROGRESS_TCP_OFFSET + index) and
+    // exchanges `ProgressUpdate` frames during Phase 2. This is the
+    // receive-side counterpart of the per-spawn snapshot we publish on
+    // each tick from inside the spawn loop below. In single-runner mode
+    // `start()` is a no-op.
+    let remote_view = progress::RemoteProgressViewHandle::new();
+    let progress_coord = progress_coord::ProgressCoordinator::new(
+        cli.name.clone(),
+        bench_config.runners.clone(),
+        cli.port,
+        remote_view.clone(),
+    );
+    if let Err(e) = progress_coord.start(&peer_hosts) {
+        // Failure to start the progress channel is non-fatal -- T15.4's
+        // safety-net `max_spawn_secs` still bounds a stuck spawn. Log
+        // and continue.
+        eprintln!(
+            "[runner:{}] progress_coord: start failed: {e:#}; \
+             proceeding without cross-runner progress visibility",
+            cli.name
+        );
+    } else if !progress_coord.is_single_runner() {
+        eprintln!(
+            "[runner:{}] progress_coord: started ({} peer(s) connected)",
+            cli.name,
+            remote_view.snapshot().peer_count().max(
+                // peers connect on both sides; peer_count() may briefly
+                // be zero before any frame has been folded in, so print
+                // the configured peer count as the operator-facing
+                // upper bound.
+                bench_config
+                    .runners
+                    .iter()
+                    .filter(|n| *n != &cli.name)
+                    .count()
+            )
+        );
+    }
+
     // Track results for summary table.
     let mut summary: Vec<SummaryRow> = Vec::new();
 
@@ -670,17 +712,39 @@ fn run(cli: &Cli) -> Result<()> {
 
         // T15.2: per-spawn stdout tracker. The reader thread parses
         // the variant's stdout-progress stream (T15.1) and folds each
-        // event into the local tracker. The tracker is dropped after
-        // the spawn completes -- T15.3 will start retaining and
-        // broadcasting it, but T15.2 only sets up the parsing channel.
+        // event into the local tracker. T15.3 reads from this tracker
+        // on every progress tick and broadcasts the snapshot to every
+        // other runner via the per-peer TCP `ProgressCoordinator`.
         let tracker = progress::TrackerHandle::new(job.effective_name.clone());
+
+        // T15.3: per-tick publisher closure passed to spawn_and_monitor.
+        // It runs on the spawn loop's poll thread every
+        // PROGRESS_BROADCAST_INTERVAL (~1s) while the child is alive.
+        // In single-runner mode the broadcaster short-circuits inside
+        // `publish`, so we can hand the closure unconditionally.
+        let spawn_name_for_publish = job.effective_name.clone();
+        let publish_fn = |snap: &progress::LocalProgressTracker| {
+            progress_coord.publish(
+                &spawn_name_for_publish,
+                &snap.phase,
+                snap.sent,
+                snap.received,
+                snap.eot_sent,
+                snap.eot_received,
+            );
+        };
 
         let outcome = spawn::spawn_and_monitor(
             &variant.binary,
             &args,
             Duration::from_secs(timeout_secs),
             Some(&stderr_capture),
-            Some((tracker.clone(), cli.name.as_str(), job.effective_name.as_str())),
+            Some((
+                tracker.clone(),
+                cli.name.as_str(),
+                job.effective_name.as_str(),
+            )),
+            Some(&publish_fn),
         )?;
 
         // Snapshot the final tracker state to stderr so an operator can
@@ -757,6 +821,12 @@ fn run(cli: &Cli) -> Result<()> {
             job_idx_in_all + 1 < all_jobs.len() && all_jobs[job_idx_in_all + 1].0 == *src_idx;
         last_spawn_was_real_in_entry.insert(*src_idx, more_in_entry);
     }
+
+    // T15.3: shut down the progress coordinator before printing the
+    // summary so reader threads exit cleanly and the process can
+    // terminate without lingering TCP fds. `Drop` would also call this,
+    // but the explicit call surfaces any cleanup errors deterministically.
+    progress_coord.shutdown();
 
     // Print summary table.
     print_summary(&bench_config.run, &summary);

@@ -7,6 +7,12 @@ use std::time::{Duration, Instant};
 
 use crate::progress::{spawn_stdout_reader, TrackerHandle};
 
+/// Cadence at which the spawn monitor calls the optional progress
+/// broadcaster while the child is running (T15.3). Matches the
+/// variant-side stdout cadence of ~1 Hz so the cross-runner view
+/// is updated at the same rate the variant emits new data.
+pub const PROGRESS_BROADCAST_INTERVAL: Duration = Duration::from_millis(1000);
+
 /// Maximum number of bytes read from the end of a stderr capture file when
 /// building a failure-diagnostic tail. Caps the tail at 64 KiB so a runaway
 /// child that filled its stderr with megabytes of output does not OOM the
@@ -75,6 +81,7 @@ pub fn spawn_and_monitor(
     timeout: Duration,
     stderr_path: Option<&Path>,
     stdout_tracker: Option<(TrackerHandle, &str, &str)>,
+    progress_publisher: Option<&dyn Fn(&crate::progress::LocalProgressTracker)>,
 ) -> Result<ChildOutcome> {
     // Validate binary path exists.
     if !Path::new(binary).exists() {
@@ -115,6 +122,12 @@ pub fn spawn_and_monitor(
         .spawn()
         .with_context(|| format!("failed to spawn: {binary}"))?;
 
+    // Capture a clone of the tracker handle BEFORE we move ownership of
+    // the `stdout_tracker` tuple into the reader thread below. T15.3's
+    // periodic publisher reads from this clone on every tick.
+    let tracker_for_publish: Option<TrackerHandle> =
+        stdout_tracker.as_ref().map(|(t, _, _)| t.clone());
+
     // Hand the piped stdout to the progress reader. We `.take()` it so
     // ownership transfers fully to the reader thread; the parent only
     // holds the `Child` for wait/kill semantics from here on.
@@ -136,6 +149,12 @@ pub fn spawn_and_monitor(
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
 
+    // T15.3: track the last time we called `progress_publisher` so the
+    // broadcast cadence is independent of `poll_interval`. We tick at
+    // ~1 Hz (PROGRESS_BROADCAST_INTERVAL) by checking elapsed since
+    // the previous call inside the same poll loop.
+    let mut last_progress_broadcast = Instant::now();
+
     let outcome = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -153,6 +172,21 @@ pub fn spawn_and_monitor(
                     // Wait for the process to actually terminate.
                     let _ = child.wait();
                     break ChildOutcome::Timeout;
+                }
+                // T15.3: per-tick progress broadcast. Only fires when
+                // both a publisher and a tracker are present; otherwise
+                // there is nothing to broadcast. The publisher is
+                // expected to be best-effort (per-peer write errors
+                // logged inside the broadcaster) so we never propagate
+                // a failure here.
+                if let (Some(publisher), Some(tracker)) =
+                    (progress_publisher, tracker_for_publish.as_ref())
+                {
+                    if last_progress_broadcast.elapsed() >= PROGRESS_BROADCAST_INTERVAL {
+                        let snap = tracker.snapshot();
+                        publisher(&snap);
+                        last_progress_broadcast = Instant::now();
+                    }
                 }
                 std::thread::sleep(poll_interval);
             }
@@ -327,6 +361,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             None,
+            None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("binary not found"));
@@ -377,7 +412,7 @@ mod tests {
         };
 
         let outcome =
-            spawn_and_monitor(binary, &args, Duration::from_secs(2), None, None).unwrap();
+            spawn_and_monitor(binary, &args, Duration::from_secs(2), None, None, None).unwrap();
         assert_eq!(outcome, ChildOutcome::Timeout);
     }
 
