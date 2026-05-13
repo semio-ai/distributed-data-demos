@@ -62,6 +62,40 @@ pub enum Message {
         t2: String,
         t3: String,
     },
+    /// Per-spawn progress snapshot broadcast from one runner to all peers
+    /// during Phase 2 (T15.3). Carried over a long-lived TCP per-peer-pair
+    /// connection (see `runner-coordination.md` Phase 2 "ProgressUpdate
+    /// transport"). The sender is the runner whose variant child wrote the
+    /// underlying stdout event; the receiver folds the message into its
+    /// `RemoteProgressView` so T15.4's idle-detection state machine can
+    /// observe peer progress.
+    ///
+    /// All counters mirror the variant's `event=progress` stdout schema
+    /// (see `variant-cli.md` "E15 additions"): monotonic per-spawn
+    /// aggregates across all peers. `phase` is the variant's current
+    /// protocol-driver phase as observed at the most recent stdout event.
+    /// `ts` is the wall-clock instant (RFC 3339 nanoseconds) at which the
+    /// sending runner captured the snapshot — included for diagnostics
+    /// and possible future drift analysis; T15.4's idle detector uses the
+    /// receiver's local arrival time, not this field.
+    ProgressUpdate {
+        /// Sending runner's name.
+        runner: String,
+        /// Effective spawn name (e.g. `dummy-qos2`).
+        spawn: String,
+        /// Variant's current phase string.
+        phase: String,
+        /// Latest `sent` counter (monotonic per-spawn aggregate).
+        sent: u64,
+        /// Latest `received` counter (monotonic per-spawn aggregate).
+        received: u64,
+        /// Sticky: latest `eot_sent` flag observed on a stdout event.
+        eot_sent: bool,
+        /// Sticky: latest `eot_received` flag observed on a stdout event.
+        eot_received: bool,
+        /// Sender's wall-clock at snapshot time. RFC 3339 nanoseconds.
+        ts: String,
+    },
 }
 
 impl Message {
@@ -278,6 +312,51 @@ mod tests {
         assert_eq!(json["from"], "a");
         assert_eq!(json["to"], "b");
         assert_eq!(json["id"], 42);
+    }
+
+    #[test]
+    fn progress_update_roundtrip() {
+        let msg = Message::ProgressUpdate {
+            runner: "alice".into(),
+            spawn: "dummy-qos2".into(),
+            phase: "operate".into(),
+            sent: 1234,
+            received: 5678,
+            eot_sent: false,
+            eot_received: true,
+            ts: "2026-05-11T00:00:00.000000000Z".into(),
+        };
+        let bytes = msg.to_bytes();
+        let parsed = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, parsed);
+    }
+
+    #[test]
+    fn progress_update_json_format() {
+        // Lock in the wire shape so a peer running a slightly newer or
+        // older binary parses the same key set / discriminant. T15.3
+        // contract: `runner`, `spawn`, `phase`, `sent`, `received`,
+        // `eot_sent`, `eot_received`, `ts`.
+        let msg = Message::ProgressUpdate {
+            runner: "alice".into(),
+            spawn: "v1".into(),
+            phase: "operate".into(),
+            sent: 7,
+            received: 5,
+            eot_sent: true,
+            eot_received: false,
+            ts: "2026-05-11T00:00:00.000000000Z".into(),
+        };
+        let json: serde_json::Value = serde_json::from_slice(&msg.to_bytes()).unwrap();
+        assert_eq!(json["type"], "progress_update");
+        assert_eq!(json["runner"], "alice");
+        assert_eq!(json["spawn"], "v1");
+        assert_eq!(json["phase"], "operate");
+        assert_eq!(json["sent"], 7);
+        assert_eq!(json["received"], 5);
+        assert_eq!(json["eot_sent"], true);
+        assert_eq!(json["eot_received"], false);
+        assert_eq!(json["ts"], "2026-05-11T00:00:00.000000000Z");
     }
 
     #[test]

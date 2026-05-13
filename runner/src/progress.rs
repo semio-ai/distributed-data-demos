@@ -31,6 +31,7 @@
 //! control only (T15.3 broadcasts snapshots; T15.4 will drive the
 //! termination state machine).
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -138,10 +139,7 @@ impl TrackerHandle {
     /// poisoned mutex, which would mean the reader thread itself
     /// panicked -- in that case there is nothing to do but propagate.
     pub fn snapshot(&self) -> LocalProgressTracker {
-        self.inner
-            .lock()
-            .expect("tracker mutex poisoned")
-            .clone()
+        self.inner.lock().expect("tracker mutex poisoned").clone()
     }
 
     /// Apply a parsed progress event under the mutex. Public for tests
@@ -240,7 +238,13 @@ where
             if line.is_empty() {
                 continue;
             }
-            handle_stdout_line(&line, &tracker, &runner_name, &spawn_name, SystemTime::now());
+            handle_stdout_line(
+                &line,
+                &tracker,
+                &runner_name,
+                &spawn_name,
+                SystemTime::now(),
+            );
         }
     })
 }
@@ -276,6 +280,199 @@ pub fn handle_stdout_line(
                 "[runner:{runner_name}] warning: malformed progress line from {spawn_name}: {err}"
             );
         }
+    }
+}
+
+/// Per-spawn snapshot of a peer runner's progress, as folded from the
+/// most recent `ProgressUpdate` message received from that peer (T15.3).
+///
+/// Counters and flags mirror the on-wire `Message::ProgressUpdate` wire
+/// fields. `last_update_ts` is the local wall-clock at which this view
+/// received the update — T15.4's idle-detection state machine uses this
+/// (not the sender's `ts` field) so receiver-side clocks remain the
+/// reference for "have we heard recently from peer X about spawn Y".
+#[derive(Debug, Clone)]
+pub struct RemoteSpawnSnapshot {
+    /// Latest phase string the peer's variant reported.
+    pub phase: String,
+    /// Latest `sent` counter from the peer.
+    pub sent: u64,
+    /// Latest `received` counter from the peer.
+    pub received: u64,
+    /// Sticky `eot_sent` flag.
+    pub eot_sent: bool,
+    /// Sticky `eot_received` flag.
+    pub eot_received: bool,
+    /// Sender's wall-clock at snapshot time (raw RFC 3339 string from
+    /// the message). Captured for diagnostics; not consumed by the
+    /// idle detector.
+    pub ts: String,
+    /// Receiver's wall-clock when this snapshot was folded in. T15.4
+    /// reads this to decide "has the peer been silent too long".
+    pub last_update_ts: SystemTime,
+}
+
+/// Borrowed view of a freshly-received `ProgressUpdate` message, used
+/// internally by [`RemoteProgressView::apply_update`] and
+/// [`RemoteSpawnSnapshot::apply`] to keep their argument lists short.
+///
+/// This struct is intentionally a thin pass-through over the on-wire
+/// `Message::ProgressUpdate` fields -- the `progress_coord` reader
+/// thread reconstructs it from the enum's variant fields rather than
+/// re-exporting the enum into this module.
+#[derive(Debug, Clone, Copy)]
+pub struct ProgressUpdateRef<'a> {
+    /// Sending runner's name.
+    pub runner: &'a str,
+    /// Spawn the snapshot pertains to (variant's `effective_name`).
+    pub spawn: &'a str,
+    /// Variant's current phase string.
+    pub phase: &'a str,
+    /// Latest monotonic `sent` counter.
+    pub sent: u64,
+    /// Latest monotonic `received` counter.
+    pub received: u64,
+    /// Sticky `eot_sent` flag.
+    pub eot_sent: bool,
+    /// Sticky `eot_received` flag.
+    pub eot_received: bool,
+    /// Sender's wall-clock at snapshot time (RFC 3339 nanoseconds).
+    pub ts: &'a str,
+}
+
+impl RemoteSpawnSnapshot {
+    /// Update this snapshot in place from an incoming `ProgressUpdate`.
+    /// `now` is injected so unit tests can drive deterministic
+    /// timestamps; production callers pass `SystemTime::now()`.
+    pub fn apply(&mut self, ev: ProgressUpdateRef<'_>, now: SystemTime) {
+        self.phase = ev.phase.to_string();
+        // Counters are documented as monotonic per-spawn; we still take
+        // the max defensively so an out-of-order frame (vanishingly
+        // unlikely on TCP, but possible if the peer ever batches and
+        // reorders) cannot regress the view backwards.
+        if ev.sent > self.sent {
+            self.sent = ev.sent;
+        }
+        if ev.received > self.received {
+            self.received = ev.received;
+        }
+        // Flags are sticky in the variant; we keep that semantics here
+        // so a transient false on the wire after a true cannot drop the
+        // flag locally.
+        if ev.eot_sent {
+            self.eot_sent = true;
+        }
+        if ev.eot_received {
+            self.eot_received = true;
+        }
+        self.ts = ev.ts.to_string();
+        self.last_update_ts = now;
+    }
+}
+
+/// Cross-runner progress visibility (T15.3).
+///
+/// Holds the most recent per-spawn snapshot received from each peer
+/// runner. Keyed first by peer runner name, then by spawn name, so a
+/// runner observing N peers each working on M spawns has at most N*M
+/// entries. In practice each peer is working on at most one spawn at a
+/// time (Phase 2 is sequential), so the view's hot working set is small.
+///
+/// The view is the receive-side counterpart of the `LocalProgressTracker`
+/// the spawn loop maintains for its own child: the same shape, on a
+/// per-peer key. T15.4 consumes a snapshot of this view alongside the
+/// local tracker to decide phase-aware termination.
+#[derive(Debug, Default, Clone)]
+pub struct RemoteProgressView {
+    /// `peer_runner_name -> spawn_name -> snapshot`. Empty until the
+    /// first inbound `ProgressUpdate` from a peer is observed.
+    by_peer: HashMap<String, HashMap<String, RemoteSpawnSnapshot>>,
+}
+
+impl RemoteProgressView {
+    /// Empty view; no peers yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one inbound `ProgressUpdate` payload into the view. The
+    /// `ev` borrow mirrors the `Message::ProgressUpdate` variant; we
+    /// intentionally take it as a flat borrowed-fields struct rather
+    /// than the enum so this module stays free of a `message`-module
+    /// dependency cycle (the broadcast helper in `progress_coord.rs`
+    /// does the enum match).
+    pub fn apply_update(&mut self, ev: ProgressUpdateRef<'_>, now: SystemTime) {
+        let peer_entry = self.by_peer.entry(ev.runner.to_string()).or_default();
+        let spawn_entry =
+            peer_entry
+                .entry(ev.spawn.to_string())
+                .or_insert_with(|| RemoteSpawnSnapshot {
+                    phase: ev.phase.to_string(),
+                    sent: ev.sent,
+                    received: ev.received,
+                    eot_sent: ev.eot_sent,
+                    eot_received: ev.eot_received,
+                    ts: ev.ts.to_string(),
+                    last_update_ts: now,
+                });
+        spawn_entry.apply(ev, now);
+    }
+
+    /// Return the snapshot for `(peer, spawn)` if one has ever been
+    /// folded in. Returns an owned clone so callers do not have to hold
+    /// any lock on the view.
+    #[allow(dead_code)] // consumed by T15.4 (phase-aware termination state machine)
+    pub fn snapshot_for(&self, peer: &str, spawn: &str) -> Option<RemoteSpawnSnapshot> {
+        self.by_peer.get(peer).and_then(|m| m.get(spawn)).cloned()
+    }
+
+    /// Number of distinct peer runners with at least one snapshot.
+    pub fn peer_count(&self) -> usize {
+        self.by_peer.len()
+    }
+
+    /// All peer names that have at least one spawn snapshot. Useful for
+    /// tests and for T15.4's all-peers-agree predicate.
+    #[allow(dead_code)] // consumed by T15.4 (phase-aware termination state machine)
+    pub fn peers(&self) -> Vec<String> {
+        self.by_peer.keys().cloned().collect()
+    }
+}
+
+/// Thread-safe handle wrapping a [`RemoteProgressView`] so the
+/// per-peer receive thread (writer) and the spawn loop / T15.4 idle
+/// detector (reader) can share access. Same `Arc<Mutex<…>>` pattern as
+/// [`TrackerHandle`] — at ~1 Hz cadence the mutex contention is
+/// negligible.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteProgressViewHandle {
+    inner: Arc<Mutex<RemoteProgressView>>,
+}
+
+impl RemoteProgressViewHandle {
+    /// Build an empty handle.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RemoteProgressView::new())),
+        }
+    }
+
+    /// Fold a parsed `ProgressUpdate` (borrowed-fields form) under the
+    /// mutex. Mirrors [`RemoteProgressView::apply_update`].
+    pub fn apply_update(&self, ev: ProgressUpdateRef<'_>, now: SystemTime) {
+        self.inner
+            .lock()
+            .expect("remote progress view mutex poisoned")
+            .apply_update(ev, now);
+    }
+
+    /// Take a cloned snapshot of the full view. Holds the mutex only
+    /// for the duration of the `clone`.
+    pub fn snapshot(&self) -> RemoteProgressView {
+        self.inner
+            .lock()
+            .expect("remote progress view mutex poisoned")
+            .clone()
     }
 }
 
@@ -442,5 +639,204 @@ mod tests {
         assert_eq!(snap.sent, 9);
         assert_eq!(snap.received, 8);
         assert_eq!(snap.phase, "operate");
+    }
+
+    // ---- RemoteProgressView tests (T15.3) --------------------------------
+
+    #[test]
+    fn remote_view_starts_empty() {
+        let v = RemoteProgressView::new();
+        assert_eq!(v.peer_count(), 0);
+        assert!(v.peers().is_empty());
+        assert!(v.snapshot_for("any", "any").is_none());
+    }
+
+    #[test]
+    fn remote_view_apply_inserts_new_peer_and_spawn() {
+        let mut v = RemoteProgressView::new();
+        let now = SystemTime::now();
+        v.apply_update(
+            ProgressUpdateRef {
+                runner: "bob",
+                spawn: "sp1",
+                phase: "operate",
+                sent: 10,
+                received: 20,
+                eot_sent: false,
+                eot_received: false,
+                ts: "t1",
+            },
+            now,
+        );
+        assert_eq!(v.peer_count(), 1);
+        let snap = v.snapshot_for("bob", "sp1").expect("snapshot present");
+        assert_eq!(snap.phase, "operate");
+        assert_eq!(snap.sent, 10);
+        assert_eq!(snap.received, 20);
+        assert!(!snap.eot_sent);
+        assert!(!snap.eot_received);
+        assert_eq!(snap.ts, "t1");
+        assert_eq!(snap.last_update_ts, now);
+    }
+
+    #[test]
+    fn remote_view_apply_updates_existing_spawn_monotonically() {
+        let mut v = RemoteProgressView::new();
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        v.apply_update(
+            ProgressUpdateRef {
+                runner: "bob",
+                spawn: "sp1",
+                phase: "operate",
+                sent: 5,
+                received: 3,
+                eot_sent: false,
+                eot_received: false,
+                ts: "t0",
+            },
+            t0,
+        );
+        // Later update advances counters; phase and flag stickiness.
+        v.apply_update(
+            ProgressUpdateRef {
+                runner: "bob",
+                spawn: "sp1",
+                phase: "silent",
+                sent: 7,
+                received: 3,
+                eot_sent: true,
+                eot_received: false,
+                ts: "t1",
+            },
+            t1,
+        );
+        let snap = v.snapshot_for("bob", "sp1").unwrap();
+        assert_eq!(snap.phase, "silent");
+        assert_eq!(snap.sent, 7);
+        assert_eq!(snap.received, 3);
+        assert!(snap.eot_sent, "eot_sent must become sticky-true");
+        assert!(!snap.eot_received);
+        assert_eq!(snap.last_update_ts, t1);
+    }
+
+    #[test]
+    fn remote_view_apply_does_not_regress_counters_on_reorder() {
+        // TCP makes intra-stream reorder vanishingly unlikely, but the
+        // merge logic still defends against it: a later-arriving frame
+        // with smaller counters must NOT roll the view backwards.
+        let mut v = RemoteProgressView::new();
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        v.apply_update(
+            ProgressUpdateRef {
+                runner: "bob",
+                spawn: "sp1",
+                phase: "operate",
+                sent: 100,
+                received: 200,
+                eot_sent: true,
+                eot_received: true,
+                ts: "t0",
+            },
+            t0,
+        );
+        v.apply_update(
+            ProgressUpdateRef {
+                runner: "bob",
+                spawn: "sp1",
+                phase: "operate",
+                sent: 1,
+                received: 2,
+                eot_sent: false,
+                eot_received: false,
+                ts: "t1",
+            },
+            t1,
+        );
+        let snap = v.snapshot_for("bob", "sp1").unwrap();
+        assert_eq!(snap.sent, 100);
+        assert_eq!(snap.received, 200);
+        assert!(snap.eot_sent);
+        assert!(snap.eot_received);
+    }
+
+    #[test]
+    fn remote_view_keeps_peers_and_spawns_isolated() {
+        let mut v = RemoteProgressView::new();
+        let now = SystemTime::now();
+        v.apply_update(
+            ProgressUpdateRef {
+                runner: "alice",
+                spawn: "sp1",
+                phase: "operate",
+                sent: 1,
+                received: 1,
+                eot_sent: false,
+                eot_received: false,
+                ts: "t",
+            },
+            now,
+        );
+        v.apply_update(
+            ProgressUpdateRef {
+                runner: "bob",
+                spawn: "sp1",
+                phase: "operate",
+                sent: 2,
+                received: 2,
+                eot_sent: false,
+                eot_received: false,
+                ts: "t",
+            },
+            now,
+        );
+        v.apply_update(
+            ProgressUpdateRef {
+                runner: "alice",
+                spawn: "sp2",
+                phase: "operate",
+                sent: 3,
+                received: 3,
+                eot_sent: false,
+                eot_received: false,
+                ts: "t",
+            },
+            now,
+        );
+        assert_eq!(v.peer_count(), 2);
+        let mut peers = v.peers();
+        peers.sort();
+        assert_eq!(peers, vec!["alice".to_string(), "bob".to_string()]);
+        assert_eq!(v.snapshot_for("alice", "sp1").unwrap().sent, 1);
+        assert_eq!(v.snapshot_for("alice", "sp2").unwrap().sent, 3);
+        assert_eq!(v.snapshot_for("bob", "sp1").unwrap().sent, 2);
+        assert!(v.snapshot_for("bob", "sp2").is_none());
+    }
+
+    #[test]
+    fn remote_view_handle_round_trips_through_mutex() {
+        // The handle is a thin wrapper; this just checks the write/read
+        // pair survives the mutex without losing data.
+        let handle = RemoteProgressViewHandle::new();
+        let now = SystemTime::now();
+        handle.apply_update(
+            ProgressUpdateRef {
+                runner: "p",
+                spawn: "s",
+                phase: "operate",
+                sent: 1,
+                received: 2,
+                eot_sent: true,
+                eot_received: false,
+                ts: "t",
+            },
+            now,
+        );
+        let snap = handle.snapshot();
+        let entry = snap.snapshot_for("p", "s").unwrap();
+        assert_eq!(entry.sent, 1);
+        assert_eq!(entry.received, 2);
+        assert!(entry.eot_sent);
     }
 }
