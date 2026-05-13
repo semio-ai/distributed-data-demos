@@ -9978,3 +9978,95 @@ flood. T14.9 (Zenoh router-RPC sidecar) is the parked fix.
 
 `logs/stress-e14-20260513_121009/`. T15.6 (analysis classifier
 adaptation to add `runner_idle_terminated`) is the natural next step.
+
+---
+
+## 2026-05-13 — E15 architecturally complete (orchestrator)
+
+After T15.8 cleanup landed (6 commits, **-3168 net lines** across 49
+files), E15's architecture is in place:
+
+### What the architecture now looks like
+
+- **Variant**: emits one JSON progress line per second to stdout
+  (T15.1). Detects local idle in operate (T15.5), emits `eot_sent` to
+  JSONL, transitions to silent, exits cleanly. No on-wire EOT
+  exchange.
+- **Runner**: reads child stdout (T15.2), tracks per-spawn state
+  (LocalProgressTracker). Exchanges aggregate progress with peer
+  runners over TCP per-peer (T15.3, mirrors T14.24 pattern).
+  Phase-aware termination state machine (T15.4) decides spawn
+  completion based on cross-runner idle agreement plus a
+  `max_spawn_secs` safety net.
+- **Analysis**: T11.5 receive-headline pivot unchanged. T14.17
+  classifier gains `runner_idle_terminated` (T15.6) for the new
+  clean-exit path.
+
+### Removed (T15.8)
+
+- `Variant::signal_end_of_test`, `Variant::poll_peer_eots`,
+  `Variant::PeerEot` from `variant-base/src/variant_trait.rs`.
+- The entire `phase=eot` block in the driver (~140 LOC).
+- `--eot-timeout-secs` CLI arg.
+- T14.18's `variants/custom-udp/src/controltcp.rs` (565 LOC) and
+  `variants/hybrid/src/controltcp.rs` (633 LOC).
+- An untracked `variants/websocket/src/controltcp.rs` (685 LOC) that
+  T14.20 had partially started before cancellation.
+- All six variants' `signal_end_of_test` / `poll_peer_eots`
+  implementations.
+- `control_base_port` and `eot_timeout_secs` fields from 5 configs +
+  11 test fixtures.
+- Tests asserting on-wire EOT semantics across the workspace.
+
+### Validation
+
+- Smoke fixture (`configs/two-runner-smoke-e14.toml`): **18/18 spawns
+  status=success** across all 6 variant families × 1-2 threading
+  modes. Every JSONL log shows phase sequence `connect / stabilize /
+  operate / silent` (no `phase=eot`), with exactly one `eot_sent`
+  and zero `eot_received` / `eot_timeout` events.
+- Workspace: build clean, clippy clean, fmt clean, tests pass.
+- Stress fixture: 8/32 spawns ran (all custom-udp 8 SUCCESS) before
+  alice hit a runner-coord ready-barrier desync on
+  `hybrid-1000x100hz-qos1-multi`. Pre-existing issue (same class as
+  T14.14): clock_sync RTT spiked to 56.9 ms vs the 0.3 ms baseline,
+  indicating a transient host-scheduler stall. Not introduced by
+  T15.8 -- runner-coord code was untouched.
+
+### What E15 net-replaces (the failure-mode table)
+
+| Failure pattern (E14 era) | E15 outcome |
+|---|---|
+| EOT-marker-dropped under transport saturation | gone -- variant idle-detects locally; no on-wire EOT to lose |
+| Asymmetric eot_lost / eot_timeout_internal | gone for TCP-family; remaining cases are Zenoh's internal threading (T14.9) |
+| Per-spawn wall-clock timeout firing | gone -- max_spawn_secs is the rarely-tripped safety net |
+| 4 separate EOT-routing CUSTOM.md sections per variant | gone -- one architecture across all variants |
+| ~1900 LOC of EOT machinery accreted across E14 | gone (-3168 LOC including dead-test removal) |
+
+### Open / parked
+
+- **T15.9**: incremental test adaptation. Mostly done in-line by
+  T15.1-T15.8 workers; remaining gaps will surface as new test runs
+  flag them.
+- **T15.10 (NEW, to be filed)**: investigate the runner-coord
+  ready-barrier desync that T15.8 worker hit on the stress fixture.
+  Same class as T14.14 (UDP-coord under same-host load). Doesn't
+  manifest in lower-rate smoke. May benefit from the same TCP-per-
+  peer treatment that T14.24 applied to resume_manifest.
+- **T14.9** (deferred): Zenoh router-RPC sidecar -- the remaining
+  architectural gap for Zenoh's qos3/qos4 internal deadlock under
+  symmetric flood.
+
+### Commits across E15
+
+T15.1: cd077c9, ddd0bbf, d387e86, af6c4f2
+T15.2: 6bc8f94 (rescue)
+T15.3: c2f6029, 29d8bd9, 7f9db31, 57e7024
+T15.4: c5c7a6d, 26b82ae, 22561e6
+T15.5: 122df1f, d414000, 6281cfd (rescue)
+T15.6: 6a49898, 1487607, 2efd3aa
+T15.7: inline by T15.1 + T15.3 + T15.8 workers
+T15.8: 9f9edb2, 24adb2f, 582204e, 5833bcb, 9548c6b, 9de8172
+
+E15 milestone: 704e833 + this entry.
+

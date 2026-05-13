@@ -5881,6 +5881,71 @@ symmetric.
 
 ---
 
+### T15.10: runner -- investigate ready-barrier desync at high stress rate
+
+**Repo**: `runner/`.
+**Status**: pending, filed 2026-05-13 after T15.8 stress repro.
+
+#### Background
+
+After T15.8 landed (E15 cleanup), re-running
+`configs/two-runner-stress-e14.toml` succeeded on the first 8 spawns
+(all custom-udp 1000x100hz × multi+single) then alice hit:
+
+```
+FATAL: barrier 'ready' for variant 'hybrid-1000x100hz-qos1-multi'
+  timed out after 120.0s waiting for peer(s): ["bob"]
+```
+
+T15.8 worker's audit of the surrounding context: alice's clock_sync
+RTT for that spawn jumped to 56.9 ms (vs 0.3 ms baseline everywhere
+else), indicating a transient host-scheduler stall. The runner-coord
+code was untouched by T15.8.
+
+Same class of issue as **T14.14** (UDP-coord desync at later spawns)
+-- present in the codebase since the start but only manifests under
+symmetric load. The smoke fixture (10K msg/s) doesn't trigger it;
+the stress fixture (100K msg/s) does, intermittently.
+
+#### Scope
+
+Audit the ready / done barrier protocol vs T14.24's TCP-per-peer
+resume_manifest fix. T14.24 documented that the UDP-coord protocol's
+`MAX_MSG_SIZE = 4096` truncation only mattered for large payloads
+(resume_manifest), so ready/done barriers stayed on UDP. But under
+same-host symmetric flood there's apparently a different failure
+mode (datagram loss, not truncation).
+
+Two paths:
+
+A. **Harden the UDP barrier**: add per-peer ACKs + retries on
+   the ready/done barrier protocol. Reuses current transport.
+B. **Move ready/done to TCP per peer pair**: mirror T14.24's
+   resume_manifest fix. Larger change, removes the UDP-coord
+   fragility entirely for control-plane messages. The
+   user-suggested architecture (E15) already advocates for TCP
+   control channels; this completes the application of that
+   principle to all runner-coord messages.
+
+Worker decides based on audit. Path B is recommended unless audit
+finds a small UDP fix.
+
+#### Acceptance criteria
+
+- [ ] Audit findings posted to STATUS.md (which path is the
+      transient failure: lost datagrams? kernel buffer fill?).
+- [ ] Path chosen and implemented.
+- [ ] Stress fixture (`configs/two-runner-stress-e14.toml`) runs
+      end-to-end without ready/done barrier timeouts.
+- [ ] Existing tests pass; clippy + fmt clean.
+
+#### Out of scope
+
+- T14.14's broader same-host coord investigation (still parked).
+- T14.9 Zenoh router-RPC (separate path).
+
+---
+
 ### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (DEFERRED)
 
 **Repo**: `variants/zenoh/`, plus a small runner-side sidecar-spawn
