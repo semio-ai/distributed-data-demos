@@ -247,6 +247,12 @@ the intersection rule.
 
 - Each runner broadcasts: `ready for variant <name>`
 - Waits until all runners have signaled ready for this variant.
+- **Transport (T15.10):** Ready frames travel over the dedicated TCP
+  barrier channel introduced in "Ready/Done barrier transport
+  (T15.10)" below. The legacy UDP multicast path is retained as a
+  fallback exercised only by the in-process unit tests that do not
+  install the TCP transport; production runners always install it
+  before the first ready barrier.
 
 ### Per-Variant Clock Resync
 
@@ -275,6 +281,95 @@ picks the most recent measurement preceding the variant's writes.
   (success / failure / timeout).
 - Waits until all runners have reported done.
 - Proceeds to the next variant, or finishes if all variants are complete.
+- **Transport (T15.10):** Done frames travel over the same TCP
+  barrier channel as Ready (see "Ready/Done barrier transport
+  (T15.10)" below).
+
+### Ready/Done barrier transport (T15.10)
+
+Before T15.10 the ready/done barriers shared the UDP coordination
+socket with discovery, clock-sync, and probe responses. Under
+symmetric same-host stress (e.g. `configs/two-runner-stress-e14.toml`
+at 1000 vpt x 100 Hz x 2 directions ~~ 200K msgs/s on the variant
+data plane plus multicast loopback on the coord socket) the kernel's
+per-socket UDP recv buffer overflowed during the variant-transition
+window between spawns, dropping `Ready` / `Done` datagrams. With no
+application-level retransmit and the receiver's 2 s linger having
+already expired, the local barrier waited the full
+`--barrier-timeout-secs` (default 120 s) and exited 75.
+
+T15.10 moves the ready/done quorum signal to a dedicated long-lived
+TCP-per-peer-pair channel mirroring T14.24's resume_manifest pattern
+and T15.3's progress_coord pattern. Wire details:
+
+- **Pairing.** Same rule as T14.24 / T15.3: for peer pair `(a, b)`
+  with `a < b` lexicographically by runner name, `a` accepts and `b`
+  connects. Self-loops do not exchange.
+- **Port derivation.** Each runner listens on
+  `--port + 96 + runner_index`, where `runner_index` is the runner's
+  position in the config's `runners` array (zero-based). The
+  constant `96` is `BARRIER_TCP_OFFSET` in
+  `runner/src/barrier_coord.rs`. Full layout:
+  - UDP coord: `base + index`
+  - Resume manifest TCP (T14.24): `base + 32 + index`
+  - Progress TCP (T15.3): `base + 64 + index`
+  - Barrier TCP (T15.10): `base + 96 + index`
+
+  All four ranges sit inside the same low ephemeral region operators
+  already permit for UDP coordination, so no new firewall rules are
+  required.
+- **Handshake.** The connecting side writes a single length-prefixed
+  UTF-8 frame carrying its runner name (`[u32 BE length][name bytes]`,
+  with a 256-byte cap on `length`). The accepting side reads this
+  frame, verifies the name is in the expected runners set, and
+  installs the stream as the peer's writer. There is no reverse
+  handshake -- peer identity is established by the connect side
+  only.
+- **Framing.** Each subsequent barrier frame is one length-prefixed
+  JSON encoding of `Message::Ready` or `Message::Done`:
+  `[u32 BE length][JSON bytes]`. Frames above
+  `BARRIER_FRAME_MAX_BYTES` (16 KiB) are rejected on read; the
+  payload today is a few hundred bytes, so this cap is purely
+  defensive against a peer that lies about its length prefix.
+- **Lifecycle.** The coordinator's `start()` runs after discovery
+  (which populates `peer_hosts`). It accepts inbound connections and
+  makes outbound connect attempts in parallel, retrying connects
+  every ~500 ms until the peer's listener has bound (bounded by an
+  internal `BARRIER_STARTUP_BUDGET` of 15 s). Once a pair has
+  connected, the connection remains open across every Phase 2 spawn.
+  A reader thread per peer folds incoming Ready/Done frames into a
+  per-peer inbox; the barrier loops drain the inbox on every poll.
+  `shutdown()` flips an atomic stop flag, closes all streams (which
+  the peers observe as EOF), and joins the reader threads. **Failure
+  to bind the TCP listener at runner startup is fatal** (the
+  runner exits with a clear error, not EX_TEMPFAIL) -- a bind
+  failure indicates a port collision or firewall rule, not a
+  transient peer condition, so the wrapper should not retry.
+- **Single-runner mode.** No transport is set up; the broadcast and
+  poll helpers short-circuit and the barrier methods return
+  immediately as they did pre-T15.10.
+
+**Defensive isolation from UDP coordination.** Ready/Done frames
+received on the UDP coord socket while a TCP barrier is in progress
+do NOT count toward quorum -- the TCP path is the sole source of
+the quorum signal once installed. The UDP socket continues to
+service clock-sync probes, late-discovery re-emission (T-coord.3),
+and stale-Done re-emission (T-coord.1b); those messages were never
+the quorum signal, they are recovery aids for cross-phase races.
+
+**Backwards compatibility.** The on-disk artefacts and the
+`Message::Ready` / `Message::Done` wire shapes are unchanged. A
+peer running an older binary that expects ready/done on UDP
+multicast is not interoperable with a peer running T15.10 -- but
+this is an internal coordination protocol on a single coordination
+port range, so all peers must run the same binary version anyway
+(the discovery `config_hash` check already enforces this indirectly
+via mismatched compiled config layouts).
+
+On overall barrier timeout (no convergence within
+`--barrier-timeout-secs`) the runner still exits with code 75
+(`EX_TEMPFAIL`) and the wrapper script re-launches with `--resume`,
+identical to the pre-T15.10 contract.
 
 ### Per-Spawn Progress Exchange (T15.3, E15)
 
