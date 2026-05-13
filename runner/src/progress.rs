@@ -48,6 +48,7 @@ use serde::Deserialize;
 pub struct LocalProgressTracker {
     /// Effective spawn name (e.g. `dummy-qos2`). Matches the
     /// `--variant` CLI arg the runner injected when spawning the child.
+    #[allow(dead_code)]
     pub spawn_name: String,
     /// Most recent `phase` value observed on a progress event.
     /// `"unknown"` until the first event arrives.
@@ -183,6 +184,7 @@ pub struct ProgressEvent {
     /// RFC 3339 timestamp with nanoseconds, as the variant wrote it.
     /// Captured for completeness / logging; not used by tracker logic.
     #[serde(default)]
+    #[allow(dead_code)]
     pub ts: String,
     /// One of `"connect"`, `"stabilize"`, `"operate"`, `"eot"`,
     /// `"silent"`, `"done"`. Stored as a string to stay forward

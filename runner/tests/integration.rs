@@ -1619,14 +1619,9 @@ fn two_runner_resume_manifest_barrier_converges_t14_24() {
     // (single-runner short-circuits). `alice` and `bob` are the
     // conventional names and also sort consistently (alice < bob) which
     // exercises the lower-sorted-name-accepts pairing rule.
-    // Note: variant-dummy has no real peer transport, so its EOT phase
-    // never receives a peer EOT in two-runner mode. Set
-    // `eot_timeout_secs = 2` so the spawn exits cleanly via the
-    // eot-timeout fast-path (it logs `eot_timeout` and proceeds to the
-    // silent / disconnect phases) instead of running until the runner's
-    // 30 s timeout. The status row will be `success` because the variant
-    // process exit code is 0 — `eot_timeout` is a soft event, not a
-    // failure.
+    // T15.8: `eot_timeout_secs` removed from configs along with the
+    // on-wire EOT exchange. variant-dummy now exits via T15.5 idle
+    // detection / runner-coordinated termination (T15.4).
     let config_content = format!(
         r#"run = "t14_24_resume"
 runners = ["alice", "bob"]
@@ -1641,7 +1636,6 @@ binary = "../target/release/variant-dummy.exe"
   stabilize_secs = 0
   operate_secs = 1
   silent_secs = 0
-  eot_timeout_secs = 2
   workload = "scalar-flood"
   values_per_tick = 1
   qos = 1
@@ -1851,7 +1845,6 @@ binary = "../target/release/variant-dummy.exe"
   stabilize_secs = 0
   operate_secs = 3
   silent_secs = 0
-  eot_timeout_secs = 2
   workload = "scalar-flood"
   values_per_tick = 1
   qos = 1
