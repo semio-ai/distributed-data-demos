@@ -10345,3 +10345,76 @@ flagged as expected T14.9 territory and out of scope for T15.10.
 e767ab6 docs(status): T15.10 audit findings for ready/done barrier desync
 ```
 
+
+---
+
+## 2026-05-13 — T15.10 closes runner-coord architectural arc (orchestrator)
+
+T15.10 worker landed 6 commits with an excellent audit finding:
+- Not T14.24's truncation case (Ready/Done payloads are ~150 bytes).
+- **UDP recv queue overflow during variant-transition windows**: the
+  single coord UDP socket is shared with discovery, clock_sync, and
+  probes; at 200K msg/s data-plane load the kernel's per-socket recv
+  buffer overflows in the window where one variant is winding down
+  and the next is ramping up.
+- The 56.9ms clock_sync RTT spike from the T15.8 stress run was the
+  same root cause -- clock_sync absorbs it gracefully via its N=32
+  sample retry, but Ready/Done barriers have no application-level
+  retransmit so the loss is permanent.
+
+Fix: Path B (TCP per peer pair), mirroring T14.24 + T15.3. New
+`runner/src/barrier_coord.rs` listens at `base_port + 96 + index`,
+length-prefixed JSON Ready/Done frames. UDP retained for discovery,
+clock-sync, probes, legacy recovery.
+
+### Stress fixture: 32/32 spawns clean
+
+End-to-end run of `configs/two-runner-stress-e14.toml`:
+- 30 SUCCESS (all custom-udp, hybrid, websocket, quic, webrtc x all
+  QoS / threading modes)
+- 2 Zenoh qos3 / qos4 multi timeouts (expected; T14.9 territory)
+- Zero barrier timeouts
+- Zero panics
+- Zero FATAL lines
+
+This is the first time the full stress fixture has run end-to-end
+without runner-coord failures.
+
+### Architectural state after T15.10
+
+All runner-coord control planes are now uniformly TCP per peer pair:
+- Ready/Done barriers (T15.10)
+- resume_manifest (T14.24)
+- ProgressUpdate (T15.3)
+
+The UDP-coord protocol is reduced to:
+- Discovery (one-shot, no retry needed)
+- Clock-sync (N=32 retry loop absorbs loss)
+- Probe responses
+- Legacy T-coord.1b / T-coord.3 recovery paths
+
+Each of these has natural smoothing properties that absorb transient
+UDP loss without app-level retry.
+
+### The journey, from E14 to here
+
+E14 era: each variant carried its own on-wire EOT machinery with
+per-transport quirks (T14.18 for UDP-family, T14.20 cancelled for
+websocket). Reactive failure fixes accumulated: T14.13/14/16/18/19/22.
+Resume was its own broken thing (T14.23, T14.24). The runner-coord
+UDP barriers desync'd under load (T14.14, T15.10).
+
+E15 + T15.10 era: variants observe their own activity (T15.5 idle
+detection), emit progress to stdout (T15.1), trust the runner to
+decide termination (T15.4). Runners coordinate via TCP per peer pair
+across all control planes. ~3168 LOC of E14-era complexity removed
+in T15.8; the remaining runner-coord fragility was closed in T15.10.
+
+Only remaining architectural gap: T14.9 (Zenoh router-RPC sidecar)
+for Zenoh's internal async deadlock at qos3/qos4 under symmetric
+flood. All other variants are clean.
+
+### Commits
+
+T15.10: e767ab6, 7db7fc6, 45018e7, 26c77ec, 86884f3, 25ec3ba.
+
