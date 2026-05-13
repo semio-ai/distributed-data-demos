@@ -1,4 +1,4 @@
-# Hybrid-only two-runner-on-localhost HIGH-THROUGHPUT validation fixture for
+﻿# Hybrid-only two-runner-on-localhost HIGH-THROUGHPUT validation fixture for
 # T10.1.
 #
 # Same shape as `two-runner-hybrid-only.toml`, but with the throughput knobs
@@ -44,4 +44,3 @@ binary = "target/release/variant-hybrid.exe"
   multicast_group = "239.0.0.1:19642"
   tcp_base_port = 19840
   # T14.18: per-pair control connection for EOT. QoS-independent.
-  control_base_port = 20040

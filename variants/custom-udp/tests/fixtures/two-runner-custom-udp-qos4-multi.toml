@@ -1,4 +1,4 @@
-# Custom-UDP T14.3 two-runner regression: QoS 4 (TCP) in BOTH threading modes.
+﻿# Custom-UDP T14.3 two-runner regression: QoS 4 (TCP) in BOTH threading modes.
 #
 # Cross-product: qos=4, threading_modes=["single", "multi"]. The runner
 # expansion (T14.8) yields two spawns:
@@ -40,4 +40,3 @@ binary = "target/release/variant-custom-udp.exe"
   buffer_size = 65536
   tcp_base_port = 19850
   # T14.18: control TCP for EOT side-channel.
-  control_base_port = 20250

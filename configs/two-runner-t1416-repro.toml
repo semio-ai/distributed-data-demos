@@ -1,4 +1,4 @@
-# T14.16 end-to-end repro: re-creates the all-variants qos2 100K msg/s
+﻿# T14.16 end-to-end repro: re-creates the all-variants qos2 100K msg/s
 # multi-mode case that surfaced the asymmetric same-host timeout where
 # one runner's reader-channel saturation dropped the peer's EOT marker
 # and forced a 120 s status=timeout exit.
@@ -17,7 +17,7 @@ run = "t1416-repro"
 runners = ["alice", "bob"]
 default_timeout_secs = 60
 
-# ─── Custom UDP: qos2 multi-mode at 100K msg/s ───────────────────────────────
+# â”€â”€â”€ Custom UDP: qos2 multi-mode at 100K msg/s â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "custom-udp-1000x100hz"
@@ -37,9 +37,8 @@ binary = "target/release/variant-custom-udp.exe"
   buffer_size = 65536
   tcp_base_port = 19800
   # T14.18: control TCP for EOT side-channel.
-  control_base_port = 20000
 
-# ─── Hybrid: qos2 multi-mode at 100K msg/s (same symmetry) ───────────────────
+# â”€â”€â”€ Hybrid: qos2 multi-mode at 100K msg/s (same symmetry) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "hybrid-1000x100hz"
@@ -58,4 +57,3 @@ binary = "target/release/variant-hybrid.exe"
   multicast_group = "239.0.0.1:19503"
   tcp_base_port = 19840
   # T14.18: control TCP for EOT side-channel.
-  control_base_port = 20040

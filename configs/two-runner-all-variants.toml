@@ -63,7 +63,6 @@ binary = "target/release/variant-custom-udp.exe"
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
   tcp_base_port = 19800
-  control_base_port = 19590
 
 [[variant]]
 template = "custom-udp-base"
@@ -138,7 +137,6 @@ binary = "target/release/variant-hybrid.exe"
   [variant_template.specific]
   multicast_group = "239.0.0.1:19503"
   tcp_base_port = 19900
-  control_base_port = 19595
 
 [[variant]]
 template = "hybrid-base"

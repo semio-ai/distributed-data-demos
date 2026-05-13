@@ -1,4 +1,4 @@
-# T14.19 regression fixture: high-rate symmetric TCP qos4 in Single
+﻿# T14.19 regression fixture: high-rate symmetric TCP qos4 in Single
 # mode at the workload that previously deadlocked custom-udp Single
 # (1000 vpt x 100 Hz = 100K msg/s symmetric).
 #
@@ -39,4 +39,3 @@ binary = "target/release/variant-custom-udp.exe"
   multicast_group = "239.0.0.1:19544"
   buffer_size = 65536
   tcp_base_port = 19840
-  control_base_port = 20210

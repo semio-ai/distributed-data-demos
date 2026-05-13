@@ -1,4 +1,4 @@
-# E14 high-rate stress smoke. Exercises the original user-reported
+﻿# E14 high-rate stress smoke. Exercises the original user-reported
 # failure cases from `logs/all-variants-01-20260512_093124/` at the
 # 1000 vpt x 100 Hz workload (100K msg/s symmetric) across all QoS
 # levels and both threading modes where supported.
@@ -21,7 +21,7 @@ run = "stress-e14"
 runners = ["alice", "bob"]
 default_timeout_secs = 60
 
-# ─── Custom UDP ──────────────────────────────────────────────────────────────
+# â”€â”€â”€ Custom UDP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant_template]]
 name = "custom-udp-base"
@@ -39,13 +39,12 @@ binary = "target/release/variant-custom-udp.exe"
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
   tcp_base_port = 19800
-  control_base_port = 19590
 
 [[variant]]
 template = "custom-udp-base"
 name = "custom-udp-1000x100hz"
 
-# ─── Hybrid UDP/TCP ──────────────────────────────────────────────────────────
+# â”€â”€â”€ Hybrid UDP/TCP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant_template]]
 name = "hybrid-base"
@@ -62,13 +61,12 @@ binary = "target/release/variant-hybrid.exe"
   [variant_template.specific]
   multicast_group = "239.0.0.1:19503"
   tcp_base_port = 19900
-  control_base_port = 19595
 
 [[variant]]
 template = "hybrid-base"
 name = "hybrid-1000x100hz"
 
-# ─── WebSocket (qos 3+4 only) ────────────────────────────────────────────────
+# â”€â”€â”€ WebSocket (qos 3+4 only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "websocket-1000x100hz"
@@ -86,7 +84,7 @@ binary = "target/release/variant-websocket.exe"
   [variant.specific]
   ws_base_port = 19960
 
-# ─── QUIC (Multi only) ───────────────────────────────────────────────────────
+# â”€â”€â”€ QUIC (Multi only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "quic-1000x100hz"
@@ -104,7 +102,7 @@ binary = "target/release/variant-quic.exe"
   [variant.specific]
   base_port = 19930
 
-# ─── Zenoh (Multi only) ──────────────────────────────────────────────────────
+# â”€â”€â”€ Zenoh (Multi only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "zenoh-1000x100hz"
@@ -122,7 +120,7 @@ binary = "target/release/variant-zenoh.exe"
   [variant.specific]
   zenoh_mode = "peer"
 
-# ─── WebRTC (Multi only, qos 1-2 unreliable mode is fine here) ───────────────
+# â”€â”€â”€ WebRTC (Multi only, qos 1-2 unreliable mode is fine here) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "webrtc-1000x100hz"

@@ -1,4 +1,4 @@
-# T14.22 regression fixture: same-host TCP startup race on qos=4 multi.
+﻿# T14.22 regression fixture: same-host TCP startup race on qos=4 multi.
 #
 # Pre-T14.22: bob's `connect()` to alice's TCP listen port fired before
 # alice's `listen()` was accepting; the kernel returned
@@ -39,4 +39,3 @@ binary = "target/release/variant-custom-udp.exe"
   multicast_group = "239.0.0.1:19548"
   buffer_size = 65536
   tcp_base_port = 19880
-  control_base_port = 20280

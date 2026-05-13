@@ -1,4 +1,4 @@
-# T14.19 regression fixture: high-rate symmetric WebSocket qos4 in
+﻿# T14.19 regression fixture: high-rate symmetric WebSocket qos4 in
 # Single mode at the workload that previously deadlocked websocket
 # Single (1000 vpt x 100 Hz = 100K msg/s symmetric).
 #
@@ -44,7 +44,6 @@ binary = "target/release/variant-websocket.exe"
   # is dropped, EOT cannot route and the EOT phase will wait the full
   # window for nothing. Cap it short so the spawn exits within the
   # runner's default_timeout_secs budget.
-  eot_timeout_secs = 5
 
   [variant.specific]
   ws_base_port = 19970

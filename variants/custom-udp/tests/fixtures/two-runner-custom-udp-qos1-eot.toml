@@ -1,4 +1,4 @@
-# Custom-UDP UDP-path EOT validation fixture (T12.3).
+﻿# Custom-UDP UDP-path EOT validation fixture (T12.3).
 #
 # A single qos=1 spawn so a manual two-runner-on-localhost run exercises
 # the UDP EOT path (5 retries with 5 ms spacing, receiver dedup by
@@ -38,4 +38,3 @@ binary = "target/release/variant-custom-udp.exe"
   buffer_size = 65536
   tcp_base_port = 19800
   # T14.18: control TCP for EOT side-channel.
-  control_base_port = 20180

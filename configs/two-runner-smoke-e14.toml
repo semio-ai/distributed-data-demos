@@ -1,4 +1,4 @@
-# E14 end-to-end smoke. One workload (100 vpt x 100 Hz = 10K msg/s) per
+﻿# E14 end-to-end smoke. One workload (100 vpt x 100 Hz = 10K msg/s) per
 # variant family at qos4, both threading modes where supported. ~12 spawns,
 # ~3 min wall-time. Used to validate the E14 plumbing (threading_modes
 # expansion + supported_modes capability gating) and exercise the T11.5
@@ -12,7 +12,7 @@ run = "smoke-e14"
 runners = ["alice", "bob"]
 default_timeout_secs = 60
 
-# ─── Custom UDP ──────────────────────────────────────────────────────────────
+# â”€â”€â”€ Custom UDP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "custom-udp-100x100hz"
@@ -31,9 +31,8 @@ binary = "target/release/variant-custom-udp.exe"
   multicast_group = "239.0.0.1:19601"
   buffer_size = 65536
   tcp_base_port = 19610
-  control_base_port = 19720
 
-# ─── Hybrid UDP/TCP ──────────────────────────────────────────────────────────
+# â”€â”€â”€ Hybrid UDP/TCP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "hybrid-100x100hz"
@@ -51,9 +50,8 @@ binary = "target/release/variant-hybrid.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19603"
   tcp_base_port = 19640
-  control_base_port = 19740
 
-# ─── WebSocket ───────────────────────────────────────────────────────────────
+# â”€â”€â”€ WebSocket â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "websocket-100x100hz"
@@ -71,7 +69,7 @@ binary = "target/release/variant-websocket.exe"
   [variant.specific]
   ws_base_port = 19660
 
-# ─── QUIC (Multi only) ───────────────────────────────────────────────────────
+# â”€â”€â”€ QUIC (Multi only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "quic-100x100hz"
@@ -90,7 +88,7 @@ binary = "target/release/variant-quic.exe"
   [variant.specific]
   base_port = 19670
 
-# ─── Zenoh (Multi only) ──────────────────────────────────────────────────────
+# â”€â”€â”€ Zenoh (Multi only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "zenoh-100x100hz"
@@ -109,7 +107,7 @@ binary = "target/release/variant-zenoh.exe"
   [variant.specific]
   zenoh_mode = "peer"
 
-# ─── WebRTC (Multi only) ─────────────────────────────────────────────────────
+# â”€â”€â”€ WebRTC (Multi only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 [[variant]]
 name = "webrtc-100x100hz"

@@ -1,7 +1,7 @@
-# Custom-UDP-only two-runner-on-localhost regression fixture for T10.4.
+﻿# Custom-UDP-only two-runner-on-localhost regression fixture for T10.4.
 #
 # Mirrors the failing entry from the user's two-machine run
-# (`custom-udp-10x1000hz-qos4`): 10 distinct paths × 1000 ticks/sec × QoS 4
+# (`custom-udp-10x1000hz-qos4`): 10 distinct paths Ã— 1000 ticks/sec Ã— QoS 4
 # (TCP). Used to verify the framing-panic fix at QoS 4 stays fixed and the
 # spawn still completes status=success on localhost.
 #
@@ -37,4 +37,3 @@ binary = "target/release/variant-custom-udp.exe"
   buffer_size = 65536
   tcp_base_port = 19800
   # T14.18: control TCP for EOT side-channel.
-  control_base_port = 20200

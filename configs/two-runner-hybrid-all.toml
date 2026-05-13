@@ -1,4 +1,4 @@
-run = "hybrid-all"
+﻿run = "hybrid-all"
 runners = ["alice", "bob"]
 default_timeout_secs = 60
 
@@ -19,7 +19,6 @@ binary = "target/release/variant-hybrid.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19502"
   tcp_base_port = 19900
-  control_base_port = 20100
   peers = "127.0.0.1:19900"
 
 [[variant]]
@@ -39,7 +38,6 @@ binary = "target/release/variant-hybrid.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19502"
   tcp_base_port = 19900
-  control_base_port = 20100
   peers = "127.0.0.1:19900"
 
 [[variant]]
@@ -59,7 +57,6 @@ binary = "target/release/variant-hybrid.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19502"
   tcp_base_port = 19900
-  control_base_port = 20100
   peers = "127.0.0.1:19900"
 
 [[variant]]
@@ -79,5 +76,4 @@ binary = "target/release/variant-hybrid.exe"
   [variant.specific]
   multicast_group = "239.0.0.1:19502"
   tcp_base_port = 19900
-  control_base_port = 20100
   peers = "127.0.0.1:19900"

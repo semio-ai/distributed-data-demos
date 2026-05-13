@@ -1,4 +1,4 @@
-# Hybrid-only two-runner-on-localhost validation fixture for T9.3.
+﻿# Hybrid-only two-runner-on-localhost validation fixture for T9.3.
 #
 # Single Hybrid entry, qos omitted -> runner expands to all 4 QoS levels:
 #   - qos 1 (UDP multicast, best-effort)
@@ -41,4 +41,3 @@ binary = "target/release/variant-hybrid.exe"
   multicast_group = "239.0.0.1:19542"
   tcp_base_port = 19940
   # T14.18: per-pair control connection for EOT. QoS-independent.
-  control_base_port = 20140
