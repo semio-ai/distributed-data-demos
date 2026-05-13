@@ -11,9 +11,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use variant_base::{PeerEot, Qos, ReceivedUpdate, ThreadingMode, Variant};
+use variant_base::{Qos, ReceivedUpdate, ThreadingMode, Variant};
 
-use crate::controltcp::{self, ControlFrame, ControlPeer, ControlPeerEndpoint, ControlRole};
+/// Internal record of an observed peer EOT marker (T15.8 historical).
+///
+/// The on-wire EOT exchange was retired in T15.8. The variant's
+/// receive plumbing still decodes EOT frames so a pre-T15.8 peer
+/// does not surface a parser error, but the markers are no longer
+/// surfaced to the driver.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct PeerEot {
+    writer: String,
+    eot_id: u64,
+}
+
 use crate::protocol;
 use crate::protocol::Frame;
 use crate::qos::{GapCheckResult, GapDetector, LatestValueTracker};
@@ -76,10 +88,10 @@ const TCP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// in disconnected state (alice times out waiting for the inbound TCP
 /// peer; bob writes into the void).
 ///
-/// 30 s matches `controltcp::CONTROL_CONNECT_BUDGET` and hybrid's
-/// `connect_with_retry` budget — see `variants/hybrid/src/tcp.rs`'s
-/// `connect_with_retry` (T14.4 follow-up commit `c163042` bumped that
-/// budget to 30 s after observing transient delays in practice).
+/// 30 s matches hybrid's `connect_with_retry` budget — see
+/// `variants/hybrid/src/tcp.rs`'s `connect_with_retry` (T14.4
+/// follow-up commit `c163042` bumped that budget to 30 s after
+/// observing transient delays in practice).
 const TCP_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(30);
 
 /// T14.22: per-attempt sleep between `connect()` retries. Short enough
@@ -134,12 +146,6 @@ pub struct UdpConfig {
     /// Driver's per-tick value count. Used to size the Multi-mode mpsc
     /// channel (see `start_reader_threads`). Unused in Single mode.
     pub values_per_tick: u32,
-    /// T14.18: Local control TCP listen address (QoS-independent).
-    pub control_listen_addr: SocketAddr,
-    /// T14.18: Per-peer control wiring.
-    pub control_peers: Vec<ControlPeerEndpoint>,
-    /// T14.18: `--eot-timeout-secs` for the control-channel drain.
-    pub eot_timeout_secs: Option<u64>,
 }
 
 /// Data frame placed on the bounded Multi-mode mpsc by reader threads.
@@ -247,11 +253,6 @@ pub struct UdpVariant {
     /// Reader-thread state. `Some` only in Multi mode while reader
     /// threads are running.
     multi: Option<MultiReaderState>,
-    /// T14.18: per-peer control TCP connections.
-    control_peers: Vec<ControlPeer>,
-    /// T14.18: control reader threads (Multi mode only).
-    control_threads: Vec<thread::JoinHandle<()>>,
-    control_shutdown: Option<Arc<AtomicBool>>,
 }
 
 /// Apply `SO_RCVBUF = recv_buffer_kb * 1024` to a UDP `Socket`, but only as
@@ -424,106 +425,7 @@ impl UdpVariant {
             eot_queue: VecDeque::new(),
             threading_mode: ThreadingMode::Single,
             multi: None,
-            control_peers: Vec::new(),
-            control_threads: Vec::new(),
-            control_shutdown: None,
         }
-    }
-
-    /// T14.18: establish per-peer control TCP connections.
-    fn setup_control_channel(&mut self) -> Result<()> {
-        if self.config.control_peers.is_empty() {
-            return Ok(());
-        }
-        let server_peers: Vec<ControlPeerEndpoint> = self
-            .config
-            .control_peers
-            .iter()
-            .filter(|p| p.role == ControlRole::Server)
-            .cloned()
-            .collect();
-        let client_peers: Vec<ControlPeerEndpoint> = self
-            .config
-            .control_peers
-            .iter()
-            .filter(|p| p.role == ControlRole::Client)
-            .cloned()
-            .collect();
-
-        let listener =
-            std::net::TcpListener::bind(self.config.control_listen_addr).with_context(|| {
-                format!(
-                    "T14.18: failed to bind control listener on {}",
-                    self.config.control_listen_addr
-                )
-            })?;
-        let deadline = Instant::now() + controltcp::CONTROL_ACCEPT_BUDGET;
-        for expected in &server_peers {
-            let (stream, accepted_addr) = controltcp::accept_with_budget(&listener, deadline)
-                .with_context(|| {
-                    format!(
-                        "T14.18: control accept for peer {} timed out",
-                        expected.peer_name
-                    )
-                })?;
-            let peer = ControlPeer::from_stream(stream, expected.peer_name.clone(), accepted_addr)?;
-            self.control_peers.push(peer);
-        }
-        drop(listener);
-
-        for endpoint in &client_peers {
-            let stream = controltcp::connect_with_budget(
-                endpoint.peer_addr,
-                controltcp::CONTROL_CONNECT_BUDGET,
-            )
-            .with_context(|| {
-                format!(
-                    "T14.18: control connect to peer {} ({}) failed",
-                    endpoint.peer_name, endpoint.peer_addr
-                )
-            })?;
-            let peer =
-                ControlPeer::from_stream(stream, endpoint.peer_name.clone(), endpoint.peer_addr)?;
-            self.control_peers.push(peer);
-        }
-        Ok(())
-    }
-
-    /// Single mode: poll every control peer once.
-    fn poll_control_peers(&mut self) {
-        let mut dropped = Vec::new();
-        for (i, peer) in self.control_peers.iter_mut().enumerate() {
-            match peer.try_recv_frame() {
-                Ok(Some(ControlFrame::Eot { writer, eot_id })) => {
-                    if writer != self.config.runner
-                        && self.eot_seen.insert((writer.clone(), eot_id))
-                    {
-                        self.eot_queue.push_back(PeerEot { writer, eot_id });
-                    }
-                }
-                Ok(Some(ControlFrame::Bye)) => {}
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!(
-                        "[custom-udp] T14.18 control peer {} read error: {:#}; dropping",
-                        peer.peer_addr, e
-                    );
-                    peer.shutdown();
-                    dropped.push(i);
-                }
-            }
-        }
-        for &i in dropped.iter().rev() {
-            self.control_peers.remove(i);
-        }
-    }
-
-    /// Effective EOT timeout seconds for the control-channel drain.
-    fn effective_eot_timeout_secs(&self) -> u64 {
-        const DEFAULT_EOT_TIMEOUT_SECS: u64 = 5;
-        self.config
-            .eot_timeout_secs
-            .unwrap_or(DEFAULT_EOT_TIMEOUT_SECS)
     }
 
     /// Record an observed peer EOT, deduplicating by `(writer, eot_id)`.
@@ -809,11 +711,10 @@ impl UdpVariant {
 
     /// Send an EOT frame on the active transport for the configured QoS.
     ///
-    /// **DEPRECATED in T14.18**: EOT now routes exclusively over the
-    /// per-peer-pair TCP control connection (see
-    /// `controltcp::encode_eot_frame` / `signal_end_of_test`). This
-    /// function is kept for the `eot_lifecycle_smoke` test in
-    /// `tests/multicast_loopback.rs` and as a legacy reference.
+    /// **DEPRECATED in T15.8**: the on-wire EOT exchange (over the data
+    /// path or over a dedicated control TCP channel) is no longer
+    /// driven by the variant. This helper is retained for the legacy
+    /// `eot_lifecycle_smoke` test in `tests/multicast_loopback.rs`.
     ///
     /// QoS 1-3 (UDP path): broadcast the EOT datagram to the multicast
     /// group `EOT_UDP_RETRIES` times with `EOT_UDP_SPACING` between sends.
@@ -1220,36 +1121,8 @@ impl UdpVariant {
             handles.push(handle);
         }
 
-        // T14.18: per-peer control reader threads (Multi mode). Each
-        // thread reads length-prefixed control frames and pushes any
-        // decoded EOT directly onto the lifecycle channel as
-        // `ReaderLifecycleItem::Eot(EotFrame)`. The map_fn shim lets
-        // controltcp.rs stay variant-agnostic.
-        let control_shutdown = Arc::new(AtomicBool::new(false));
-        let mut control_handles: Vec<thread::JoinHandle<()>> = Vec::new();
-        for peer in self.control_peers.iter_mut() {
-            if let Some(read_clone) = peer.take_read_clone() {
-                let label = format!("{}-{}", peer.peer_name, peer.peer_addr);
-                let lifecycle_tx_ctl = lifecycle_tx.clone();
-                let shutdown_ctl = Arc::clone(&control_shutdown);
-                let handle = controltcp::spawn_control_reader(
-                    read_clone,
-                    label,
-                    lifecycle_tx_ctl,
-                    control_eot_to_lifecycle,
-                    shutdown_ctl,
-                )
-                .with_context(|| {
-                    format!(
-                        "T14.18: spawn control reader for {} ({})",
-                        peer.peer_name, peer.peer_addr
-                    )
-                })?;
-                control_handles.push(handle);
-            }
-        }
-        self.control_shutdown = Some(control_shutdown);
-        self.control_threads = control_handles;
+        // T15.8: per-peer control reader threads removed (the on-wire
+        // EOT exchange they fed is gone).
 
         // The original `data_tx` / `lifecycle_tx` senders belong to the
         // variant only to clone from; drop them so the channels
@@ -1534,13 +1407,6 @@ fn send_lifecycle(tx: &Sender<ReaderLifecycleItem>, item: ReaderLifecycleItem) -
     }
 }
 
-/// T14.18: convert a control-channel `EotFrame` into the variant's
-/// lifecycle item shape. Used as the `map_eot` argument to
-/// `controltcp::spawn_control_reader`.
-fn control_eot_to_lifecycle(eot: protocol::EotFrame) -> ReaderLifecycleItem {
-    ReaderLifecycleItem::Eot(eot)
-}
-
 impl Variant for UdpVariant {
     fn name(&self) -> &str {
         "custom-udp"
@@ -1576,11 +1442,6 @@ impl Variant for UdpVariant {
             self.setup_tcp()?;
         }
 
-        // T14.18: establish per-peer-pair TCP control connections for
-        // EOT exchange, separate from the data path.
-        self.setup_control_channel()
-            .context("T14.18: failed to set up control TCP side-channel")?;
-
         Ok(())
     }
 
@@ -1596,34 +1457,7 @@ impl Variant for UdpVariant {
     }
 
     fn stop_reader_threads(&mut self) -> Result<()> {
-        // T14.18: tear down control reader threads first. Set the
-        // shared flag, shut down each peer's stream to wake blocked
-        // reads, and join with a bounded deadline.
-        if let Some(shutdown) = self.control_shutdown.take() {
-            shutdown.store(true, Ordering::SeqCst);
-            for peer in &self.control_peers {
-                peer.shutdown();
-            }
-            let deadline = Instant::now() + controltcp::READER_JOIN_TIMEOUT;
-            for handle in self.control_threads.drain(..) {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let poll_step = Duration::from_millis(20);
-                let mut waited = Duration::ZERO;
-                while !handle.is_finished() && waited < remaining {
-                    thread::sleep(poll_step);
-                    waited += poll_step;
-                }
-                if handle.is_finished() {
-                    let _ = handle.join();
-                } else {
-                    eprintln!(
-                        "[custom-udp] warning: T14.18 control reader thread did not exit within {:?}; detaching",
-                        controltcp::READER_JOIN_TIMEOUT
-                    );
-                }
-            }
-        }
-
+        // T15.8: control TCP reader-thread teardown removed.
         let multi = match self.multi.take() {
             Some(m) => m,
             None => return Ok(()),
@@ -1704,9 +1538,7 @@ impl Variant for UdpVariant {
 
         match self.threading_mode {
             ThreadingMode::Single => {
-                // T14.18: poll the control fd alongside the data
-                // path. EOTs land in `eot_queue`; data is unaffected.
-                self.poll_control_peers();
+                // T15.8: control-channel poll removed.
                 // Try receiving from UDP.
                 self.recv_udp()?;
                 // For QoS 4, also check TCP.
@@ -1745,28 +1577,7 @@ impl Variant for UdpVariant {
             }
         }
 
-        // T14.18: graceful control-channel teardown.
-        let drain_budget = Duration::from_secs(self.effective_eot_timeout_secs().clamp(1, 30));
-        let drain_deadline = Instant::now() + drain_budget;
-        let single_mode = self.threading_mode == ThreadingMode::Single;
-        for peer in self.control_peers.iter_mut() {
-            peer.send_bye();
-            peer.shutdown_write();
-            if single_mode {
-                let last_frames = peer.drain_until_closed(drain_deadline);
-                for frame in last_frames {
-                    if let ControlFrame::Eot { writer, eot_id } = frame {
-                        if writer != self.config.runner
-                            && self.eot_seen.insert((writer.clone(), eot_id))
-                        {
-                            self.eot_queue.push_back(PeerEot { writer, eot_id });
-                        }
-                    }
-                }
-            }
-            peer.shutdown();
-        }
-        self.control_peers.clear();
+        // T15.8: control-channel teardown removed.
 
         // Leave multicast group and close socket.
         if let Some(socket) = self.udp_socket.take() {
@@ -1786,37 +1597,10 @@ impl Variant for UdpVariant {
         Ok(())
     }
 
-    /// T14.18: Generate an EOT id and dispatch the marker over the
-    /// per-peer-pair TCP control connection, regardless of QoS. The
-    /// pre-T14.18 UDP-multicast / TCP-data-stream EOT dispatch is
-    /// removed: the control connection is QoS-independent and cannot
-    /// be dropped by data-path saturation.
-    fn signal_end_of_test(&mut self) -> Result<u64> {
-        let eot_id: u64 = rand::random::<u64>();
-        let frame = controltcp::encode_eot_frame(&self.config.runner, eot_id);
-        let mut failed_idx = Vec::new();
-        for (i, peer) in self.control_peers.iter_mut().enumerate() {
-            if let Err(e) = peer.send_frame(&frame) {
-                eprintln!(
-                    "[custom-udp] T14.18: control EOT send to peer {} failed: {:#}; dropping peer",
-                    peer.peer_addr, e
-                );
-                peer.shutdown();
-                failed_idx.push(i);
-            }
-        }
-        for &i in failed_idx.iter().rev() {
-            self.control_peers.remove(i);
-        }
-        Ok(eot_id)
-    }
-
-    fn poll_peer_eots(&mut self) -> Result<Vec<PeerEot>> {
-        // Variant is the source of truth for dedup (`eot_seen` HashSet),
-        // so each (writer, eot_id) reaches the driver at most once.
-        let drained: Vec<PeerEot> = self.eot_queue.drain(..).collect();
-        Ok(drained)
-    }
+    // T15.8: signal_end_of_test / poll_peer_eots removed from the trait.
+    // The control TCP side-channel introduced by T14.18 is gone; the
+    // variant relies on runner-coordinated termination (T15.4) and
+    // variant-side idle detection (T15.5) for end-of-operate.
 }
 
 #[cfg(test)]
@@ -1834,9 +1618,6 @@ mod tests {
             tcp_peers: Vec::new(),
             recv_buffer_kb: 4096,
             values_per_tick: 1,
-            control_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            control_peers: Vec::new(),
-            eot_timeout_secs: Some(2),
         }
     }
 
@@ -2005,96 +1786,35 @@ mod tests {
         }
     }
 
-    // ---- EOT: dedup, queue drain, bounds-check regression ----
+    // ---- EOT: dedup, queue drain, bounds-check regression (T15.8: many removed) ----
 
     #[test]
-    fn record_peer_eot_dedupes_repeated_sends() {
-        // UDP delivers EOT 5 times by design; receiver must surface each
-        // (writer, eot_id) pair exactly once.
-        let mut variant = UdpVariant::new(default_config(Qos::BestEffort));
-        for _ in 0..EOT_UDP_RETRIES {
-            variant.record_peer_eot("alice".to_string(), 0xABCD);
-        }
-        let drained = variant.poll_peer_eots().unwrap();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].writer, "alice");
-        assert_eq!(drained[0].eot_id, 0xABCD);
-
-        // Subsequent calls return nothing -- queue is drained.
-        let drained2 = variant.poll_peer_eots().unwrap();
-        assert!(drained2.is_empty());
-    }
+    #[ignore = "T15.8: poll_peer_eots removed from the Variant trait; the queue still exists \
+                for parser tolerance but is no longer drained by the driver."]
+    fn record_peer_eot_dedupes_repeated_sends() {}
 
     #[test]
-    fn record_peer_eot_distinct_writers_distinct_entries() {
-        let mut variant = UdpVariant::new(default_config(Qos::BestEffort));
-        // Multiple bursts from two distinct peers.
-        for _ in 0..3 {
-            variant.record_peer_eot("alice".to_string(), 1);
-        }
-        for _ in 0..3 {
-            variant.record_peer_eot("bob".to_string(), 2);
-        }
-        let drained = variant.poll_peer_eots().unwrap();
-        assert_eq!(drained.len(), 2, "expected one entry per distinct writer");
-        let names: Vec<String> = drained.iter().map(|e| e.writer.clone()).collect();
-        assert!(names.contains(&"alice".to_string()));
-        assert!(names.contains(&"bob".to_string()));
-    }
+    #[ignore = "T15.8: poll_peer_eots removed."]
+    fn record_peer_eot_distinct_writers_distinct_entries_placeholder() {}
 
+    /// Dead-code sink to keep the historical helper functions referenced
+    /// from at least one symbol. The test is `#[ignore]`d -- it's a
+    /// compile-only assertion that the variant still owns the EOT
+    /// receive plumbing in case a future task wants to re-introduce a
+    /// driver hook.
     #[test]
-    fn record_peer_eot_skips_self() {
-        // The variant's own runner name must never be queued -- a sanity
-        // guard against multicast loopback echoing our EOT back at us.
+    #[ignore = "T15.8 compile-only artifact"]
+    fn _t15_8_eot_plumbing_still_compiles_internally() {
         let mut variant = UdpVariant::new(default_config(Qos::BestEffort));
-        variant.record_peer_eot("test-runner".to_string(), 7); // self
-        variant.record_peer_eot("alice".to_string(), 8);
-        let drained = variant.poll_peer_eots().unwrap();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].writer, "alice");
+        let _ = variant.record_peer_eot("alice".into(), 0xABCD);
     }
 
-    #[test]
-    fn poll_peer_eots_default_state_is_empty() {
-        // No observations recorded -> empty drain.
-        let mut variant = UdpVariant::new(default_config(Qos::BestEffort));
-        assert!(variant.poll_peer_eots().unwrap().is_empty());
-    }
-
-    /// UDP retry-and-dedup harness: simulate the receiver's `recv_udp`
-    /// path being fed five copies of the same EOT datagram and assert it
-    /// surfaces a single `PeerEot` from `poll_peer_eots`.
-    #[test]
-    fn udp_retry_dedup_yields_single_peer_eot() {
-        let mut variant = UdpVariant::new(default_config(Qos::BestEffort));
-
-        // Simulate 5 multicast deliveries of the same EOT frame (writer
-        // "alice", id 0x1234).
-        let frame = protocol::encode_eot("alice", 0x1234).unwrap();
-        for _ in 0..EOT_UDP_RETRIES {
-            assert!(protocol::is_eot_udp(&frame));
-            let decoded = protocol::decode_eot(&frame).unwrap();
-            variant.record_peer_eot(decoded.writer, decoded.eot_id);
-        }
-
-        let drained = variant.poll_peer_eots().unwrap();
-        assert_eq!(
-            drained.len(),
-            1,
-            "five copies of the same EOT must dedupe to one PeerEot"
-        );
-        assert_eq!(drained[0].writer, "alice");
-        assert_eq!(drained[0].eot_id, 0x1234);
-    }
-
-    #[test]
-    fn signal_end_of_test_returns_nonzero_id_without_socket() {
-        // Even when no socket is connected (we haven't called `connect`),
-        // signal_end_of_test should fail loudly rather than panic. We don't
-        // strictly assert success here -- only that it terminates.
-        let mut variant = UdpVariant::new(default_config(Qos::BestEffort));
-        let _ = variant.signal_end_of_test();
-    }
+    // T15.8: removed test `record_peer_eot_skips_self`,
+    // `poll_peer_eots_default_state_is_empty`,
+    // `udp_retry_dedup_yields_single_peer_eot`, and
+    // `signal_end_of_test_returns_nonzero_id_without_socket`.
+    // They asserted poll_peer_eots / signal_end_of_test semantics that
+    // no longer exist on the Variant trait.
 
     /// Regression: a malformed EOT frame whose length prefix is below
     /// `HEADER_FIXED_SIZE` MUST drop the peer cleanly without panic, the
@@ -2743,103 +2463,9 @@ mod tests {
         v.disconnect().ok();
     }
 
-    // ---- T14.16: EOT survives reader-channel saturation ----
-
-    /// Stub the reader-thread path: synthesise a `MultiReaderState`
-    /// with hand-rolled channels, push N data items into a TINY data
-    /// channel (so most of them drop on `Full`) interleaved with M
-    /// `Eot` lifecycle items into the unbounded lifecycle channel, and
-    /// confirm `drain_multi_channel` surfaces ALL M EOTs regardless of
-    /// how many data drops happen along the way.
-    ///
-    /// This is the core T14.16 invariant: "data may drop, EOT must
-    /// not." It exercises `drain_multi_channel` end-to-end without
-    /// needing real sockets.
-    #[test]
-    fn t14_16_eot_survives_data_channel_saturation() {
-        // Tiny data channel (8 slots) so saturating it is trivial.
-        let (data_tx, data_rx) = mpsc::sync_channel::<ReaderDataItem>(8);
-        let (lifecycle_tx, lifecycle_rx) = mpsc::channel::<ReaderLifecycleItem>();
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        // Build a no-network variant in Multi mode so
-        // `drain_multi_channel` runs.
-        let mut cfg = default_config(Qos::BestEffort);
-        cfg.runner = "self".to_string();
-        let mut v = UdpVariant::new(cfg);
-        v.threading_mode = ThreadingMode::Multi;
-        v.multi = Some(MultiReaderState {
-            data_rx,
-            lifecycle_rx,
-            shutdown,
-            handles: Vec::new(),
-        });
-
-        // Push 1000 data frames (will mostly drop), interleaved with
-        // 16 EOTs across 16 distinct writers. Use try_send so
-        // saturation doesn't block the test.
-        let total_data = 1000u64;
-        let eot_writers = 16u64;
-        let eot_stride = total_data / eot_writers;
-        let mut drops = 0u64;
-        let mut eots_sent = 0u64;
-        for i in 0..total_data {
-            let msg = protocol::Message {
-                qos: Qos::BestEffort,
-                seq: i,
-                path: "/p".to_string(),
-                writer: format!("peer{}", i % eot_writers),
-                payload: vec![0xAA; 8],
-            };
-            match data_tx.try_send(ReaderDataItem::Data(msg)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => drops += 1,
-                Err(TrySendError::Disconnected(_)) => panic!("data channel disconnected"),
-            }
-            // Every `eot_stride` data sends fire an EOT on the
-            // lifecycle channel until we have pushed `eot_writers`
-            // EOTs. The data channel is tiny so this fires AFTER
-            // saturation begins.
-            if eots_sent < eot_writers && i.is_multiple_of(eot_stride) {
-                let writer = format!("eot-writer-{}", eots_sent);
-                let eot = protocol::EotFrame {
-                    writer,
-                    eot_id: 0x1000 + eots_sent,
-                };
-                lifecycle_tx
-                    .send(ReaderLifecycleItem::Eot(eot))
-                    .expect("lifecycle channel must not drop");
-                eots_sent += 1;
-            }
-        }
-        assert!(
-            drops > 0,
-            "test premise: at least one Data frame must have been dropped"
-        );
-        assert_eq!(eots_sent, eot_writers, "test pushed every EOT");
-
-        // Drop the senders so the channels can signal Disconnected
-        // after drain.
-        drop(data_tx);
-        drop(lifecycle_tx);
-
-        // Run the drain. We expect EVERY EOT to surface in
-        // `poll_peer_eots` regardless of how many data frames were
-        // dropped during the burst above.
-        v.drain_multi_channel()
-            .expect("drain_multi_channel must succeed");
-
-        let drained = v.poll_peer_eots().expect("poll_peer_eots");
-        assert_eq!(
-            drained.len() as u64,
-            eot_writers,
-            "every Eot pushed onto the lifecycle channel must survive data-channel saturation \
-             (drops={}, eots_sent={}, eots_observed={})",
-            drops,
-            eots_sent,
-            drained.len()
-        );
-    }
+    // T15.8: removed test `t14_16_eot_survives_data_channel_saturation`.
+    // It asserted poll_peer_eots semantics that no longer exist; the EOT
+    // routing path it covered is dead code post-T15.8.
 
     /// T14.16: NACK items ride the lifecycle channel and must survive
     /// data-channel saturation. (Worker chose to fold NACK into the
