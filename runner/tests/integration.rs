@@ -1802,3 +1802,156 @@ binary = "../target/release/variant-dummy.exe"
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+/// T15.3 regression: two real runner subprocesses must establish the
+/// per-peer-pair TCP progress channel during Phase 2 and exchange
+/// `ProgressUpdate` frames while the variant child is running. The
+/// test inspects each runner's stderr for the `progress_coord: started`
+/// banner and confirms the channel did NOT report any write / read
+/// failures during the spawn.
+///
+/// Marked `#[ignore]` because it spawns two real `runner` subprocesses
+/// and depends on `variant-dummy.exe`. Run locally via
+/// `cargo test --release -p runner -- --ignored`.
+#[test]
+#[ignore]
+fn two_runner_progress_coord_exchanges_t15_3() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    // Pick a port range well clear of the other two-runner integration
+    // tests' pools to avoid bind conflicts when the suite runs in
+    // parallel: the resume_manifest test uses 33200, this one uses
+    // 33400.
+    let base_port: u16 = 33400;
+
+    let tmp_dir = std::env::temp_dir().join("runner-t15-3-progress-it");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let log_dir = tmp_dir.join("logs");
+    let log_dir_escaped = log_dir.to_string_lossy().replace('\\', "/");
+
+    // operate_secs is long enough (3s) that at least two ~1Hz
+    // progress ticks fire from the variant and the runner's per-tick
+    // broadcaster (every PROGRESS_BROADCAST_INTERVAL = 1s) has time
+    // to publish at least one ProgressUpdate frame to the peer.
+    let config_content = format!(
+        r#"run = "t15_3_progress"
+runners = ["alice", "bob"]
+default_timeout_secs = 30
+inter_qos_grace_ms = 0
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 0
+  operate_secs = 3
+  silent_secs = 0
+  eot_timeout_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  log_dir = "{log_dir_escaped}"
+  [variant.specific]
+"#
+    );
+    let config_path = tmp_dir.join("t15_3_progress.toml");
+    std::fs::write(&config_path, &config_content).unwrap();
+
+    let runner = runner_binary();
+    let config_str = config_path.to_str().unwrap().to_string();
+    let runner_a = runner.clone();
+    let config_a = config_str.clone();
+    let thread_a = std::thread::spawn(move || {
+        Command::new(runner_a)
+            .arg("--name")
+            .arg("alice")
+            .arg("--config")
+            .arg(&config_a)
+            .arg("--port")
+            .arg(base_port.to_string())
+            .arg("--barrier-timeout-secs")
+            .arg("30")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("failed to run alice")
+    });
+    let runner_b = runner.clone();
+    let config_b = config_str.clone();
+    let thread_b = std::thread::spawn(move || {
+        Command::new(runner_b)
+            .arg("--name")
+            .arg("bob")
+            .arg("--config")
+            .arg(&config_b)
+            .arg("--port")
+            .arg(base_port.to_string())
+            .arg("--barrier-timeout-secs")
+            .arg("30")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("failed to run bob")
+    });
+    let out_a = thread_a.join().expect("alice thread panicked");
+    let out_b = thread_b.join().expect("bob thread panicked");
+    let stderr_a = String::from_utf8_lossy(&out_a.stderr);
+    let stderr_b = String::from_utf8_lossy(&out_b.stderr);
+    let stdout_a = String::from_utf8_lossy(&out_a.stdout);
+    let stdout_b = String::from_utf8_lossy(&out_b.stdout);
+    eprintln!("--- alice stdout ---\n{stdout_a}");
+    eprintln!("--- alice stderr ---\n{stderr_a}");
+    eprintln!("--- bob   stdout ---\n{stdout_b}");
+    eprintln!("--- bob   stderr ---\n{stderr_b}");
+
+    assert!(
+        out_a.status.success(),
+        "alice should exit 0, got: {:?}",
+        out_a.status.code()
+    );
+    assert!(
+        out_b.status.success(),
+        "bob should exit 0, got: {:?}",
+        out_b.status.code()
+    );
+
+    // Both runners must log that progress_coord came up.
+    assert!(
+        stderr_a.contains("progress_coord: started"),
+        "alice should report progress_coord started, got:\n{stderr_a}"
+    );
+    assert!(
+        stderr_b.contains("progress_coord: started"),
+        "bob should report progress_coord started, got:\n{stderr_b}"
+    );
+
+    // No peer-write failures should be reported during the run. A
+    // "write to peer ... failed" line is the canonical signal that the
+    // TCP channel was unhealthy.
+    assert!(
+        !stderr_a.contains("progress_coord: write to peer"),
+        "alice should not have logged any progress_coord peer-write failures, got:\n{stderr_a}"
+    );
+    assert!(
+        !stderr_b.contains("progress_coord: write to peer"),
+        "bob should not have logged any progress_coord peer-write failures, got:\n{stderr_b}"
+    );
+
+    // The final-progress diagnostic line confirms the variant emitted
+    // progress events into the runner's local tracker. With the
+    // operate_secs=3 / tick_rate=10 config, both sides should observe
+    // a non-trivial `sent` counter on at least one side.
+    assert!(
+        stderr_a.contains("final progress:"),
+        "alice should log a final-progress line, got:\n{stderr_a}"
+    );
+    assert!(
+        stderr_b.contains("final progress:"),
+        "bob should log a final-progress line, got:\n{stderr_b}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
