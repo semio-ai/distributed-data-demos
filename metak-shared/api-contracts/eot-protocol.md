@@ -1,4 +1,25 @@
-# API Contract: End-of-Test (EOT) Protocol
+# API Contract: End-of-Test (EOT) Protocol -- HISTORICAL (E12-E14)
+
+> **Historical (E12-E14).** This protocol was used until E15 introduced
+> runner-coordinated termination based on the variant's stdout
+> `progress` events (T15.1-T15.4) combined with variant-side idle
+> detection (T15.5). The on-wire EOT exchange described below -- and
+> the dedicated TCP control side-channel added in T14.18 for
+> `custom-udp` / `hybrid` -- was removed in **T15.8**. The
+> `Variant::signal_end_of_test` / `Variant::poll_peer_eots` trait
+> methods, the `PeerEot` type, the `--eot-timeout-secs` CLI arg, and
+> the `--control-base-port` CLI arg are all gone.
+>
+> The `eot_sent` JSONL event still appears in every variant log -- the
+> driver emits it once between operate and silent on every spawn so
+> the analysis pipeline (T11.5, T14.17) keeps working unchanged. No
+> `eot_received` or `eot_timeout` events are emitted by post-T15.8
+> variants.
+>
+> The document is retained for archaeology and for interpreting
+> pre-E15 datasets where the on-wire exchange did run.
+
+---
 
 Defines the deterministic boundary between active write traffic and the
 silent/drain phase. Replaces reliance on `silent_secs` being "long

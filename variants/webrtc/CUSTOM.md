@@ -1,5 +1,12 @@
 # WebRTC Variant — Custom Instructions
 
+> **T15.8 (E15 cleanup):** The on-wire EOT exchange driven by the
+> `Variant::signal_end_of_test` / `Variant::poll_peer_eots` trait
+> methods was removed. End-of-operate is now driven by variant-base's
+> idle detection (T15.5) and the runner-coordinated termination state
+> machine (T15.4). The `eot_sent` JSONL event is still emitted exactly
+> once per spawn (the marker analysis T11.5 / T14.17 consume).
+
 ## Overview
 
 Rust binary implementing the `Variant` trait from `variant-base` using
