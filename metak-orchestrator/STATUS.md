@@ -10070,3 +10070,151 @@ T15.8: 9f9edb2, 24adb2f, 582204e, 5833bcb, 9548c6b, 9de8172
 
 E15 milestone: 704e833 + this entry.
 
+---
+
+## T15.10 — ready/done barrier desync audit (2026-05-13)
+
+**Worker:** runner subfolder. **Status:** audit posted, fix in progress.
+
+### Audit findings
+
+1. **Shared UDP socket across barriers, clock-sync, discovery, and
+   probe responses.** `ready_barrier`, `done_barrier`,
+   `exchange_resume_manifest` (UDP path, deprecated post-T14.24),
+   discovery, `ClockSyncEngine`, and `respond_to_probe` all read and
+   write the same UDP socket through the same `recv_from()` with a
+   100 ms timeout. The socket is bound INADDR_ANY at
+   `base_port + runner_index` and joins the org-local multicast group
+   `239.77.66.55`. See `Coordinator::clock_sync_engine` (which clones
+   the same `Arc<Socket>`) and the barrier loops in
+   `runner/src/protocol.rs`.
+
+2. **No per-peer ACK or state machine.** Each barrier re-broadcasts
+   the same self-message every 500 ms and accepts a peer's message
+   once. Convergence is "I have observed a matching message from
+   every name in `self.expected`". If the kernel drops the peer's
+   datagram during a transient buffer overflow AND the peer has
+   already exited its 2 s linger, the receiver waits 120 s and exits
+   75. There is no application-level retransmit triggered by
+   "missing acknowledgement from peer X".
+
+3. **No payload-truncation problem (this is NOT T14.24).** Ready/Done
+   payloads are ~150 bytes well under `MAX_MSG_SIZE = 4096`. T14.24's
+   root cause (oversized manifests truncated to a non-parsing prefix)
+   does not apply here.
+
+4. **The transient failure mode is datagram loss under symmetric
+   same-host load.** At 1000 vpt × 100 Hz × 2 directions =
+   ~200,000 msgs/s on the variant-data plane plus the kernel-level
+   multicast loopback for the coord socket (which receives every
+   datagram it sends to its own group). The kernel's per-socket UDP
+   recv buffer on the coord port fills under that pressure. The
+   56.9 ms clock_sync RTT spike right before the 120 s ready-barrier
+   timeout is the same socket's recv queue starting to back up; the
+   probe response packet that should have arrived in 0.3 ms instead
+   sat in a queue behind backlogged barrier/multicast frames. **The
+   barrier loss and the clock_sync RTT spike share the same root
+   cause.** The audit task instructions explicitly framed this as a
+   risk; the conclusion is: yes, clock-sync is affected by the same
+   socket pressure, but its built-in N=32-sample loop with 100 ms
+   per-sample timeout absorbs the loss into a single elevated-RTT
+   sample (or a zero-sample warning) without aborting the run.
+   Barriers, in contrast, have no per-peer retry budget and time
+   out catastrophically at 120 s.
+
+5. **Triggering window: variant transition between spawns.** The
+   loss spike correlates with the boundary where one variant child
+   has just exited (its multicast/UDP plane is winding down) and
+   the next variant child is starting up (ramping its outbound
+   traffic). During that ~100 ms transition the coord socket can
+   lose multiple datagrams in a row, well past any 500 ms tick the
+   barriers operate on, and well past the 2 s linger the linger
+   pattern relies on to cover slow peers.
+
+6. **Why this is the same class as T14.24 but a different root
+   cause.** Both T14.24 and T15.10 are "UDP coordination silently
+   loses datagrams under same-host pressure". T14.24's loss
+   mechanism was payload-size truncation (oversized manifest into
+   undersized recv buffer). T15.10's loss mechanism is kernel-level
+   buffer overflow under cross-traffic pressure. Both have the same
+   fix shape — move to TCP per peer pair, inherit kernel-level
+   retransmit for free — because TCP solves both the truncation case
+   AND the buffer-overflow case (kernel queues the bytes, application
+   reads at its own pace, retransmit handles in-flight loss).
+
+### Path A vs Path B
+
+- **Path A (harden UDP barrier with per-peer ACK + retry).** Would
+  require: adding an `Ack` message type, tracking per-peer
+  acked/missing state, exponential backoff on missing acks, and
+  some bound on retry storms. This is essentially a hand-rolled
+  reliable-datagram protocol — re-implementing TCP poorly, exactly
+  the verdict the T14.24 audit reached. Rejected.
+- **Path B (TCP per peer pair).** Mirrors T14.24's resume_manifest
+  fix and T15.3's progress_coord fix. The pattern is now established
+  three times in the runner; ready/done is the final UDP-coord
+  control channel to migrate. Accepted.
+
+### Implementation decision: dedicated barrier TCP channel
+
+The progress_coord channel already opens long-lived TCP per peer
+pair via `start()` AFTER discovery. We could piggyback ready/done
+onto that channel, but:
+
+1. Lifecycle alignment is wrong. Resume_manifest TCP fires once
+   per resume invocation during Phase 1.25, BEFORE progress_coord
+   starts. Ready/done fires every spawn from Phase 2. Reusing
+   progress_coord's channel would force ready/done to depend on
+   progress_coord lifecycle. A dedicated channel keeps each
+   barrier orthogonal.
+
+2. Failure isolation. Progress is best-effort (failures degrade
+   observability only). Barriers are fatal (a barrier timeout
+   exits 75). Mixing them on the same socket conflates the
+   recovery strategies.
+
+3. The cost of a dedicated channel is one extra port per peer
+   (base_port + 96 + peer_index) and ~150 lines of bind/accept/
+   connect code that mirrors progress_coord almost exactly.
+
+The new module is `runner/src/barrier_coord.rs` with the same
+shape as `progress_coord.rs`: bind a listener, accept/connect with
+the lower-sorted-name-accepts rule, install a writer per peer plus
+a reader thread that places inbound `Ready`/`Done` frames into a
+per-peer inbox. `Coordinator::ready_barrier` and `done_barrier`
+delegate to the inbox-pull when the barrier coordinator is
+installed; the UDP path stays in place as fallback (and for the
+T-coord.1b / T-coord.3 re-emission semantics, which remain
+useful for slow peer / late peer recovery — they migrate to the
+TCP path semantically intact).
+
+### Implementation plan (next commits)
+
+- Add `runner/src/barrier_coord.rs` modelled on `progress_coord.rs`.
+  Long-lived TCP per peer pair, length-prefixed JSON frames carrying
+  `Message::Ready` / `Message::Done`. Per-peer reader thread folds
+  arrivals into an `Inbox` (one `Mutex<Vec<Message>>` per peer).
+- New constant `BARRIER_TCP_OFFSET = 96`. Layout:
+  - UDP coord: `base + index`
+  - Resume manifest TCP (T14.24): `base + 32 + index`
+  - Progress TCP (T15.3): `base + 64 + index`
+  - Barrier TCP (T15.10): `base + 96 + index`
+- `Coordinator::ready_barrier` / `done_barrier`: when a barrier
+  coordinator is installed, broadcast over TCP and poll the inbox
+  for matching `Ready`/`Done` messages. UDP probe-response and
+  late-discover-reemit and stale-done-reemit paths stay on the
+  existing UDP socket (they exist to absorb cross-phase races; they
+  do NOT carry the barrier quorum signal anymore).
+- `main.rs`: construct the barrier coordinator after discovery,
+  call `start()` before the first ready_barrier, call `shutdown()`
+  at the end (next to `progress_coord.shutdown()`).
+- Tests: barrier-protocol convergence over the new TCP transport
+  with simulated single-peer loss, and a two-runner subprocess
+  regression that exercises many barriers under stress.
+
+The on-disk artifacts and the public `Coordinator` API are
+unchanged. Only the transport differs. The UDP barrier path
+remains in the codebase as a fallback used by tests that want to
+exercise the legacy semantics without spinning up the TCP listeners
+(and as the single-runner short-circuit).
+
