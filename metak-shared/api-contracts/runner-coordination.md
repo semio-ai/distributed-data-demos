@@ -276,6 +276,108 @@ picks the most recent measurement preceding the variant's writes.
 - Waits until all runners have reported done.
 - Proceeds to the next variant, or finishes if all variants are complete.
 
+### Per-Spawn Progress Exchange (T15.3, E15)
+
+While a variant child is running, each runner broadcasts a per-spawn
+progress snapshot to every other runner once per second. The receivers
+maintain a `RemoteProgressView { peer_runner -> spawn -> snapshot }`
+that T15.4's phase-aware termination state machine consults alongside
+the local progress tracker.
+
+**Message.** A new coordination-message type is added:
+
+```json
+{
+  "type": "progress_update",
+  "runner": "alice",
+  "spawn": "dummy-qos2",
+  "phase": "operate",
+  "sent": 1234,
+  "received": 5678,
+  "eot_sent": false,
+  "eot_received": false,
+  "ts": "2026-05-11T00:00:00.000000000Z"
+}
+```
+
+Fields mirror the variant's `event=progress` stdout schema (see
+`variant-cli.md` "E15 additions"). `runner` is the sender's identity;
+`spawn` is the variant's `effective_name`; counters are monotonic
+per-spawn aggregates across all peers; `eot_sent` / `eot_received` are
+sticky flags; `phase` reflects the variant's current protocol-driver
+phase as observed at the most recent stdout event; `ts` is the
+sender's wall-clock at snapshot time (RFC 3339 nanoseconds).
+
+The receiver indexes incoming snapshots by `(runner, spawn)` and
+updates counters monotonically (a later frame whose counters are
+smaller than the stored snapshot is ignored defensively). T15.4
+consumes the receiver-side `last_update_ts` (not the wire `ts`) when
+deciding "have we heard recently from peer X about spawn Y".
+
+**Cadence.** Approximately one snapshot per active spawn per second
+per peer. The publisher reads the local `LocalProgressTracker` on each
+tick and broadcasts to every connected peer. Snapshots stop when the
+local variant child exits (the spawn loop drops the broadcaster
+closure between spawns).
+
+**Transport.** Long-lived per-peer-pair TCP, **distinct from the
+T14.24 resume-manifest TCP channel** even though it mirrors that
+pattern. Rationale: resume_manifest is a one-shot exchange that closes
+after a single round-trip during Phase 1.25; reusing it for the
+continuous-stream Phase 2 case would force a complicated lifecycle
+across both. A dedicated channel keeps both protocols simple and
+independent. Wire details:
+
+- **Pairing.** For each unordered peer pair `(a, b)` with `a < b`
+  lexicographically, `a` accepts and `b` connects -- same rule as
+  T14.24's resume_manifest exchange. Self-loops do not exchange.
+- **Port derivation.** Each runner listens on
+  `--port + 64 + runner_index`, where `runner_index` is the runner's
+  position in the config's `runners` array (zero-based). The
+  constant `64` is `PROGRESS_TCP_OFFSET` in
+  `runner/src/progress_coord.rs`. Layout summary:
+  - UDP coord: `base + index`
+  - Resume manifest TCP (T14.24): `base + 32 + index`
+  - Progress TCP (T15.3): `base + 64 + index`
+
+  All three ranges sit inside the same low ephemeral region operators
+  already permit for UDP coordination, so no new firewall rules are
+  required.
+- **Handshake.** The connecting side writes a single length-prefixed
+  UTF-8 frame carrying its runner name (`[u32 BE length][name bytes]`,
+  with a 256-byte cap on `length`). The accepting side reads this
+  frame, verifies the name is in the expected runners set, and
+  installs the stream as the peer's writer. There is no reverse
+  handshake -- a peer's identity is established by the connect side
+  only.
+- **Framing.** Each subsequent `progress_update` is one length-prefixed
+  JSON frame: `[u32 BE length][JSON bytes]`. Frames above
+  `PROGRESS_FRAME_MAX_BYTES` (64 KiB) are rejected on read; the
+  payload today is a few hundred bytes, so this cap is purely
+  defensive against a peer that lies about its length prefix.
+- **Lifecycle.** The coordinator's `start()` runs after discovery
+  (which populates `peer_hosts`). It accepts inbound connections and
+  makes outbound connect attempts in parallel, retrying connects
+  every ~500 ms until the peer's listener has bound (bounded by an
+  internal `PROGRESS_STARTUP_BUDGET` of 15 s). Once a pair has
+  connected, the connection remains open across every Phase 2 spawn.
+  A reader thread per peer folds incoming frames into the shared
+  `RemoteProgressView`. `shutdown()` flips an atomic stop flag,
+  closes all streams (which the peers observe as EOF), and joins the
+  reader threads. The progress channel is best-effort: per-peer
+  write errors mark that pair unhealthy (it is removed from the
+  writer map) and the runner continues with the peers it still has.
+  Losing the channel does **not** abort the run -- T15.4's safety-net
+  `max_spawn_secs` still bounds a stuck spawn.
+- **Single-runner mode.** No transport is set up; the publisher is a
+  quick early return and the `RemoteProgressView` stays empty.
+
+**Defensive isolation from UDP coordination.** The UDP coordination
+parser intentionally drops any inbound `progress_update` it observes on
+the multicast port (a stray frame from a buggy peer cannot perturb
+discovery / ready / done barriers). `progress_update` is **only**
+valid on the dedicated TCP channel.
+
 ### Ready barrier responds to stale done requests
 
 The done barrier's 2-second linger covers slow peers that arrive at done-N
@@ -362,6 +464,20 @@ The `resume_manifest` message wire-shape is unchanged, but as of T14.24
 it is exchanged over a per-peer-pair TCP connection (length-prefixed
 JSON frame), not UDP multicast. See "Manifest exchange transport
 (T14.24)" under Phase 1.25 for the framing and pairing rules.
+
+T15.3 adds the `progress_update` message:
+
+```json
+{"type":"progress_update","runner":"alice","spawn":"dummy-qos2",
+ "phase":"operate","sent":1234,"received":5678,
+ "eot_sent":false,"eot_received":false,
+ "ts":"2026-05-11T00:00:00.000000000Z"}
+```
+
+This message is **only** exchanged on the dedicated TCP per-peer-pair
+channel introduced in "Per-Spawn Progress Exchange (T15.3, E15)" under
+Phase 2; the UDP coordination parser drops it defensively if it ever
+appears there.
 
 ## Barrier Timeout
 
