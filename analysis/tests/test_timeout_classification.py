@@ -382,6 +382,181 @@ class TestEotTimeoutInternal:
         assert result["alice"].classification == "eot_timeout_internal"
 
 
+def _alice_idle_terminated_events(*, run: str = "run01") -> list[dict]:
+    """Events for an alice spawn that exited cleanly via E15 idle detection.
+
+    Writer reaches operate, emits ``eot_sent`` on its own idle
+    transition (T15.5), then transitions to ``phase=silent`` and
+    exits. No on-wire EOT exchange happens, so no peer logs
+    ``eot_received{writer=alice}`` and no ``eot_timeout`` event is
+    written. This is the canonical shape that T15.6 classifies as
+    ``runner_idle_terminated``.
+    """
+    return [
+        make_event("phase", runner="alice", run=run, phase="connect", offset_ms=0),
+        make_event("phase", runner="alice", run=run, phase="stabilize", offset_ms=10),
+        make_event("phase", runner="alice", run=run, phase="operate", offset_ms=100),
+        make_event(
+            "write",
+            runner="alice",
+            run=run,
+            seq=1,
+            path="/k",
+            qos=4,
+            bytes=8,
+            offset_ms=110,
+        ),
+        # T15.5: variant emits eot_sent on its own idle detection.
+        make_event("eot_sent", runner="alice", run=run, eot_id=0, offset_ms=5000),
+        make_event("phase", runner="alice", run=run, phase="silent", offset_ms=5001),
+    ]
+
+
+class TestRunnerIdleTerminated:
+    def test_eot_sent_silent_no_peer_confirm_no_eot_timeout_classifies_idle(
+        self, tmp_path: Path
+    ) -> None:
+        """T15.6 rule: clean exit via E15 idle detection."""
+        variant = "test-variant"
+        run = "run01"
+        alice = _alice_idle_terminated_events(run=run)
+        # Bob also exits cleanly via idle detection -- no on-wire EOT
+        # exchange happens in E15, so neither side logs
+        # ``eot_received`` against the peer.
+        bob = [
+            make_event("phase", runner="bob", run=run, phase="operate", offset_ms=100),
+            make_event(
+                "write",
+                runner="bob",
+                run=run,
+                seq=1,
+                path="/k",
+                qos=4,
+                bytes=8,
+                offset_ms=115,
+            ),
+            make_event("eot_sent", runner="bob", run=run, eot_id=0, offset_ms=5000),
+            make_event("phase", runner="bob", run=run, phase="silent", offset_ms=5001),
+        ]
+
+        _write_jsonl_clean(tmp_path / f"{variant}-alice-{run}.jsonl", alice)
+        _write_jsonl_clean(tmp_path / f"{variant}-bob-{run}.jsonl", bob)
+
+        lazy = events_to_lazy(alice + bob)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "runner_idle_terminated"
+        assert result["bob"].classification == "runner_idle_terminated"
+        assert result["alice"].sub_tags == ()
+        assert result["bob"].sub_tags == ()
+
+    def test_completed_takes_precedence_when_peer_confirms(
+        self, tmp_path: Path
+    ) -> None:
+        """T15.6 precedence: peer-confirmed handshake stays ``completed``.
+
+        The ``completed`` rule still wins when at least one peer logs
+        a matching ``eot_received``. ``runner_idle_terminated`` only
+        fires when peer confirmation is ABSENT and ``eot_timeout`` is
+        also absent.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice = _alice_completed_events(run=run)
+        bob = _bob_completed_events(run=run)
+
+        _write_jsonl_clean(tmp_path / f"{variant}-alice-{run}.jsonl", alice)
+        _write_jsonl_clean(tmp_path / f"{variant}-bob-{run}.jsonl", bob)
+
+        lazy = events_to_lazy(alice + bob)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "completed"
+        assert result["bob"].classification == "completed"
+
+    def test_eot_timeout_present_blocks_idle_classification(
+        self, tmp_path: Path
+    ) -> None:
+        """T15.6 precedence: ``eot_timeout_internal`` still wins.
+
+        A spawn that emitted ``eot_timeout`` is using the legacy
+        on-wire EOT-wait path (per the E12 protocol). T15.6 must not
+        relabel it as ``runner_idle_terminated`` even when the writer
+        also reaches ``phase=silent`` and the peer did not confirm.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice_events = [
+            make_event(
+                "phase", runner="alice", run=run, phase="operate", offset_ms=100
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                run=run,
+                seq=1,
+                path="/k",
+                qos=4,
+                bytes=8,
+                offset_ms=110,
+            ),
+            make_event("eot_sent", runner="alice", run=run, eot_id=111, offset_ms=210),
+            make_event(
+                "eot_timeout",
+                runner="alice",
+                run=run,
+                missing=["bob"],
+                wait_ms=5000,
+                offset_ms=5210,
+            ),
+            # Some legacy variants reach phase=silent even after
+            # emitting eot_timeout (the websocket Single path on the
+            # post-E15 stress fixture exhibits this exact shape).
+            make_event(
+                "phase", runner="alice", run=run, phase="silent", offset_ms=5300
+            ),
+        ]
+
+        _write_jsonl_clean(tmp_path / f"{variant}-alice-{run}.jsonl", alice_events)
+
+        lazy = events_to_lazy(alice_events)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "eot_timeout_internal"
+
+    def test_loopback_self_eot_received_does_not_count_as_peer_confirm(
+        self, tmp_path: Path
+    ) -> None:
+        """Self-loopback ``eot_received`` does not satisfy peer-confirm.
+
+        Single-runner variants observe their own EOT marker via the
+        local subscriber (``writer=alice`` on alice's own log). Since
+        ``classify_spawn`` consults only OTHER runners' summaries
+        (``peer_summaries``), a self-receive does not flip the
+        classification away from ``runner_idle_terminated``. The
+        regression guard is here because the same JSONL contains the
+        self-loopback row, and the test ensures the classifier still
+        sees the absence of a true peer confirmation.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice_events = _alice_idle_terminated_events(run=run) + [
+            # Self-loopback: alice's own log records receiving its
+            # own EOT marker. Must not be counted as a peer confirm.
+            make_event(
+                "eot_received",
+                runner="alice",
+                run=run,
+                writer="alice",
+                eot_id=0,
+                offset_ms=5002,
+            ),
+        ]
+
+        _write_jsonl_clean(tmp_path / f"{variant}-alice-{run}.jsonl", alice_events)
+
+        lazy = events_to_lazy(alice_events)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "runner_idle_terminated"
+
+
 class TestUnknown:
     def test_no_signal_matches_classifies_unknown(self, tmp_path: Path) -> None:
         """Spec rule 7: nothing matches -> unknown."""
