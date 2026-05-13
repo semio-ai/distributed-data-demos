@@ -49,6 +49,12 @@ fn dummy_binary_args(
         "single".to_string(),
         "--progress-stdout-interval-ms".to_string(),
         progress_stdout_interval_ms.to_string(),
+        // Default disable idle detection in the existing smoke tests so
+        // their pre-T15.5 expectations (eot phase event, on-wire
+        // eot_sent shape) still hold. Tests that exercise the T15.5
+        // idle path build args explicitly.
+        "--operate-idle-secs".to_string(),
+        "0".to_string(),
         "--peers".to_string(),
         format!("{runner}=127.0.0.1"),
     ]
@@ -502,6 +508,154 @@ fn test_variant_dummy_emits_progress_to_stdout() {
     assert!(
         prev_received > 0,
         "final received counter must be > 0 after a 2 s operate phase"
+    );
+}
+
+/// T15.5: spawn `variant-dummy` with `--operate-idle-secs 1
+/// --operate-secs 30 --tick-rate-hz 0` so the variant publishes nothing
+/// during operate. With both counters flat from the start, idle
+/// detection must fire within ~1.5 s and the operate phase must end
+/// well before the 30 s operate_secs budget. Captured JSONL must
+/// contain exactly one `eot_sent` event, no `phase=eot` event, and a
+/// clean `silent` phase transition.
+#[test]
+fn test_variant_dummy_idle_detection_short_circuits_operate() {
+    // Strategy: set tick_rate_hz=1 and operate-secs=30 to put the
+    // operate loop on a one-second cadence, then force values_per_tick
+    // very small. The dummy still echoes whatever it publishes, so
+    // both counters advance together on every tick. To genuinely idle
+    // we use the existing dummy as-is and rely on the LAST publish
+    // having drained the queue: after that tick the queue stays empty
+    // for the rest of operate. But because the dummy publishes again
+    // each tick, this test relies on the special case of
+    // tick_rate_hz=1 with values_per_tick=0. Setting values_per_tick=0
+    // means the workload generator produces no ops, so try_publish is
+    // never called and `sent` stays at 0. poll_receive then always
+    // returns None and `received` also stays at 0. This is the
+    // cleanest integration scenario for the T15.5 path.
+    let binary = env!("CARGO_BIN_EXE_variant-dummy");
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let launch_ts = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .to_string();
+
+    // Hand-build the arg list so we can override values_per_tick to 0
+    // and set --operate-idle-secs to 1 without going through the
+    // helper (which fixes those values).
+    let args = vec![
+        "--tick-rate-hz".to_string(),
+        "10".to_string(),
+        "--stabilize-secs".to_string(),
+        "0".to_string(),
+        "--operate-secs".to_string(),
+        "30".to_string(),
+        "--silent-secs".to_string(),
+        "0".to_string(),
+        "--eot-timeout-secs".to_string(),
+        "1".to_string(),
+        "--workload".to_string(),
+        "scalar-flood".to_string(),
+        // Zero values per tick -> workload generates no ops -> sent
+        // counter never advances. The dummy's queue stays empty so
+        // received never advances either. Both counters idle from t=0.
+        "--values-per-tick".to_string(),
+        "0".to_string(),
+        "--qos".to_string(),
+        "1".to_string(),
+        "--log-dir".to_string(),
+        log_dir.to_string(),
+        "--launch-ts".to_string(),
+        launch_ts.clone(),
+        "--variant".to_string(),
+        "dummy".to_string(),
+        "--runner".to_string(),
+        "idle-test".to_string(),
+        "--run".to_string(),
+        "run-idle".to_string(),
+        "--threading-mode".to_string(),
+        "single".to_string(),
+        "--progress-stdout-interval-ms".to_string(),
+        "200".to_string(),
+        "--operate-idle-secs".to_string(),
+        "1".to_string(),
+        "--peers".to_string(),
+        "idle-test=127.0.0.1".to_string(),
+    ];
+
+    let start = std::time::Instant::now();
+    let output = Command::new(binary)
+        .args(&args)
+        .output()
+        .expect("variant-dummy binary should run");
+    let elapsed = start.elapsed();
+
+    assert!(
+        output.status.success(),
+        "variant-dummy should exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Idle threshold of 1 s + tick + emitter sleep + process overhead.
+    // 5 s is generous slack for CI on Windows.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "idle detection should short-circuit the 30 s operate phase; got {elapsed:?}"
+    );
+
+    // JSONL log shape on the idle path.
+    let log_path = dir.path().join("dummy-idle-test-run-idle.jsonl");
+    assert!(log_path.exists(), "JSONL log file should be created");
+    let file = std::fs::File::open(&log_path).unwrap();
+    let reader = std::io::BufReader::new(file);
+    let lines: Vec<serde_json::Value> = reader
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(&l.unwrap()).unwrap())
+        .collect();
+
+    // Phase order: connect, stabilize, operate, silent (NO eot).
+    let phases: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["event"] == "phase")
+        .map(|l| l["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["connect", "stabilize", "operate", "silent"],
+        "idle path must skip the eot phase, got {phases:?}"
+    );
+
+    // Exactly one `eot_sent` event.
+    let eot_sent: Vec<&serde_json::Value> =
+        lines.iter().filter(|l| l["event"] == "eot_sent").collect();
+    assert_eq!(
+        eot_sent.len(),
+        1,
+        "idle path must emit exactly one eot_sent, got {}",
+        eot_sent.len()
+    );
+
+    // No on-wire EOT byproducts.
+    let eot_timeout_count = lines
+        .iter()
+        .filter(|l| l["event"] == "eot_timeout")
+        .count();
+    assert_eq!(eot_timeout_count, 0, "idle path must not emit eot_timeout");
+
+    // Stdout progress: at least one line with eot_sent:true should be
+    // observable after the idle transition.
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
+    let progress_lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .collect();
+    let has_eot_sent_true = progress_lines
+        .iter()
+        .any(|v| v["eot_sent"].as_bool() == Some(true));
+    assert!(
+        has_eot_sent_true,
+        "expected at least one progress line with eot_sent=true after idle transition; got progress lines:\n{stdout}"
     );
 }
 

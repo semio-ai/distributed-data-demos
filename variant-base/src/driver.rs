@@ -645,7 +645,7 @@ mod tests {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::Result;
     use tempfile::TempDir;
@@ -2130,5 +2130,257 @@ mod tests {
             .expect("connected event must be present");
         assert_eq!(connected["threading_mode"], "multi");
         assert_eq!(connected["recv_buffer_kb"], 8192);
+    }
+
+    // ----- T15.5: variant-side idle detection tests -----
+
+    /// Variant that lets a test independently script the answers of
+    /// `try_publish` (Ok(true) accepts, Ok(false) rejects without
+    /// publishing) and `poll_receive` (Some advances `received`, None
+    /// is a no-op). The pattern of each is driven by a closure of the
+    /// elapsed wallclock since the variant was constructed -- this is
+    /// how the tests pin "no progress on either counter after t=X" or
+    /// "received still advances at t=X" timing semantics without
+    /// relying on the in-process workload generator.
+    struct IdleDetectionVariant {
+        start: Instant,
+        try_publish_accept: Box<dyn FnMut(Duration) -> bool + Send>,
+        poll_receive_some: Box<dyn FnMut(Duration) -> bool + Send>,
+        try_publish_calls: u64,
+        poll_receive_calls: u64,
+    }
+
+    impl IdleDetectionVariant {
+        fn new(
+            try_publish_accept: impl FnMut(Duration) -> bool + Send + 'static,
+            poll_receive_some: impl FnMut(Duration) -> bool + Send + 'static,
+        ) -> Self {
+            Self {
+                start: Instant::now(),
+                try_publish_accept: Box::new(try_publish_accept),
+                poll_receive_some: Box::new(poll_receive_some),
+                try_publish_calls: 0,
+                poll_receive_calls: 0,
+            }
+        }
+    }
+
+    impl Variant for IdleDetectionVariant {
+        fn name(&self) -> &str {
+            "idle-detection"
+        }
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            Ok(())
+        }
+        fn try_publish(
+            &mut self,
+            _path: &str,
+            _payload: &[u8],
+            _qos: Qos,
+            _seq: u64,
+        ) -> Result<bool> {
+            self.try_publish_calls += 1;
+            let elapsed = self.start.elapsed();
+            Ok((self.try_publish_accept)(elapsed))
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            self.poll_receive_calls += 1;
+            let elapsed = self.start.elapsed();
+            if (self.poll_receive_some)(elapsed) {
+                Ok(Some(ReceivedUpdate {
+                    writer: "peer".to_string(),
+                    seq: self.poll_receive_calls,
+                    path: "/idle-test".to_string(),
+                    qos: Qos::BestEffort,
+                    payload: vec![0u8; 8],
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Phase sequence helper: collect every `phase` event from the log
+    /// in order of appearance.
+    fn phase_sequence(lines: &[serde_json::Value]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l["event"] == "phase")
+            .map(|l| l["phase"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn idle_detection_fires_when_both_counters_idle() {
+        // Both counters stay flat from t=0: try_publish always rejects
+        // (so `sent` never advances), poll_receive always returns None
+        // (so `received` never advances). With operate_idle_secs=1 and
+        // operate_secs=30, the loop must exit on idle well before the
+        // 30 s budget.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        args.workload = "scalar-flood".to_string();
+        args.tick_rate_hz = 50;
+        args.operate_secs = 30;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+        args.operate_idle_secs = 1;
+
+        let mut variant = IdleDetectionVariant::new(|_| false, |_| false);
+        let start = Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+
+        // Must exit well before the 30 s operate_secs budget. 5 s is
+        // generous: idle threshold (1 s) + Windows scheduler jitter +
+        // logger I/O.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "idle detection should fire within ~1 s of going idle; got {elapsed:?}"
+        );
+
+        let lines = read_log(dir.path(), "alice");
+
+        // Phase order on the idle path: connect, stabilize, operate,
+        // silent. The `eot` phase is SKIPPED -- that is the defining
+        // shape of the T15.5 short-circuit.
+        let phases = phase_sequence(&lines);
+        assert_eq!(
+            phases,
+            vec!["connect", "stabilize", "operate", "silent"],
+            "idle path must skip the eot phase, got {phases:?}"
+        );
+
+        // Exactly one `eot_sent` JSONL event must be emitted (the
+        // marker analysis T11.5 / T14.17 consumes).
+        let eot_sent: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["event"] == "eot_sent").collect();
+        assert_eq!(
+            eot_sent.len(),
+            1,
+            "idle path must emit exactly one eot_sent, got {}",
+            eot_sent.len()
+        );
+
+        // No on-wire EOT events on the idle path: no `eot_received`
+        // (there were no peers anyway) and no `eot_timeout`.
+        let eot_received_count = lines.iter().filter(|l| l["event"] == "eot_received").count();
+        let eot_timeout_count = lines.iter().filter(|l| l["event"] == "eot_timeout").count();
+        assert_eq!(eot_received_count, 0, "idle path must not emit eot_received");
+        assert_eq!(eot_timeout_count, 0, "idle path must not emit eot_timeout");
+    }
+
+    #[test]
+    fn idle_detection_does_not_fire_when_received_keeps_advancing() {
+        // Sender goes idle (try_publish always rejects) but the receive
+        // path keeps producing messages. With one counter still
+        // advancing, idle detection must NOT fire -- the operate phase
+        // runs to its time-based budget and the on-wire EOT path
+        // executes. This corresponds to a reader-still-active scenario.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        args.workload = "scalar-flood".to_string();
+        args.tick_rate_hz = 50;
+        args.operate_secs = 2;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+        args.operate_idle_secs = 1;
+
+        let mut variant = IdleDetectionVariant::new(|_| false, |_| true);
+        let start = Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+
+        // The operate phase MUST have run to its time-based budget.
+        // 2 s operate + EOT immediate exit (empty peer set) + 0 silent
+        // + connect/stabilize. Lower bound asserts we did NOT short-
+        // circuit; upper bound is loose for CI jitter.
+        assert!(
+            elapsed >= Duration::from_millis(1900),
+            "operate phase short-circuited despite received still advancing; got {elapsed:?}"
+        );
+
+        let lines = read_log(dir.path(), "alice");
+        let phases = phase_sequence(&lines);
+        // On the time-based exit path, the eot phase IS present.
+        assert_eq!(
+            phases,
+            vec!["connect", "stabilize", "operate", "eot", "silent"],
+            "received-still-advancing run must take the on-wire EOT path, got {phases:?}"
+        );
+    }
+
+    #[test]
+    fn idle_detection_does_not_fire_when_sent_keeps_advancing() {
+        // Symmetric to the previous test: writer is alive
+        // (try_publish accepts everything) but the receive path is
+        // dead (poll_receive always returns None). With one counter
+        // still advancing, idle detection must NOT fire.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        args.workload = "scalar-flood".to_string();
+        args.tick_rate_hz = 50;
+        args.operate_secs = 2;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+        args.operate_idle_secs = 1;
+
+        let mut variant = IdleDetectionVariant::new(|_| true, |_| false);
+        let start = Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(1900),
+            "operate phase short-circuited despite sent still advancing; got {elapsed:?}"
+        );
+
+        let lines = read_log(dir.path(), "alice");
+        let phases = phase_sequence(&lines);
+        assert_eq!(
+            phases,
+            vec!["connect", "stabilize", "operate", "eot", "silent"],
+            "sent-still-advancing run must take the on-wire EOT path, got {phases:?}"
+        );
+    }
+
+    #[test]
+    fn idle_detection_disabled_with_zero_threshold() {
+        // Both counters stay flat from t=0 -- the same scenario as
+        // `idle_detection_fires_when_both_counters_idle` -- BUT
+        // operate_idle_secs=0 disables the new path entirely. The
+        // operate loop must run to its time-based budget regardless.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        args.workload = "scalar-flood".to_string();
+        args.tick_rate_hz = 50;
+        args.operate_secs = 2;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+        args.operate_idle_secs = 0;
+
+        let mut variant = IdleDetectionVariant::new(|_| false, |_| false);
+        let start = Instant::now();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(1900),
+            "operate phase short-circuited despite idle detection disabled; got {elapsed:?}"
+        );
+
+        let lines = read_log(dir.path(), "alice");
+        let phases = phase_sequence(&lines);
+        assert_eq!(
+            phases,
+            vec!["connect", "stabilize", "operate", "eot", "silent"],
+            "operate_idle_secs=0 must preserve pre-T15.5 behaviour, got {phases:?}"
+        );
     }
 }
