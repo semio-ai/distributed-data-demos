@@ -2905,4 +2905,166 @@ mod tests {
             "bob's discover() took too long ({bob_elapsed:?}) — T-coord.3 recovery is too slow"
         );
     }
+
+    /// T15.10 regression: a long sequence of ready/done barriers must
+    /// converge cleanly when the TCP barrier transport is installed.
+    /// Before T15.10 the UDP path could lose datagrams under
+    /// same-host pressure between spawns; with the TCP path installed
+    /// the test executes 50 ready+done pairs sequentially and must
+    /// finish in well under the per-barrier timeout * count.
+    ///
+    /// Wall-clock budget: each barrier has a 5 s timeout, 50 pairs
+    /// means 100 barriers. If every barrier waited for its full
+    /// timeout this would take 500 s; the assertion below caps the
+    /// run at 30 s so a transport-level regression is loud and fast.
+    #[test]
+    fn many_ready_done_barriers_in_sequence_t15_10() {
+        use crate::barrier_coord::BarrierCoordinator;
+        use std::sync::Arc;
+
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let runners = vec!["alice".to_string(), "bob".to_string()];
+        let hash = "many-barriers-hash".to_string();
+        let run_id = "many-barriers-run".to_string();
+        let subdir = "many-barriers-sub".to_string();
+        let mut hosts = std::collections::HashMap::new();
+        hosts.insert("alice".to_string(), "127.0.0.1".to_string());
+        hosts.insert("bob".to_string(), "127.0.0.1".to_string());
+
+        const ROUNDS: usize = 50;
+        let timeout = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+
+        let runners_a = runners.clone();
+        let hash_a = hash.clone();
+        let run_a = run_id.clone();
+        let subdir_a = subdir.clone();
+        let hosts_a = hosts.clone();
+        let thread_a = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "alice".into(),
+                &runners_a,
+                hash_a,
+                port,
+                subdir_a,
+                run_a,
+                false,
+            )
+            .unwrap();
+            coord.discover().unwrap();
+            let bc = Arc::new(BarrierCoordinator::new(
+                "alice".into(),
+                runners_a.clone(),
+                port,
+            ));
+            bc.start(&hosts_a).unwrap();
+            coord.install_barrier_coordinator(bc.clone());
+            for i in 0..ROUNDS {
+                let v = format!("v{i}");
+                coord.ready_barrier(&v, timeout).unwrap_or_else(|e| {
+                    panic!("alice ready_barrier({v}) failed: {e:#}");
+                });
+                coord
+                    .done_barrier(&v, "success", 0, timeout)
+                    .unwrap_or_else(|e| {
+                        panic!("alice done_barrier({v}) failed: {e:#}");
+                    });
+            }
+            bc.shutdown();
+        });
+
+        let runners_b = runners;
+        let hash_b = hash;
+        let run_b = run_id;
+        let subdir_b = subdir;
+        let hosts_b = hosts;
+        let thread_b = std::thread::spawn(move || {
+            let coord = Coordinator::new(
+                "bob".into(),
+                &runners_b,
+                hash_b,
+                port,
+                subdir_b,
+                run_b,
+                false,
+            )
+            .unwrap();
+            coord.discover().unwrap();
+            let bc = Arc::new(BarrierCoordinator::new(
+                "bob".into(),
+                runners_b.clone(),
+                port,
+            ));
+            bc.start(&hosts_b).unwrap();
+            coord.install_barrier_coordinator(bc.clone());
+            for i in 0..ROUNDS {
+                let v = format!("v{i}");
+                coord.ready_barrier(&v, timeout).unwrap_or_else(|e| {
+                    panic!("bob ready_barrier({v}) failed: {e:#}");
+                });
+                coord
+                    .done_barrier(&v, "success", 0, timeout)
+                    .unwrap_or_else(|e| {
+                        panic!("bob done_barrier({v}) failed: {e:#}");
+                    });
+            }
+            bc.shutdown();
+        });
+
+        thread_a.join().expect("alice thread panicked");
+        thread_b.join().expect("bob thread panicked");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "T15.10 regression: {ROUNDS} ready+done pairs took {elapsed:?} \
+             (expected well under 30 s with TCP transport)"
+        );
+    }
+
+    /// T15.10 regression: when the TCP barrier transport is installed
+    /// but a peer is silent (never starts its own coordinator), the
+    /// `ready_barrier` still surfaces a `BarrierTimeoutError` -- the
+    /// TCP path must not mask the timeout case.
+    ///
+    /// We install a `BarrierCoordinator` WITHOUT calling its
+    /// `start()`: the writers map is empty, so `broadcast()` is a
+    /// no-op and the per-peer inbox never gains an entry. The
+    /// `ready_barrier_tcp` poll loop must run out its deadline and
+    /// return a `BarrierTimeoutError` naming the silent peer.
+    #[test]
+    fn ready_barrier_tcp_path_returns_timeout_when_peer_silent_t15_10() {
+        use crate::barrier_coord::BarrierCoordinator;
+        use std::sync::Arc;
+
+        let _guard = multicast_test_lock();
+        let port = next_test_port();
+        let coord = coord_with_silent_peer("rb_tcp_alone", "rb_tcp_ghost", port);
+        // Build but do NOT start -- writers map stays empty, so the
+        // TCP path will see no inbound Ready and must time out on
+        // the configured deadline rather than waiting the 15s
+        // startup budget.
+        let bc = Arc::new(BarrierCoordinator::new(
+            "rb_tcp_alone".into(),
+            vec!["rb_tcp_alone".into(), "rb_tcp_ghost".into()],
+            port,
+        ));
+        coord.install_barrier_coordinator(bc.clone());
+
+        let started = std::time::Instant::now();
+        let err = coord
+            .ready_barrier("v-tcp-tmo", Duration::from_millis(500))
+            .expect_err("ready_barrier (TCP path) with silent peer must time out");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(5),
+            "expected ~500ms timeout, got {elapsed:?}"
+        );
+        let bt = err
+            .downcast_ref::<BarrierTimeoutError>()
+            .expect("error must downcast to BarrierTimeoutError");
+        assert_eq!(bt.kind, "ready");
+        assert_eq!(bt.variant, "v-tcp-tmo");
+        assert_eq!(bt.missing_peers, vec!["rb_tcp_ghost".to_string()]);
+    }
 }
