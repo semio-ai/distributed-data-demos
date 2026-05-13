@@ -24,6 +24,16 @@ pub const MAX_RECV_BUFFER_KB: u32 = 65_536;
 /// `metak-shared/api-contracts/variant-cli.md` (E15 additions).
 pub const DEFAULT_PROGRESS_STDOUT_INTERVAL_MS: u32 = 1000;
 
+/// Default value for `--operate-idle-secs` when the runner does not
+/// inject one. Matches the E15 design: when the variant observes no
+/// progress on EITHER its `sent` or `received` counter for this many
+/// seconds during the operate phase, it short-circuits the on-wire EOT
+/// exchange and transitions directly to `silent`. See T15.5.
+///
+/// `0` disables variant-side idle detection: only the time-based
+/// `operate_secs` transition fires (pre-E15 behaviour).
+pub const DEFAULT_OPERATE_IDLE_SECS: u32 = 5;
+
 /// Validate that `kb` falls within the documented `--recv-buffer-kb`
 /// range. Returned by clap's `value_parser`.
 fn parse_recv_buffer_kb(s: &str) -> Result<u32, String> {
@@ -153,6 +163,19 @@ pub struct CliArgs {
     /// so the runner can parse the stream as line-delimited JSON.
     #[arg(long, default_value_t = DEFAULT_PROGRESS_STDOUT_INTERVAL_MS)]
     pub progress_stdout_interval_ms: u32,
+
+    /// Variant-side idle-detection threshold in seconds (see E15 / T15.5).
+    ///
+    /// During the operate phase, if BOTH the local `sent` and `received`
+    /// counters have not advanced for this many seconds, the variant
+    /// emits `eot_sent` to its JSONL log and transitions internally to
+    /// the `silent` phase -- without engaging the on-wire EOT exchange.
+    ///
+    /// `0` disables variant-side idle detection: only the time-based
+    /// `operate_secs` transition fires (pre-E15 behaviour). Default
+    /// `5` matches the runner-side `operate_idle_secs` default.
+    #[arg(long, default_value_t = DEFAULT_OPERATE_IDLE_SECS)]
+    pub operate_idle_secs: u32,
 
     // -- Variant-specific pass-through arguments --
     /// Additional variant-specific arguments (collected as trailing args).

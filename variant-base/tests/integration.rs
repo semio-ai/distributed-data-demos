@@ -82,6 +82,9 @@ fn test_args_with_mode(log_dir: &str, threading_mode: ThreadingMode) -> CliArgs 
         // path -- the smoke test below covers the enabled path via the
         // child-binary spawn.
         progress_stdout_interval_ms: 0,
+        // Disable variant-side idle detection (T15.5) for these
+        // protocol-shape tests so the operate phase is purely time-bounded.
+        operate_idle_secs: 0,
         // Single-runner self-loopback peers list -> empty expected set
         // -> EOT phase terminates immediately with no `eot_timeout`.
         extra: vec!["--peers".to_string(), "test-runner=127.0.0.1".to_string()],

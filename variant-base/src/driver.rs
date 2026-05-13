@@ -702,6 +702,10 @@ mod tests {
             // Disable stdout progress in driver unit tests so they
             // never touch the real process stdout.
             progress_stdout_interval_ms: 0,
+            // Disable variant-side idle detection in driver unit tests
+            // by default. Tests that exercise the new T15.5 path
+            // override this explicitly.
+            operate_idle_secs: 0,
             extra: vec!["--peers".to_string(), peers.to_string()],
         }
     }
