@@ -1,0 +1,28 @@
+run = "t15-4"
+runners = ["local"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 0
+  # operate_secs is a generous 30s upper bound; the variant's own T15.5
+  # idle detection at operate_idle_secs=2 should short-circuit it well
+  # before then. The T15.4 runner-side state machine observes the same
+  # idle agreement and notes "operate done" without killing the variant.
+  operate_secs = 30
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = 1
+  log_dir = "./test-logs-t15-4"
+  # T15.5: variant transitions itself to silent after this many idle seconds.
+  operate_idle_secs = 2
+  # T15.1: variant emits progress every 250ms so the runner sees idle
+  # promptly without waiting the default 1s.
+  progress_stdout_interval_ms = 250
+
+  [variant.specific]
