@@ -11,33 +11,47 @@ runner (per ``runner/src/spawn.rs::stderr_capture_path``).
 
 The classification taxonomy and rules are documented in
 ``metak-shared/ANALYSIS.md`` -- see the "Timeout classification" section.
-Six values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
+Seven values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
 
 ``completed``
     Spawn ran to graceful exit (``phase=silent`` reached) and the
     writer's ``eot_sent`` is matched by a peer ``eot_received``.
+``runner_idle_terminated`` (T15.6)
+    Spawn ran to graceful exit (``phase=silent`` reached) via the
+    E15 variant-side idle-detection path: the writer emitted
+    ``eot_sent`` to its own JSONL on idle, no ``eot_timeout`` event
+    is present, but no peer logged a matching ``eot_received`` --
+    consistent with the post-E15 architecture where no on-wire EOT
+    exchange happens. This is a clean exit, distinct from the
+    failure-mode ``eot_lost`` (which requires the writer to NOT
+    reach ``phase=silent``).
 ``deadlock``
     Killed mid-operate: no ``eot_sent`` AND the JSONL ends with an
     incomplete record (last line not valid JSON).
 ``eot_lost``
-    Writer reached ``eot_sent`` but the peer never confirmed (no
-    matching ``eot_received`` on the peer side). The peer's reader
-    likely dropped the EOT marker. If the asymmetric side's stderr
-    capture has ``reader channel full`` lines, attach the
+    Writer reached ``eot_sent`` but never reached ``phase=silent``.
+    Legacy E12/E14 failure shape: writer published EOT but
+    something on the other side prevented the spawn from
+    completing cleanly. If the asymmetric side's stderr capture
+    has ``reader channel full`` lines, attach the
     ``eot_lost_likely_saturation`` sub-tag.
 ``variant_rejected``
     Variant exited before reaching ``phase=operate``; stderr capture
     is non-empty.
 ``eot_timeout_internal``
     Variant emitted ``eot_sent`` AND ``eot_timeout`` -- decided to
-    give up waiting for peer EOTs per the E12 EOT protocol.
+    give up waiting for peer EOTs per the E12 EOT protocol. Post-E15
+    this fires only for legacy code paths that still run the
+    on-wire EOT phase (e.g. websocket Single before T15.8 cleanup).
 ``unknown``
     None of the above. Operator must inspect manually.
 
 Stderr capture reads are LAZY: only spawns whose JSONL-derived state
 is ambiguous (``variant_rejected`` candidates, ``eot_lost`` candidates
 for the saturation sub-tag) trigger a read. Stderr files are not
-loaded unconditionally.
+loaded unconditionally. Spawns that classify as ``completed`` /
+``runner_idle_terminated`` / ``eot_timeout_internal`` / ``deadlock`` /
+``unknown`` never touch stderr.
 """
 
 from __future__ import annotations
@@ -53,6 +67,7 @@ import polars as pl
 # table column without quoting.
 Classification = Literal[
     "completed",
+    "runner_idle_terminated",
     "deadlock",
     "eot_lost",
     "variant_rejected",
@@ -357,7 +372,31 @@ def classify_spawn(
             classification="completed",
         )
 
-    # 3. eot_lost: writer reached eot_sent but never reached
+    # 3. runner_idle_terminated (T15.6): writer emitted eot_sent on
+    #    its own idle detection (E15 architecture, T15.5), reached
+    #    phase=silent cleanly, and did NOT log eot_timeout. No peer
+    #    confirmation is required -- E15 no longer runs an on-wire
+    #    EOT exchange, so peer eot_received events only appear for
+    #    legacy code paths. Precedence: this rule sits AFTER
+    #    ``completed`` (peer-confirmed handshake wins when it
+    #    happens, e.g. websocket multi which still observes the
+    #    on-wire EOT marker) and BEFORE ``eot_lost`` (which requires
+    #    the writer to NOT reach phase=silent and therefore cannot
+    #    coexist with this rule).
+    if (
+        summary.has_eot_sent
+        and summary.has_phase_silent
+        and not summary.has_eot_timeout
+        and not peer_confirmed
+    ):
+        return SpawnClassification(
+            variant=variant,
+            run=run,
+            runner=runner,
+            classification="runner_idle_terminated",
+        )
+
+    # 4. eot_lost: writer reached eot_sent but never reached
     #    phase=silent. Spec rule (T14.17): the timed-out side IS the
     #    side with eot_sent in its own JSONL -- strong signal the
     #    writer published EOT but the peer never confirmed back in
@@ -402,7 +441,7 @@ def classify_spawn(
             sub_tags=sub_tags,
         )
 
-    # 4. variant_rejected: never reached operate phase, stderr present.
+    # 5. variant_rejected: never reached operate phase, stderr present.
     if not summary.has_phase_operate:
         stderr_text = (
             read_stderr_capture(_stderr_path(logs_dir, variant, runner))
@@ -423,7 +462,7 @@ def classify_spawn(
                 classification="variant_rejected",
             )
 
-    # 5. deadlock: no eot_sent, no graceful silent, JSONL ends mid-record.
+    # 6. deadlock: no eot_sent, no graceful silent, JSONL ends mid-record.
     if not summary.has_eot_sent and not summary.has_phase_silent:
         if logs_dir is not None and jsonl_ends_mid_record(
             _jsonl_path(logs_dir, variant, run, runner)
@@ -435,7 +474,7 @@ def classify_spawn(
                 classification="deadlock",
             )
 
-    # 6. Fallthrough.
+    # 7. Fallthrough.
     return SpawnClassification(
         variant=variant,
         run=run,

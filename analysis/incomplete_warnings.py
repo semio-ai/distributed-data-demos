@@ -6,7 +6,8 @@ results for any job-run case that hits one of three triggers and emit
 row-by-row:
 
 1. **Not completed**: ``IntegrityResult.timeout_classification`` is
-   anything other than ``"completed"``. Granularity: per
+   anything other than ``"completed"`` or ``"runner_idle_terminated"``
+   (both are clean-exit classifications). Granularity: per
    ``(variant, run, writer)`` spawn -- a single non-completed spawn
    is reported once even if the integrity table has multiple
    ``(writer -> receiver)`` rows for it.
@@ -87,9 +88,15 @@ def collect_incomplete_warnings(
     not_completed: dict[tuple[str, str, str], _NotCompletedWarning] = {}
     delivery_shortfall: list[_DeliveryShortfallWarning] = []
 
+    # Both "completed" (peer-confirmed E12 handshake) and the new
+    # "runner_idle_terminated" (T15.6; E15 variant-side idle-detection
+    # path) are clean-exit classifications -- neither triggers a
+    # not-completed warning.
+    _CLEAN_EXIT_CLASSIFICATIONS = frozenset({"completed", "runner_idle_terminated"})
+
     for r in integrity_results:
         # Rule 1: spawn did not finish gracefully.
-        if r.timeout_classification != "completed":
+        if r.timeout_classification not in _CLEAN_EXIT_CLASSIFICATIONS:
             key = (r.variant, r.run, r.writer)
             # Keep the first occurrence -- they all share the same
             # writer-side classification by construction (T14.17).
