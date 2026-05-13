@@ -783,8 +783,11 @@ mod tests {
         bc_a.broadcast(&ready_a);
         bc_b.broadcast(&ready_b);
 
-        // Poll for arrival within a generous bound.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Poll for arrival within a generous bound. Wide enough to
+        // absorb scheduling jitter when this test runs in parallel
+        // with the broader workspace test set on Windows; the
+        // happy-path completes well under 200 ms on an idle host.
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let a_inbox = bc_a.drain_inbox("bob");
             let b_inbox = bc_b.drain_inbox("alice");
