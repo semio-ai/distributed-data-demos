@@ -60,7 +60,20 @@ use tungstenite::{
 
 use variant_base::logger::LoggerHandle;
 use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
-use variant_base::{PeerEot, Variant};
+use variant_base::Variant;
+
+/// Internal record of an observed EOT marker on the data WebSocket
+/// stream. The on-wire EOT exchange was retired in T15.8; this type
+/// remains so peers running pre-T15.8 binaries that still emit EOT
+/// markers on the data stream can be decoded and discarded without
+/// surfacing as `Frame` parse errors. The decoded markers are no
+/// longer surfaced to the driver.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct PeerEot {
+    writer: String,
+    eot_id: u64,
+}
 
 use crate::pairing::{DerivedEndpoints, PairRole, PeerDesc};
 use crate::protocol::{self, Frame};
@@ -1145,18 +1158,10 @@ impl Variant for WebSocketVariant {
         Ok(())
     }
 
-    fn signal_end_of_test(&mut self) -> Result<u64> {
-        let eot_id: u64 = rand::random();
-        let frame = protocol::encode_eot(&self.runner, eot_id);
-        self.broadcast_binary(frame)
-            .context("failed to broadcast WS EOT marker")?;
-        Ok(eot_id)
-    }
-
-    fn poll_peer_eots(&mut self) -> Result<Vec<PeerEot>> {
-        let drained: Vec<PeerEot> = self.pending_eots.drain(..).collect();
-        Ok(drained)
-    }
+    // T15.8: signal_end_of_test / poll_peer_eots removed. The on-wire
+    // EOT exchange is no longer driven; runner-coordinated termination
+    // (T15.4) plus variant-side idle detection (T15.5) is the sole
+    // exit mechanism.
 }
 
 fn accepted_count_for_ip(accepted: &[WsPeer], ip: std::net::IpAddr) -> usize {
@@ -1267,36 +1272,9 @@ mod tests {
         assert_eq!(v.active_threading_mode(), ThreadingMode::Multi);
     }
 
-    #[test]
-    fn record_eot_dedupes() {
-        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableTcp));
-        v.record_eot("alice".to_string(), 42);
-        v.record_eot("alice".to_string(), 42);
-        let drained = v.poll_peer_eots().unwrap();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].writer, "alice");
-        assert_eq!(drained[0].eot_id, 42);
-        assert!(v.poll_peer_eots().unwrap().is_empty());
-    }
-
-    #[test]
-    fn record_eot_filters_own_runner() {
-        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableTcp));
-        v.record_eot("self".to_string(), 7);
-        assert!(v.poll_peer_eots().unwrap().is_empty());
-    }
-
-    #[test]
-    fn record_eot_distinguishes_writers() {
-        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableTcp));
-        v.record_eot("alice".to_string(), 1);
-        v.record_eot("bob".to_string(), 2);
-        let drained = v.poll_peer_eots().unwrap();
-        assert_eq!(drained.len(), 2);
-        let names: HashSet<&str> = drained.iter().map(|e| e.writer.as_str()).collect();
-        assert!(names.contains("alice"));
-        assert!(names.contains("bob"));
-    }
+    // T15.8: removed tests `record_eot_dedupes`, `record_eot_filters_own_runner`,
+    // and `record_eot_distinguishes_writers`. They exercised the
+    // poll_peer_eots trait method that no longer exists.
 
     #[test]
     fn try_publish_qos3_returns_true_in_happy_path() {
@@ -1479,43 +1457,8 @@ mod tests {
         let _ = server_thread.join();
     }
 
-    /// T14.10: `poll_peers_once_multi` must drain lifecycle items
-    /// (`Eot`, `PeerDropped`) from the shared channel and return `None`.
-    /// Data items never appear on the channel post-T14.10 -- the
-    /// reader thread writes them directly to JSONL via the logger
-    /// handle. This test feeds an `Eot` straight into the channel via
-    /// a synthesised sender and verifies the side effect (an EOT marker
-    /// surfaced through `poll_peer_eots`) without spinning up a real
-    /// reader thread.
-    #[test]
-    fn t14_10_poll_multi_drains_lifecycle_items_only() {
-        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableTcp));
-        v.threading_mode = ThreadingMode::Multi;
-        let (tx, rx) = sync_channel::<ReaderItem>(LIFECYCLE_CHANNEL_CAPACITY);
-        v.recv_tx = Some(tx.clone());
-        v.recv_rx = Some(rx);
-
-        // Push an Eot item -- this is what reader threads still emit
-        // through the channel after T14.10.
-        tx.send(ReaderItem::Eot {
-            writer: "alice".to_string(),
-            eot_id: 7,
-        })
-        .expect("send eot");
-
-        // Drain the channel via poll_peers_once_multi. It must return
-        // None (no data items pass through the channel any more) and
-        // the EOT must surface through poll_peer_eots.
-        let data_hit = v.poll_peers_once_multi();
-        assert!(
-            data_hit.is_none(),
-            "poll_peers_once_multi must NOT return Data items post-T14.10"
-        );
-        let drained = v.poll_peer_eots().expect("poll_peer_eots");
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].writer, "alice");
-        assert_eq!(drained[0].eot_id, 7);
-    }
+    // T15.8: removed test `t14_10_poll_multi_drains_lifecycle_items_only`.
+    // It exercised the poll_peer_eots trait method that no longer exists.
 
     /// T14.10: `poll_peers_once_multi` must process a `PeerDropped`
     /// lifecycle item by removing the named peer from the active set.

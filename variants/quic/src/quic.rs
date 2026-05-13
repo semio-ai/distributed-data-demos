@@ -9,7 +9,21 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
-use variant_base::variant_trait::{PeerEot, Variant};
+use variant_base::variant_trait::Variant;
+
+/// Internal record of an observed peer EOT marker.
+///
+/// The on-wire EOT exchange was retired in T15.8 (the `Variant` trait
+/// methods `signal_end_of_test` / `poll_peer_eots` are gone). EOT
+/// markers received from a pre-T15.8 peer are still decoded by the
+/// transport layer to keep the parser tolerant of mixed-version
+/// peers, but they are no longer surfaced to the driver.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct PeerEot {
+    writer: String,
+    eot_id: u64,
+}
 
 use crate::certs::generate_self_signed_cert;
 
@@ -24,9 +38,14 @@ const TAG_EOT: u8 = 0x02;
 /// Number of times to send each EOT datagram (qos 1-2). The retries
 /// give us redundancy against UDP loss without relying on the data
 /// channel's drain timing.
+///
+/// T15.8: no longer driven by the variant; kept so the transport
+/// stays parser-tolerant of pre-T15.8 peers that still emit EOT.
+#[allow(dead_code)]
 const EOT_DATAGRAM_RETRIES: usize = 5;
 
 /// Spacing between successive EOT datagram sends (qos 1-2).
+#[allow(dead_code)]
 const EOT_DATAGRAM_SPACING: Duration = Duration::from_millis(5);
 
 /// Data-message header layout (after the leading TAG_DATA byte):
@@ -43,6 +62,7 @@ const DATA_HEADER_OVERHEAD: usize = 1 + 2 + 2 + 1 + 8;
 ///   - writer_len: u16 (big-endian)
 ///   - writer: [u8; writer_len]
 ///   - eot_id: u64 (big-endian)
+#[allow(dead_code)]
 const EOT_HEADER_OVERHEAD: usize = 1 + 2 + 8;
 
 /// Decoded inbound frame: either a data message or an EOT marker.
@@ -70,6 +90,7 @@ fn encode_data(writer: &str, path: &str, qos: Qos, seq: u64, payload: &[u8]) -> 
     buf
 }
 
+#[allow(dead_code)]
 fn encode_eot(writer: &str, eot_id: u64) -> Vec<u8> {
     let writer_bytes = writer.as_bytes();
     let total = EOT_HEADER_OVERHEAD + writer_bytes.len();
@@ -846,52 +867,9 @@ impl Variant for QuicVariant {
         Ok(())
     }
 
-    fn signal_end_of_test(&mut self) -> Result<u64> {
-        let send_tx = self
-            .send_tx
-            .as_ref()
-            .context("not connected -- call connect() first")?;
-
-        let eot_id: u64 = rand::random::<u64>();
-        let payload = encode_eot(&self.runner, eot_id);
-
-        // Reliable per-stream EOT (qos 3-4 path): one frame per stream
-        // followed by `finish`, exactly like a data message. Sent
-        // alongside the datagram path so EOT travels through every
-        // transport this variant uses.
-        send_tx
-            .send(OutboundMessage {
-                data: payload.clone(),
-                reliable: true,
-                retries: 1,
-                spacing: Duration::ZERO,
-            })
-            .map_err(|_| anyhow::anyhow!("send channel closed"))?;
-
-        // Datagram EOT (qos 1-2 path): 5 sends with 5ms spacing for
-        // redundancy under loss; receivers dedupe by `(writer, eot_id)`.
-        send_tx
-            .send(OutboundMessage {
-                data: payload,
-                reliable: false,
-                retries: EOT_DATAGRAM_RETRIES,
-                spacing: EOT_DATAGRAM_SPACING,
-            })
-            .map_err(|_| anyhow::anyhow!("send channel closed"))?;
-
-        Ok(eot_id)
-    }
-
-    fn poll_peer_eots(&mut self) -> Result<Vec<PeerEot>> {
-        // Pump first so any EOTs queued behind data (or data queued
-        // behind EOTs) make it onto our side buffers. The
-        // dedup-by-(writer, eot_id) work happens on the receive side
-        // in `dispatch_decoded`, so anything that lands in
-        // `pending_eots` is already first-sight.
-        self.pump_inbound();
-        let drained = std::mem::take(&mut self.pending_eots);
-        Ok(drained)
-    }
+    // T15.8: signal_end_of_test / poll_peer_eots removed from the trait.
+    // The on-wire EOT path was retired in favour of runner-coordinated
+    // termination (T15.4) plus variant-side idle detection (T15.5).
 }
 
 impl QuicVariant {

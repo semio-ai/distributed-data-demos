@@ -27,8 +27,6 @@ fn dummy_binary_args(
         operate_secs.to_string(),
         "--silent-secs".to_string(),
         "0".to_string(),
-        "--eot-timeout-secs".to_string(),
-        "1".to_string(),
         "--workload".to_string(),
         "scalar-flood".to_string(),
         "--values-per-tick".to_string(),
@@ -71,7 +69,6 @@ fn test_args_with_mode(log_dir: &str, threading_mode: ThreadingMode) -> CliArgs 
         stabilize_secs: 0,
         operate_secs: 1,
         silent_secs: 0,
-        eot_timeout_secs: Some(1),
         workload: "scalar-flood".to_string(),
         values_per_tick: 5,
         qos: 1,
@@ -147,7 +144,9 @@ fn test_full_protocol_with_dummy() {
         })
         .collect();
 
-    assert_eq!(phase_events.len(), 5, "should have 5 phase events");
+    // After T15.8 the EOT phase is removed; the driver emits four
+    // phase events (connect, stabilize, operate, silent).
+    assert_eq!(phase_events.len(), 4, "should have 4 phase events");
     assert_eq!(phase_events[0].0, "connect");
     assert_eq!(phase_events[1].0, "stabilize");
     assert_eq!(phase_events[2].0, "operate");
@@ -156,18 +155,17 @@ fn test_full_protocol_with_dummy() {
         Some("scalar-flood"),
         "operate phase should include workload profile"
     );
-    assert_eq!(phase_events[3].0, "eot");
-    assert_eq!(phase_events[4].0, "silent");
+    assert_eq!(phase_events[3].0, "silent");
 
-    // EOT phase: an `eot_sent` event must appear exactly once. With an
-    // empty expected-peer set (single-runner self-loopback) no
-    // `eot_timeout` should fire.
+    // The `eot_sent` JSONL marker is still emitted exactly once between
+    // operate and silent. No on-wire byproducts (`eot_timeout`,
+    // `eot_received`).
     let eot_sent_count = events.iter().filter(|&&e| e == "eot_sent").count();
     assert_eq!(eot_sent_count, 1, "should have exactly one eot_sent event");
     let eot_timeout_count = events.iter().filter(|&&e| e == "eot_timeout").count();
     assert_eq!(
         eot_timeout_count, 0,
-        "single-runner self-loopback should not emit eot_timeout"
+        "post-T15.8 driver never emits eot_timeout"
     );
 
     // Connected event must exist with launch_ts and elapsed_ms.
@@ -257,8 +255,6 @@ fn test_variant_dummy_binary_exit_code() {
             "1",
             "--silent-secs",
             "0",
-            "--eot-timeout-secs",
-            "1",
             "--workload",
             "scalar-flood",
             "--values-per-tick",
@@ -339,8 +335,8 @@ fn test_variant_dummy_runs_in_both_threading_modes() {
             .collect();
         assert_eq!(
             phases,
-            vec!["connect", "stabilize", "operate", "eot", "silent"],
-            "phase order must be canonical in {mode} mode"
+            vec!["connect", "stabilize", "operate", "silent"],
+            "phase order must be canonical in {mode} mode (T15.8: no eot phase)"
         );
 
         // Exactly one `connected` event carrying the mode and the
@@ -368,7 +364,7 @@ fn test_variant_dummy_runs_in_both_threading_modes() {
         let eot_timeout = events.iter().filter(|&&e| e == "eot_timeout").count();
         assert_eq!(
             eot_timeout, 0,
-            "single-runner self-loopback should not emit eot_timeout in {mode} mode"
+            "post-T15.8 driver never emits eot_timeout in {mode} mode"
         );
 
         // The dummy echoes every publish; we expect both writes and
@@ -552,8 +548,6 @@ fn test_variant_dummy_idle_detection_short_circuits_operate() {
         "30".to_string(),
         "--silent-secs".to_string(),
         "0".to_string(),
-        "--eot-timeout-secs".to_string(),
-        "1".to_string(),
         "--workload".to_string(),
         "scalar-flood".to_string(),
         // Zero values per tick -> workload generates no ops -> sent
@@ -636,10 +630,7 @@ fn test_variant_dummy_idle_detection_short_circuits_operate() {
     );
 
     // No on-wire EOT byproducts.
-    let eot_timeout_count = lines
-        .iter()
-        .filter(|l| l["event"] == "eot_timeout")
-        .count();
+    let eot_timeout_count = lines.iter().filter(|l| l["event"] == "eot_timeout").count();
     assert_eq!(eot_timeout_count, 0, "idle path must not emit eot_timeout");
 
     // Stdout progress: at least one line with eot_sent:true should be

@@ -24,7 +24,7 @@
 //! tracks the highest seen `seq` per `(writer, path)` for QoS 2 and
 //! drops stale frames before they reach the driver.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -52,10 +52,23 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
-use variant_base::variant_trait::{PeerEot, Variant};
+use variant_base::variant_trait::Variant;
+
+/// Internal record of an observed peer EOT marker (T15.8 historical).
+///
+/// The on-wire EOT exchange was retired in T15.8. This struct stays so
+/// the variant's internal channel plumbing compiles unchanged; the
+/// receive path still decodes EOT control frames from pre-T15.8 peers,
+/// but they are no longer surfaced to the driver.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct PeerEot {
+    writer: String,
+    eot_id: u64,
+}
 
 use crate::pairing::{PairRole, PeerDesc};
-use crate::protocol::{decode_frame, encode_data, encode_eot, Frame};
+use crate::protocol::{decode_frame, encode_data, Frame};
 use crate::signaling::{read_frame, write_frame, SignalEnvelope};
 
 /// Maximum time to wait for the full WebRTC connect (per peer): SDP
@@ -111,8 +124,9 @@ fn channel_options(qos: Qos) -> RTCDataChannelInit {
 }
 
 /// "Reliable" channel used for EOT regardless of the spawn's primary
-/// QoS. Sending EOT on an unreliable channel could deadlock the wait
-/// if the marker drops in flight.
+/// QoS. Retained for historical reference (T15.8 removed the on-wire
+/// EOT exchange).
+#[allow(dead_code)]
 const EOT_CHANNEL_QOS: Qos = Qos::ReliableTcp;
 
 /// Soft upper bound on the per-(peer, qos) outbound queue depth, in
@@ -998,47 +1012,10 @@ impl Variant for WebRtcVariant {
         Ok(())
     }
 
-    fn signal_end_of_test(&mut self) -> Result<u64> {
-        let send_tx = self
-            .send_tx
-            .as_ref()
-            .context("not connected -- call connect() first")?;
-        let eot_id: u64 = rand::random::<u64>();
-        let bytes = encode_eot(&self.runner, eot_id);
-        let data = Bytes::from(bytes);
-        // Always go on the reliable channel regardless of the spawn's
-        // primary QoS -- an EOT lost on an unreliable channel could
-        // deadlock the wait.
-        for peer in &self.peers {
-            // EOT frames bypass the T-impl.7 backpressure accounting:
-            // they are reliable, one-shot, and must not be skipped.
-            send_tx
-                .send(OutboundMessage {
-                    peer: peer.name.clone(),
-                    qos: EOT_CHANNEL_QOS.as_int(),
-                    data: data.clone(),
-                    inflight_counter: None,
-                    inflight_bytes: 0,
-                })
-                .map_err(|_| anyhow!("send channel closed"))?;
-        }
-        Ok(eot_id)
-    }
-
-    fn poll_peer_eots(&mut self) -> Result<Vec<PeerEot>> {
-        self.pump_inbound();
-        // Dedup defensively at the variant boundary too: a duplicate
-        // EOT could in principle land on multiple channels (we only
-        // send on reliable, but be safe).
-        let mut seen: HashSet<(String, u64)> = HashSet::new();
-        let mut out: Vec<PeerEot> = Vec::with_capacity(self.pending_eots.len());
-        for e in std::mem::take(&mut self.pending_eots) {
-            if seen.insert((e.writer.clone(), e.eot_id)) {
-                out.push(e);
-            }
-        }
-        Ok(out)
-    }
+    // T15.8: signal_end_of_test / poll_peer_eots removed from the trait.
+    // The on-wire EOT exchange is no longer used; the inbound EOT
+    // routing in `pump_inbound` stays so pre-T15.8 peers that still
+    // emit EOT frames are tolerated without parser errors.
 }
 
 #[cfg(test)]

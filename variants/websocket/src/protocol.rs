@@ -66,6 +66,7 @@ pub fn encode_data(qos: Qos, seq: u64, path: &str, writer: &str, payload: &[u8])
 }
 
 /// Encode an end-of-test marker into the compact binary format.
+#[allow(dead_code)]
 pub fn encode_eot(writer: &str, eot_id: u64) -> Vec<u8> {
     let writer_bytes = writer.as_bytes();
     let total = 1 + 8 + 2 + writer_bytes.len();

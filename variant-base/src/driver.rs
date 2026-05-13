@@ -1,10 +1,9 @@
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::DateTime;
 
-use crate::cli::{parse_peer_names_from_extra, CliArgs};
+use crate::cli::CliArgs;
 use crate::logger::{Logger, LoggerHandle};
 use crate::progress_emitter::ProgressEmitter;
 use crate::resource::ResourceMonitor;
@@ -72,14 +71,6 @@ impl<'a> LoggerProxy<'a> {
         self.lock()?.log_eot_sent(eot_id)
     }
 
-    fn log_eot_received(&mut self, writer: &str, eot_id: u64) -> Result<()> {
-        self.lock()?.log_eot_received(writer, eot_id)
-    }
-
-    fn log_eot_timeout(&mut self, missing: &[String], wait_ms: u64) -> Result<()> {
-        self.lock()?.log_eot_timeout(missing, wait_ms)
-    }
-
     fn log_resource(&mut self, cpu_percent: f64, memory_mb: f64) -> Result<()> {
         self.lock()?.log_resource(cpu_percent, memory_mb)
     }
@@ -87,30 +78,6 @@ impl<'a> LoggerProxy<'a> {
     fn flush(&mut self) -> Result<()> {
         self.lock()?.flush()
     }
-}
-
-/// Minimum EOT-phase drain budget in seconds when no explicit override is
-/// provided. Replaces the previous 5-second floor: even short fixture runs
-/// (e.g. `operate_secs = 1..=10`) get a meaningful 30-second drain window
-/// for late-arriving messages on hybrid TCP/UDP transports.
-pub const MIN_DEFAULT_EOT_TIMEOUT_SECS: u64 = 30;
-
-/// Multiplier applied to `operate_secs` when computing the default EOT
-/// timeout. At 100 K writes/s the in-flight backlog can take roughly the
-/// operate-phase wall-clock to drain on hybrid transports; the factor of 3
-/// gives headroom for late deliveries while still being bounded.
-pub const DEFAULT_EOT_TIMEOUT_OPERATE_MULTIPLIER: u64 = 3;
-
-/// Compute the default EOT timeout in seconds from `operate_secs`.
-///
-/// Formula: `max(3 * operate_secs, 30)`. Used by the driver when
-/// `--eot-timeout-secs` is not provided on the CLI.
-#[inline]
-pub fn default_eot_timeout_secs(operate_secs: u64) -> u64 {
-    std::cmp::max(
-        operate_secs.saturating_mul(DEFAULT_EOT_TIMEOUT_OPERATE_MULTIPLIER),
-        MIN_DEFAULT_EOT_TIMEOUT_SECS,
-    )
 }
 
 /// Minimum operate-phase drain wallclock budget. Applies to both
@@ -272,13 +239,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // loop below. See `compute_operate_drain_time_budget` for the
     // tick-aware formula motivated by the 2026-05-11 websocket-1000x100hz
     // diagnostic incident.
-    //
-    // The EOT-phase drain (further below) retains the pre-T-impl.10
-    // budgets (2 * vpt, 1 ms wallclock) -- the failure mode the new
-    // formula addresses only manifests during operate-phase pacing.
     let drain_msg_budget = (config.values_per_tick as usize).saturating_mul(4).max(1);
-    let eot_drain_msg_budget = (config.values_per_tick as usize).saturating_mul(2).max(1);
-    let eot_drain_time_budget = Duration::from_millis(1);
 
     // Two-tier back-off counter for the max-throughput loop (T-impl.8).
     // Local to this protocol run -- only relevant under MaxThroughput;
@@ -437,164 +398,21 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         }
     }
 
-    // Variant-side idle short-circuit (T15.5).
+    // End-of-operate marker (T15.5 / T15.8).
     //
-    // When the operate loop exited via idle detection (rather than
-    // operate_secs expiring), emit the `eot_sent` JSONL event the
-    // analysis pipeline expects (T11.5, T14.17) and flip the progress
-    // flags so the next stdout tick reflects `eot_sent: true`. We do
-    // NOT engage the on-wire EOT exchange in this path -- the runner
+    // Whether the operate phase exited via idle detection or by the
+    // time-based `operate_secs` budget expiring, the variant emits a
+    // single `eot_sent` JSONL event (the marker T11.5 / T14.17 consume)
+    // and flips the progress flags so the next stdout tick reflects
+    // `eot_sent: true`. No on-wire EOT exchange runs -- the runner
     // (E15 / T15.4) is the authoritative observer of cross-peer
-    // agreement, so the variant can mark `eot_received` optimistically
-    // and proceed straight to `silent`. The on-wire path further below
-    // stays in place for back-compat (T15.8 removes it later).
-    if idle_triggered {
-        // Optimistic eot_id of 0 -- the on-wire exchange is bypassed so
-        // there is no peer-supplied id to record. The eot_id field on
-        // the JSONL event is informational; analysis (T11.5) only uses
-        // the `ts`.
-        logger.log_eot_sent(0)?;
-        progress.mark_eot_sent();
-        progress.mark_eot_received();
-
-        // -- Phase 5: Silent (drain + flush) -- (idle-triggered path) --
-        //
-        // We re-implement the same drain loop the on-wire path below
-        // uses so the silent-phase semantics are preserved regardless
-        // of which exit fires. Duplicating ~10 lines keeps the
-        // pre-T15.5 code path totally untouched on the time-based
-        // exit, which is the back-compat property the task spec calls
-        // out.
-        logger.log_phase(Phase::Silent, None)?;
-        progress.set_phase(Phase::Silent);
-
-        let silent_duration = Duration::from_secs(config.silent_secs);
-        let silent_start = Instant::now();
-        while silent_start.elapsed() < silent_duration {
-            match variant.poll_receive()? {
-                Some(update) => {
-                    logger.log_receive(
-                        &update.writer,
-                        update.seq,
-                        &update.path,
-                        update.qos,
-                        update.payload.len(),
-                    )?;
-                    progress.inc_received();
-                }
-                None => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
-
-        variant.stop_reader_threads()?;
-        variant.disconnect()?;
-        logger.flush()?;
-
-        progress.set_done();
-        progress.stop();
-
-        return Ok(());
-    }
-
-    // -- Phase 4: EOT (end-of-test handshake) --
-    //
-    // Per `metak-shared/api-contracts/eot-protocol.md`: the writer
-    // signals EOT once, then waits (bounded by `--eot-timeout-secs`)
-    // for every expected peer to signal EOT back. While waiting, any
-    // in-flight `receive` events are still drained. Variants that do
-    // not override `signal_end_of_test` / `poll_peer_eots` see an
-    // `eot_timeout` event after the timeout (with the full peer set
-    // as `missing`) but the spawn does NOT abort.
-    logger.log_phase(Phase::Eot, None)?;
-    progress.set_phase(Phase::Eot);
-
-    let expected: HashSet<String> = parse_peer_names_from_extra(&config.extra)
-        .into_iter()
-        .filter(|name| name != &config.runner)
-        .collect();
-    // If there are no expected peers (single-runner self-loopback or
-    // a misconfigured peer list), the variant has effectively
-    // "received" every expected EOT before the wait loop starts. Set
-    // the flag eagerly so the first progress tick in EOT phase
-    // reflects that.
-    if expected.is_empty() {
-        progress.mark_eot_received();
-    }
-
-    let eot_timeout_secs = config
-        .eot_timeout_secs
-        .unwrap_or_else(|| default_eot_timeout_secs(config.operate_secs));
-    let eot_timeout = Duration::from_secs(eot_timeout_secs);
-
-    let my_eot_id = variant.signal_end_of_test()?;
-    logger.log_eot_sent(my_eot_id)?;
+    // agreement, so the variant marks `eot_received` optimistically
+    // and proceeds straight to `silent`. The `eot_id` field is
+    // informational; analysis (T11.5) only uses the `ts`.
+    let _ = idle_triggered; // bookkeeping kept; both exits emit eot_sent.
+    logger.log_eot_sent(0)?;
     progress.mark_eot_sent();
-
-    let eot_start = Instant::now();
-    let deadline = eot_start + eot_timeout;
-    let mut seen: HashSet<String> = HashSet::new();
-
-    while seen != expected && Instant::now() < deadline {
-        let new_eots = variant.poll_peer_eots()?;
-        let mut got_any_new = false;
-        for eot in new_eots {
-            // Defensive dedup-by-writer: variant is the source of truth
-            // but we backstop on our side too.
-            if seen.insert(eot.writer.clone()) {
-                logger.log_eot_received(&eot.writer, eot.eot_id)?;
-                got_any_new = true;
-            }
-        }
-        // Flip the progress flag once the expected-peer set has been
-        // fully observed. Sticky for the remainder of the spawn.
-        if !expected.is_empty() && expected.is_subset(&seen) {
-            progress.mark_eot_received();
-        }
-
-        // Drain any in-flight data updates while waiting. Bound each
-        // pass with the same two-budget pattern as the operate phase so a
-        // peer that keeps publishing cannot starve the EOT poll loop.
-        // Overall EOT semantics are unchanged: the outer loop keeps
-        // iterating until every expected peer is seen or the timeout
-        // expires, so total time spent draining can still exceed 1ms.
-        //
-        // EOT uses the pre-T-impl.10 budgets (2 * vpt, 1 ms wallclock)
-        // deliberately -- the tick-aware widening is operate-only.
-        let drain_start = Instant::now();
-        let mut drained = 0usize;
-        while drained < eot_drain_msg_budget {
-            match variant.poll_receive()? {
-                Some(update) => {
-                    logger.log_receive(
-                        &update.writer,
-                        update.seq,
-                        &update.path,
-                        update.qos,
-                        update.payload.len(),
-                    )?;
-                    progress.inc_received();
-                    drained += 1;
-                    if drain_start.elapsed() >= eot_drain_time_budget {
-                        break;
-                    }
-                }
-                None => break,
-            }
-        }
-
-        if !got_any_new {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    if !expected.is_subset(&seen) {
-        let mut missing: Vec<String> = expected.difference(&seen).cloned().collect();
-        missing.sort();
-        let wait_ms = eot_start.elapsed().as_millis() as u64;
-        logger.log_eot_timeout(&missing, wait_ms)?;
-    }
+    progress.mark_eot_received();
 
     // -- Phase 5: Silent (drain + flush) --
     logger.log_phase(Phase::Silent, None)?;
@@ -641,7 +459,6 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     use std::path::Path;
@@ -651,73 +468,13 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::cli::{CliArgs, DEFAULT_RECV_BUFFER_KB};
-    use crate::driver::{
-        default_eot_timeout_secs, run_protocol, DEFAULT_EOT_TIMEOUT_OPERATE_MULTIPLIER,
-        MIN_DEFAULT_EOT_TIMEOUT_SECS,
-    };
+    use crate::driver::run_protocol;
     use crate::types::{Qos, ReceivedUpdate, ThreadingMode};
-    use crate::variant_trait::{PeerEot, Variant};
+    use crate::variant_trait::Variant;
 
-    #[test]
-    fn default_eot_timeout_secs_uses_30s_floor_for_short_operate() {
-        // operate_secs = 5 -> 3*5 = 15, floor at 30 -> 30.
-        assert_eq!(default_eot_timeout_secs(5), 30);
-        // operate_secs = 0 -> floor applies.
-        assert_eq!(default_eot_timeout_secs(0), 30);
-        // operate_secs = 10 -> 3*10 = 30, exactly at the floor.
-        assert_eq!(default_eot_timeout_secs(10), 30);
-    }
-
-    #[test]
-    fn default_eot_timeout_secs_scales_with_operate_secs() {
-        // operate_secs = 30 -> 3*30 = 90, well above the 30s floor.
-        assert_eq!(default_eot_timeout_secs(30), 90);
-        // operate_secs = 60 -> 3*60 = 180.
-        assert_eq!(default_eot_timeout_secs(60), 180);
-    }
-
-    #[test]
-    fn default_eot_timeout_secs_saturates_on_overflow() {
-        // u64::MAX as operate_secs would overflow 3 * operate_secs;
-        // saturating_mul keeps the result at u64::MAX rather than panicking.
-        assert_eq!(default_eot_timeout_secs(u64::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn default_eot_timeout_constants_match_documented_values() {
-        assert_eq!(MIN_DEFAULT_EOT_TIMEOUT_SECS, 30);
-        assert_eq!(DEFAULT_EOT_TIMEOUT_OPERATE_MULTIPLIER, 3);
-    }
-
-    #[test]
-    fn driver_uses_default_when_eot_timeout_secs_is_none() {
-        // We cannot directly observe the computed duration without spawning
-        // a 90 s wait, so we verify the computation lives in
-        // `default_eot_timeout_secs` and matches the documented examples.
-        // operate_secs = 30, override = None -> 90
-        assert_eq!(default_eot_timeout_secs(30), 90);
-        // operate_secs = 5, override = None -> 30 (floor)
-        assert_eq!(default_eot_timeout_secs(5), 30);
-        // Override-wins path: driver applies the exact override unchanged,
-        // ignoring the default-computation helper.
-        fn pick(override_value: Option<u64>, operate_secs: u64) -> u64 {
-            override_value.unwrap_or_else(|| default_eot_timeout_secs(operate_secs))
-        }
-        assert_eq!(pick(Some(5), 30), 5, "explicit override wins over default");
-        assert_eq!(
-            pick(None, 30),
-            90,
-            "default formula applies when override is None"
-        );
-        assert_eq!(
-            pick(None, 5),
-            30,
-            "floor applies when override is None and operate is short"
-        );
-    }
-
-    /// Variant that does NOT override the EOT trait methods, used to
-    /// exercise the default-impl fallback path.
+    /// Stub variant for driver unit tests. Connects, never publishes,
+    /// never receives, disconnects cleanly. Used to exercise the
+    /// phase-shape contract without any transport behaviour.
     struct StubVariant {
         name: &'static str,
     }
@@ -746,58 +503,12 @@ mod tests {
         }
     }
 
-    /// A second stub that DOES override the EOT methods so we can verify
-    /// the driver's logging and dedup paths.
-    struct EotStubVariant {
-        name: &'static str,
-        my_eot_id: u64,
-        signal_calls: u32,
-        scripted_eots: VecDeque<Vec<PeerEot>>,
-    }
-
-    impl EotStubVariant {
-        fn new(name: &'static str, my_eot_id: u64, scripted: Vec<Vec<PeerEot>>) -> Self {
-            Self {
-                name,
-                my_eot_id,
-                signal_calls: 0,
-                scripted_eots: scripted.into(),
-            }
-        }
-    }
-
-    impl Variant for EotStubVariant {
-        fn name(&self) -> &str {
-            self.name
-        }
-        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
-            Ok(())
-        }
-        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
-            Ok(())
-        }
-        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
-            Ok(None)
-        }
-        fn disconnect(&mut self) -> Result<()> {
-            Ok(())
-        }
-        fn signal_end_of_test(&mut self) -> Result<u64> {
-            self.signal_calls += 1;
-            Ok(self.my_eot_id)
-        }
-        fn poll_peer_eots(&mut self) -> Result<Vec<PeerEot>> {
-            Ok(self.scripted_eots.pop_front().unwrap_or_default())
-        }
-    }
-
-    fn base_args(log_dir: &str, runner: &str, peers: &str, eot_timeout_secs: u64) -> CliArgs {
+    fn base_args(log_dir: &str, runner: &str, peers: &str) -> CliArgs {
         CliArgs {
             tick_rate_hz: 100,
             stabilize_secs: 0,
             operate_secs: 0,
             silent_secs: 0,
-            eot_timeout_secs: Some(eot_timeout_secs),
             workload: "scalar-flood".to_string(),
             values_per_tick: 1,
             qos: 1,
@@ -831,46 +542,22 @@ mod tests {
     }
 
     #[test]
-    fn test_trait_defaults_return_zero_and_empty_vec() {
-        let mut v = StubVariant::new("a");
-        // Default impls are accessible via the trait.
-        assert_eq!(v.signal_end_of_test().unwrap(), 0);
-        assert!(v.poll_peer_eots().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_eot_phase_emits_timeout_for_no_override_variant() {
+    fn protocol_phase_sequence_skips_eot_phase() {
+        // After T15.8 there is no on-wire EOT phase. The driver emits
+        // a single `eot_sent` JSONL event between operate and silent
+        // (preserved as a marker for the analysis pipeline) but no
+        // `phase=eot` log event. Phases observed in the JSONL stream:
+        // connect -> stabilize -> operate -> silent.
         let dir = TempDir::new().unwrap();
         let args = base_args(
             dir.path().to_str().unwrap(),
             "alice",
             "alice=127.0.0.1,bob=127.0.0.1",
-            1,
         );
         let mut variant = StubVariant::new("stub");
         run_protocol(&mut variant, &args).expect("protocol completes");
 
         let lines = read_log(dir.path(), "alice");
-        let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
-
-        // phase=eot must appear and `eot_sent` with eot_id 0 (default impl).
-        let eot_sent_lines: Vec<&serde_json::Value> =
-            lines.iter().filter(|l| l["event"] == "eot_sent").collect();
-        assert_eq!(eot_sent_lines.len(), 1);
-        assert_eq!(eot_sent_lines[0]["eot_id"], 0);
-
-        // The driver must emit a single `eot_timeout` listing `bob` as missing.
-        let timeout_lines: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "eot_timeout")
-            .collect();
-        assert_eq!(timeout_lines.len(), 1);
-        let missing = timeout_lines[0]["missing"].as_array().unwrap();
-        let names: Vec<&str> = missing.iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(names, vec!["bob"]);
-        assert!(timeout_lines[0]["wait_ms"].as_u64().unwrap() > 0);
-
-        // Phase ordering: operate -> eot -> silent
         let phase_seq: Vec<&str> = lines
             .iter()
             .filter(|l| l["event"] == "phase")
@@ -878,116 +565,45 @@ mod tests {
             .collect();
         assert_eq!(
             phase_seq,
-            vec!["connect", "stabilize", "operate", "eot", "silent"]
+            vec!["connect", "stabilize", "operate", "silent"],
+            "T15.8: eot phase is removed; only operate-silent transition remains"
         );
 
-        // Existence of phase=eot in the event stream.
-        assert!(events.contains(&"phase"));
-    }
-
-    #[test]
-    fn test_eot_phase_logs_eot_received_and_no_timeout_when_all_peers_seen() {
-        let dir = TempDir::new().unwrap();
-        let args = base_args(
-            dir.path().to_str().unwrap(),
-            "alice",
-            "alice=127.0.0.1,bob=127.0.0.1,carol=127.0.0.1",
-            5,
-        );
-
-        // First poll returns nothing (test the sleep path), second returns
-        // bob and carol.
-        let mut variant = EotStubVariant::new(
-            "stub",
-            123,
-            vec![
-                vec![],
-                vec![
-                    PeerEot {
-                        writer: "bob".into(),
-                        eot_id: 11,
-                    },
-                    PeerEot {
-                        writer: "carol".into(),
-                        eot_id: 22,
-                    },
-                ],
-            ],
-        );
-        run_protocol(&mut variant, &args).expect("protocol completes");
-        assert_eq!(variant.signal_calls, 1, "signal_end_of_test called once");
-
-        let lines = read_log(dir.path(), "alice");
-
+        // Exactly one `eot_sent` event is still emitted as the analysis
+        // marker (T11.5 / T14.17 depend on this).
         let eot_sent_lines: Vec<&serde_json::Value> =
             lines.iter().filter(|l| l["event"] == "eot_sent").collect();
         assert_eq!(eot_sent_lines.len(), 1);
-        assert_eq!(eot_sent_lines[0]["eot_id"], 123);
+        assert_eq!(eot_sent_lines[0]["eot_id"], 0);
 
-        let received_lines: Vec<&serde_json::Value> = lines
+        // No on-wire EOT byproducts.
+        let received: Vec<&serde_json::Value> = lines
             .iter()
             .filter(|l| l["event"] == "eot_received")
             .collect();
-        assert_eq!(received_lines.len(), 2);
-        let writers: std::collections::HashSet<&str> = received_lines
-            .iter()
-            .map(|l| l["writer"].as_str().unwrap())
-            .collect();
-        assert!(writers.contains("bob"));
-        assert!(writers.contains("carol"));
-
-        let timeout_lines: Vec<&serde_json::Value> = lines
+        assert!(received.is_empty());
+        let timeout: Vec<&serde_json::Value> = lines
             .iter()
             .filter(|l| l["event"] == "eot_timeout")
             .collect();
-        assert!(
-            timeout_lines.is_empty(),
-            "no eot_timeout when every peer EOT is seen"
-        );
+        assert!(timeout.is_empty());
     }
 
-    #[test]
-    fn test_eot_phase_dedupes_repeated_writer() {
-        let dir = TempDir::new().unwrap();
-        let args = base_args(
-            dir.path().to_str().unwrap(),
-            "alice",
-            "alice=127.0.0.1,bob=127.0.0.1",
-            5,
-        );
+    // ----- removed in T15.8: -----
+    //
+    // The following tests exercised the on-wire EOT exchange:
+    //   - `test_trait_defaults_return_zero_and_empty_vec`
+    //   - `test_eot_phase_emits_timeout_for_no_override_variant`
+    //   - `test_eot_phase_logs_eot_received_and_no_timeout_when_all_peers_seen`
+    //   - `test_eot_phase_dedupes_repeated_writer`
+    //   - `test_eot_phase_terminates_immediately_when_expected_set_is_empty`
+    //   - `default_eot_timeout_secs_*` (helper-function tests)
+    //
+    // They tested behaviour that no longer exists. Coverage of the new
+    // exit mechanism is provided by `protocol_phase_sequence_skips_eot_phase`
+    // above plus the T15.5 idle-detection tests further down.
 
-        // Variant returns bob twice (defensive dedup test on the driver
-        // side).
-        let mut variant = EotStubVariant::new(
-            "stub",
-            7,
-            vec![
-                vec![PeerEot {
-                    writer: "bob".into(),
-                    eot_id: 99,
-                }],
-                vec![PeerEot {
-                    writer: "bob".into(),
-                    eot_id: 99,
-                }],
-            ],
-        );
-        run_protocol(&mut variant, &args).expect("protocol completes");
-
-        let lines = read_log(dir.path(), "alice");
-        let received_lines: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "eot_received")
-            .collect();
-        assert_eq!(
-            received_lines.len(),
-            1,
-            "driver must dedupe by-writer even if variant emits the same writer twice"
-        );
-        assert_eq!(received_lines[0]["writer"], "bob");
-    }
-
-    /// A variant whose `poll_receive` returns `Some` forever — modelling
+    /// A variant whose `poll_receive` returns `Some` forever â€” modelling
     /// a peer that publishes faster than we can drain. Used to verify
     /// that the driver's bounded receive-drain still gives `publish` a
     /// chance to run (T-fairness.1).
@@ -1013,7 +629,7 @@ mod tests {
             Ok(())
         }
         fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
-            // Always return Some — simulates an unbounded incoming firehose.
+            // Always return Some â€” simulates an unbounded incoming firehose.
             Ok(Some(ReceivedUpdate {
                 writer: "peer".to_string(),
                 seq: 0,
@@ -1038,12 +654,11 @@ mod tests {
         let mut args = base_args(
             dir.path().to_str().unwrap(),
             "alice",
-            // Single-runner so the EOT phase exits immediately.
+            // Single-runner -- no peers.
             "alice=127.0.0.1",
-            1,
         );
         // Max-throughput skips the tick sleep, so the outer loop is
-        // dominated by the drain budget itself — easiest to measure.
+        // dominated by the drain budget itself â€” easiest to measure.
         args.workload = "max-throughput".to_string();
         args.operate_secs = 1;
         args.silent_secs = 0;
@@ -1054,7 +669,7 @@ mod tests {
 
         // 1ms drain budget over 1s operate -> conservatively expect at
         // least ~50 publishes (allows for scheduler jitter and slow CI).
-        // The pre-fix code would publish exactly once per tick — i.e.
+        // The pre-fix code would publish exactly once per tick â€” i.e.
         // it would never get past the first iteration, so `publish_calls`
         // would equal `values_per_tick = 1`.
         assert!(
@@ -1062,56 +677,6 @@ mod tests {
             "publish should be called at least once per drain budget; got {}",
             variant.publish_calls
         );
-    }
-
-    #[test]
-    fn test_eot_phase_terminates_immediately_when_expected_set_is_empty() {
-        let dir = TempDir::new().unwrap();
-        // Single-runner config: only this runner in --peers.
-        let args = base_args(
-            dir.path().to_str().unwrap(),
-            "solo",
-            "solo=127.0.0.1",
-            // Set a long timeout to prove the phase exits without hitting it.
-            60,
-        );
-
-        let mut variant = StubVariant::new("stub");
-        let start = std::time::Instant::now();
-        run_protocol(&mut variant, &args).expect("protocol completes");
-        let elapsed = start.elapsed();
-
-        // Empty expected set -> the eot wait loop must exit immediately.
-        // Ten seconds is far below the 60-second timeout but well above
-        // any plausible scheduler jitter, so a true wait would clearly
-        // exceed it.
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "EOT phase should not wait when expected set is empty (took {:?})",
-            elapsed
-        );
-
-        let lines = read_log(dir.path(), "solo");
-        let timeout_lines: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "eot_timeout")
-            .collect();
-        assert!(
-            timeout_lines.is_empty(),
-            "single-runner case must not emit eot_timeout"
-        );
-
-        // `eot_sent` is still emitted (default impl returns id 0).
-        let eot_sent_lines: Vec<&serde_json::Value> =
-            lines.iter().filter(|l| l["event"] == "eot_sent").collect();
-        assert_eq!(eot_sent_lines.len(), 1);
-
-        // `eot_received` is NOT emitted (no peers).
-        let received: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "eot_received")
-            .collect();
-        assert!(received.is_empty());
     }
 
     /// A variant whose `try_publish` always reports backpressure.
@@ -1171,9 +736,8 @@ mod tests {
         let mut args = base_args(
             dir.path().to_str().unwrap(),
             "alice",
-            // Single-runner self-loopback so EOT exits immediately.
+            // Single-runner self-loopback.
             "alice=127.0.0.1",
-            1,
         );
         args.tick_rate_hz = 10;
         args.operate_secs = 1;
@@ -1374,7 +938,7 @@ mod tests {
         // 1000-66000 writes/sec; without sleep (yield-only) the rate
         // is bounded by libc/log I/O at millions/sec.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 5);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "max-throughput".to_string();
         args.operate_secs = 1; // smallest non-zero value the CLI supports
         args.silent_secs = 0;
@@ -1442,12 +1006,7 @@ mod tests {
         // Free-spin (no back-off) would produce millions of skips per
         // second. We assert (well) below that.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(
-            dir.path().to_str().unwrap(),
-            "alice",
-            "alice=127.0.0.1",
-            5, // small EOT timeout, but empty expected-peer set exits immediately
-        );
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "max-throughput".to_string();
         args.operate_secs = 1; // smallest non-zero value the CLI supports
         args.silent_secs = 0;
@@ -1503,7 +1062,7 @@ mod tests {
         // we should accumulate many thousands of skip+write pairs over
         // a 1-second operate window.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 5);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "max-throughput".to_string();
         args.operate_secs = 1; // smallest non-zero value
         args.silent_secs = 0;
@@ -1578,7 +1137,7 @@ mod tests {
         // events (one per intended value), and the wall-clock should
         // be roughly operate_secs (no extra back-off was added).
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "scalar-flood".to_string();
         args.operate_secs = 1;
         args.silent_secs = 0;
@@ -1642,7 +1201,7 @@ mod tests {
         // identically to today: every value -> one `write` event, zero
         // `backpressure_skipped` events.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.tick_rate_hz = 10;
         args.operate_secs = 1;
         args.silent_secs = 0;
@@ -1759,7 +1318,7 @@ mod tests {
         // formula the message budget (`4 * vpt = 40`) is the operative
         // limit.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "scalar-flood".to_string();
         args.tick_rate_hz = 100;
         args.operate_secs = 1;
@@ -1822,7 +1381,7 @@ mod tests {
         // operate-phase wall-clock stays within `operate_secs + 50 ms`
         // over a 1-second run.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "scalar-flood".to_string();
         args.tick_rate_hz = 1000;
         args.operate_secs = 1;
@@ -1864,7 +1423,7 @@ mod tests {
         // effectively unreachable (4 million per phase) so the
         // wallclock cap is the operative limit.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "max-throughput".to_string();
         args.tick_rate_hz = 1; // ignored under max-throughput
         args.operate_secs = 1;
@@ -1946,7 +1505,7 @@ mod tests {
         // operate phase, plus a few from the EOT/silent paths) and
         // that the operate phase completes in roughly `operate_secs`.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "scalar-flood".to_string();
         args.tick_rate_hz = 100;
         args.operate_secs = 1;
@@ -2065,9 +1624,8 @@ mod tests {
         let mut args = base_args(
             dir.path().to_str().unwrap(),
             "solo",
-            // Single-runner self-loopback -> empty expected EOT peers.
+            // Single-runner self-loopback.
             "solo=127.0.0.1",
-            1,
         );
         args.operate_secs = 0;
         args.silent_secs = 0;
@@ -2097,7 +1655,7 @@ mod tests {
         // Same shape as the Multi test but verifies the Single path so
         // we know the driver doesn't accidentally hard-code one mode.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "solo", "solo=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "solo", "solo=127.0.0.1");
         args.operate_secs = 0;
         args.silent_secs = 0;
         args.threading_mode = ThreadingMode::Single;
@@ -2114,7 +1672,7 @@ mod tests {
         // The driver must emit a `connected` event tagged with the
         // exact threading mode and recv-buffer-kb the spawn ran under.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "solo", "solo=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "solo", "solo=127.0.0.1");
         args.operate_secs = 0;
         args.silent_secs = 0;
         args.threading_mode = ThreadingMode::Multi;
@@ -2224,7 +1782,7 @@ mod tests {
         // operate_secs=30, the loop must exit on idle well before the
         // 30 s budget.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "scalar-flood".to_string();
         args.tick_rate_hz = 50;
         args.operate_secs = 30;
@@ -2270,9 +1828,15 @@ mod tests {
 
         // No on-wire EOT events on the idle path: no `eot_received`
         // (there were no peers anyway) and no `eot_timeout`.
-        let eot_received_count = lines.iter().filter(|l| l["event"] == "eot_received").count();
+        let eot_received_count = lines
+            .iter()
+            .filter(|l| l["event"] == "eot_received")
+            .count();
         let eot_timeout_count = lines.iter().filter(|l| l["event"] == "eot_timeout").count();
-        assert_eq!(eot_received_count, 0, "idle path must not emit eot_received");
+        assert_eq!(
+            eot_received_count, 0,
+            "idle path must not emit eot_received"
+        );
         assert_eq!(eot_timeout_count, 0, "idle path must not emit eot_timeout");
     }
 
@@ -2281,10 +1845,11 @@ mod tests {
         // Sender goes idle (try_publish always rejects) but the receive
         // path keeps producing messages. With one counter still
         // advancing, idle detection must NOT fire -- the operate phase
-        // runs to its time-based budget and the on-wire EOT path
-        // executes. This corresponds to a reader-still-active scenario.
+        // runs to its time-based budget. After T15.8 the phase sequence
+        // on either exit path is the same (no on-wire EOT phase); this
+        // test asserts the timing-based property only.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "scalar-flood".to_string();
         args.tick_rate_hz = 50;
         args.operate_secs = 2;
@@ -2298,9 +1863,8 @@ mod tests {
         let elapsed = start.elapsed();
 
         // The operate phase MUST have run to its time-based budget.
-        // 2 s operate + EOT immediate exit (empty peer set) + 0 silent
-        // + connect/stabilize. Lower bound asserts we did NOT short-
-        // circuit; upper bound is loose for CI jitter.
+        // Lower bound asserts we did NOT short-circuit; upper bound is
+        // loose for CI jitter.
         assert!(
             elapsed >= Duration::from_millis(1900),
             "operate phase short-circuited despite received still advancing; got {elapsed:?}"
@@ -2308,11 +1872,11 @@ mod tests {
 
         let lines = read_log(dir.path(), "alice");
         let phases = phase_sequence(&lines);
-        // On the time-based exit path, the eot phase IS present.
+        // T15.8: phase sequence is always connect/stabilize/operate/silent.
         assert_eq!(
             phases,
-            vec!["connect", "stabilize", "operate", "eot", "silent"],
-            "received-still-advancing run must take the on-wire EOT path, got {phases:?}"
+            vec!["connect", "stabilize", "operate", "silent"],
+            "phase sequence post-T15.8 has no eot phase, got {phases:?}"
         );
     }
 
@@ -2323,7 +1887,7 @@ mod tests {
         // dead (poll_receive always returns None). With one counter
         // still advancing, idle detection must NOT fire.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "scalar-flood".to_string();
         args.tick_rate_hz = 50;
         args.operate_secs = 2;
@@ -2345,8 +1909,8 @@ mod tests {
         let phases = phase_sequence(&lines);
         assert_eq!(
             phases,
-            vec!["connect", "stabilize", "operate", "eot", "silent"],
-            "sent-still-advancing run must take the on-wire EOT path, got {phases:?}"
+            vec!["connect", "stabilize", "operate", "silent"],
+            "phase sequence post-T15.8 has no eot phase, got {phases:?}"
         );
     }
 
@@ -2357,7 +1921,7 @@ mod tests {
         // operate_idle_secs=0 disables the new path entirely. The
         // operate loop must run to its time-based budget regardless.
         let dir = TempDir::new().unwrap();
-        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1", 1);
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.workload = "scalar-flood".to_string();
         args.tick_rate_hz = 50;
         args.operate_secs = 2;
@@ -2379,8 +1943,8 @@ mod tests {
         let phases = phase_sequence(&lines);
         assert_eq!(
             phases,
-            vec!["connect", "stabilize", "operate", "eot", "silent"],
-            "operate_idle_secs=0 must preserve pre-T15.5 behaviour, got {phases:?}"
+            vec!["connect", "stabilize", "operate", "silent"],
+            "phase sequence post-T15.8 has no eot phase, got {phases:?}"
         );
     }
 }

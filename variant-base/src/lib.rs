@@ -20,5 +20,5 @@ pub use resource::ResourceMonitor;
 pub use seq::SeqGenerator;
 pub use socket::{tune_udp_buffers, tune_udp_buffers_std};
 pub use types::{Phase, Qos, ReceivedUpdate, ThreadingMode, ThreadingModeParseError};
-pub use variant_trait::{PeerEot, Variant};
+pub use variant_trait::Variant;
 pub use workload::{create_workload, ScalarFlood, Workload, WriteOp};

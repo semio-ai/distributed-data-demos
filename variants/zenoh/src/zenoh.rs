@@ -14,7 +14,20 @@ use zenoh::qos::CongestionControl;
 use zenoh::sample::Sample;
 
 use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
-use variant_base::variant_trait::{PeerEot, Variant};
+use variant_base::variant_trait::Variant;
+
+/// Internal record of an observed peer EOT marker (T15.8 historical).
+///
+/// The on-wire EOT exchange was retired in T15.8; this struct is kept
+/// so the receive-side machinery that still decodes EOT publications
+/// from pre-T15.8 peers compiles without churn. The decoded markers
+/// are no longer surfaced to the driver.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct PeerEot {
+    writer: String,
+    eot_id: u64,
+}
 
 /// Helper: emit a `[zenoh-trace]` line on stderr if debug-trace is enabled.
 /// The macro is a no-op when `enabled` is false so the hot path stays cheap.
@@ -180,6 +193,7 @@ const EOT_KEY_PREFIX: &str = "bench/__eot__/";
 const EOT_WILDCARD: &str = "bench/__eot__/**";
 
 /// Construct the per-writer EOT key from a runner name.
+#[allow(dead_code)]
 fn eot_key_for(writer: &str) -> String {
     format!("{}{}", EOT_KEY_PREFIX, writer)
 }
@@ -196,6 +210,7 @@ fn writer_from_eot_key(key: &str) -> Option<&str> {
 }
 
 /// Encode an `eot_id` as 8 big-endian bytes per the EOT contract.
+#[allow(dead_code)]
 fn encode_eot_payload(eot_id: u64) -> [u8; 8] {
     eot_id.to_be_bytes()
 }
@@ -325,6 +340,7 @@ impl ZenohArgs {
 
 /// Outbound publish request shuttled from the variant's main thread to the
 /// publisher task running on the dedicated tokio runtime.
+#[allow(dead_code)]
 enum OutboundMessage {
     /// A regular data publish to a workload key.
     Data {
@@ -1280,84 +1296,8 @@ impl Variant for ZenohVariant {
         }
     }
 
-    fn signal_end_of_test(&mut self) -> Result<u64> {
-        let trace = self.zenoh_args.debug_trace;
-        let send_tx = self
-            .send_tx
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("not connected"))?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("not connected"))?;
-
-        let eot_id: u64 = rand::random::<u64>();
-        let key = eot_key_for(&self.runner);
-        let payload = encode_eot_payload(eot_id);
-
-        if trace {
-            trace_now!(
-                "signal_end_of_test: publishing EOT key={} id={}",
-                key,
-                eot_id
-            );
-        }
-
-        let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
-        let outbound = OutboundMessage::Eot {
-            key: key.clone(),
-            payload,
-            done: done_tx,
-        };
-        send_tx
-            .blocking_send(outbound)
-            .map_err(|_| anyhow::anyhow!("publish channel closed during signal_end_of_test"))?;
-
-        // Block on the publisher_task's confirmation that the put committed.
-        // The recv runs inside the existing runtime via `block_on` so the
-        // EOT publish lands on the same runtime as every other Zenoh call
-        // (per T10.2b's bridge architecture).
-        let put_result = runtime
-            .block_on(done_rx)
-            .map_err(|_| anyhow::anyhow!("EOT publisher dropped completion oneshot"))?;
-        put_result?;
-
-        if trace {
-            trace_now!(
-                "signal_end_of_test: EOT committed key={} id={}",
-                key,
-                eot_id
-            );
-        }
-        Ok(eot_id)
-    }
-
-    fn poll_peer_eots(&mut self) -> Result<Vec<PeerEot>> {
-        let eot_rx = match self.eot_rx.as_mut() {
-            Some(rx) => rx,
-            None => return Ok(Vec::new()),
-        };
-
-        let mut out: Vec<PeerEot> = Vec::new();
-        loop {
-            match eot_rx.try_recv() {
-                Ok((writer, eot_id)) => {
-                    // Variant-side dedup is the source of truth per the
-                    // EOT contract -- a (writer, eot_id) pair is returned
-                    // to the driver at most once per spawn.
-                    if self.eot_seen.insert((writer.clone(), eot_id)) {
-                        out.push(PeerEot { writer, eot_id });
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // Subscriber task ended; nothing more is coming.
-                    break;
-                }
-            }
-        }
-        Ok(out)
-    }
+    // T15.8: signal_end_of_test / poll_peer_eots removed from the Variant
+    // trait. The on-wire EOT exchange is no longer used.
 
     fn disconnect(&mut self) -> Result<()> {
         let trace = self.zenoh_args.debug_trace;
@@ -1678,67 +1618,9 @@ mod tests {
         assert_eq!(decode_eot_payload(&[0; 16]), None);
     }
 
-    #[test]
-    fn test_poll_peer_eots_dedups_repeated_pairs() {
-        // Inject two arrivals with the same (writer, eot_id) into the
-        // EOT observations channel. `poll_peer_eots` MUST return only
-        // the first as a `PeerEot` -- the variant is the source of
-        // truth for dedup per the EOT contract.
-        let mut variant =
-            ZenohVariant::new("self-runner", &[]).expect("construct variant for dedup test");
-
-        let (tx, rx) = mpsc::channel::<(String, u64)>(8);
-        variant.eot_rx = Some(rx);
-
-        // Two identical arrivals plus a distinct (writer, eot_id) plus a
-        // same-writer-different-id arrival to confirm dedup is on the
-        // FULL pair, not just the writer.
-        tx.try_send(("peer-a".to_string(), 0xAAAA)).unwrap();
-        tx.try_send(("peer-a".to_string(), 0xAAAA)).unwrap();
-        tx.try_send(("peer-b".to_string(), 0xBBBB)).unwrap();
-        tx.try_send(("peer-a".to_string(), 0xCCCC)).unwrap();
-        drop(tx);
-
-        let observed = variant.poll_peer_eots().expect("poll_peer_eots");
-        assert_eq!(
-            observed.len(),
-            3,
-            "expected 3 unique (writer, eot_id) pairs after dedup, got {observed:?}"
-        );
-        assert!(observed.contains(&PeerEot {
-            writer: "peer-a".to_string(),
-            eot_id: 0xAAAA,
-        }));
-        assert!(observed.contains(&PeerEot {
-            writer: "peer-b".to_string(),
-            eot_id: 0xBBBB,
-        }));
-        assert!(observed.contains(&PeerEot {
-            writer: "peer-a".to_string(),
-            eot_id: 0xCCCC,
-        }));
-
-        // A second poll must return nothing (channel closed; all dedup
-        // entries have already been emitted).
-        let again = variant
-            .poll_peer_eots()
-            .expect("poll_peer_eots second call");
-        assert!(
-            again.is_empty(),
-            "second poll must be empty after dedup, got {again:?}"
-        );
-    }
-
-    #[test]
-    fn test_poll_peer_eots_returns_empty_when_disconnected() {
-        // Before connect, eot_rx is None -- the trait default behaviour
-        // is to return an empty vec, and our impl matches that.
-        let mut variant = ZenohVariant::new("solo", &[]).expect("construct variant");
-        let observed = variant
-            .poll_peer_eots()
-            .expect("poll_peer_eots without connect");
-        assert!(observed.is_empty());
-    }
+    // T15.8: removed tests `test_poll_peer_eots_dedups_repeated_pairs`
+    // and `test_poll_peer_eots_returns_empty_when_disconnected`. They
+    // exercised the poll_peer_eots trait method that no longer exists.
 
     /// Stress test for the bridge: publish 10000 messages back-to-back
     /// through a connected ZenohVariant in single-process loopback and

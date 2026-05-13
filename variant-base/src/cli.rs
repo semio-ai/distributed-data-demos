@@ -82,14 +82,6 @@ pub struct CliArgs {
     #[arg(long)]
     pub silent_secs: u64,
 
-    /// Maximum duration in seconds the EOT phase will wait for peer EOTs
-    /// before giving up and logging an `eot_timeout` event. When unset,
-    /// the driver computes the default at runtime as
-    /// `max(3 * operate_secs, 30)` (see
-    /// `driver::default_eot_timeout_secs`).
-    #[arg(long)]
-    pub eot_timeout_secs: Option<u64>,
-
     /// Workload profile name (e.g. `scalar-flood`).
     #[arg(long)]
     pub workload: String,
@@ -425,76 +417,6 @@ mod tests {
             "run01",
         ]);
         assert_eq!(args.threading_mode, ThreadingMode::Single);
-    }
-
-    #[test]
-    fn parse_eot_timeout_secs_when_provided() {
-        let args = CliArgs::parse_from([
-            "variant-dummy",
-            "--tick-rate-hz",
-            "100",
-            "--stabilize-secs",
-            "0",
-            "--operate-secs",
-            "1",
-            "--silent-secs",
-            "0",
-            "--workload",
-            "scalar-flood",
-            "--values-per-tick",
-            "1",
-            "--qos",
-            "1",
-            "--log-dir",
-            "/tmp/logs",
-            "--launch-ts",
-            "2026-04-12T14:00:00.000000000Z",
-            "--variant",
-            "dummy",
-            "--runner",
-            "a",
-            "--run",
-            "run01",
-            "--threading-mode",
-            "single",
-            "--eot-timeout-secs",
-            "7",
-        ]);
-        assert_eq!(args.eot_timeout_secs, Some(7));
-    }
-
-    #[test]
-    fn parse_eot_timeout_secs_default_none_when_absent() {
-        let args = CliArgs::parse_from([
-            "variant-dummy",
-            "--tick-rate-hz",
-            "100",
-            "--stabilize-secs",
-            "0",
-            "--operate-secs",
-            "1",
-            "--silent-secs",
-            "0",
-            "--workload",
-            "scalar-flood",
-            "--values-per-tick",
-            "1",
-            "--qos",
-            "1",
-            "--log-dir",
-            "/tmp/logs",
-            "--launch-ts",
-            "2026-04-12T14:00:00.000000000Z",
-            "--variant",
-            "dummy",
-            "--runner",
-            "a",
-            "--run",
-            "run01",
-            "--threading-mode",
-            "single",
-        ]);
-        assert_eq!(args.eot_timeout_secs, None);
     }
 
     #[test]
