@@ -1,4 +1,3 @@
-mod controltcp;
 mod hybrid;
 mod protocol;
 mod reader;
@@ -44,24 +43,12 @@ fn run() -> Result<()> {
         .parse()
         .with_context(|| format!("invalid --tcp-base-port: {}", tcp_base_port_str))?;
 
-    // T14.18: required `--control-base-port` for the per-peer-pair TCP
-    // control side-channel. QoS-independent (`runner_stride = 1`, no QoS
-    // stride); see CUSTOM.md "Control side-channel (T14.18)".
-    let control_base_port_str = parse_required_extra_arg(&args.extra, "control-base-port")
-        .context("missing required --control-base-port in variant-specific args (T14.18)")?;
-    let control_base_port: u16 = control_base_port_str
-        .parse()
-        .with_context(|| format!("invalid --control-base-port: {}", control_base_port_str))?;
-
     let peers_raw = parse_required_extra_arg(&args.extra, "peers")
         .context("missing runner-injected --peers argument")?;
     let peer_map = parse_peers(&peers_raw).context("failed to parse --peers")?;
 
     let derived = derive_endpoints(&peer_map, &args.runner, tcp_base_port, args.qos)
         .context("TCP port derivation failed")?;
-
-    let control_endpoints = derive_control_endpoints(&peer_map, &args.runner, control_base_port)
-        .context("control TCP port derivation failed")?;
 
     let qos = Qos::from_int(args.qos)
         .ok_or_else(|| anyhow!("invalid --qos {}; expected 1..=4", args.qos))?;
@@ -73,9 +60,6 @@ fn run() -> Result<()> {
         tcp_peers: derived.tcp_peers,
         qos,
         recv_buffer_kb: args.recv_buffer_kb,
-        control_listen_addr: control_endpoints.listen_addr,
-        control_peers: control_endpoints.peers,
-        eot_timeout_secs: args.eot_timeout_secs,
     };
     let mut variant = HybridVariant::new(&args.runner, config);
     run_protocol(&mut variant, &args)?;
@@ -88,98 +72,6 @@ fn run() -> Result<()> {
 pub struct DerivedTcpEndpoints {
     pub tcp_listen_addr: SocketAddr,
     pub tcp_peers: Vec<SocketAddr>,
-}
-
-/// Result of control-TCP port derivation (T14.18).
-///
-/// Each runner gets ONE control listen port (the lower-sorted peer in a
-/// pair listens; the higher-sorted peer connects to that listener).
-/// `peers` holds the `(peer_name, peer_addr, role)` tuple for every
-/// non-self peer; the variant uses `role` to decide whether to dial or
-/// accept on the per-pair control connection.
-#[derive(Debug, Clone)]
-pub struct DerivedControlEndpoints {
-    /// Local control listen address (always bound; peer pairs that we
-    /// "win" the listen race for use this).
-    pub listen_addr: SocketAddr,
-    /// Per-peer control wiring.
-    pub peers: Vec<controltcp::ControlPeerEndpoint>,
-}
-
-pub use controltcp::ControlRole;
-
-/// Derive per-runner control TCP endpoints (T14.18).
-///
-/// Convention:
-///   runner_stride = 1
-///   port = control_base_port + runner_index * runner_stride
-///   (NO qos stride -- one control port per (runner, variant binary).)
-///
-/// Pairing: in a sorted-by-name peer list, the lower-index peer
-/// listens; the higher-index peer connects to the lower-index peer's
-/// listen port. Self always listens on its own derived port (peers
-/// with index < self_index connect TO us; peers with index > self_index
-/// we connect TO).
-pub fn derive_control_endpoints(
-    peer_map: &[(String, String)],
-    runner: &str,
-    control_base_port: u16,
-) -> Result<DerivedControlEndpoints> {
-    let runner_index = peer_map
-        .iter()
-        .position(|(name, _)| name == runner)
-        .ok_or_else(|| {
-            anyhow!(
-                "runner '{}' not present in --peers (have: {})",
-                runner,
-                peer_map
-                    .iter()
-                    .map(|(n, _)| n.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        })?;
-
-    let my_offset = (runner_index as u16)
-        .checked_mul(RUNNER_STRIDE)
-        .ok_or_else(|| anyhow!("control runner offset overflow"))?;
-    let my_port = control_base_port
-        .checked_add(my_offset)
-        .ok_or_else(|| anyhow!("control listen port overflow"))?;
-    let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), my_port);
-
-    let mut peers: Vec<controltcp::ControlPeerEndpoint> = Vec::new();
-    for (idx, (name, host)) in peer_map.iter().enumerate() {
-        if idx == runner_index {
-            continue;
-        }
-        let peer_offset = (idx as u16)
-            .checked_mul(RUNNER_STRIDE)
-            .ok_or_else(|| anyhow!("peer control offset overflow"))?;
-        let peer_port = control_base_port
-            .checked_add(peer_offset)
-            .ok_or_else(|| anyhow!("peer control port overflow"))?;
-        let peer_ip: IpAddr = host
-            .parse()
-            .with_context(|| format!("invalid peer host IP '{host}' for '{name}'"))?;
-        let peer_addr = SocketAddr::new(peer_ip, peer_port);
-        // Lower-sorted peer (smaller index) listens; higher-sorted (us
-        // here, if `runner_index > idx`) is the client. When the peer's
-        // index is smaller, WE are higher -> client. When the peer's
-        // index is larger, WE are lower -> server.
-        let role = if runner_index > idx {
-            ControlRole::Client
-        } else {
-            ControlRole::Server
-        };
-        peers.push(controltcp::ControlPeerEndpoint {
-            peer_name: name.clone(),
-            peer_addr,
-            role,
-        });
-    }
-
-    Ok(DerivedControlEndpoints { listen_addr, peers })
 }
 
 /// Parse a `--peers name1=host1,name2=host2,...` value into a sorted-by-name
@@ -442,90 +334,5 @@ mod tests {
         let derived = derive_endpoints(&peers, "self", 19900, 1).unwrap();
         assert_eq!(derived.tcp_listen_addr.port(), 19900);
         assert!(derived.tcp_peers.is_empty());
-    }
-
-    // ---- T14.18: control TCP endpoint derivation ----
-
-    #[test]
-    fn control_endpoints_alice_listens_bob_connects() {
-        let peers = parse_peers("alice=127.0.0.1,bob=127.0.0.1").unwrap();
-        let alice = derive_control_endpoints(&peers, "alice", 30000).unwrap();
-        let bob = derive_control_endpoints(&peers, "bob", 30000).unwrap();
-
-        // Alice is index 0 -> listens on 30000. Bob is index 1 -> listens on 30001.
-        assert_eq!(alice.listen_addr.port(), 30000);
-        assert_eq!(bob.listen_addr.port(), 30001);
-
-        // Pairing: alice's peer is bob, and alice has lower index -> alice is Server.
-        assert_eq!(alice.peers.len(), 1);
-        assert_eq!(alice.peers[0].peer_name, "bob");
-        assert_eq!(alice.peers[0].role, ControlRole::Server);
-        // Bob's peer is alice, and bob has higher index -> bob is Client and dials alice's port.
-        assert_eq!(bob.peers.len(), 1);
-        assert_eq!(bob.peers[0].peer_name, "alice");
-        assert_eq!(bob.peers[0].role, ControlRole::Client);
-        assert_eq!(bob.peers[0].peer_addr.port(), 30000);
-    }
-
-    #[test]
-    fn control_endpoints_no_qos_stride() {
-        // QoS is not part of the formula -- the same base + runner
-        // produces the same port regardless of QoS context.
-        let peers = parse_peers("alice=127.0.0.1,bob=127.0.0.1").unwrap();
-        let p1 = derive_control_endpoints(&peers, "alice", 30000).unwrap();
-        let p2 = derive_control_endpoints(&peers, "alice", 30000).unwrap();
-        assert_eq!(p1.listen_addr.port(), p2.listen_addr.port());
-    }
-
-    #[test]
-    fn control_endpoints_self_only_no_peers() {
-        let peers = parse_peers("self=127.0.0.1").unwrap();
-        let endpoints = derive_control_endpoints(&peers, "self", 30000).unwrap();
-        assert_eq!(endpoints.listen_addr.port(), 30000);
-        assert!(endpoints.peers.is_empty());
-    }
-
-    #[test]
-    fn control_endpoints_runner_missing_errors() {
-        let peers = parse_peers("alice=127.0.0.1,bob=127.0.0.1").unwrap();
-        let err = derive_control_endpoints(&peers, "carol", 30000).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("carol") && msg.contains("not present"));
-    }
-
-    #[test]
-    fn control_endpoints_three_peers_pairing() {
-        let peers = parse_peers("alice=127.0.0.1,bob=127.0.0.1,carol=127.0.0.1").unwrap();
-        let alice = derive_control_endpoints(&peers, "alice", 30000).unwrap();
-        let bob = derive_control_endpoints(&peers, "bob", 30000).unwrap();
-        let carol = derive_control_endpoints(&peers, "carol", 30000).unwrap();
-
-        assert_eq!(alice.listen_addr.port(), 30000);
-        assert_eq!(bob.listen_addr.port(), 30001);
-        assert_eq!(carol.listen_addr.port(), 30002);
-
-        // Alice (idx 0) is server for both bob and carol.
-        let alice_roles: Vec<ControlRole> = alice.peers.iter().map(|p| p.role).collect();
-        assert!(alice_roles.iter().all(|r| *r == ControlRole::Server));
-
-        // Bob (idx 1) is client to alice, server to carol.
-        let bob_role_alice = bob
-            .peers
-            .iter()
-            .find(|p| p.peer_name == "alice")
-            .unwrap()
-            .role;
-        let bob_role_carol = bob
-            .peers
-            .iter()
-            .find(|p| p.peer_name == "carol")
-            .unwrap()
-            .role;
-        assert_eq!(bob_role_alice, ControlRole::Client);
-        assert_eq!(bob_role_carol, ControlRole::Server);
-
-        // Carol (idx 2) is client to both.
-        let carol_roles: Vec<ControlRole> = carol.peers.iter().map(|p| p.role).collect();
-        assert!(carol_roles.iter().all(|r| *r == ControlRole::Client));
     }
 }
