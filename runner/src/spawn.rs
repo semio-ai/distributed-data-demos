@@ -3,15 +3,40 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::progress::{spawn_stdout_reader, TrackerHandle};
+use crate::progress::{spawn_stdout_reader, RemoteProgressViewHandle, TrackerHandle};
+use crate::termination::{evaluate, TerminationConfig, TerminationDecision};
 
 /// Cadence at which the spawn monitor calls the optional progress
 /// broadcaster while the child is running (T15.3). Matches the
 /// variant-side stdout cadence of ~1 Hz so the cross-runner view
 /// is updated at the same rate the variant emits new data.
 pub const PROGRESS_BROADCAST_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Cadence at which the spawn monitor evaluates the phase-aware
+/// termination state machine (T15.4). 250 ms is short enough that
+/// the safety-net + idle-detection decisions respond promptly without
+/// burning CPU on a tight poll. The actual `child.try_wait()` polling
+/// cadence is `poll_interval` (100 ms), which the loop already runs.
+pub const TERMINATION_EVAL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Inputs the phase-aware termination state machine needs on every
+/// poll-loop tick (T15.4). Bundled into one struct so the
+/// [`spawn_and_monitor`] signature stays manageable.
+pub struct TerminationContext<'a> {
+    /// Idle / safety-net configuration for this spawn.
+    pub config: TerminationConfig,
+    /// Shared handle on the cross-runner view T15.3 maintains.
+    pub remote_view: &'a RemoteProgressViewHandle,
+    /// Variant's effective name; used to index into per-peer
+    /// snapshots inside the view.
+    pub spawn_name: String,
+    /// Peer runner names this runner should hear from. Empty in
+    /// single-runner mode (the every-peer-idle predicate is then
+    /// vacuously true).
+    pub peers_expected: Vec<String>,
+}
 
 /// Maximum number of bytes read from the end of a stderr capture file when
 /// building a failure-diagnostic tail. Caps the tail at 64 KiB so a runaway
@@ -82,6 +107,7 @@ pub fn spawn_and_monitor(
     stderr_path: Option<&Path>,
     stdout_tracker: Option<(TrackerHandle, &str, &str)>,
     progress_publisher: Option<&dyn Fn(&crate::progress::LocalProgressTracker)>,
+    termination_ctx: Option<TerminationContext<'_>>,
 ) -> Result<ChildOutcome> {
     // Validate binary path exists.
     if !Path::new(binary).exists() {
@@ -155,6 +181,21 @@ pub fn spawn_and_monitor(
     // the previous call inside the same poll loop.
     let mut last_progress_broadcast = Instant::now();
 
+    // T15.4: track the last time we evaluated the termination state
+    // machine. Decoupled from `poll_interval` so the evaluation runs
+    // at its own ~250 ms cadence regardless of how often `try_wait()`
+    // is called. Initialised to the past (start - eval interval) so
+    // the very first iteration evaluates immediately.
+    let mut last_termination_eval = Instant::now()
+        .checked_sub(TERMINATION_EVAL_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    // T15.4: track whether we have already emitted the "operate done"
+    // observational log line so it does not spam the console once the
+    // local + every-peer idle predicate latches. The runner does not
+    // act on this signal (the variant self-terminates via T15.5); the
+    // line is purely diagnostic.
+    let mut operate_idle_logged = false;
+
     let outcome = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -167,9 +208,13 @@ pub fn spawn_and_monitor(
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    // Timeout -- kill the child process.
+                    // Wall-clock backstop. With T15.4 enabled this is
+                    // effectively redundant with the state-machine
+                    // safety net (whichever is shorter trips first),
+                    // but pre-T15.4 callers that pass only `timeout`
+                    // and no `termination_ctx` still rely on this
+                    // branch for hard cutoff.
                     let _ = child.kill();
-                    // Wait for the process to actually terminate.
                     let _ = child.wait();
                     break ChildOutcome::Timeout;
                 }
@@ -186,6 +231,52 @@ pub fn spawn_and_monitor(
                         let snap = tracker.snapshot();
                         publisher(&snap);
                         last_progress_broadcast = Instant::now();
+                    }
+                }
+                // T15.4: per-tick phase-aware termination check. The
+                // tracker snapshot AND the remote view snapshot are
+                // both read under their own short-lived mutex acquire
+                // (~microseconds at 1 Hz cadence). When no termination
+                // context was supplied we behave exactly as the
+                // pre-T15.4 loop (the wall-clock `timeout` branch
+                // above is the only kill path).
+                if let (Some(ctx), Some(tracker)) =
+                    (termination_ctx.as_ref(), tracker_for_publish.as_ref())
+                {
+                    if last_termination_eval.elapsed() >= TERMINATION_EVAL_INTERVAL {
+                        let local = tracker.snapshot();
+                        let remote = ctx.remote_view.snapshot();
+                        let decision = evaluate(
+                            &local,
+                            &remote,
+                            &ctx.spawn_name,
+                            &ctx.peers_expected,
+                            ctx.config,
+                            start.elapsed(),
+                            SystemTime::now(),
+                        );
+                        match decision {
+                            TerminationDecision::Continue => {}
+                            TerminationDecision::OperateIdle => {
+                                if !operate_idle_logged {
+                                    eprintln!(
+                                        "[runner] '{}' operate-idle agreement reached (local + every peer idle for >= {}s); waiting for variant self-transition",
+                                        ctx.spawn_name, ctx.config.operate_idle_secs
+                                    );
+                                    operate_idle_logged = true;
+                                }
+                            }
+                            TerminationDecision::SafetyNet => {
+                                eprintln!(
+                                    "[runner] '{}' safety-net kill: spawn exceeded max_spawn_secs={}s without reaching done",
+                                    ctx.spawn_name, ctx.config.max_spawn_secs
+                                );
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break ChildOutcome::Timeout;
+                            }
+                        }
+                        last_termination_eval = Instant::now();
                     }
                 }
                 std::thread::sleep(poll_interval);
@@ -362,6 +453,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("binary not found"));
@@ -411,8 +503,16 @@ mod tests {
             vec!["999".into()]
         };
 
-        let outcome =
-            spawn_and_monitor(binary, &args, Duration::from_secs(2), None, None, None).unwrap();
+        let outcome = spawn_and_monitor(
+            binary,
+            &args,
+            Duration::from_secs(2),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(outcome, ChildOutcome::Timeout);
     }
 

@@ -10,6 +10,7 @@ mod protocol;
 mod resume;
 mod spawn;
 mod spawn_job;
+mod termination;
 
 use anyhow::{bail, Result};
 use clap::Parser;
@@ -113,9 +114,6 @@ struct Cli {
     /// Default `5` matches the variant-side `--operate-idle-secs` default
     /// in `variant-base/src/cli.rs` so cross-runner agreement on idle
     /// fires at roughly the same time as the variant's self-transition.
-    ///
-    /// Wired into the per-spawn termination state machine in T15.4's
-    /// follow-up commit; this commit only adds the CLI surface.
     #[arg(long, default_value_t = 5)]
     operate_idle_secs: u32,
 
@@ -134,9 +132,6 @@ struct Cli {
     /// for any benchmark in the existing fixture set. Operators who
     /// want a tighter bound can shrink it; very long stress runs may
     /// need to raise it.
-    ///
-    /// Wired into the per-spawn termination state machine in T15.4's
-    /// follow-up commit; this commit only adds the CLI surface.
     #[arg(long, default_value_t = 300)]
     max_spawn_secs: u32,
 }
@@ -775,6 +770,36 @@ fn run(cli: &Cli) -> Result<()> {
             );
         };
 
+        // T15.4: build the phase-aware termination context for this
+        // spawn. The state machine inside `spawn_and_monitor` reads
+        // the local tracker (T15.2) and the cross-runner view (T15.3)
+        // on every tick and decides whether to keep polling, log an
+        // operate-idle observation, or fire the safety net.
+        //
+        // `max_spawn_secs` is bounded by the existing per-variant
+        // `timeout_secs` so pre-T15.4 tests that pass small timeouts
+        // still trip on the original deadline. New configs that
+        // rely on idle detection should set `timeout_secs` (or
+        // `default_timeout_secs`) generously and tune the safety
+        // net via `--max-spawn-secs` on the runner CLI.
+        let term_config = termination::TerminationConfig::with_bounded_max(
+            cli.operate_idle_secs,
+            cli.max_spawn_secs,
+            timeout_secs,
+        );
+        let peers_expected: Vec<String> = bench_config
+            .runners
+            .iter()
+            .filter(|n| **n != cli.name)
+            .cloned()
+            .collect();
+        let termination_ctx = spawn::TerminationContext {
+            config: term_config,
+            remote_view: &remote_view,
+            spawn_name: job.effective_name.clone(),
+            peers_expected,
+        };
+
         let outcome = spawn::spawn_and_monitor(
             &variant.binary,
             &args,
@@ -786,6 +811,7 @@ fn run(cli: &Cli) -> Result<()> {
                 job.effective_name.as_str(),
             )),
             Some(&publish_fn),
+            Some(termination_ctx),
         )?;
 
         // Snapshot the final tracker state to stderr so an operator can
