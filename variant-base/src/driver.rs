@@ -292,6 +292,31 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     //   - Ok(true) resets the counter to 0.
     let mut consecutive_skipped: u32 = 0;
 
+    // Variant-side idle detection (E15 / T15.5).
+    //
+    // When both `sent` and `received` counters have not advanced for
+    // `operate_idle_secs`, the variant transitions directly to the
+    // `silent` phase, bypassing the on-wire EOT exchange. The
+    // bookkeeping below is unconditional (cheap atomic snapshots) but
+    // the trigger check is gated on `operate_idle_secs > 0`: `0`
+    // disables idle detection entirely (pre-E15 behaviour, only the
+    // time-based `operate_secs` transition fires).
+    //
+    // We compare against the emitter's snapshot rather than mirror
+    // counters locally because the emitter is the source of truth for
+    // both: every successful `try_publish` calls `inc_sent`, and every
+    // `poll_receive` -> `Some(...)` calls `inc_received`. Tracking
+    // `last_*_value` rather than a "saw any work this iteration"
+    // boolean is robust to drain iterations that happen to publish
+    // zero values per tick (e.g. very small `values_per_tick`).
+    let idle_threshold = Duration::from_secs(u64::from(config.operate_idle_secs));
+    let idle_enabled = config.operate_idle_secs > 0;
+    let mut last_sent_value: u64 = 0;
+    let mut last_received_value: u64 = 0;
+    let mut last_sent_change_at = Instant::now();
+    let mut last_received_change_at = Instant::now();
+    let mut idle_triggered = false;
+
     while operate_start.elapsed() < operate_duration {
         // In max-throughput mode, skip the tick sleep entirely.
         if !max_throughput {
@@ -385,6 +410,92 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
             logger.log_resource(cpu, mem)?;
             last_resource_sample = Instant::now();
         }
+
+        // Variant-side idle detection (T15.5). Refresh the per-counter
+        // "last change" timestamps from the emitter's atomic snapshot,
+        // then -- if enabled -- check whether BOTH counters have been
+        // flat for at least `operate_idle_secs`. The check is
+        // unconditional bookkeeping followed by a single gated
+        // comparison, so disabling it via `operate_idle_secs = 0` adds
+        // no measurable overhead.
+        let snap = progress.snapshot();
+        let now_idle = Instant::now();
+        if snap.sent > last_sent_value {
+            last_sent_value = snap.sent;
+            last_sent_change_at = now_idle;
+        }
+        if snap.received > last_received_value {
+            last_received_value = snap.received;
+            last_received_change_at = now_idle;
+        }
+        if idle_enabled
+            && now_idle.duration_since(last_sent_change_at) >= idle_threshold
+            && now_idle.duration_since(last_received_change_at) >= idle_threshold
+        {
+            idle_triggered = true;
+            break;
+        }
+    }
+
+    // Variant-side idle short-circuit (T15.5).
+    //
+    // When the operate loop exited via idle detection (rather than
+    // operate_secs expiring), emit the `eot_sent` JSONL event the
+    // analysis pipeline expects (T11.5, T14.17) and flip the progress
+    // flags so the next stdout tick reflects `eot_sent: true`. We do
+    // NOT engage the on-wire EOT exchange in this path -- the runner
+    // (E15 / T15.4) is the authoritative observer of cross-peer
+    // agreement, so the variant can mark `eot_received` optimistically
+    // and proceed straight to `silent`. The on-wire path further below
+    // stays in place for back-compat (T15.8 removes it later).
+    if idle_triggered {
+        // Optimistic eot_id of 0 -- the on-wire exchange is bypassed so
+        // there is no peer-supplied id to record. The eot_id field on
+        // the JSONL event is informational; analysis (T11.5) only uses
+        // the `ts`.
+        logger.log_eot_sent(0)?;
+        progress.mark_eot_sent();
+        progress.mark_eot_received();
+
+        // -- Phase 5: Silent (drain + flush) -- (idle-triggered path) --
+        //
+        // We re-implement the same drain loop the on-wire path below
+        // uses so the silent-phase semantics are preserved regardless
+        // of which exit fires. Duplicating ~10 lines keeps the
+        // pre-T15.5 code path totally untouched on the time-based
+        // exit, which is the back-compat property the task spec calls
+        // out.
+        logger.log_phase(Phase::Silent, None)?;
+        progress.set_phase(Phase::Silent);
+
+        let silent_duration = Duration::from_secs(config.silent_secs);
+        let silent_start = Instant::now();
+        while silent_start.elapsed() < silent_duration {
+            match variant.poll_receive()? {
+                Some(update) => {
+                    logger.log_receive(
+                        &update.writer,
+                        update.seq,
+                        &update.path,
+                        update.qos,
+                        update.payload.len(),
+                    )?;
+                    progress.inc_received();
+                }
+                None => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        variant.stop_reader_threads()?;
+        variant.disconnect()?;
+        logger.flush()?;
+
+        progress.set_done();
+        progress.stop();
+
+        return Ok(());
     }
 
     // -- Phase 4: EOT (end-of-test handshake) --
