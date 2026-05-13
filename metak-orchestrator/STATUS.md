@@ -10418,3 +10418,42 @@ flood. All other variants are clean.
 
 T15.10: e767ab6, 7db7fc6, 45018e7, 26c77ec, 86884f3, 25ec3ba.
 
+
+---
+
+## 2026-05-13 — Post-T15.10 stress analysis (orchestrator)
+
+T14.17 classifier output on `logs/stress-e14-20260513_151341/`:
+
+- **30 path-rows classify `runner_idle_terminated`** (clean exit via
+  the E15 idle-detection path), including:
+  - websocket-1000x100hz-qos3-single and qos4-single -- previously
+    `eot_timeout_internal`, now correctly reflecting their clean exit
+  - custom-udp-1000x100hz-qos4-single -- previously `deadlock`,
+    now clean
+  - hybrid-1000x100hz-qos3-single and qos4-single -- 0.15-0.24%
+    delivery but `runner_idle_terminated` (the "log everything with
+    bad latency" intent fully realized)
+  - **Zenoh qos1 + qos2 multi** -- previously `eot_lost` /
+    `eot_timeout_internal`; the E15 architecture incidentally fixed
+    these too by removing the dependency on cross-variant EOT
+- **2 path-rows still classify `deadlock`**: Zenoh qos3/qos4 multi
+  alice-side, where alice's variant process truly wedges (JSONL
+  truncated mid-record). Bob-side classifies clean.
+
+### Translation of this run
+
+What started as "we shouldn't be seeing timeouts" 36 hours ago and
+manifested as eot_lost / asymmetric timeout / deadlock outcomes
+across half the variants is now a clean picture:
+
+1. 30/32 spawns clean (90%+ structural success rate).
+2. The 2 remaining cases are isolated to ONE transport at ONE
+   reliability tier under symmetric flood (Zenoh qos3/qos4 multi).
+3. T14.17 classifies every other outcome correctly along the
+   "clean-exit / variant-crash" axis without operator gymnastics.
+
+T14.9 (Zenoh router-RPC sidecar) is the last architectural item to
+close the remaining 2-of-32 gap. Until then the project's structural
+state is as strong as it has been since session start.
+
