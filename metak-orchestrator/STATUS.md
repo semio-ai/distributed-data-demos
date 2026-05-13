@@ -10218,3 +10218,130 @@ remains in the codebase as a fallback used by tests that want to
 exercise the legacy semantics without spinning up the TCP listeners
 (and as the single-runner short-circuit).
 
+---
+
+## T15.10 -- completion report (2026-05-13)
+
+### AUDIT findings (recap)
+
+The pre-T15.10 failure mode was UDP-coord datagram loss under
+symmetric same-host load. Variant data plane at ~200K msg/s, plus
+multicast loopback on the coord socket, overflows the kernel's
+per-socket UDP recv buffer during the variant-transition window.
+Lost Ready / Done datagrams had no application-level retransmit;
+the 500 ms re-broadcast tick kept re-sending the same payload but
+the receiver had already exited its 2 s linger, so the loss was
+permanent and the barrier waited 120 s before exiting 75. The
+clock-sync RTT spike to 56.9 ms observed in the T15.8 failure run
+was the same socket's recv queue starting to back up -- shared
+root cause with the barrier loss. Not T14.24's truncation case:
+Ready/Done payloads are ~150 bytes, well under MAX_MSG_SIZE=4096.
+
+### Chosen path
+
+Path B (TCP per peer pair) with a **dedicated** `BarrierCoordinator`
+mirroring the T15.3 `progress_coord` pattern -- not reusing the
+existing TCP channel, because lifecycles differ (resume_manifest
+is one-shot pre-Phase-2; progress_coord is continuous Phase 2;
+barriers are per-spawn Phase 2). New module
+`runner/src/barrier_coord.rs`, length-prefixed JSON frames,
+`base_port + 96 + index` listener ports, lower-sorted-name-accepts
+pairing rule. `Coordinator::ready_barrier` / `done_barrier`
+delegate to the TCP helpers when the transport is installed; the
+UDP socket continues servicing clock-sync, probe responses,
+discovery, and the legacy T-coord.1b / T-coord.3 recovery paths.
+
+### Validation
+
+| Check | Result |
+|------|--------|
+| `cargo build --release -p runner` | clean |
+| `cargo test --release -p runner --bins` (default parallelism) | 207 / 208 pass; 1 pre-existing UDP-coord flake on `done_barrier_hang_repro` -- confirmed flake in isolation (passes 2/3 retries), unrelated to T15.10 code paths since that test exercises the UDP fallback only (no BarrierCoordinator installed). |
+| `cargo test --release -p runner --bins -- --test-threads=4` | 208 / 208 pass |
+| `cargo test --release -p runner --test integration` | 19 / 19 pass |
+| `cargo test --release -p runner --test integration -- --ignored` | 2 / 2 pass |
+| `cargo clippy --release -p runner --all-targets -- -D warnings` | clean |
+| `cargo fmt -p runner -- --check` | clean |
+
+The `done_barrier_hang_repro` flake is structural in the UDP fallback path
+(precisely the failure mode T15.10 fixes by moving production to TCP).
+Documented; not addressed in this task.
+
+### End-to-end stress repro (MANDATORY)
+
+Ran `configs/two-runner-stress-e14.toml` end-to-end with both
+alice and bob on localhost via `target/release/runner.exe`.
+
+**Result: 30 / 32 spawns success, 2 / 32 timeout (both expected
+T14.9 zenoh qos3 / qos4 territory). Zero ready/done barrier
+timeouts. Zero panics. Zero `FATAL` lines on either runner.**
+The pre-T15.10 failure spawn (`hybrid-1000x100hz-qos1-multi`)
+completed `status=success, exit_code=0` on both runners.
+
+Transport startup lines confirm both T15.3 and T15.10 channels
+came up:
+
+```
+[runner:alice] progress_coord: started (1 peer(s) connected)
+[runner:alice] barrier_coord: started (1 peer(s) connected: {"bob"})
+[runner:bob] progress_coord: started (1 peer(s) connected)
+[runner:bob] barrier_coord: started (1 peer(s) connected: {"alice"})
+```
+
+Alice's stdout summary tail (last 12 rows of 64-row summary):
+
+```
+zenoh-1000x100hz-qos2-multi bob      success   0
+zenoh-1000x100hz-qos2-multi alice    success   0
+zenoh-1000x100hz-qos3-multi bob      success   0
+zenoh-1000x100hz-qos3-multi alice    timeout   -1
+zenoh-1000x100hz-qos4-multi alice    timeout   -1
+zenoh-1000x100hz-qos4-multi bob      success   0
+webrtc-1000x100hz-qos1-multi alice    success   0
+webrtc-1000x100hz-qos1-multi bob      success   0
+webrtc-1000x100hz-qos2-multi bob      success   0
+webrtc-1000x100hz-qos2-multi alice    success   0
+webrtc-1000x100hz-qos3-multi bob      success   0
+webrtc-1000x100hz-qos3-multi alice    success   0
+webrtc-1000x100hz-qos4-multi alice    success   0
+webrtc-1000x100hz-qos4-multi bob      success   0
+```
+
+Alice's stderr tail (last 5 lines):
+
+```
+[runner:alice] ready barrier for spawn 'webrtc-1000x100hz-qos4-multi' (hz=100, vpt=1000, qos=4)
+[runner:alice] clock_sync (webrtc-1000x100hz-qos4-multi) peer=bob offset_ms=0.040 rtt_ms=0.275
+[runner:alice] spawning 'webrtc-1000x100hz-qos4-multi' (hz=100, vpt=1000, qos=4, timeout: 60s)
+[runner:alice] 'webrtc-1000x100hz-qos4-multi' final progress: phase=done sent=800000 received=800000 eot_sent=true eot_received=true
+[runner:alice] 'webrtc-1000x100hz-qos4-multi' finished: status=success, exit_code=0
+```
+
+Bob's stderr tail (last 5 lines):
+
+```
+[runner:bob] ready barrier for spawn 'webrtc-1000x100hz-qos4-multi' (hz=100, vpt=1000, qos=4)
+[runner:bob] clock_sync (webrtc-1000x100hz-qos4-multi) peer=alice offset_ms=-0.000 rtt_ms=0.362
+[runner:bob] spawning 'webrtc-1000x100hz-qos4-multi' (hz=100, vpt=1000, qos=4, timeout: 60s)
+[runner:bob] 'webrtc-1000x100hz-qos4-multi' final progress: phase=done sent=800000 received=800000 eot_sent=true eot_received=true
+[runner:bob] 'webrtc-1000x100hz-qos4-multi' finished: status=success, exit_code=0
+```
+
+`grep -cE "FATAL|panicked|barrier_coord:.*timed out|ready barrier.*timed out|done barrier.*timed out"`
+on both stderr files returns 0.
+
+**Status breakdown:** 62 success + 2 timeout (= 64 entries; 32 spawns
+× 2 runners). The two timeouts are both `zenoh-1000x100hz-qos*-multi
+alice` (qos3 and qos4), which the task instructions explicitly
+flagged as expected T14.9 territory and out of scope for T15.10.
+
+### Commits
+
+```
+86884f3 test(runner): extend barrier_coord unit-test deadline under parallel load (T15.10)
+26c77ec docs(contract): T15.10 -- ready/done barriers now per-peer-pair TCP
+45018e7 test(runner): regression for barrier convergence under stress (T15.10)
+7db7fc6 feat(runner): move ready/done barriers to TCP per peer pair (T15.10)
+e767ab6 docs(status): T15.10 audit findings for ready/done barrier desync
+```
+
