@@ -433,3 +433,18 @@ thread is the smallest correct design.
 would be disproportionate; `std::thread::Builder::new().spawn(...)`
 with a 1 Hz sleep loop is sufficient and matches the existing
 `ProgressEmitter` thread's style.
+
+**Limitations -- crashes vs stalls.** The watchdog only converts
+STALLS (the driver thread blocked inside a library call). If the
+transport library panics or aborts the process within the
+watchdog's threshold (observed empirically on Zenoh qos3 multi
+under sustained flood, where Zenoh occasionally aborts via
+`STATUS_CONTROL_C_EXIT` / `None`-from-`status.code()` within ~2 s
+of operate-phase start), the watchdog has no chance to fire. The
+analysis pipeline still distinguishes the two outcomes: a crash
+keeps the legacy `deadlock` classification (no `eot_sent` + no
+`phase=silent` + stderr lacking the watchdog substring), a stall
+becomes `variant_self_killed_idle`. Both still land as "not
+completed" warnings, but the operator can read the JSONL cleanness
+and stderr signature to tell which library failure mode produced
+the row.
