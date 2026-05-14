@@ -465,9 +465,18 @@ pub struct ZenohVariant {
     /// `connect(Single)` succeeds; dropped (which kills zenohd) on
     /// `disconnect`. Multi mode never sets this.
     sidecar: Option<crate::sidecar::Sidecar>,
+    /// T14.9b: Single-mode sync RPC client targeting the sidecar's
+    /// REST plugin. `publish`/`try_publish` route through this when
+    /// `connected_mode == Single`. Multi mode never sets this.
+    rest_publisher: Option<crate::rest_client::HttpPublisher>,
+    /// T14.9b: Single-mode SSE reader thread + its mpsc receiver.
+    /// `poll_receive` drains the receiver. Populated in
+    /// `connect(Single)`; dropped (which signals the thread to stop)
+    /// during `disconnect`. Multi mode never sets this.
+    sse_reader: Option<crate::rest_client::SseReader>,
     /// T14.9a: which threading mode the current connection was opened
-    /// with. Used by `publish`/`poll_receive` to short-circuit with
-    /// the "not yet implemented (T14.9b)" error when in Single mode.
+    /// with. Used by `publish`/`poll_receive` to branch between the
+    /// Multi-mode tokio bridge and the Single-mode REST+SSE path.
     connected_mode: Option<ThreadingMode>,
     runtime: Option<Runtime>,
     send_tx: Option<mpsc::Sender<OutboundMessage>>,
@@ -501,17 +510,18 @@ pub struct ZenohVariant {
 }
 
 impl ZenohVariant {
-    /// Create a new Zenoh variant.
+    /// Establish a Single-mode connection: spawn the zenohd sidecar
+    /// (T14.9a lifecycle) and wire the sync RPC client (T14.9b) on
+    /// top.
     ///
-    /// `runner` is the runner name used as the writer field in messages.
-    /// `extra` contains the pass-through CLI args for Zenoh-specific config.
-    /// T14.9a: spawn the zenohd sidecar but skip all session / runtime
-    /// setup. Returned as an `Err` from publish/poll_receive (with a
-    /// pointer at T14.9b) so the variant is honest about its current
-    /// scaffolding. Capability stays `[Multi]` — the runner skips
-    /// Single spawns; this branch exists for tests and the manual
-    /// smoke documented in `CUSTOM.md`.
-    fn connect_single_sidecar_only(&mut self) -> Result<()> {
+    /// Single-mode call graph is tokio-free: `ureq` (HTTP PUT) +
+    /// dedicated OS thread reading the SSE stream + `std::sync::mpsc`
+    /// to the variant's main thread. No `tokio::runtime`, no `async`,
+    /// no Zenoh `Session` is opened from inside this process.
+    ///
+    /// On any failure after the sidecar spawn, the sidecar is killed
+    /// before returning the error so we don't leak a `zenohd` child.
+    fn connect_single(&mut self) -> Result<()> {
         let trace = self.zenoh_args.debug_trace;
         // Locate the binary first so a missing zenohd surfaces as
         // the actionable error documented in CUSTOM.md, BEFORE we
@@ -549,14 +559,73 @@ impl ZenohVariant {
             rest_port,
         );
 
-        let sidecar = crate::sidecar::Sidecar::spawn(&binary.path, rest_port)
-            .with_context(|| format!("spawn zenohd sidecar on REST port {rest_port}"))?;
+        // T14.9b: derive the inter-router Zenoh TCP listen port
+        // (this runner's sidecar) and the connect endpoints (peer
+        // runners' sidecar TCP ports). We offset the REST port by
+        // a fixed +1000 to get the Zenoh TCP port -- this keeps the
+        // two port ranges trivially partitioned without requiring
+        // an extra CLI knob. Solo runs (no `--peers`) leave both
+        // lists empty and zenohd's default multicast scouting
+        // handles same-host discovery -- not strictly necessary
+        // but consistent with the operator-facing manual smoke.
+        const ZENOH_TCP_PORT_OFFSET: u16 = 1000;
+        let zenoh_tcp_port = rest_port + ZENOH_TCP_PORT_OFFSET;
+        let listen_tcp = Some(format!("127.0.0.1:{}", zenoh_tcp_port));
+        let pairs = self.peer_name_host_pairs();
+        let mut connect_tcp: Vec<String> = Vec::new();
+        for (idx, (name, host)) in pairs.iter().enumerate() {
+            if name == &self.runner {
+                continue;
+            }
+            // Derive the peer's REST port from its index in the
+            // sorted peer list (same convention this variant uses
+            // for its own port). Add the +1000 Zenoh-TCP offset.
+            let peer_rest_port =
+                crate::sidecar::derive_sidecar_port(base_port, idx).with_context(|| {
+                    format!("derive peer sidecar port for {} (index {})", name, idx)
+                })?;
+            let peer_zenoh_tcp = peer_rest_port + ZENOH_TCP_PORT_OFFSET;
+            // Peer host: the runner-injected map carries the host
+            // verbatim from the bench config; on the localhost test
+            // fixture it is "127.0.0.1". We use it as-is.
+            connect_tcp.push(format!("{}:{}", host, peer_zenoh_tcp));
+        }
+        trace_if!(
+            trace,
+            "connect(Single): sidecar peering listen={:?} connect={:?}",
+            listen_tcp,
+            connect_tcp,
+        );
+
+        let sidecar =
+            crate::sidecar::Sidecar::spawn(&binary.path, rest_port, listen_tcp, &connect_tcp)
+                .with_context(|| format!("spawn zenohd sidecar on REST port {rest_port}"))?;
         trace_if!(
             trace,
             "connect(Single): zenohd sidecar live on REST port {}",
             rest_port,
         );
         self.sidecar = Some(sidecar);
+
+        // T14.9b: wire the sync RPC client. ureq agent for publish,
+        // dedicated OS thread for SSE poll_receive. Both target the
+        // same `127.0.0.1:<rest_port>` the sidecar is bound to.
+        let publisher = crate::rest_client::HttpPublisher::new(rest_port);
+        self.rest_publisher = Some(publisher);
+        trace_if!(
+            trace,
+            "connect(Single): REST publisher ready (port {})",
+            rest_port,
+        );
+
+        let sse_reader = crate::rest_client::SseReader::start(rest_port, MessageCodec::decode);
+        self.sse_reader = Some(sse_reader);
+        trace_if!(
+            trace,
+            "connect(Single): SSE reader thread started (port {})",
+            rest_port,
+        );
+
         self.connected_mode = Some(ThreadingMode::Single);
         Ok(())
     }
@@ -572,6 +641,52 @@ impl ZenohVariant {
         names.iter().position(|n| n == &self.runner).unwrap_or(0)
     }
 
+    /// Parse the runner-injected `--peers` extra arg into a sorted
+    /// list of `(name, host)` pairs. Returns the pairs in the same
+    /// alphabetical order [`derive_runner_index`] uses, so caller
+    /// can derive remote ports from the index symmetrically across
+    /// all runners. Empty / absent `--peers` -> empty vec.
+    fn peer_name_host_pairs(&self) -> Vec<(String, String)> {
+        let raw = extract_extra_arg(&self.extra, "peers").unwrap_or_default();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((name, host)) = part.split_once('=') {
+                pairs.push((name.trim().to_string(), host.trim().to_string()));
+            }
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    }
+}
+
+/// Tiny `--<name> <value>` extractor for the `extra` args buffer. The
+/// variant's lenient `ZenohArgs::parse` already skips `--peers`, so
+/// we re-walk `extra` here when we need the peer map for sidecar
+/// peering (T14.9b). Returns the first match; returns `None` if the
+/// flag is absent or has no value.
+fn extract_extra_arg(extra: &[String], name: &str) -> Option<String> {
+    let target = format!("--{}", name);
+    let mut i = 0;
+    while i < extra.len() {
+        if extra[i] == target {
+            if i + 1 < extra.len() {
+                return Some(extra[i + 1].clone());
+            }
+            return None;
+        }
+        if let Some(stripped) = extra[i].strip_prefix(&format!("--{}=", name)) {
+            return Some(stripped.to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+impl ZenohVariant {
     pub fn new(runner: &str, extra: &[String]) -> Result<Self> {
         let zenoh_args = ZenohArgs::parse(extra)?;
         Ok(Self {
@@ -579,6 +694,8 @@ impl ZenohVariant {
             zenoh_args,
             extra: extra.to_vec(),
             sidecar: None,
+            rest_publisher: None,
+            sse_reader: None,
             connected_mode: None,
             runtime: None,
             send_tx: None,
@@ -1002,26 +1119,30 @@ impl Variant for ZenohVariant {
     }
 
     fn supported_threading_modes(&self) -> &'static [ThreadingMode] {
-        // T14.7: the zenoh crate runs an internal multi-threaded
-        // runtime (route resolution, transport TX/RX, sessions) that
-        // we cannot disable from the client. Declaring Single would
-        // be dishonest. A genuinely single-threaded zenoh client is
-        // possible via a sidecar `zenohd` router process speaking
-        // RPC -- filed as deferred T14.9, not part of E14.
+        // T14.9b: Single mode is now genuinely single-threaded. It
+        // talks to an out-of-process `zenohd` sidecar (T14.9a
+        // lifecycle) through the REST plugin -- HTTP PUT for
+        // publish, dedicated OS thread reading SSE for receive --
+        // and the in-process call graph is tokio-free.
         //
-        // See `variants/zenoh/CUSTOM.md` "Threading modes (T14.7)".
-        &[ThreadingMode::Multi]
+        // Multi mode continues to use the in-process zenoh crate
+        // with its internal tokio runtime; that runtime is the
+        // exact reason Single used to be unsupported before T14.9.
+        //
+        // See `variants/zenoh/CUSTOM.md` "Threading modes" and
+        // "T14.9b RPC client architecture".
+        &[ThreadingMode::Single, ThreadingMode::Multi]
     }
 
     fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()> {
-        // T14.9a: Single mode now spawns the zenohd sidecar
-        // (lifecycle only -- the RPC client is T14.9b). The variant
-        // still declares `supported_threading_modes() = [Multi]` so
-        // the runner skips Single-mode spawns; this branch is
-        // exercised by tests + the manual smoke documented in
-        // CUSTOM.md.
+        // T14.9b: Single mode delegates to `connect_single`, which
+        // composes T14.9a's sidecar spawn with this task's sync
+        // RPC client (HTTP PUT publisher + SSE reader thread). The
+        // variant now declares `[Single, Multi]` capability so the
+        // runner spawns Single-mode fixtures through this branch
+        // alongside the in-process Multi-mode path.
         if threading_mode == ThreadingMode::Single {
-            return self.connect_single_sidecar_only();
+            return self.connect_single();
         }
         let trace = self.zenoh_args.debug_trace;
         let t0 = Instant::now();
@@ -1213,15 +1334,18 @@ impl Variant for ZenohVariant {
     }
 
     fn publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<()> {
-        // T14.9a: Single mode connects the sidecar but does NOT yet
-        // wire up the RPC client. Refuse explicitly with the
-        // T14.9b pointer so callers don't silently no-op.
+        // T14.9b: Single mode routes through the sidecar's REST
+        // plugin. HTTP PUT is synchronous + blocking; the call
+        // graph from here is `ureq` -> `std::net` -> `WinSock` /
+        // BSD sockets -- no tokio, no async.
         if self.connected_mode == Some(ThreadingMode::Single) {
-            anyhow::bail!(
-                "zenoh Single mode RPC client not yet implemented; \
-                 pending T14.9b. Sidecar is running but no client \
-                 surface is wired up."
-            );
+            let key = path_to_key(path).to_string();
+            let encoded = MessageCodec::encode(&self.runner, seq, qos, path, payload);
+            let publisher = self
+                .rest_publisher
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Single mode publisher not initialised"))?;
+            return publisher.put(&key, encoded.to_vec());
         }
         let trace = self.zenoh_args.debug_trace;
         let send_tx = self
@@ -1329,13 +1453,18 @@ impl Variant for ZenohVariant {
     ///   `Ok(true)` and no seq gap, which is the reliable-QoS
     ///   contract.
     fn try_publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<bool> {
-        // T14.9a: Single mode -- not yet wired up (pending T14.9b).
+        // T14.9b: Single mode delegates to `publish` for simplicity.
+        // The REST plugin's PUT path does not surface a backpressure
+        // signal we can use to short-circuit (it's a blocking
+        // HTTP request); the closest analogue is "PUT took longer
+        // than expected", which we already cap via the ureq agent's
+        // global timeout. Returning `Ok(true)` whenever the PUT
+        // succeeded keeps the contract symmetric with the
+        // Multi-mode reliable path (QoS 3/4 there is also always
+        // `Ok(true)` once `publisher.put().await` resolves).
         if self.connected_mode == Some(ThreadingMode::Single) {
-            anyhow::bail!(
-                "zenoh Single mode RPC client not yet implemented; \
-                 pending T14.9b. Sidecar is running but no client \
-                 surface is wired up."
-            );
+            self.publish(path, payload, qos, seq)?;
+            return Ok(true);
         }
         // Reliable path: full delegation to publish() which uses
         // try_send + blocking_send fallback. Publish-side back-pressure
@@ -1391,13 +1520,18 @@ impl Variant for ZenohVariant {
     }
 
     fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
-        // T14.9a: Single mode -- not yet wired up (pending T14.9b).
+        // T14.9b: Single mode drains the SSE reader's mpsc. The
+        // dedicated reader thread (started in connect(Single)) parses
+        // the JSON-wrapped + base64-encoded payload off the SSE
+        // stream and pushes decoded `ReceivedUpdate`s here. Same
+        // try_recv shape as the established log-from-reader (T14.10)
+        // and progress_coord (T15.3) patterns.
         if self.connected_mode == Some(ThreadingMode::Single) {
-            anyhow::bail!(
-                "zenoh Single mode RPC client not yet implemented; \
-                 pending T14.9b. Sidecar is running but no client \
-                 surface is wired up."
-            );
+            let reader = self
+                .sse_reader
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Single mode SSE reader not initialised"))?;
+            return reader.try_recv();
         }
         let trace = self.zenoh_args.debug_trace;
         let recv_rx = self
@@ -1440,6 +1574,21 @@ impl Variant for ZenohVariant {
     fn disconnect(&mut self) -> Result<()> {
         let trace = self.zenoh_args.debug_trace;
         let t0 = Instant::now();
+
+        // T14.9b: stop the SSE reader thread first (it blocks on the
+        // sidecar's HTTP/SSE socket; closing the socket below would
+        // surface as a connect-error retry loop without this stop).
+        // Drop the publisher so the underlying ureq agent / TCP
+        // socket releases cleanly. Both must precede the sidecar
+        // kill so the threads don't observe the half-broken sidecar
+        // state.
+        if let Some(mut reader) = self.sse_reader.take() {
+            reader.stop();
+            trace_if!(trace, "disconnect: SSE reader stopped");
+        }
+        if self.rest_publisher.take().is_some() {
+            trace_if!(trace, "disconnect: REST publisher dropped");
+        }
 
         // T14.9a: tear down the zenohd sidecar if connect spawned
         // one. Done up-front so a panic in the runtime shutdown
@@ -1614,16 +1763,16 @@ mod tests {
         assert_eq!(v.name(), "zenoh");
     }
 
-    /// T14.7: Zenoh declares Multi-only support. The zenoh crate runs
-    /// internal threads we cannot disable from the client; declaring
-    /// Single would be dishonest. T14.9 covers the deferred sidecar
-    /// router-RPC path that gives Zenoh a genuinely single-threaded
-    /// client surface.
+    /// T14.9b: Zenoh now supports BOTH threading modes. Multi keeps
+    /// the in-process zenoh crate with its internal tokio runtime;
+    /// Single talks to an out-of-process zenohd sidecar via the
+    /// REST plugin (HTTP PUT + SSE) and is genuinely tokio-free in
+    /// the variant's call graph.
     #[test]
-    fn test_supported_threading_modes_is_multi_only() {
+    fn test_supported_threading_modes_is_single_and_multi() {
         let v = ZenohVariant::new("a", &[]).unwrap();
         let modes = v.supported_threading_modes();
-        assert_eq!(modes, &[ThreadingMode::Multi]);
+        assert_eq!(modes, &[ThreadingMode::Single, ThreadingMode::Multi]);
     }
 
     /// T14.9a: `connect(Single)` no longer aborts pre-I/O -- it now
