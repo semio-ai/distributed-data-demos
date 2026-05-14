@@ -11,7 +11,7 @@ runner (per ``runner/src/spawn.rs::stderr_capture_path``).
 
 The classification taxonomy and rules are documented in
 ``metak-shared/ANALYSIS.md`` -- see the "Timeout classification" section.
-Eight values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
+Nine values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
 
 ``completed``
     Spawn ran to graceful exit (``phase=silent`` reached) and the
@@ -27,7 +27,12 @@ Eight values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
     reach ``phase=silent``).
 ``deadlock``
     Killed mid-operate: no ``eot_sent`` AND the JSONL ends with an
-    incomplete record (last line not valid JSON).
+    incomplete record (last line not valid JSON). Post-T15.11 the
+    ``variant_self_killed_idle`` and ``variant_crashed`` rules
+    siphon off the two practical sub-cases; ``deadlock`` keeps its
+    label for the legacy edge cases (truncation before
+    ``phase=operate``, or ``logs_dir`` absent so stderr-aware rules
+    cannot run).
 ``eot_lost``
     Writer reached ``eot_sent`` but never reached ``phase=silent``.
     Legacy E12/E14 failure shape: writer published EOT but
@@ -50,6 +55,17 @@ Eight values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
     mid-record) and ``eot_lost`` (which requires ``eot_sent`` to be
     present). Precedence: above ``deadlock`` so the watchdog's
     explicit diagnostic wins over the generic truncation heuristic.
+``variant_crashed`` (T14.17 follow-up, 2026-05-14)
+    Variant reached ``phase=operate`` but did NOT emit ``eot_sent``
+    and did NOT reach ``phase=silent``; stderr capture lacks the
+    watchdog signature AND the JSONL ends mid-record. The
+    fast-panic shape: variant crashed (likely inside a transport
+    library) too quickly for T15.11's watchdog to fire (default
+    threshold 30s). The Zenoh qos3 alice case observed under stress
+    is the motivating example. Mutually exclusive with
+    ``variant_self_killed_idle`` (which requires the signature) and
+    sits above ``deadlock`` so the ``has_phase_operate`` predicate
+    distinguishes fast-panic from generic truncation.
 ``eot_timeout_internal``
     Variant emitted ``eot_sent`` AND ``eot_timeout`` -- decided to
     give up waiting for peer EOTs per the E12 EOT protocol. Post-E15
@@ -60,12 +76,12 @@ Eight values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
 
 Stderr capture reads are LAZY: only spawns whose JSONL-derived state
 is ambiguous (``variant_rejected`` candidates, ``eot_lost`` candidates
-for the saturation sub-tag, and ``variant_self_killed_idle``
-candidates after T15.11) trigger a read. Stderr files are not loaded
-unconditionally. Spawns that classify as ``completed`` /
-``runner_idle_terminated`` / ``eot_timeout_internal`` / ``deadlock`` /
-``unknown`` without first being a watchdog candidate never touch
-stderr.
+for the saturation sub-tag, and ``variant_self_killed_idle`` /
+``variant_crashed`` candidates after T15.11) trigger a read. Stderr
+files are not loaded unconditionally. Spawns that classify as
+``completed`` / ``runner_idle_terminated`` / ``eot_timeout_internal`` /
+``deadlock`` / ``unknown`` without first being a watchdog candidate
+never touch stderr.
 """
 
 from __future__ import annotations
@@ -86,6 +102,7 @@ Classification = Literal[
     "eot_lost",
     "variant_rejected",
     "variant_self_killed_idle",
+    "variant_crashed",
     "eot_timeout_internal",
     "unknown",
 ]
@@ -520,6 +537,13 @@ def classify_spawn(
     #    stderr signature is the load-bearing signal. Falls back to
     #    the deadlock rule (then to ``unknown``) if no stderr file
     #    exists.
+    #
+    #    Note: this branch also drives the (T14.17 follow-up,
+    #    2026-05-14) ``variant_crashed`` distinction. Both rules
+    #    consult the same stderr capture; the watchdog substring
+    #    discriminates between a slow stall (signature present ->
+    #    self-killed-idle) and a fast crash/panic (signature absent
+    #    -> variant_crashed, handled by rule 7 below).
     if (
         summary.has_phase_operate
         and not summary.has_eot_sent
@@ -535,7 +559,67 @@ def classify_spawn(
                 classification="variant_self_killed_idle",
             )
 
-    # 7. deadlock: no eot_sent, no graceful silent, JSONL ends mid-record.
+        # 7. variant_crashed (T14.17 follow-up, 2026-05-14): variant
+        #    reached operate, did NOT emit eot_sent, did NOT reach
+        #    phase=silent, stderr capture lacks the watchdog
+        #    signature, AND the JSONL ends mid-record. This is the
+        #    fast-panic shape -- the variant entered operate then
+        #    crashed abnormally within the variant process (e.g.
+        #    transport-library panic on Zenoh qos3 alice under flood)
+        #    too fast for the T15.11 watchdog (default 30s) to
+        #    observe and fire. The JSONL tail is truncated because
+        #    the process died before flushing its writer buffer.
+        #
+        #    Mutually exclusive with:
+        #      - ``variant_self_killed_idle`` -- requires watchdog
+        #        signature; this rule fires only in the absence.
+        #      - ``deadlock`` (below) -- both rules key on truncated
+        #        JSONL, but ``variant_crashed`` adds the
+        #        ``has_phase_operate`` predicate so deadlock keeps
+        #        its precedence only for the legacy pre-operate
+        #        truncation edge cases.
+        #      - ``eot_lost`` / ``runner_idle_terminated`` /
+        #        ``completed`` -- all require ``has_eot_sent``,
+        #        which is false here.
+        #      - ``variant_rejected`` -- requires
+        #        ``not has_phase_operate``.
+        #
+        #    Precedence note: placed between
+        #    ``variant_self_killed_idle`` and ``deadlock`` so the
+        #    watchdog signal (when present) keeps top precedence,
+        #    crashes (truncated + no signature + reached operate)
+        #    take the next slot, and the legacy ``deadlock`` label
+        #    survives for truncated pre-operate cases or when
+        #    ``logs_dir`` is unavailable for stderr reads.
+        #
+        #    Spawn-status caveat: ideally this rule would also gate
+        #    on the runner's ``ChildOutcome::Failed(_)`` (non-zero,
+        #    non-timeout exit code). The analysis pipeline does not
+        #    have access to the runner's spawn-status sidecar (no
+        #    such file is written today), so the rule infers the
+        #    crash shape from the JSONL + stderr signals alone. In
+        #    practice with T15.11 active the only way to land in
+        #    this branch is a crash inside the variant -- the runner
+        #    safety-net would have first triggered the watchdog or
+        #    let it self-exit. If a future change writes a status
+        #    sidecar, this rule can tighten by also requiring
+        #    ``status == failed``.
+        if jsonl_ends_mid_record(_jsonl_path(logs_dir, variant, run, runner)):
+            return SpawnClassification(
+                variant=variant,
+                run=run,
+                runner=runner,
+                classification="variant_crashed",
+            )
+
+    # 8. deadlock: no eot_sent, no graceful silent, JSONL ends mid-record.
+    #    With T15.11 + the T14.17 follow-up ``variant_crashed`` rule
+    #    above, the only paths that still land here are: (a) the
+    #    variant truncated its JSONL BEFORE reaching ``phase=operate``,
+    #    or (b) ``logs_dir`` was not supplied so the stderr-aware
+    #    rules 6 and 7 short-circuited. Operator reading: the variant
+    #    was killed mid-record by something the classifier can't see;
+    #    inspect the run manually.
     if not summary.has_eot_sent and not summary.has_phase_silent:
         if logs_dir is not None and jsonl_ends_mid_record(
             _jsonl_path(logs_dir, variant, run, runner)
@@ -547,7 +631,7 @@ def classify_spawn(
                 classification="deadlock",
             )
 
-    # 8. Fallthrough.
+    # 9. Fallthrough.
     return SpawnClassification(
         variant=variant,
         run=run,

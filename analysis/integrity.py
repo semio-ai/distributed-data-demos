@@ -31,15 +31,16 @@ class IntegrityResult:
     the report. Defaults to 0 when no ``backpressure_skipped`` events
     are present (e.g. legacy logs from before T-impl.6 / T-impl.7).
 
-    ``timeout_classification`` (T14.17, extended in T15.6 and T15.11)
-    is the per-spawn failure-cause bucket for the WRITER side of this
-    row -- one of ``completed``, ``runner_idle_terminated``,
-    ``deadlock``, ``eot_lost``, ``variant_rejected``,
-    ``variant_self_killed_idle``, ``eot_timeout_internal``,
-    ``unknown``. Defaults to ``"unknown"`` when classification was
-    skipped (e.g. ``logs_dir`` was not passed to
-    ``integrity_for_group``). ``timeout_sub_tags`` carries refinements
-    such as ``("eot_lost_likely_saturation",)``.
+    ``timeout_classification`` (T14.17, extended in T15.6, T15.11, and
+    a 2026-05-14 follow-up that added ``variant_crashed``) is the
+    per-spawn failure-cause bucket for the WRITER side of this row --
+    one of ``completed``, ``runner_idle_terminated``, ``deadlock``,
+    ``eot_lost``, ``variant_rejected``, ``variant_self_killed_idle``,
+    ``variant_crashed``, ``eot_timeout_internal``, ``unknown``.
+    Defaults to ``"unknown"`` when classification was skipped (e.g.
+    ``logs_dir`` was not passed to ``integrity_for_group``).
+    ``timeout_sub_tags`` carries refinements such as
+    ``("eot_lost_likely_saturation",)``.
     """
 
     variant: str
