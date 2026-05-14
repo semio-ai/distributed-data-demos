@@ -22,6 +22,7 @@ to re-correlate the source shards.
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -125,6 +126,30 @@ class PerformanceResult:
     # that produces ``latency_p50_ms`` etc., so values are already
     # clock-skew-corrected when ``has_uncorrected_latency`` is False.
     latency_samples_ms: list[float] = field(default_factory=list)
+    # Pivot-tables additions (T-pivot.1). ``latency_mean_ms`` and
+    # ``latency_std_ms`` are computed from ``latency_samples_ms`` using
+    # ``statistics.mean`` / ``statistics.stdev`` from the stdlib (sample
+    # std-dev, ddof=1). When the sample vector is empty (no deliveries),
+    # both are ``nan`` so the pivot renderer can distinguish "no data"
+    # from a genuine zero. When the vector has exactly one sample,
+    # std-dev is 0.0 (a one-sample population has no spread).
+    #
+    # ``expected_writes_per_sec`` is the nominal per-writer publish rate
+    # parsed from the spawn name (``tick_rate_hz * values_per_tick``) for
+    # the ``scalar-flood`` workload. It is ``None`` for the unbounded
+    # ``max-throughput`` workload where no nominal rate exists.
+    #
+    # ``receives_to_expected_ratio_pct`` is
+    # ``100 * receives_per_sec / expected_writes_per_sec``. It is the
+    # "expected 10k/s but got 5k/s = 50%" metric used by the pivot
+    # tables. Can exceed 100% for multicast variants where the receiver
+    # also gets its own loopback writes (e.g. custom-udp single-mode
+    # subscribes to its own multicast group). ``None`` when the
+    # expected rate is undefined (max-throughput).
+    latency_mean_ms: float = float("nan")
+    latency_std_ms: float = float("nan")
+    expected_writes_per_sec: float | None = None
+    receives_to_expected_ratio_pct: float | None = None
 
 
 def _percentile(data: list[float], p: float) -> float:
@@ -322,6 +347,27 @@ def _operate_duration_seconds(windows: _OperateWindows) -> float:
     if delta <= 0:
         return 0.001
     return float(delta)
+
+
+def _latency_mean_std(samples: list[float]) -> tuple[float, float]:
+    """Mean and sample std-dev of ``samples`` in ms.
+
+    Returns ``(nan, nan)`` when ``samples`` is empty so the pivot
+    renderer can distinguish "no deliveries" from a genuine zero
+    latency. A single-sample vector returns ``(value, 0.0)`` -- one
+    sample has no spread, but its mean is well-defined.
+
+    Uses ``statistics.mean`` / ``statistics.stdev`` from the stdlib (no
+    new dependencies). ``stdev`` uses ddof=1 (sample stddev) which is
+    the same convention used by ``_jitter`` above.
+    """
+    n = len(samples)
+    if n == 0:
+        return float("nan"), float("nan")
+    mean = statistics.mean(samples)
+    if n == 1:
+        return float(mean), 0.0
+    return float(mean), float(statistics.stdev(samples))
 
 
 def _latency_samples(deliveries: pl.DataFrame) -> list[float]:
@@ -687,6 +733,28 @@ def performance_for_group(
     late_receives = _late_receives_count(group, windows)
     late_tail_count, late_tail_pct = _late_tail_stats(deliveries, p99)
     threading_mode = _threading_mode(group)
+    latency_mean, latency_std = _latency_mean_std(latency_samples)
+
+    # T-pivot.1: expected per-writer publish rate parsed from the spawn
+    # name. Imported lazily to avoid a module-load cycle (pivot_tables
+    # imports PerformanceResult from this module). When the spawn name
+    # does not match the canonical ``<family>-<vpt>x<hz>hz-qos<N>-<mode>``
+    # pattern (e.g. legacy logs predating T14.8) the parser returns
+    # ``None``; the pivot tables then render the ratio cell as ``n/a``.
+    from pivot_tables import parse_spawn_name
+
+    identity = parse_spawn_name(variant)
+    if identity is not None and identity.workload_kind == "scalar-flood":
+        expected_wps: float | None = float(
+            identity.tick_rate_hz * identity.values_per_tick
+        )
+        if expected_wps > 0:
+            ratio_pct: float | None = 100.0 * receives_per_sec / expected_wps
+        else:
+            ratio_pct = None
+    else:
+        expected_wps = None
+        ratio_pct = None
 
     return PerformanceResult(
         variant=variant,
@@ -709,4 +777,8 @@ def performance_for_group(
         late_receives_tail_pct=late_tail_pct,
         latency_samples_ms=latency_samples,
         threading_mode=threading_mode,
+        latency_mean_ms=latency_mean,
+        latency_std_ms=latency_std,
+        expected_writes_per_sec=expected_wps,
+        receives_to_expected_ratio_pct=ratio_pct,
     )
