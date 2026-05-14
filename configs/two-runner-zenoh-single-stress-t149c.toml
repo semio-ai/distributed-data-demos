@@ -1,0 +1,39 @@
+# T14.9c repro fixture. Reduces the E14 stress matrix to just the
+# rows that previously failed: Zenoh Single qos2/qos3/qos4 at the
+# 1000 vpt x 100 Hz workload (100K msg/s).
+#
+# Pre-T14.9c: every Single-mode publish opened a fresh TCP connection
+# (keep-alive disabled in ureq Agent), exhausting Windows' ~16K
+# ephemeral port pool within ~1 s and surfacing as:
+#   io: Only one usage of each socket address (...) (os error 10048)
+#
+# Post-T14.9c: keep-alive on; ureq pools the localhost socket; no
+# more port exhaustion. Operate-window delivery numbers may still
+# look catastrophic (Zenoh-internal stalls under saturated load,
+# documented in T14.16/T14.17) but the spawn no longer hard-errors.
+#
+# Run from the repo root:
+#   target/release/runner --name alice --config configs/two-runner-zenoh-single-stress-t149c.toml
+#   target/release/runner --name bob   --config configs/two-runner-zenoh-single-stress-t149c.toml
+
+run = "zenoh-single-stress-t149c"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-1000x100hz"
+supported_modes = ["single"]
+binary = "target/release/variant-zenoh.exe"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  stabilize_secs = 2
+  operate_secs = 8
+  silent_secs = 2
+  workload = "scalar-flood"
+  qos = [2, 3, 4]
+  threading_modes = ["single"]
+  log_dir = "./logs"
+  [variant.specific]
+  zenoh_mode = "peer"
+  zenoh_sidecar_base_port = 20100

@@ -366,13 +366,41 @@ bytes as-is and forwards them to all matching subscribers.
   treat as UTF-8/JSON and fails on our binary header. Explicit
   octet-stream makes the plugin take the base64 SSE path -- the
   same path the subscriber side is wired to decode.
-* **Keep-alive disabled** (`max_idle_connections = 0`,
-  `max_idle_connections_per_host = 0`): each PUT opens a fresh TCP
-  connection. The REST plugin on Windows localhost occasionally
-  drops a kept-alive connection silently, surfacing as a
-  `send_request` timeout; fresh connections sidestep this without
-  measurable throughput loss at the 1K msg/s scale the Single mode
-  targets.
+* **Keep-alive ENABLED** (ureq defaults: `max_idle_connections = 10`,
+  `max_idle_connections_per_host = 3`, `max_idle_age = 15 s`).
+  T14.9b initially disabled keep-alive on the suspicion that the
+  REST plugin silently dropped kept-alive connections on Windows
+  localhost; the stress fixture exposed that decision as wrong.
+  T14.9c reverses it. The construction now leaves these knobs at
+  their ureq-default values (no explicit override). The previous
+  hypothesis was either incorrect or specific to a narrower
+  scenario; in practice, the pooled connection is healthy and
+  reused for the lifetime of the spawn. `put()` drains the
+  Content-Length: 0 response body via
+  `response.body_mut().read_to_vec()` so ureq returns the socket
+  to the pool rather than leaving it half-consumed (without the
+  drain, the response handler's `ended()` is never invoked and
+  the connection is not pooled).
+
+  Why keep-alive is **mandatory**: under the T14.9c-era stress
+  fixture (1000 vpt × 100 Hz = 100K msg/s × 8 s operate per
+  spawn, qos2/3/4 Single), every fresh-per-PUT TCP connection
+  consumed one ephemeral port. Windows' default dynamic port
+  range is ~16K ports (49152-65535), so the pool exhausted within
+  ~1 s and subsequent connects failed as
+  `Only one usage of each socket address (...) (os error 10048)`
+  — i.e. WSAEADDRINUSE. Linux' default 28K range (`net.ipv4.ip_local_port_range`)
+  would hit the same wall at ~30K msg/s. With keep-alive on the
+  outbound TCP socket count drops from N-per-publish to ~1, and
+  the failure mode is eliminated regardless of platform.
+
+  Pool sizing: ureq's defaults (10 total / 3 per host) are
+  deliberately not tuned. The Single-mode call graph only ever
+  connects to one host (`127.0.0.1:<rest_port>`), so the per-host
+  cap is the relevant constraint; 3 idle connections is more than
+  the variant ever needs because publishes are serialised through
+  the main thread. The variant uses one pooled connection in
+  steady state.
 * **Retry-once on transport error**: a single in-method retry on
   any send-side error before propagating to the variant. One retry
   is sufficient: the failure modes seen on Windows localhost are
