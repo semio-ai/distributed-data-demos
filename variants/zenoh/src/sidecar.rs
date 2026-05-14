@@ -206,22 +206,53 @@ pub fn derive_sidecar_port(base_port: u16, runner_index: usize) -> Result<u16> {
 }
 
 /// Build a zenohd JSON5 config string enabling the REST plugin on the
-/// given port. Returned as a String so the caller can dump it to a
-/// temp file before spawning. JSON is a subset of JSON5, so we emit
-/// strict JSON via `serde_json` and zenohd parses it happily.
-pub fn build_zenohd_config_json(rest_port: u16) -> String {
-    // Bind to 127.0.0.1 specifically -- T14.9a sidecars are
+/// given port and optionally configuring inter-router Zenoh peering.
+///
+/// `listen_tcp` is `Some(host:port)` when this sidecar should accept
+/// inbound Zenoh sessions from peer-runners' sidecars (T14.9b
+/// two-runner topology). `connect_tcp` lists `tcp/<host>:<port>`
+/// endpoints to actively dial out to; combined, the two cover the
+/// "every sidecar peers with every other sidecar" full-mesh shape
+/// the runner-coordinated Single-mode fixture expects.
+///
+/// Returned as a String so the caller can dump it to a temp file
+/// before spawning. JSON is a subset of JSON5, so we emit strict
+/// JSON via `serde_json` and zenohd parses it happily.
+pub fn build_zenohd_config_json(
+    rest_port: u16,
+    listen_tcp: Option<String>,
+    connect_tcp: &[String],
+) -> String {
+    // Bind REST to 127.0.0.1 specifically -- T14.9a sidecars are
     // per-runner-process and never expose the REST API beyond
     // localhost. Listening on 0.0.0.0 would surprise operators by
-    // making the variant's internal RPC surface externally reachable.
-    let value = serde_json::json!({
-        "plugins": {
-            "rest": {
-                "http_port": format!("127.0.0.1:{}", rest_port),
-            }
-        }
-    });
-    serde_json::to_string_pretty(&value).expect("static JSON value always serialises")
+    // making the variant's internal RPC surface externally
+    // reachable.
+    let mut top = serde_json::Map::new();
+    top.insert(
+        "plugins".to_string(),
+        serde_json::json!({
+            "rest": { "http_port": format!("127.0.0.1:{}", rest_port) }
+        }),
+    );
+    if let Some(listen) = listen_tcp {
+        top.insert(
+            "listen".to_string(),
+            serde_json::json!({ "endpoints": [format!("tcp/{}", listen)] }),
+        );
+    }
+    if !connect_tcp.is_empty() {
+        let endpoints: Vec<serde_json::Value> = connect_tcp
+            .iter()
+            .map(|e| serde_json::Value::String(format!("tcp/{}", e)))
+            .collect();
+        top.insert(
+            "connect".to_string(),
+            serde_json::json!({ "endpoints": endpoints }),
+        );
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(top))
+        .expect("static JSON value always serialises")
 }
 
 /// The REST-plugin smoke-test URL we poll after spawning zenohd. The
@@ -259,7 +290,19 @@ impl Sidecar {
     /// plugin on `rest_port`. Waits up to 5 s for the REST plugin
     /// to start responding before returning, so the caller can
     /// assume the sidecar is live on success.
-    pub fn spawn(binary: &Path, rest_port: u16) -> Result<Self> {
+    ///
+    /// `listen_tcp` (host:port) and `connect_tcp` (list of host:port)
+    /// configure inter-router Zenoh peering: when omitted the sidecar
+    /// is an isolated single-runner-of-its-kind (still useful for
+    /// the operator-facing smoke), when populated they let multiple
+    /// per-runner sidecars form a Zenoh peer mesh so a publish on
+    /// one is delivered to the SSE subscribers on every other.
+    pub fn spawn(
+        binary: &Path,
+        rest_port: u16,
+        listen_tcp: Option<String>,
+        connect_tcp: &[String],
+    ) -> Result<Self> {
         // Write the config to a temp file. We don't use the
         // `tempfile` crate (dev-only dep); a plain `std::env::temp_dir`
         // path keyed on the PID + port is unique enough for one
@@ -267,7 +310,7 @@ impl Sidecar {
         let pid = std::process::id();
         let config_path =
             std::env::temp_dir().join(format!("variant-zenoh-sidecar-{}-{}.json", pid, rest_port));
-        let config_json = build_zenohd_config_json(rest_port);
+        let config_json = build_zenohd_config_json(rest_port, listen_tcp, connect_tcp);
         fs::write(&config_path, config_json)
             .with_context(|| format!("write zenohd config to {}", config_path.display()))?;
 
@@ -709,14 +752,54 @@ mod tests {
     /// sidecar RPC surface is per-process, not a network service).
     #[test]
     fn build_zenohd_config_includes_rest_port_on_localhost() {
-        let cfg = build_zenohd_config_json(20003);
+        let cfg = build_zenohd_config_json(20003, None, &[]);
         assert!(
             cfg.contains("127.0.0.1:20003"),
             "config must bind REST to 127.0.0.1:<port>, got:\n{cfg}"
         );
+        // No listen/connect blocks when both inputs are empty.
+        assert!(
+            !cfg.contains("\"listen\""),
+            "no listen block expected: {cfg}"
+        );
+        assert!(
+            !cfg.contains("\"connect\""),
+            "no connect block expected: {cfg}"
+        );
         // Must be valid JSON.
         let _: serde_json::Value =
             serde_json::from_str(&cfg).expect("generated config must be valid JSON");
+    }
+
+    /// T14.9b: when peering is requested, the config emits a
+    /// `tcp/<listen>` listen endpoint and `tcp/<peer>` connect
+    /// endpoints so multiple per-runner sidecars can form a Zenoh
+    /// peer mesh.
+    #[test]
+    fn build_zenohd_config_includes_listen_and_connect_when_provided() {
+        let cfg = build_zenohd_config_json(
+            20003,
+            Some("127.0.0.1:21003".to_string()),
+            &["127.0.0.1:21004".to_string(), "127.0.0.1:21005".to_string()],
+        );
+        assert!(
+            cfg.contains("tcp/127.0.0.1:21003"),
+            "listen endpoint must be present: {cfg}"
+        );
+        assert!(
+            cfg.contains("tcp/127.0.0.1:21004"),
+            "first connect endpoint must be present: {cfg}"
+        );
+        assert!(
+            cfg.contains("tcp/127.0.0.1:21005"),
+            "second connect endpoint must be present: {cfg}"
+        );
+        // Round-trip via serde_json to confirm the structure.
+        let v: serde_json::Value = serde_json::from_str(&cfg).expect("valid JSON");
+        let listen_eps = v["listen"]["endpoints"].as_array().expect("listen array");
+        assert_eq!(listen_eps.len(), 1);
+        let connect_eps = v["connect"]["endpoints"].as_array().expect("connect array");
+        assert_eq!(connect_eps.len(), 2);
     }
 
     /// T14.9a smoke URL: matches the admin space the integration

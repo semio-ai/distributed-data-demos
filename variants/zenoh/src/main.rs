@@ -1,3 +1,4 @@
+mod rest_client;
 mod sidecar;
 mod zenoh;
 

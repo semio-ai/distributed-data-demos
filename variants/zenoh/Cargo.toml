@@ -32,6 +32,19 @@ bytes = "1"
 # file enabling the REST plugin. Promoted from a dev-dep to a runtime
 # dep when the sidecar lifecycle was added.
 serde_json = "1"
+# T14.9b: synchronous HTTP + SSE client used by Single mode against the
+# `zenoh-plugin-rest` surface on the sidecar. `default-features = false`
+# strips out `rustls` + `gzip` -- the sidecar is bound to 127.0.0.1 so
+# HTTP-only is fine, and the verified-tokio-free invariant matters
+# here (see CUSTOM.md "T14.9b tokio-free verification"). ureq 3.x is a
+# pure-sync client built on `std::net`; it does NOT pull tokio.
+ureq = { version = "3", default-features = false }
+# T14.9b: the zenoh-plugin-rest SSE surface base64-encodes payloads
+# inside its JSON `value` field when the sample's encoding does not
+# parse as UTF-8 / JSON (our binary `MessageCodec` output always
+# triggers this path). Decoding it back to bytes is one
+# `base64::engine::general_purpose::STANDARD.decode` call.
+base64 = "0.22"
 
 # T14.9a per-platform sidecar child-process cleanup.
 # Windows: Job Object with KILL_ON_JOB_CLOSE guarantees zenohd dies if
