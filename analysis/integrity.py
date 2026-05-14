@@ -392,12 +392,19 @@ def integrity_for_group(
         duplicate_error = False
         gap_error = False
 
+        # T14.17 follow-up (2026-05-14): the ordering check is QoS-aware.
+        # qos1 (best-effort) and qos2 (latest-value) are datagram-style
+        # QoS levels with no ordering guarantee by design -- the
+        # WebRTC qos1/qos2 implementations rely on the underlying
+        # transport's unreliable/unordered datagram channel and
+        # therefore observe out-of-order receives as a normal feature
+        # of the protocol, not a failure. Only qos3 (reliable-ordered)
+        # and qos4 (reliable-tcp) carry an ordering contract; the
+        # ``[FAIL: ordering]`` annotation is reserved for those.
         if qos >= 3:
             completeness_error = receive_count < write_count
             ordering_error = out_of_order > 0
             duplicate_error = duplicates > 0
-        elif qos == 2:
-            ordering_error = out_of_order > 0
 
         if qos == 3 and unresolved_gaps is not None:
             gap_error = unresolved_gaps > 0
