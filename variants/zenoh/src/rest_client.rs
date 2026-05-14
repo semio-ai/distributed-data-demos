@@ -109,24 +109,24 @@ impl HttpPublisher {
         // legitimate publish against the global deadline; the
         // per-stage `connect` / `send_request` / `send_body` /
         // `recv_response` knobs are bounded individually.
-        // Disable HTTP keep-alive (max_idle_connections* = 0) so each
-        // PUT opens a fresh TCP connection. Two reasons:
-        //   1. The sidecar's REST plugin can drop a kept-alive
-        //      connection silently after a brief idle window
-        //      (observed in T14.9b integration testing on Windows
-        //      localhost); a fresh connection per PUT sidesteps any
-        //      half-open-socket class of error.
-        //   2. The hot path is 1K msg/s on localhost; the TCP setup
-        //      cost is negligible at that rate and the trade-off
-        //      buys robustness without measurable throughput loss.
+        //
+        // HTTP keep-alive: T14.9c reverses T14.9b's explicit disable.
+        // The stress fixture at 100K msg/s qos2-4 Single saturates
+        // Windows' ~16K ephemeral port range within ~1 s when every
+        // PUT opens a fresh TCP connection, surfacing as
+        // `io: ... (os error 10048)` (WSAEADDRINUSE). With keep-alive
+        // on (ureq 3.x default: `max_idle_connections = 10`,
+        // `max_idle_connections_per_host = 3`), the agent pools the
+        // localhost connection and reuses it across PUTs; outbound
+        // TCP socket count drops from N-per-publish to ~1. ureq's
+        // defaults are intentionally left untouched -- they're tuned
+        // for the same single-host pattern this variant exhibits.
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(2)))
             .timeout_send_request(Some(Duration::from_secs(5)))
             .timeout_send_body(Some(Duration::from_secs(5)))
             .timeout_recv_response(Some(Duration::from_secs(5)))
             .timeout_recv_body(Some(Duration::from_secs(5)))
-            .max_idle_connections(0)
-            .max_idle_connections_per_host(0)
             .build();
         let agent: ureq::Agent = config.into();
         Self { agent, rest_port }
@@ -158,8 +158,15 @@ impl HttpPublisher {
                 .content_type("application/octet-stream")
                 .send(&body[..]);
             match send {
-                Ok(response) => {
+                Ok(mut response) => {
                     let status = response.status().as_u16();
+                    // T14.9c: drain the response body before dropping
+                    // the Response so ureq returns the underlying TCP
+                    // connection to the pool (keep-alive reuse). Body
+                    // is typically empty (Content-Length: 0) from
+                    // zenoh-plugin-rest's PUT handler, so this is a
+                    // single bounded read.
+                    let _ = response.body_mut().read_to_vec();
                     if (200..300).contains(&status) {
                         return Ok(());
                     }
@@ -905,6 +912,31 @@ mod tests {
     fn extract_payload_rejects_bad_base64() {
         let s = r#"{"key":"bench/0","value":"!!!not-base64!!!"}"#;
         assert!(extract_payload_from_sse_data(s).is_err());
+    }
+
+    /// T14.9c: the publisher's ureq Agent must have HTTP keep-alive
+    /// enabled so consecutive PUTs reuse the same TCP connection.
+    /// With keep-alive disabled the Single-mode stress workload (100K
+    /// msg/s qos2-4) exhausts Windows' ~16K ephemeral port pool within
+    /// ~1 s and fails as WSAEADDRINUSE (`os error 10048`).
+    ///
+    /// We assert on the Agent's config directly: both
+    /// `max_idle_connections` and `max_idle_connections_per_host` must
+    /// be > 0. Zero on either knob disables pooling for this Agent.
+    #[test]
+    fn http_publisher_has_keepalive_enabled() {
+        let publisher = HttpPublisher::new(20100);
+        let cfg = publisher.agent.config();
+        assert!(
+            cfg.max_idle_connections() > 0,
+            "T14.9c: max_idle_connections must be > 0 (keep-alive on); got {}",
+            cfg.max_idle_connections()
+        );
+        assert!(
+            cfg.max_idle_connections_per_host() > 0,
+            "T14.9c: max_idle_connections_per_host must be > 0 (keep-alive on); got {}",
+            cfg.max_idle_connections_per_host()
+        );
     }
 
     #[test]
