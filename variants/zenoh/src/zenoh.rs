@@ -291,6 +291,17 @@ pub struct ZenohArgs {
     /// hot path / poll_receive / disconnect. Off by default so production
     /// runs are quiet; enable by passing `--debug-trace` (no value).
     pub debug_trace: bool,
+    /// T14.9a: base port for the `zenohd` sidecar's REST plugin in Single
+    /// mode. The per-runner port is derived as
+    /// `base + runner_index * runner_stride` (runner_stride = 1, matching
+    /// T14.18 / T15.10 control ports). Optional: Multi mode does not
+    /// spawn a sidecar and silently ignores this arg. Single mode
+    /// requires it (T14.9b will surface the derived port to the RPC
+    /// client); if absent at `connect(Single)` we fall back to a
+    /// reasonable default of 20100 so the operator-facing manual smoke
+    /// "spawn variant-zenoh --threading-mode single" path works
+    /// without per-spawn TOML wiring.
+    pub sidecar_base_port: Option<u16>,
 }
 
 impl ZenohArgs {
@@ -299,6 +310,7 @@ impl ZenohArgs {
         let mut mode = String::from("peer");
         let mut listen = None;
         let mut debug_trace = false;
+        let mut sidecar_base_port: Option<u16> = None;
 
         let mut i = 0;
         while i < extra.len() {
@@ -312,6 +324,22 @@ impl ZenohArgs {
                     i += 1;
                     anyhow::ensure!(i < extra.len(), "--zenoh-listen requires a value");
                     listen = Some(extra[i].clone());
+                }
+                "--zenoh-sidecar-base-port" => {
+                    // T14.9a: base port for the zenohd sidecar's REST
+                    // plugin. Parsed as u16; the per-runner port is
+                    // derived in connect(Single) via
+                    // `sidecar::derive_sidecar_port`.
+                    i += 1;
+                    anyhow::ensure!(
+                        i < extra.len(),
+                        "--zenoh-sidecar-base-port requires a value"
+                    );
+                    let raw = &extra[i];
+                    let port: u16 = raw.parse().with_context(|| {
+                        format!("invalid --zenoh-sidecar-base-port value '{raw}': expected u16")
+                    })?;
+                    sidecar_base_port = Some(port);
                 }
                 "--debug-trace" => {
                     // Boolean flag: no value follows.
@@ -334,6 +362,7 @@ impl ZenohArgs {
             mode,
             listen,
             debug_trace,
+            sidecar_base_port,
         })
     }
 }
@@ -427,6 +456,19 @@ struct PublisherState {
 pub struct ZenohVariant {
     runner: String,
     zenoh_args: ZenohArgs,
+    /// Extra args buffer kept around so connect() can re-parse the
+    /// runner-injected `--peers` map for sidecar port derivation
+    /// (T14.9a). Owned (not borrowed) so the variant doesn't carry a
+    /// lifetime parameter.
+    extra: Vec<String>,
+    /// T14.9a: zenohd sidecar lifetime. Populated when
+    /// `connect(Single)` succeeds; dropped (which kills zenohd) on
+    /// `disconnect`. Multi mode never sets this.
+    sidecar: Option<crate::sidecar::Sidecar>,
+    /// T14.9a: which threading mode the current connection was opened
+    /// with. Used by `publish`/`poll_receive` to short-circuit with
+    /// the "not yet implemented (T14.9b)" error when in Single mode.
+    connected_mode: Option<ThreadingMode>,
     runtime: Option<Runtime>,
     send_tx: Option<mpsc::Sender<OutboundMessage>>,
     recv_rx: Option<mpsc::Receiver<ReceivedUpdate>>,
@@ -463,11 +505,81 @@ impl ZenohVariant {
     ///
     /// `runner` is the runner name used as the writer field in messages.
     /// `extra` contains the pass-through CLI args for Zenoh-specific config.
+    /// T14.9a: spawn the zenohd sidecar but skip all session / runtime
+    /// setup. Returned as an `Err` from publish/poll_receive (with a
+    /// pointer at T14.9b) so the variant is honest about its current
+    /// scaffolding. Capability stays `[Multi]` — the runner skips
+    /// Single spawns; this branch exists for tests and the manual
+    /// smoke documented in `CUSTOM.md`.
+    fn connect_single_sidecar_only(&mut self) -> Result<()> {
+        let trace = self.zenoh_args.debug_trace;
+        // Locate the binary first so a missing zenohd surfaces as
+        // the actionable error documented in CUSTOM.md, BEFORE we
+        // do any other work.
+        let binary = crate::sidecar::locate_zenohd()
+            .context("zenoh Single mode requires the zenohd sidecar")?;
+        trace_if!(
+            trace,
+            "connect(Single): zenohd located at {} (source: {:?})",
+            binary.path.display(),
+            binary.source,
+        );
+
+        // Default base port chosen to be well above the
+        // T14.18 / T15.10 control-port range and outside the typical
+        // ephemeral pool to avoid clashing with other infrastructure.
+        // 20100 is the canonical default; operators override via
+        // --zenoh-sidecar-base-port.
+        const DEFAULT_SIDECAR_BASE_PORT: u16 = 20100;
+        let base_port = self
+            .zenoh_args
+            .sidecar_base_port
+            .unwrap_or(DEFAULT_SIDECAR_BASE_PORT);
+
+        // Derive the per-runner port from the runner-injected peer
+        // map. Solo invocations (no `--peers`) collapse to index 0.
+        let runner_index = self.derive_runner_index();
+        let rest_port = crate::sidecar::derive_sidecar_port(base_port, runner_index)
+            .context("zenoh sidecar port derivation overflowed")?;
+        trace_if!(
+            trace,
+            "connect(Single): sidecar base_port={} runner_index={} rest_port={}",
+            base_port,
+            runner_index,
+            rest_port,
+        );
+
+        let sidecar = crate::sidecar::Sidecar::spawn(&binary.path, rest_port)
+            .with_context(|| format!("spawn zenohd sidecar on REST port {rest_port}"))?;
+        trace_if!(
+            trace,
+            "connect(Single): zenohd sidecar live on REST port {}",
+            rest_port,
+        );
+        self.sidecar = Some(sidecar);
+        self.connected_mode = Some(ThreadingMode::Single);
+        Ok(())
+    }
+
+    /// Determine this runner's 0-based index in the runner-injected
+    /// `--peers` map. Sorted alphabetically (matches the other
+    /// variants' `parse_peers` convention) so the derivation is
+    /// stable across all runners. Returns 0 when `--peers` is absent
+    /// or this runner is not in the map (e.g. unit tests).
+    fn derive_runner_index(&self) -> usize {
+        let mut names = variant_base::cli::parse_peer_names_from_extra(&self.extra);
+        names.sort();
+        names.iter().position(|n| n == &self.runner).unwrap_or(0)
+    }
+
     pub fn new(runner: &str, extra: &[String]) -> Result<Self> {
         let zenoh_args = ZenohArgs::parse(extra)?;
         Ok(Self {
             runner: runner.to_string(),
             zenoh_args,
+            extra: extra.to_vec(),
+            sidecar: None,
+            connected_mode: None,
             runtime: None,
             send_tx: None,
             recv_rx: None,
@@ -902,15 +1014,14 @@ impl Variant for ZenohVariant {
     }
 
     fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()> {
-        // T14.7: reject Single mode BEFORE any I/O. Capability is
-        // declared via `supported_threading_modes()`; this is the
-        // belt-and-braces guard for the case the runner asks anyway.
+        // T14.9a: Single mode now spawns the zenohd sidecar
+        // (lifecycle only -- the RPC client is T14.9b). The variant
+        // still declares `supported_threading_modes() = [Multi]` so
+        // the runner skips Single-mode spawns; this branch is
+        // exercised by tests + the manual smoke documented in
+        // CUSTOM.md.
         if threading_mode == ThreadingMode::Single {
-            anyhow::bail!(
-                "variant-zenoh does not currently support single-threaded mode \
-                 (Zenoh has internal threads we cannot disable); see T14.9 for \
-                 the deferred router-RPC path. Spawn with --threading-mode multi"
-            );
+            return self.connect_single_sidecar_only();
         }
         let trace = self.zenoh_args.debug_trace;
         let t0 = Instant::now();
@@ -1095,12 +1206,23 @@ impl Variant for ZenohVariant {
         self.eot_shutdown_tx = Some(eot_shutdown_tx);
         self.eot_rx = Some(eot_rx);
         self.eot_seen.clear();
+        self.connected_mode = Some(ThreadingMode::Multi);
 
         trace_if!(trace, "connect: total {} ms", t0.elapsed().as_millis());
         Ok(())
     }
 
     fn publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<()> {
+        // T14.9a: Single mode connects the sidecar but does NOT yet
+        // wire up the RPC client. Refuse explicitly with the
+        // T14.9b pointer so callers don't silently no-op.
+        if self.connected_mode == Some(ThreadingMode::Single) {
+            anyhow::bail!(
+                "zenoh Single mode RPC client not yet implemented; \
+                 pending T14.9b. Sidecar is running but no client \
+                 surface is wired up."
+            );
+        }
         let trace = self.zenoh_args.debug_trace;
         let send_tx = self
             .send_tx
@@ -1207,6 +1329,14 @@ impl Variant for ZenohVariant {
     ///   `Ok(true)` and no seq gap, which is the reliable-QoS
     ///   contract.
     fn try_publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<bool> {
+        // T14.9a: Single mode -- not yet wired up (pending T14.9b).
+        if self.connected_mode == Some(ThreadingMode::Single) {
+            anyhow::bail!(
+                "zenoh Single mode RPC client not yet implemented; \
+                 pending T14.9b. Sidecar is running but no client \
+                 surface is wired up."
+            );
+        }
         // Reliable path: full delegation to publish() which uses
         // try_send + blocking_send fallback. Publish-side back-pressure
         // is absorbed inside Zenoh's per-publisher Block queue.
@@ -1261,6 +1391,14 @@ impl Variant for ZenohVariant {
     }
 
     fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+        // T14.9a: Single mode -- not yet wired up (pending T14.9b).
+        if self.connected_mode == Some(ThreadingMode::Single) {
+            anyhow::bail!(
+                "zenoh Single mode RPC client not yet implemented; \
+                 pending T14.9b. Sidecar is running but no client \
+                 surface is wired up."
+            );
+        }
         let trace = self.zenoh_args.debug_trace;
         let recv_rx = self
             .recv_rx
@@ -1302,6 +1440,21 @@ impl Variant for ZenohVariant {
     fn disconnect(&mut self) -> Result<()> {
         let trace = self.zenoh_args.debug_trace;
         let t0 = Instant::now();
+
+        // T14.9a: tear down the zenohd sidecar if connect spawned
+        // one. Done up-front so a panic in the runtime shutdown
+        // path below still leaves no orphan zenohd. The Job Object
+        // (Windows) / pre-exec hook (Linux) is belt-and-braces for
+        // crash paths.
+        if let Some(mut sidecar) = self.sidecar.take() {
+            if let Err(e) = sidecar.stop() {
+                trace_if!(trace, "disconnect: sidecar stop failed: {}", e);
+            } else {
+                trace_if!(trace, "disconnect: sidecar stopped");
+            }
+        }
+        self.connected_mode = None;
+
         if trace {
             trace_now!(
                 "disconnect: start; publishes={} avg_pub={} us max_pub={} us recv={} polls={}",
@@ -1473,41 +1626,73 @@ mod tests {
         assert_eq!(modes, &[ThreadingMode::Multi]);
     }
 
-    /// T14.7: `connect(Single)` must error BEFORE any I/O. If the
-    /// guard failed to short-circuit, the variant would attempt to
-    /// build a multi-thread tokio runtime and open a Zenoh session,
-    /// which is observably slow and noisy. We assert both the Err
-    /// outcome and that the variant remains in its pre-connect state.
-    /// We also cross-reference T14.9 in the error message so operators
-    /// have a discoverable path to the deferred router-RPC follow-up.
+    /// T14.9a: `connect(Single)` no longer aborts pre-I/O -- it now
+    /// spawns the zenohd sidecar (lifecycle only; the RPC client is
+    /// T14.9b). Two outcomes are valid depending on the test host:
+    ///
+    /// 1. **`zenohd` not installed**: discovery errors with a clear
+    ///    message naming `ZENOHD_PATH` and the install command.
+    ///    No tokio runtime / session is set up.
+    /// 2. **`zenohd` installed**: the sidecar spawns, the variant
+    ///    records `connected_mode = Single`, and publish /
+    ///    poll_receive return the "not yet implemented (T14.9b)"
+    ///    error. No tokio runtime / session is set up (those are
+    ///    Multi mode infrastructure).
+    ///
+    /// Either way the bridge handles must remain `None` because
+    /// Single mode does NOT exercise the Multi-mode bridge.
     #[test]
-    fn test_connect_single_mode_errors_before_io() {
+    fn test_connect_single_mode_spawns_sidecar_or_errors_cleanly() {
+        // Force the "no binary" path so this test is hermetic on any
+        // CI without zenohd installed. We point ZENOHD_PATH at a
+        // non-existent file; the variant should surface the
+        // actionable error rather than falling through to PATH.
+        let nonexistent = std::env::temp_dir().join("variant-zenoh-test-no-such-zenohd");
+        let _ = std::fs::remove_file(&nonexistent);
+        let prev = std::env::var_os("ZENOHD_PATH");
+        // SAFETY (test-only): mutating env is fine in a single test
+        // because the harness runs unit tests on a single thread by
+        // default; we restore the previous value at the end.
+        unsafe {
+            std::env::set_var("ZENOHD_PATH", &nonexistent);
+        }
+
         let mut v = ZenohVariant::new("a", &[]).expect("construct ZenohVariant");
         let err = v
             .connect(variant_base::ThreadingMode::Single)
-            .expect_err("connect(Single) must error for variant-zenoh");
+            .expect_err("connect(Single) must error when zenohd is not findable");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("does not currently support single-threaded mode"),
-            "error message should explain Single is unsupported, got: {msg}",
+            msg.contains("ZENOHD_PATH"),
+            "error should mention ZENOHD_PATH, got: {msg}",
         );
         assert!(
-            msg.contains("T14.9"),
-            "error message should cross-reference T14.9 router-RPC path, got: {msg}",
+            msg.contains("cargo install zenohd"),
+            "error should suggest install command, got: {msg}",
         );
-        assert!(
-            msg.contains("--threading-mode multi"),
-            "error message should point at the multi flag, got: {msg}",
-        );
-        // Structural assertion that no I/O happened: every owned
-        // bridge handle is still None (no tokio runtime, no session,
-        // no subscribers, no publishers, no EOT channel).
-        assert!(v.runtime.is_none(), "no tokio runtime should be set up");
-        assert!(v.send_tx.is_none(), "no publish channel should exist");
-        assert!(v.recv_rx.is_none(), "no receive channel should exist");
+
+        // No Multi-mode infrastructure should have been touched.
+        assert!(v.runtime.is_none(), "no tokio runtime in Single mode");
+        assert!(v.send_tx.is_none(), "no publish channel in Single mode");
+        assert!(v.recv_rx.is_none(), "no receive channel in Single mode");
         assert!(v.shutdown_tx.is_none());
         assert!(v.eot_shutdown_tx.is_none());
         assert!(v.eot_rx.is_none());
+        // The connect call errored before the sidecar handle could
+        // be installed, so it remains None too.
+        assert!(
+            v.sidecar.is_none(),
+            "sidecar must be None when discovery failed"
+        );
+        assert!(v.connected_mode.is_none(), "connected_mode unset on error");
+
+        // Restore env. Tests share the process; do not leak.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("ZENOHD_PATH", v),
+                None => std::env::remove_var("ZENOHD_PATH"),
+            }
+        }
     }
 
     #[test]

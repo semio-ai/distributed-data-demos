@@ -1,3 +1,4 @@
+mod sidecar;
 mod zenoh;
 
 use anyhow::Result;
