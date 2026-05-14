@@ -5946,77 +5946,189 @@ finds a small UDP fix.
 
 ---
 
-### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar
+### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (SPLIT)
 
-**Repo**: `variants/zenoh/`, plus possibly a small runner-side
-sidecar-spawn mechanism.
-**Status**: active 2026-05-14 (un-deferred). The primary motivation
-is the team's WASM compilation target (single-threaded sync variant
-client + multi-threaded router living in a separate process). A
-secondary effect is that the Zenoh qos3/qos4 deadlock under
-symmetric flood would be isolated inside the router process rather
-than the variant — but T15.11 (variant-side watchdog) is a much
-smaller fix for the deadlock specifically, so T14.9 should be
-scoped purely around the WASM-client architecture, not as a fix for
-the qos3/qos4 stall.
+**Status**: split 2026-05-14 into T14.9a + T14.9b after audit
+(see commit `e70a01f` for the full audit). Original scope was
+~600-1500 LOC and triggered two of the brief's hard-stop conditions
+(non-cargo binary distribution, RPC surface design). Split allows
+each sub-task to commit to one design decision in isolation.
+
+**Sub-tasks**:
+- **T14.9a**: sidecar lifecycle only (binary discovery, spawn/kill,
+  port allocation, OS-level cleanup). ~250 LOC. Doesn't change the
+  variant's user-visible capability.
+- **T14.9b**: sync RPC client via `zenoh-plugin-rest` (HTTP PUT +
+  SSE) using `ureq`. Depends on T14.9a. Flips capability to
+  `[Single, Multi]`. ~350 LOC.
+
+The audit-derived design choices (REST+SSE first cut, variant-owned
+lifecycle, REST plugin's static linking) are recorded in
+`metak-orchestrator/STATUS.md`'s "T14.9 -- AUDIT findings" section
+(commit `e70a01f`). T14.9a / T14.9b worker prompts inherit those
+choices unless explicitly revisited.
+
+---
+
+### T14.9a: variants/zenoh -- zenohd sidecar lifecycle (Single mode scaffolding)
+
+**Repo**: `variants/zenoh/`.
+**Status**: pending, filed 2026-05-14 from T14.9 audit split.
 
 #### Background
 
-Zenoh's crate is internally multi-threaded, so T14.7 declares the
-variant `[Multi]` only. However, Zenoh's architecture naturally
-supports an out-of-process router (`zenohd`). A thin single-threaded
-RPC client talking to a sidecar router process gives Zenoh a
-genuinely single-threaded, sync, WASM-compatible client surface
-without lying about what runs where.
+T14.9's audit identified three independent risks. T14.9a handles
+**sidecar lifecycle only**: binary discovery, spawn at connect, kill
+at disconnect, port allocation, per-platform child-process cleanup.
+The variant remains `[Multi]`-only at the capability surface — Single
+mode publish/poll_receive still error out cleanly. T14.9b adds the
+sync RPC client and flips the capability.
 
-This is the path the team identified as the production topology for
-Zenoh in WASM scenarios.
+#### Scope
 
-#### Scope (high level -- worker fills in detail when scheduled)
+- **`zenohd` binary discovery**: check `ZENOHD_PATH` env var, then
+  PATH, fail with a clear actionable error if neither finds the
+  binary. Document the install command in CUSTOM.md
+  (`cargo install zenohd --version 1.9.0`).
+- **Sidecar lifecycle (variant-owned)**: at `connect`, spawn `zenohd`
+  with a per-spawn-unique config (REST plugin enabled on a derived
+  port; clean working dir; minimal stderr). At `disconnect`, send
+  SIGTERM (or Windows equivalent) + wait, then SIGKILL if needed.
+- **Port allocation**: derive REST plugin port + Zenoh listen port
+  from a new `--zenoh-sidecar-base-port <u16>` CLI arg using the
+  same runner-stride convention as T14.18 / T15.10 control ports.
+- **Per-platform cleanup** (so a SIGKILLed variant doesn't orphan
+  zenohd):
+  - Windows: Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+  - Linux: `prctl(PR_SET_PDEATHSIG, SIGTERM)` in the child.
+  - macOS: best-effort process-group kill.
+- **`supported_threading_modes()` stays `&[Multi]`** in T14.9a.
+  T14.9b flips it.
+- **Single-mode publish/poll_receive**: return a clear error
+  ("Single mode RPC client not yet implemented; pending T14.9b").
+  This is intermediate scaffolding; users won't actually exercise
+  Single until T14.9b lands.
 
-- Update `variants/zenoh` capability to `[Single, Multi]`. Existing
-  Multi mode unchanged from T14.7.
-- New Single mode: variant spawns a `zenohd` sidecar process at
-  `connect` time (or runner manages the sidecar lifecycle -- see
-  below), then opens a single-threaded RPC client connection to it.
-  Publish/poll_receive go through the RPC client. No tokio in the
-  variant process itself.
-- Sidecar lifecycle management: open question whether the variant
-  owns the sidecar (simpler, but spawn/teardown per variant) or the
-  runner owns it (sharable across variants, but more contract surface).
-  T14.9 decides; my default expectation is variant-owned for the
-  first cut and runner-promoted-if-needed later.
-- RPC protocol: the obvious candidate is Zenoh's own admin/control
-  surface, exposed via `zenohd`'s REST/WS admin API or a custom
-  Zenoh subscription. Worker picks one and documents the choice.
-- Analysis: optionally report router resource usage separately from
-  variant resource usage. Out of scope for first cut.
+#### Tests
 
-#### Contract impact
+- Unit: binary-discovery falls back through `ZENOHD_PATH` → PATH →
+  clean error.
+- Unit: port derivation per runner stride.
+- Integration (`#[ignore]`): connect spawns a real `zenohd`, the
+  REST plugin port responds to a simple HTTP GET, disconnect cleans
+  it up.
 
-If the runner owns sidecar lifecycle, a new contract for sidecar
-declaration in TOML would be needed. If the variant owns it, no
-contract change. Default: variant-owned, no contract change.
+#### Validation
 
-#### Acceptance criteria (rough)
+- `cargo build --release -p variant-zenoh` clean (no new deps).
+- `cargo test --release -p variant-zenoh` all-green (existing tests
+  unchanged; the few new T14.9a tests added).
+- Clippy + fmt clean.
 
-- [ ] Zenoh variant declares `[Single, Multi]`.
-- [ ] Single mode spawns and tears down a `zenohd` sidecar cleanly.
-- [ ] Variant binary itself contains no tokio in Single mode (verified
-  by `cargo tree -e features` or similar).
-- [ ] Two-runner localhost regression passes in Single mode at a
-  modest workload (worker picks; not high-rate symmetric for the
-  first cut).
-- [ ] CUSTOM.md documents the sidecar topology and the RPC choice.
-- [ ] EPICS.md "Future work" subsection on E14 promoted to a
-  retrospective note pointing here.
+#### Acceptance criteria
+
+- [ ] `zenohd` binary discovery + clear-error path.
+- [ ] Variant-owned sidecar lifecycle implemented + tested.
+- [ ] Per-platform child cleanup (Job Object / `PR_SET_PDEATHSIG`).
+- [ ] `--zenoh-sidecar-base-port` CLI arg.
+- [ ] CUSTOM.md "Single mode scaffolding (T14.9a)" subsection
+      documenting the install command + the staged plan (T14.9b
+      adds the RPC client).
+- [ ] No tokio additions; existing Multi mode unaffected.
 
 #### Out of scope
 
-- Same as T14.7's out-of-scope plus the sidecar-spawn mechanism
-  generalisation across other variants. If a future variant benefits
-  from a sidecar (e.g. a Aeron driver process) that's a separate
-  effort.
+- The sync RPC client (T14.9b).
+- Flipping capability to `[Single, Multi]` (T14.9b).
+- Multiple variants sharing a single sidecar (deferred — variant-
+  owned is fine for the first cut).
+- Runner-owned sidecar lifecycle (would require contract change;
+  reconsider only if multiple variant families need sidecars later).
+
+---
+
+### T14.9b: variants/zenoh -- sync RPC client via REST+SSE (T14.9 completion)
+
+**Repo**: `variants/zenoh/`.
+**Status**: pending, filed 2026-05-14 from T14.9 audit split.
+**Depends on**: T14.9a.
+
+#### Background
+
+With T14.9a's sidecar lifecycle in place, T14.9b wires the variant's
+publish/poll_receive through the `zenoh-plugin-rest` HTTP+SSE
+surface using sync Rust (`ureq` for HTTP PUT; `ureq` or a small
+SSE reader for the subscription). The variant's Single mode becomes
+genuinely single-threaded sync — no tokio in that code path. Flips
+capability to `[Single, Multi]`.
+
+#### Scope
+
+- Add `ureq` as a dep, gated to Single mode if necessary (or always
+  on; the binary already has tokio for Multi mode so the tokio-free
+  story is about the call graph, not the dependency tree).
+- **publish**: HTTP PUT to `http://localhost:<rest_port>/<key>` with
+  the binary value as the body. Synchronous, blocking.
+- **poll_receive**: dedicated OS thread (NOT tokio) that consumes
+  the SSE stream from
+  `http://localhost:<rest_port>/<key_expr>?_method=SUB`. Parses each
+  SSE event into a `ReceivedUpdate`, pushes onto an
+  `mpsc::sync_channel` that `poll_receive` drains. Same pattern as
+  T14.10 (websocket log-from-reader) and T15.3 (progress_coord) —
+  reuse the established invariants.
+- **`supported_threading_modes()` flips to `&[Single, Multi]`**.
+- **`connect(Single)`**: spawns `zenohd` (T14.9a) + opens the HTTP
+  client + spawns the SSE reader thread. `connect(Multi)`: unchanged.
+- **`disconnect`**: stops the SSE reader thread, closes the HTTP
+  client, kills the sidecar (T14.9a).
+- **Tokio-free verification in Single mode**: confirm via call-graph
+  audit + a doc comment in `connect(Single)` listing the dependency
+  chain (`ureq` → `rustls`/`native-tls` ... → no tokio). Document
+  the verification method in CUSTOM.md.
+
+#### Tests
+
+- Unit: HTTP PUT request shape (mock server returns 200; assert the
+  PUT body + headers).
+- Unit: SSE parser handles complete and partial events correctly.
+- Integration (`#[ignore]`): two-runner localhost regression in
+  `Single` mode at a modest workload (10 vpt × 100 Hz = 1K msg/s,
+  NOT the high-rate stress). Both runners reach `runner_idle_terminated`
+  via the new sidecar-routed path.
+
+#### Validation
+
+- `cargo build --release -p variant-zenoh` clean.
+- `cargo test --release -p variant-zenoh` all-green including the
+  new `#[ignore]`-d Single-mode regression.
+- `cargo tree -e features -p variant-zenoh` annotated in CUSTOM.md
+  showing the Single-mode call graph.
+- Clippy + fmt clean.
+- **End-to-end smoke**: a focused fixture with one Zenoh entry at
+  `threading_modes = ["single", "multi"]` at 10 vpt × 100 Hz qos1.
+  Both modes complete with `runner_idle_terminated`. T14.9b doesn't
+  claim to fix the qos3/qos4 stall — that's left to T15.11
+  (variant-side watchdog).
+
+#### Acceptance criteria
+
+- [ ] HTTP PUT publish path via `ureq`.
+- [ ] SSE poll_receive path via dedicated sync thread + mpsc.
+- [ ] `supported_threading_modes() = &[Single, Multi]`.
+- [ ] Connect / disconnect lifecycle composes T14.9a's sidecar with
+      the RPC client.
+- [ ] Tokio-free Single-mode call graph verified + documented.
+- [ ] Two-runner regression passes in Single mode at modest workload.
+- [ ] CUSTOM.md rewritten for the post-T14.9 architecture.
+
+#### Out of scope
+
+- High-rate symmetric workloads in Single mode (the deadlock is
+  Zenoh-internal; T15.11 watchdog converts to clean exit).
+- Swapping to `zenoh-plugin-remote-api` (WebSocket). REST+SSE is the
+  first cut; revisit only if WASM target reveals concrete
+  limitations of SSE over `fetch`/`EventSource`.
+- Generalising the sidecar pattern across other variants.
 
 ---
 
