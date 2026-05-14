@@ -108,7 +108,17 @@ class TestIntegrityQoS1:
 
 
 class TestIntegrityQoS2:
-    """QoS 2: ordering checked, loss-tolerant."""
+    """QoS 2 (latest-value datagram): loss-tolerant, no ordering guarantee.
+
+    Pre-T14.17-follow-up the qos2 ordering check fired ``[FAIL: ordering]``
+    on out-of-order receives. The 2026-05-14 follow-up makes the check
+    QoS-aware: qos1 and qos2 are unreliable/latest-value datagram-style
+    QoS levels with no ordering contract by design (the WebRTC qos2
+    implementation uses an unreliable/unordered SCTP channel and
+    relies on the receiver's latest-value semantics, so out-of-order
+    receives are a normal protocol feature). The ``[FAIL: ordering]``
+    annotation is reserved for qos3/qos4 from this point on.
+    """
 
     def test_in_order(self) -> None:
         events = [
@@ -156,7 +166,14 @@ class TestIntegrityQoS2:
         assert r.out_of_order == 0
         assert not r.ordering_error
 
-    def test_out_of_order_flagged(self) -> None:
+    def test_out_of_order_not_flagged(self) -> None:
+        """qos2 out-of-order receives are counted but NOT flagged.
+
+        Post-2026-05-14 ``[FAIL: ordering]`` only fires for qos3 and
+        qos4. The ``out_of_order`` field still records the count so
+        operators can see the absolute number; the ``ordering_error``
+        boolean stays False.
+        """
         events = [
             make_event(
                 "write",
@@ -201,7 +218,9 @@ class TestIntegrityQoS2:
         results = _verify(events)
         r = results[0]
         assert r.out_of_order > 0
-        assert r.ordering_error
+        # qos2 has no ordering guarantee -- the count is recorded but
+        # the boolean error flag stays False.
+        assert not r.ordering_error
 
 
 class TestIntegrityQoS3:
@@ -397,6 +416,95 @@ class TestIntegrityQoS4:
         r = results[0]
         assert r.completeness_error
         assert r.unresolved_gaps is None  # gap checking not applicable
+
+
+def _out_of_order_pair(qos: int) -> list[dict]:
+    """Build a write+receive event sequence whose receives are out of order.
+
+    Used by the QoS-aware ordering tests: at every QoS level we want
+    the same input shape so the only variable is the ``qos`` field
+    -- the integrity rule is what changes per level.
+    """
+    return [
+        make_event(
+            "write",
+            runner="alice",
+            seq=1,
+            path="/k",
+            qos=qos,
+            bytes=8,
+            offset_ms=100,
+        ),
+        make_event(
+            "write",
+            runner="alice",
+            seq=2,
+            path="/k",
+            qos=qos,
+            bytes=8,
+            offset_ms=101,
+        ),
+        # Received out of order (seq 2 before seq 1)
+        make_event(
+            "receive",
+            runner="bob",
+            writer="alice",
+            seq=2,
+            path="/k",
+            qos=qos,
+            bytes=8,
+            offset_ms=109,
+        ),
+        make_event(
+            "receive",
+            runner="bob",
+            writer="alice",
+            seq=1,
+            path="/k",
+            qos=qos,
+            bytes=8,
+            offset_ms=110,
+        ),
+    ]
+
+
+class TestOrderingQoSAware:
+    """T14.17 follow-up (2026-05-14): the ordering check is QoS-aware.
+
+    qos1 (best-effort) and qos2 (latest-value) are datagram-style QoS
+    levels with no ordering guarantee by design. The WebRTC qos1/qos2
+    implementations rely on the underlying transport's
+    unreliable/unordered datagram channel, so out-of-order receives
+    are a normal protocol feature -- the ``[FAIL: ordering]``
+    annotation must NOT fire. Only qos3 (reliable-ordered) and qos4
+    (reliable-tcp) carry an ordering contract and continue to flag.
+    """
+
+    def test_qos1_out_of_order_not_flagged(self) -> None:
+        results = _verify(_out_of_order_pair(qos=1))
+        r = results[0]
+        # The count is still recorded so operators can see the absolute
+        # number; only the boolean error flag is suppressed.
+        assert r.out_of_order > 0
+        assert not r.ordering_error
+
+    def test_qos2_out_of_order_not_flagged(self) -> None:
+        results = _verify(_out_of_order_pair(qos=2))
+        r = results[0]
+        assert r.out_of_order > 0
+        assert not r.ordering_error
+
+    def test_qos3_out_of_order_still_flagged(self) -> None:
+        results = _verify(_out_of_order_pair(qos=3))
+        r = results[0]
+        assert r.out_of_order > 0
+        assert r.ordering_error
+
+    def test_qos4_out_of_order_still_flagged(self) -> None:
+        results = _verify(_out_of_order_pair(qos=4))
+        r = results[0]
+        assert r.out_of_order > 0
+        assert r.ordering_error
 
 
 class TestIntegrityBackpressureSkipped:
