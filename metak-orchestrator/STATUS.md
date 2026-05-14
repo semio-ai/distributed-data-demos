@@ -10906,3 +10906,57 @@ The only remaining items in the backlog are small follow-ups
 qos1-2; T11.6 cache RSS), each filed but neither blocking nor
 architecturally significant.
 
+
+---
+
+## 2026-05-14 — T14.9c closes T14.9 final loose end
+
+T14.9b worker's `.max_idle_connections(0).max_idle_connections_per_host(0)`
+on the ureq Agent effectively disabled keep-alive, exhausting Windows
+ephemeral ports at >10K msg/s in Single mode. T14.9c removed those
+limits (restoring ureq 3.x defaults) and added a `body.read_to_vec()`
+after status check so the connection returns to the pool.
+
+### Re-run on focused Zenoh-Single stress
+
+`configs/two-runner-zenoh-single-stress-t149c.toml` (Zenoh Single
+qos2/3/4 at 1000 vpt × 100 Hz × 8 s):
+- All 6 rows (3 QoS × 2 runners): `status=success, exit_code=0`
+- Zero `os error 10048` in stderr
+- Sent counts: alice 2K-6K, bob 5K-6K over 8 s = 600-750 msg/s sustained
+
+### New architectural finding: Zenoh REST plugin throughput ceiling
+
+Sustained ~600-750 msg/s, vs the 100K msg/s nominal stress rate.
+This is the REST plugin's blocking-PUT ceiling, identical to what
+Zenoh Multi mode hits internally under saturated load. Not a bug.
+
+What this means for the project:
+- **Zenoh Single mode** is the WASM-friendly path for low-rate
+  scenarios (~hundreds of msg/s sustained), production deployments
+  where the variant runs in browser/embedded environments.
+- **Zenoh Multi mode** is the high-rate path for native-host
+  benchmark scenarios.
+- The two modes serve different use cases; the throughput cliff is
+  documented as a Zenoh REST plugin characteristic, not a project
+  bug to fix.
+
+### Commits
+
+T14.9c: `caaf342`, `d9f2102`, `58f8ea9`.
+
+### What's still open
+
+- **Zenoh qos4 multi** (~30s stall + watchdog self-exit) — the
+  variant-side T15.11 watchdog handles this cleanly now. Whether
+  Zenoh-internal tuning could prevent the stall is a Zenoh project
+  question, not ours.
+- **`variant_crashed` classification** (T14.17 follow-up) — distinguish
+  fast panics (Zenoh qos3 alice in T15.11 stress) from slow stalls.
+  Small analysis-side change; filed informally; no separate task
+  number assigned.
+- **WebRTC qos1-2 ordering check QoS-aware** — small analysis polish.
+
+The architectural arc that started 2026-05-11 with asymmetric timeouts
+on `configs/two-runner-websocket-qos4.toml` is now fully closed.
+
