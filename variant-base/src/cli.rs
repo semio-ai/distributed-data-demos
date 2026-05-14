@@ -44,11 +44,16 @@ pub const DEFAULT_OPERATE_IDLE_SECS: u32 = 5;
 /// runner kill.
 ///
 /// `0` disables the watchdog: no monitor thread is spawned and no
-/// self-exit can fire (pre-T15.11 behaviour). The default of `60`
-/// matches the runner's typical `default_timeout_secs` headroom: a
-/// stalled spawn self-exits cleanly well before the runner trips its
-/// safety-net kill.
-pub const DEFAULT_WATCHDOG_SECS: u32 = 60;
+/// self-exit can fire (pre-T15.11 behaviour). The default of `30`
+/// is chosen so the watchdog wins the race against typical runner
+/// safety-net deadlines: many existing fixtures set
+/// `default_timeout_secs = 60`, and the watchdog must fire well
+/// before that to leave Drop impls + buffered I/O time to flush.
+/// Empirically `30 s` is far longer than any cooperative
+/// stabilize / operate / silent phase budget in the existing
+/// fixture set (longest is ~12 s) yet comfortably under the
+/// shortest reasonable runner deadline.
+pub const DEFAULT_WATCHDOG_SECS: u32 = 30;
 
 /// Validate that `kb` falls within the documented `--recv-buffer-kb`
 /// range. Returned by clap's `value_parser`.
@@ -207,10 +212,11 @@ pub struct CliArgs {
     ///
     /// `0` disables the watchdog entirely: no monitor thread is
     /// spawned and no self-exit can fire (pre-T15.11 behaviour).
-    /// Default `60` matches the typical runner `default_timeout_secs`
-    /// headroom: a stalled variant self-exits cleanly well before
-    /// the runner's safety-net kill would have produced a truncated
-    /// JSONL.
+    /// Default `30` is chosen to win the race against typical
+    /// runner safety-net deadlines (the existing stress fixtures
+    /// use `default_timeout_secs = 60`); the watchdog must fire well
+    /// before the runner's safety-net kill so the JSONL flush has
+    /// time to complete.
     #[arg(long, default_value_t = DEFAULT_WATCHDOG_SECS)]
     pub watchdog_secs: u32,
 

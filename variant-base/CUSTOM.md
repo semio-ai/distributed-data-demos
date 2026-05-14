@@ -381,12 +381,16 @@ self-exits cleanly + flushed JSONL".
   phase -- internal stall; self-exiting` to stderr, then call
   `std::process::exit(WATCHDOG_EXIT_CODE)`.
 
-**CLI arg**: `--watchdog-secs <u32>` (default `60`, `0` disables).
-The default matches the typical runner `default_timeout_secs`
-headroom: a stalled variant self-exits cleanly well before the
-runner's safety-net kill would have produced a truncated JSONL.
-When `0`, no thread is spawned and `Watchdog::is_enabled()` returns
-false.
+**CLI arg**: `--watchdog-secs <u32>` (default `30`, `0` disables).
+The default is chosen to win the race against typical runner
+safety-net deadlines: the existing stress fixtures set
+`default_timeout_secs = 60`, and the watchdog must fire well before
+that to leave the JSONL flush time to complete. Thirty seconds is
+far longer than any cooperative phase budget in the existing fixture
+set (stabilize + operate + silent ~12 s) yet comfortably under the
+shortest reasonable runner deadline. Operators running fixtures
+with longer per-spawn timeouts may raise this. When `0`, no thread
+is spawned and `Watchdog::is_enabled()` returns false.
 
 **Exit-code choice**: `WATCHDOG_EXIT_CODE = 2`.
 
