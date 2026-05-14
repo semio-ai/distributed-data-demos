@@ -307,7 +307,7 @@ crate is async but the boundary is sharper (one tokio runtime we
 build, one set of tasks we spawn). Zenoh's threading is internal to
 the crate and not under our control.
 
-### Future: T14.9 (deferred, NOT part of E14)
+### Future: T14.9 (split into T14.9a + T14.9b after audit)
 
 Although the in-process zenoh client is multi-threaded, Zenoh's
 architecture naturally supports an **out-of-process router**
@@ -315,18 +315,226 @@ architecture naturally supports an **out-of-process router**
 would talk RPC to a sidecar `zenohd` process that absorbs all the
 concurrency, leaving the client surface sync and free of tokio.
 
-That work is filed as **T14.9** in `metak-orchestrator/TASKS.md`. It
-is **deferred**: not scheduled, not part of the E14 sprint, and
-spawning is gated on E14 (T14.1 - T14.8) landing AND the team
-confirming a real WASM use case for Zenoh. When T14.9 implements,
-this variant's capability declaration becomes
-`[ThreadingMode::Single, ThreadingMode::Multi]` and this section
-gets revised accordingly.
+T14.9 was filed in `metak-orchestrator/TASKS.md` and **split during
+its audit** into two sub-tasks (see STATUS.md "T14.9 -- AUDIT
+findings"):
 
-T14.9 also requires a small runner-side mechanism to spawn a
-sidecar process per variant and tear it down after the spawn. That
-mechanism would be reusable for any other future variant that
-benefits from a sidecar (none on the current backlog).
+* **T14.9a (delivered, see "Single mode scaffolding" below)** — the
+  sidecar **lifecycle** only. Binary discovery, spawn at
+  `connect(Single)`, kill at `disconnect`, port allocation, and
+  per-platform child-process cleanup. Capability stays `[Multi]` —
+  the variant errors out of publish/poll_receive with a clear
+  T14.9b pointer.
+* **T14.9b (NOT YET DELIVERED)** — the sync RPC client over the
+  REST plugin's HTTP+SSE surface. When T14.9b lands, the variant's
+  `supported_threading_modes()` flips to
+  `[ThreadingMode::Single, ThreadingMode::Multi]` and Single-mode
+  publish/poll_receive route through the sidecar.
+
+## Single mode scaffolding (T14.9a)
+
+T14.9a is shipped. The variant **declares `[Multi]` only** so the
+runner skips Single-mode spawns; the scaffolding exists for the
+post-T14.9b transition and for the manual smoke documented below.
+Tests + the manual smoke construct the variant directly with
+`--threading-mode single`.
+
+### Installing `zenohd`
+
+```
+cargo install zenohd --version 1.9.0
+```
+
+`cargo install zenohd --version 1.9.0` builds and installs the
+router binary into `~/.cargo/bin/zenohd(.exe)`. **However** the
+cargo-installed `zenohd` does NOT bundle the REST plugin's dynamic
+library — `zenoh_plugin_rest.{dll,so,dylib}` — that the sidecar
+needs to expose the HTTP RPC surface T14.9b consumes. There is no
+official pre-built distribution for the plugin yet on cargo, so the
+operator workaround on a developer host is:
+
+```
+# Build the plugin from its cargo-registry source. cdylib output
+# lands in `target/release/zenoh_plugin_rest.{dll,so,dylib}`.
+cd ~/.cargo/registry/src/index.crates.io-*/zenoh-plugin-rest-1.9.0/
+cargo build --release
+
+# Then drop the resulting library next to zenohd so zenohd's
+# default plugin search path (`current_exe_parent`) finds it.
+cp target/release/zenoh_plugin_rest.dll ~/.cargo/bin/   # Windows
+cp target/release/libzenoh_plugin_rest.so ~/.cargo/bin/  # Linux
+cp target/release/libzenoh_plugin_rest.dylib ~/.cargo/bin/  # macOS
+```
+
+T14.9b can revisit this when the upstream Zenoh project ships a
+binary distribution; the variant code itself does NOT depend on
+the plugin at compile time.
+
+### Binary discovery
+
+`connect(Single)` resolves the `zenohd` binary in this order, and
+returns a clear actionable error if neither finds it:
+
+1. `ZENOHD_PATH` environment variable. Must point at an existing
+   file; a bad path is a hard error (no fallthrough to PATH so a
+   typo doesn't silently boot a different installation).
+2. Walk the `PATH` env var. On Windows we honour `PATHEXT` so
+   `zenohd.exe` resolves from a bare `zenohd` lookup.
+
+Failure message (operator-facing contract; do not change without
+updating tests + this doc):
+
+```
+zenohd binary not found. Install via 'cargo install zenohd --version 1.9.0'
+or set ZENOHD_PATH=<path>
+```
+
+### Port allocation (`--zenoh-sidecar-base-port`)
+
+The variant accepts a new CLI flag in its `extra` (Zenoh-specific)
+args: `--zenoh-sidecar-base-port <u16>`. The REST plugin port for
+this runner is derived as:
+
+```
+runner_stride = 1
+rest_port     = base_port + runner_index * runner_stride
+```
+
+`runner_index` is derived from the sorted `--peers` map the runner
+injects (same convention as T14.18 / T15.10 control ports across
+the TCP / hybrid / QUIC variants). Solo runs without `--peers`
+collapse to `runner_index = 0`. The default `base_port` is 20100
+so the operator-facing manual smoke ("spawn variant-zenoh
+`--threading-mode single`") works without per-spawn TOML wiring;
+production fixtures should specify the base port explicitly to
+avoid collisions with other infrastructure.
+
+### Sidecar lifecycle
+
+At `connect(ThreadingMode::Single)`:
+
+1. Locate the `zenohd` binary (fail-fast with the actionable error
+   above if missing).
+2. Generate a per-spawn JSON config enabling the REST plugin on the
+   derived port. The plugin is bound to `127.0.0.1:<port>` so the
+   sidecar's RPC surface is not exposed beyond the local host.
+3. `Command::spawn` with per-platform child-cleanup setup (below).
+4. Poll the REST admin space (`/@/router/local`) for up to 5 s. If
+   the plugin never responds we kill the child and surface a clean
+   error rather than letting the sidecar hang the connect path.
+5. Store the `Sidecar` handle on the variant; record
+   `connected_mode = Single`.
+
+`publish` / `try_publish` / `poll_receive` in Single mode return
+the deliberate error:
+
+```
+zenoh Single mode RPC client not yet implemented; pending T14.9b.
+Sidecar is running but no client surface is wired up.
+```
+
+This is **intentional**: T14.9a establishes the lifecycle wiring so
+T14.9b can drop its sync RPC client into a known-good sidecar
+process; without the explicit error a silent no-op would mislead
+operators running the manual smoke.
+
+At `disconnect`:
+
+1. Send SIGTERM (Unix) / `Child::kill` (Windows) to the sidecar.
+2. Wait up to 500 ms for graceful exit; fall back to `kill()` for
+   anything still alive.
+3. Remove the per-spawn temp config file.
+4. Drop the Job Object handle (Windows) -- belt-and-braces in case
+   the explicit kill ever fails.
+
+### Per-platform child-process cleanup
+
+A SIGKILLed variant must not orphan its `zenohd` sidecar. Each
+platform uses a different OS-level primitive:
+
+* **Windows** (`windows-sys` crate, JobObjects feature): each
+  spawned `zenohd` is assigned to a Job Object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When the variant process
+  exits (clean, panic, SIGKILL alike), Windows closes the Job
+  Object handle and terminates every process inside the job. This
+  is the strongest of the three guarantees and the only one that
+  survives `TerminateProcess` of the parent.
+* **Linux** (`libc` crate, `Command::pre_exec` hook):
+  `prctl(PR_SET_PDEATHSIG, SIGTERM)` tells the kernel to deliver
+  SIGTERM to the child as soon as the parent dies. Works for any
+  parent-exit cause.
+* **macOS / other BSDs** (same pre-exec hook): no
+  `PR_SET_PDEATHSIG` equivalent. The hook calls `setpgid(0, 0)`
+  so the child becomes its own process-group leader, and the
+  variant relies on the explicit kill in `Sidecar::stop` for the
+  clean-exit path. A SIGKILLed variant on macOS may leak its
+  sidecar until the operator notices — accepted limitation for
+  the first cut. T14.9b can revisit if real macOS deployments
+  appear.
+
+Implementation lives in `variants/zenoh/src/sidecar.rs`.
+
+#### Why `windows-sys` and not `windows`
+
+`windows-sys` is already a transitive dependency of the workspace
+(via `winapi-util` and others) and is significantly lighter than
+the higher-level `windows` crate. The required surface (Job Object
++ AssignProcessToJobObject + CloseHandle, all under
+`Win32_System_JobObjects` + `Win32_Security` features) is identical
+between the two crates.
+
+### Why `connect(Single)` runs at all when capability is `[Multi]`
+
+The runner consults `supported_threading_modes()` and skips Single
+spawns for variant-zenoh -- so the `connect(Single)` path is NOT
+exercised by production fixture spawns. The deliberate decision to
+keep `connect(Single)` functional regardless is so the
+manual-smoke `cargo test ... -- --ignored sidecar_lifecycle_smoke`
+flow + the operator-facing `variant-zenoh --threading-mode single`
+invocation are useful **before** T14.9b lands. After T14.9b the
+capability flips to `[Single, Multi]` and the runner will spawn
+Single fixtures for Zenoh through the same `connect(Single)`
+entry point.
+
+### Manual smoke
+
+After installing zenohd + dropping the plugin DLL alongside it (see
+"Installing zenohd" above):
+
+```
+cargo build --release -p variant-zenoh
+cargo test --release -p variant-zenoh -- --ignored sidecar_lifecycle_smoke
+```
+
+The test skips gracefully if zenohd is not found (printing a
+diagnostic) so it works on CI without zenohd installed.
+
+For a hand-driven smoke equivalent to the integration test:
+
+```
+./target/release/variant-zenoh \
+  --tick-rate-hz 10 --stabilize-secs 0 --operate-secs 2 --silent-secs 0 \
+  --workload scalar-flood --values-per-tick 1 --qos 1 \
+  --log-dir /tmp/zenoh-smoke --launch-ts 2026-05-14T00:00:00.000000000Z \
+  --variant zenoh --runner smoke --run smoke01 \
+  --threading-mode single \
+  -- --zenoh-sidecar-base-port 20100
+```
+
+Expected output:
+
+```
+[zenoh] build: <sha>+dirty (rustc <version>)
+{"event":"progress",...}
+Error: zenoh Single mode RPC client not yet implemented; pending
+T14.9b. Sidecar is running but no client surface is wired up.
+```
+
+i.e. the variant brings the sidecar up, the driver runs through
+connect/operate, the first publish refuses, the disconnect path
+kills the sidecar, and the process exits non-zero with the T14.9b
+pointer. Inspect `Get-Process zenohd` (Windows) or `pgrep zenohd`
+(Unix) afterwards to confirm no orphan sidecar.
 
 ### `--recv-buffer-kb`
 
