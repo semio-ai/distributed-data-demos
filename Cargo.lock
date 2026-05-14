@@ -4438,12 +4438,14 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "libc",
  "num_cpus",
  "rand 0.8.6",
  "serde_json",
  "tempfile",
  "tokio",
  "variant-base",
+ "windows-sys 0.60.2",
  "zenoh",
 ]
 

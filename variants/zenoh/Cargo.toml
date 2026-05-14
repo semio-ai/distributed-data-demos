@@ -28,7 +28,29 @@ num_cpus = "1"
 # slices off it, and hand them to `publisher.put(...)` without per-call
 # allocation in the hot path.
 bytes = "1"
+# T14.9a: `serde_json` is used to build the per-spawn zenohd config
+# file enabling the REST plugin. Promoted from a dev-dep to a runtime
+# dep when the sidecar lifecycle was added.
+serde_json = "1"
+
+# T14.9a per-platform sidecar child-process cleanup.
+# Windows: Job Object with KILL_ON_JOB_CLOSE guarantees zenohd dies if
+# variant-zenoh is SIGKILLed (preventing orphans). `windows-sys` is
+# already a transitive dep in the workspace and lighter than `windows`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+# T14.9a Linux: prctl(PR_SET_PDEATHSIG, SIGTERM) in a pre-exec hook so
+# the kernel signals the child when the variant process dies (orphan
+# protection). macOS gets best-effort setpgid via the same path; see
+# CUSTOM.md "Sidecar lifecycle".
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-serde_json = "1"
