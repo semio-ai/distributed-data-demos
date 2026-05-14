@@ -11060,3 +11060,46 @@ classifier polish), the benchmark now produces:
 + stderr captures. Cache at `logs/.../.cache/` is 5.1 GB (the T11.6
 first-rebuild RSS pain point, took ~50 min on this dataset).
 
+
+---
+
+## 2026-05-14 -- Analysis pivot tables and CSV export (orchestrator)
+
+Extended `analyze.py --summary` with a per-QoS pivot table that the
+user asked for ("Option A": family x mode rows, workload-profile
+columns, one table per QoS level = 4 tables, each cell renders three
+sub-lines `Delivery% / Ratio% / mean+-std ms`). Same module backs a
+new `--csv-out <path>` flag that dumps the full result matrix as CSV
+for downstream spreadsheet/notebook work.
+
+### Commits
+
+- `9fc5887` PerformanceResult gains `latency_mean_ms`, `latency_std_ms`,
+  `expected_writes_per_sec`, `receives_to_expected_ratio_pct`
+- `ca92494` new `analysis/pivot_tables.py` module -- spawn-name parser,
+  PivotCell/PivotTable types, builder, formatter, CSV exporter
+- `a44ea97` `analyze.py` integration: pivot section in `--summary`,
+  new `--csv-out <path>` flag
+- `5b8fdd7` 48 tests covering parser edge cases, multi-QoS bucketing,
+  empty-cell rendering, CSV escaping
+- `0cba328` ANALYSIS.md sections 6.8 (pivot layout) and 6.9 (CSV schema)
+
+### Validation
+
+- `pytest analysis/`: 263 pass + 6 pre-existing skips, ruff clean.
+- Real-data spot check on the 108 GB canonical dataset rendered the
+  expected 4 tables and the QoS-4 multi pivot matched the headline
+  numbers in the prior STATUS entry (websocket 100% / quic 99.9% /
+  hybrid-single catastrophic at high vpt / zenoh >100% on multicast
+  loopback).
+
+### What's still open
+
+- **T11.6** -- cache-rebuild RSS optimisation. Documented one-time
+  cost on the 108 GB dataset is ~5.1 GB cache / ~50 min wall-time.
+  Not blocking; filed as low priority.
+
+The architectural arc that began 2026-05-11 (websocket asymmetric
+timeouts) and the analysis polish that followed are now complete.
+Backlog reduces to T11.6.
+
