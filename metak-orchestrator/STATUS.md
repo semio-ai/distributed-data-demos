@@ -10820,3 +10820,89 @@ plumbing.
    replace the REST one with minimal code churn (the variant's
    trait surface is unaffected by the swap).
 
+
+---
+
+## 2026-05-14 — T14.9 architectural piece complete (orchestrator)
+
+T15.11 (variant watchdog) + T14.9a (sidecar lifecycle) + T14.9b (sync
+RPC client) all landed in one cycle. Net architectural state:
+
+### T15.11 — variant-base watchdog
+
+Catches variants stalled inside transport library code that T15.5's
+inline idle detector can't see (because the driver thread is blocked).
+Self-exits with code 2 + flushed JSONL + clear stderr signature; T14.17
+classifies as `variant_self_killed_idle`. Default 30s threshold (lowered
+from spec's 60s to win the race vs runner's `default_timeout_secs`).
+
+Honest limitation discovered: the watchdog handles slow STALLS but NOT
+fast PANICS. Zenoh qos3 alice crashes within ~2s of operate (faster
+than watchdog can fire), JSONL still gets truncated, still classifies
+as `deadlock`. Distinct failure mode from the stall case Zenoh qos4
+exhibits.
+
+### T14.9a + T14.9b — Zenoh sidecar architecture
+
+Zenoh now has `[Single, Multi]` capability. Single mode is:
+
+```
+variant-zenoh (sync, tokio-free)
+    ├── HTTP PUT to localhost:<rest_port>/<key>  (publish via ureq)
+    └── SSE reader thread on localhost:<rest_port>/<key_expr>  (poll_receive)
+                ↓
+        zenohd sidecar (multi-threaded async, Job-Object-killed-on-variant-exit)
+                ↓
+        Zenoh peer mesh (TCP listen/connect on 127.0.0.1:<rest_port + 1000>)
+```
+
+`cargo tree -e features -p variant-zenoh` confirms tokio + zenoh are
+NOT in the Single-mode call graph. WASM compatibility is verifiable.
+
+Two-runner integration test (`tests/two_runner_regression.rs`
+`two_runner_regression_single_mode_t149b`): 99.97% / 99.67% cross-peer
+delivery at 1K msg/s, both runners `runner_idle_terminated`.
+
+Three audit-time predictions corrected empirically by the worker:
+1. SSE trigger is `Accept: text/event-stream` header, not `?_method=SUB`.
+2. Payload is JSON-wrapped with base64-encoded `value`, not raw bytes.
+3. Same-host sidecar mesh needs explicit TCP listen/connect.
+
+Install caveat (documented in `variants/zenoh/CUSTOM.md`): `cargo install
+zenohd --version 1.9.0` doesn't bundle the REST plugin DLL — operators
+must build `zenoh-plugin-rest-1.9.0` separately and place
+`zenoh_plugin_rest.{dll,so,dylib}` alongside the binary.
+
+### What's still open
+
+- **Zenoh qos3 alice panic at high rate** — variant process crashes
+  fast inside Zenoh's library code. Watchdog can't catch it (too fast).
+  Worth re-testing after T14.9 lands in `[Single, Multi]` mode: if the
+  sidecar absorbs the panic into the zenohd process, the variant may
+  see only a closed connection and exit gracefully via T15.5 idle
+  detection. A focused stress repro with Zenoh in Single mode would
+  confirm.
+- **`variant_crashed` classification** — currently truncated-JSONL
+  outcomes all classify as `deadlock`. Two distinct underlying causes:
+  variant stalled past safety-net (rare with T15.11 active) vs variant
+  panicked/crashed mid-write (Zenoh qos3 case). Splitting the
+  classification would improve operator diagnostics. Small T14.17
+  follow-up if motivated.
+
+### Commits this cycle
+
+- T15.11: `97e3b38`, `113e54d`, `60674dc`, `c525714`, `16a4296`
+- T14.9a: `a518352`, `7d66089`, `2996592`, `6965e63`, `ac64232`
+- T14.9b: `98a5ac5`, `58c6433`, `2b48376`, `d99ca42`
+
+### The end-state map
+
+E14-era reactive complexity → E15 unified observational architecture
+→ T15.10 closes UDP-coord fragility → T15.11 cleanly diagnoses
+variant stalls → T14.9 gives Zenoh a WASM-friendly Single mode.
+
+The only remaining items in the backlog are small follow-ups
+(`variant_crashed` classification; QoS-aware ordering check for webrtc
+qos1-2; T11.6 cache RSS), each filed but neither blocking nor
+architecturally significant.
+
