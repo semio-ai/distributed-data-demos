@@ -57,21 +57,47 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Resolve a release binary path, preferring the workspace-level
+/// `target/release/` location (where `cargo build --release -p <pkg>`
+/// from the repo root produces output) and falling back to the
+/// historical per-subfolder `<pkg>/target/release/` paths the tests
+/// originally documented as pre-requisites.
+fn locate_release_binary(workspace_relative: &[&str], legacy_relative: &[&str]) -> PathBuf {
+    let workspace = {
+        let mut p = repo_root();
+        for seg in workspace_relative {
+            p = p.join(seg);
+        }
+        p
+    };
+    if workspace.exists() {
+        return workspace;
+    }
+    let mut legacy = repo_root();
+    for seg in legacy_relative {
+        legacy = legacy.join(seg);
+    }
+    legacy
+}
+
 fn runner_binary() -> PathBuf {
-    repo_root()
-        .join("runner")
-        .join("target")
-        .join("release")
-        .join("runner.exe")
+    locate_release_binary(
+        &["target", "release", "runner.exe"],
+        &["runner", "target", "release", "runner.exe"],
+    )
 }
 
 fn variant_binary() -> PathBuf {
-    repo_root()
-        .join("variants")
-        .join("zenoh")
-        .join("target")
-        .join("release")
-        .join("variant-zenoh.exe")
+    locate_release_binary(
+        &["target", "release", "variant-zenoh.exe"],
+        &[
+            "variants",
+            "zenoh",
+            "target",
+            "release",
+            "variant-zenoh.exe",
+        ],
+    )
 }
 
 /// Skip the test (returns true) if either binary is missing.
@@ -658,5 +684,171 @@ fn two_runner_regression_max_throughput_no_deadlock() {
         bob_pct >= 80.0,
         "max: bob received only {bob_recv_from_alice}/{alice_writes} \
          ({bob_pct:.2}%) from alice in alice's operate window; below the 80% threshold"
+    );
+}
+
+/// Returns true (= test should skip) if `zenohd` is not findable on
+/// this host. T14.9b's Single-mode path requires the binary +
+/// `zenoh_plugin_rest.{dll,so,dylib}` to be installed alongside (see
+/// CUSTOM.md "Installing zenohd"). The test prints a clear skip
+/// reason so CI without zenohd doesn't fail; install via
+/// `cargo install zenohd --version 1.9.0` to exercise it locally.
+fn check_zenohd_or_skip(test_name: &str) -> bool {
+    if let Some(p) = std::env::var_os("ZENOHD_PATH") {
+        let candidate = PathBuf::from(&p);
+        if candidate.is_file() {
+            return false;
+        }
+        eprintln!(
+            "[T14.9b-zenoh] SKIP {test_name}: ZENOHD_PATH={} does not point at a file",
+            candidate.display()
+        );
+        return true;
+    }
+    let path_env = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => {
+            eprintln!("[T14.9b-zenoh] SKIP {test_name}: PATH unset");
+            return true;
+        }
+    };
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for dir in std::env::split_paths(&path_env) {
+        if dir.join("zenohd").is_file() {
+            return false;
+        }
+        if cfg!(windows) {
+            for ext in &exts {
+                if dir.join(format!("zenohd{ext}")).is_file() {
+                    return false;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[T14.9b-zenoh] SKIP {test_name}: zenohd not found on PATH and \
+         ZENOHD_PATH is unset. Install via \
+         `cargo install zenohd --version 1.9.0` (and copy \
+         zenoh_plugin_rest.dll alongside, see CUSTOM.md) to run this test."
+    );
+    true
+}
+
+/// T14.9b regression: end-to-end two-runner Single-mode test. Both
+/// runners spawn their own variant-zenoh, which each spawn a zenohd
+/// sidecar and route publish/poll_receive through the REST plugin
+/// (HTTP PUT + SSE). Cross-peer delivery percentages must be >=80%
+/// in alice<-bob and bob<-alice over the operate window; below
+/// that indicates a regression of the T14.9b RPC client wiring.
+///
+/// **Modest workload** (10 vpt x 100 Hz qos1 = 1K msg/s) per the
+/// T14.9b task brief. High-rate Single-mode is out of scope.
+#[test]
+#[ignore]
+fn two_runner_regression_single_mode_t149b() {
+    let _guard = serialize_tests().lock().unwrap_or_else(|p| p.into_inner());
+    let test_name = "single-t149b";
+    if check_binaries_or_skip(test_name) {
+        return;
+    }
+    if check_zenohd_or_skip(test_name) {
+        return;
+    }
+    let fixture = repo_root()
+        .join("variants")
+        .join("zenoh")
+        .join("tests")
+        .join("fixtures")
+        .join("two-runner-zenoh-single.toml");
+
+    // Distinct base port from the other tests so a parallel run
+    // (cargo test runs ignored tests in parallel) doesn't collide.
+    let base_port: u16 = 29476;
+    let result = drive_two_runners(
+        &fixture,
+        // Fixture declares `threading_modes = ["single"]` -- a
+        // single-element array -- so the runner's spawn-name
+        // expansion (see `runner/src/spawn_job.rs` `expand_jobs`)
+        // does NOT append the `-single` suffix. The spawn name
+        // therefore matches the variant.name directly.
+        "zenoh-t149b-single",
+        "zenoh-t149b-single",
+        test_name,
+        base_port,
+    );
+
+    let alice_writes = result.alice.writes_in_window();
+    let bob_writes = result.bob.writes_in_window();
+    let alice_recv_from_bob = result
+        .alice
+        .receives_from_in_writer_window("bob", &result.bob);
+    let bob_recv_from_alice = result
+        .bob
+        .receives_from_in_writer_window("alice", &result.alice);
+
+    let alice_pct = if bob_writes == 0 {
+        0.0
+    } else {
+        (alice_recv_from_bob as f64) * 100.0 / (bob_writes as f64)
+    };
+    let bob_pct = if alice_writes == 0 {
+        0.0
+    } else {
+        (bob_recv_from_alice as f64) * 100.0 / (alice_writes as f64)
+    };
+
+    println!(
+        "[T14.9b-zenoh] alice <- bob single: {alice_recv_from_bob}/{bob_writes} \
+         ({alice_pct:.2}%) in [op_start..eot_sent] (alice_writes={alice_writes}, wall={:.2}s)",
+        result.wall_time.as_secs_f64()
+    );
+    println!(
+        "[T14.9b-zenoh] bob <- alice single: {bob_recv_from_alice}/{alice_writes} \
+         ({bob_pct:.2}%) in [op_start..eot_sent] (bob_writes={bob_writes})"
+    );
+
+    assert!(
+        !result.combined_stderr.contains("panic"),
+        "single-t149b: combined stderr contained `panic`:\n{}",
+        result.combined_stderr
+    );
+    assert!(
+        !result
+            .combined_stderr
+            .contains("not yet implemented; pending T14.9b"),
+        "single-t149b: variant still reports the T14.9b pre-implementation error; \
+         T14.9b RPC client is NOT wired up. stderr:\n{}",
+        result.combined_stderr
+    );
+    assert!(
+        alice_writes > 0,
+        "single-t149b: alice produced zero writes; runner did not reach operate"
+    );
+    assert!(
+        bob_writes > 0,
+        "single-t149b: bob produced zero writes; runner did not reach operate"
+    );
+    // 80% threshold mirrors the established max-throughput test
+    // tolerance: SSE / REST plugin may drop on sustained 1K msg/s
+    // but the variant must demonstrate end-to-end Single-mode
+    // delivery is working.
+    assert!(
+        alice_pct >= 80.0,
+        "single-t149b: alice received only {alice_recv_from_bob}/{bob_writes} \
+         ({alice_pct:.2}%) from bob; below the 80% T14.9b regression threshold"
+    );
+    assert!(
+        bob_pct >= 80.0,
+        "single-t149b: bob received only {bob_recv_from_alice}/{alice_writes} \
+         ({bob_pct:.2}%) from alice; below the 80% T14.9b regression threshold"
     );
 }

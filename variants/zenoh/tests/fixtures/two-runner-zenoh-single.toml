@@ -1,0 +1,42 @@
+# T14.9b two-runner Single-mode integration fixture.
+#
+# Exercises the post-T14.9 sidecar topology end-to-end: each runner
+# spawns its own variant-zenoh, which spawns its own zenohd sidecar
+# (via T14.9a), and publish/poll_receive route through the sidecar's
+# REST plugin (HTTP PUT + SSE -- T14.9b).
+#
+# Modest workload (10 vpt x 100 Hz = 1000 msg/s, qos 1) keeps the
+# REST plugin within its comfort zone; the test is not a stress
+# test, it's a regression that the Single-mode call graph works
+# end-to-end. High-rate Single-mode stress is out of scope per the
+# T14.9b task brief (the deadlock is Zenoh-internal; T15.11
+# watchdog converts to clean exit).
+#
+# The two sidecars listen on per-runner REST ports derived from
+# `--zenoh-sidecar-base-port`: alice -> 20300, bob -> 20301 via
+# `runner_index * runner_stride` (stride = 1). The variant code
+# auto-derives `runner_index` from the runner-injected `--peers`
+# map, so we just specify the base.
+
+run = "zenoh-t149b-single"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-t149b-single"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 3
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 10
+  qos = 1
+  threading_modes = ["single"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+  zenoh_sidecar_base_port = 20300
