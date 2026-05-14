@@ -10457,3 +10457,366 @@ T14.9 (Zenoh router-RPC sidecar) is the last architectural item to
 close the remaining 2-of-32 gap. Until then the project's structural
 state is as strong as it has been since session start.
 
+---
+
+## T14.9 -- AUDIT findings (2026-05-11, worker)
+
+Worker: spawned to implement T14.9 (Zenoh `Single` mode via a
+`zenohd` sidecar). Per the task brief, an AUDIT was mandatory before
+writing code; the worker stopped after the audit and recommends
+**Path B**: split T14.9 into two sub-tasks. The rationale, evidence,
+and proposed split follow.
+
+### Decision: Path B (split into T14.9a + T14.9b)
+
+The audit surfaces three independent risks that each on its own
+would qualify as a "Hard stop" condition in the task brief, and
+together they make a single-shot Path A implementation untractable
+inside the worker's authorised scope. The work is well-bounded once
+each risk has its own design decision, but those decisions belong in
+separate tasks so the orchestrator can sequence them and any one
+can be re-scoped without invalidating the other.
+
+The three risks:
+
+1. **`zenohd` binary distribution is not a `cargo build` concern.**
+   `zenohd` ships as its own crate (`zenohd = "1.9.0"`) and as a
+   pre-built download from the Zenoh project. There is no
+   `[build-dependency]` invocation that produces a `zenohd` binary
+   inside the workspace's `target/release/`. The realistic install
+   stories are `cargo install zenohd --version 1.9` (writes to
+   `~/.cargo/bin/`, persists across `cargo clean`) or operator-
+   installed package (Debian, Homebrew, Windows MSI from the
+   project releases). Either way the binary is **not** produced by
+   `cargo build -p variant-zenoh` and the variant has to discover
+   it at runtime (PATH lookup, env var override, or a config flag).
+
+   This is the brief's first hard-stop trigger verbatim: "If
+   `zenohd` binary distribution is a non-trivial integration
+   problem (e.g. requires a separate install step that breaks
+   `cargo build`): STOP after audit. File the install-story as a
+   sub-task."
+
+2. **RPC surface choice is genuinely WASM-shape-dependent and not
+   a free pick.** Three surfaces exist:
+
+   - **`zenoh-plugin-rest`** (statically linked into `zenohd`,
+     loaded with `--rest-http-port=<port>`). PUT for publish, SSE
+     (`Accept: text/event-stream`) GET on a key expression for
+     subscribe. Payload is base64-wrapped JSON on the SSE path;
+     PUT body is raw bytes. Pros: zero extra install (statically
+     linked). Cons: HTTP/1.1 + SSE; subscribe consumes a
+     long-lived HTTP connection; encoding overhead vs native
+     Zenoh wire format; the SSE format JSON-wraps the value so
+     hot-path receive must base64-decode every sample.
+
+   - **`zenoh-plugin-remote-api`** (dynamic plugin; **this is what
+     the official `zenoh-ts` browser SDK speaks**). WebSocket
+     wire protocol between client and router; carries native
+     Zenoh sample types as binary. Pros: this is the
+     project-sanctioned WASM/browser path -- exactly the topology
+     the team's WASM use case will land on. Cons: requires
+     building or vendoring the `libzenoh_plugin_remote_api`
+     dynamic library and placing it in `~/.zenoh/lib` (or via
+     `plugins_loading.search_dirs`), and the protocol surface is
+     opaque (no public spec; the contract is the zenoh-ts client
+     code).
+
+   - **Variant publishes/subscribes to its own colocated `zenohd`
+     via native Zenoh wire (`mode: "client"`)**. The variant is
+     still a Zenoh client crate; the router is just a peer it
+     connects to. Pros: zero new protocol surface; we keep the
+     existing `ZenohVariant` code largely intact. Cons: this is
+     **not** the WASM topology -- in browser-WASM the variant
+     CANNOT speak native Zenoh because the underlying transports
+     (TCP/UDP/QUIC links) are unavailable from the sandbox. So
+     this satisfies the qos3/qos4 deadlock-isolation use case but
+     does NOT satisfy the load-bearing acceptance criterion (WASM
+     compatibility). Per the brief: "T14.9 should NOT be designed
+     as a deadlock fix [...] If you find yourself motivating
+     T14.9 by the deadlock, redirect to the WASM framing."
+
+   Picking between these is a design decision with non-trivial
+   downstream consequences (test layout, install story, log
+   schema, the variant's encoding path). The worker's
+   recommendation is to **target `zenoh-plugin-remote-api` for the
+   WASM-true path**, but recording the rationale and a small spike
+   in a dedicated sub-task is the right move; rolling it into the
+   implementation task would force the worker to commit to one
+   surface mid-coding.
+
+3. **Sync RPC client + tokio-free verification is non-trivial.**
+   The brief calls out: "WASM compatibility is the load-bearing
+   acceptance criterion: the Single-mode client code path MUST NOT
+   pull in tokio. Verify with `cargo tree -e features` after
+   implementation." Sync HTTP+SSE clients exist (`ureq` is the
+   obvious choice; pure-Rust, blocking I/O, no tokio); a sync
+   WebSocket client without tokio is harder (`tungstenite` is the
+   reference, but the WASM-friendly path via browser fetch /
+   WebSocket APIs needs a separate adapter, e.g. `web-sys`).
+   Worse: `cargo tree -e features` operates per-crate, so we
+   need a `cargo` invocation that excludes the existing `[Multi]`
+   path's tokio (which stays in the binary for backwards compat).
+   The "tokio not in Single mode" claim therefore requires either
+   (a) cfg-gating the Multi mode out at compile time for
+   WASM builds (a clean architectural move but invasive across
+   the file), or (b) accepting that the binary contains tokio
+   but proving the `Single` codepath does not call into it. (b)
+   is verifiable but the verification artifact is a hand-traced
+   call graph, not a `cargo tree` output -- much weaker.
+
+### Audit -- detailed findings
+
+#### 1. `zenohd` binary distribution
+
+- Available as: `cargo install zenohd --version 1.9.0` (installs
+  to `~/.cargo/bin/zenohd[.exe]`). No tokio leakage into the
+  variant crate -- it's a separate binary entirely.
+- Alternative: pre-built binaries from
+  https://download.eclipse.org/zenoh/zenoh/ (Debian, RPM, msi,
+  source tar). Not used in CI today.
+- The `zenoh-plugin-rest` is **statically linked into `zenohd`**
+  per the upstream README ("the `zenohd` links this plugin
+  statically, it's not necessary to install it"). Activated with
+  `--rest-http-port=<port>` or via JSON5 config.
+- The `zenoh-plugin-remote-api` is a **dynamic plugin**: a
+  `libzenoh_plugin_remote_api.so` / `.dll` / `.dylib` shared
+  library that `zenohd` loads from `~/.zenoh/lib/` or a path
+  listed in `plugins_loading.search_dirs`. Building it requires
+  the same Rust version as `zenohd` (the README warns of SIGSEGV
+  on ABI mismatch). This is the harder install story.
+- **PATH discovery**: the variant's `connect(Single)` should:
+  - check `ZENOHD_PATH` env var first;
+  - fall back to `which zenohd` (PATH lookup);
+  - return a clear error early ("zenohd binary not found; install
+    with `cargo install zenohd` or set ZENOHD_PATH") BEFORE
+    spawning any process or opening any RPC client. This matches
+    the brief's "return the SAME error path before any I/O".
+
+#### 2. RPC surface comparison
+
+| Surface | Install | Sync client | WASM-shape | Notes |
+|---------|---------|-------------|-----------|-------|
+| `zenoh-plugin-rest` (HTTP+SSE) | statically linked in `zenohd` -- no extra step | `ureq` for HTTP, ureq+stream-reader for SSE | YES via browser `fetch` + `EventSource` (web-sys), but encoding overhead | publish=PUT, subscribe=SSE GET on key expression |
+| `zenoh-plugin-remote-api` (WebSocket) | dynamic plugin, separate build, ABI-locked to `zenohd` | `tungstenite` for native; `web-sys::WebSocket` for browser-WASM | YES; this is the official zenoh-ts SDK path | richer protocol; native sample types |
+| Colocated `zenohd` + native Zenoh client (`mode: "client"`) | uses existing `zenoh` crate | NO -- existing crate is async | NO (browser-WASM can't speak native Zenoh wire) | qos3/qos4 deadlock isolated to router process; WASM-incompatible |
+
+Worker's surface ranking for T14.9's stated motivation:
+
+1. **`remote-api` (WebSocket)** -- highest fidelity to the WASM
+   use case the task targets. The team is implicitly already
+   building toward this if they're targeting browser-WASM, since
+   `zenoh-ts` is the official browser binding.
+2. **`zenoh-plugin-rest` (HTTP+SSE)** -- simpler install story
+   (statically linked), simpler sync Rust client story (`ureq`),
+   and still WASM-compatible (browser `fetch` + `EventSource` work
+   in any browser). Lower fidelity to the production path the team
+   actually plans to use, but a workable first cut.
+3. **Colocated native Zenoh client** -- does not satisfy the WASM
+   load-bearing criterion. Explicitly rejected.
+
+#### 3. Sidecar lifecycle: variant-owned vs runner-owned
+
+- **Variant-owned**: variant spawns `zenohd` as a child in
+  `connect(Single)`, kills in `disconnect`. Pros: no contract
+  change; isolation per spawn; the variant's own process tree
+  reflects the topology. Cons: spawn/teardown cost per variant
+  invocation (~1-2 seconds for zenohd cold start; non-trivial
+  against a 1-2s operate phase); port collision risk if two
+  variants spawn concurrently on the same host (the runner
+  multiplexes by writer name today, but two writers on the same
+  machine each need a distinct router port).
+- **Runner-owned**: runner spawns one `zenohd` per host at startup,
+  kills at shutdown. Pros: faster operate phase (router stays
+  warm); shared across spawns; clearer ownership when multiple
+  variant types want the same sidecar (none today, but the future
+  Aeron variant might). Cons: new contract surface (TOML field
+  declaring sidecar lifecycle; spawn-time arg telling the variant
+  where to connect); contract change crosses the variant/runner
+  boundary which T14.7 explicitly kept clean.
+- **Worker recommendation**: variant-owned for T14.9 first cut.
+  Match the task's "default expectation is variant-owned for the
+  first cut and runner-promoted-if-needed later". Port allocation
+  via OS-assigned port (`--rest-http-port=0` is not supported by
+  `zenoh-plugin-rest` at the moment -- a fixed-port-with-retry
+  loop is the pragmatic workaround). The Cargo.toml hint that
+  `cargo install zenohd` produces `~/.cargo/bin/zenohd[.exe]`
+  applies to both lifecycle choices.
+
+#### 4. OS-level child-process cleanup
+
+The brief calls out: "If variant crashes / is SIGKILLed, the OS
+should clean up the child sidecar (verify per platform -- Windows
+uses Job Objects; Linux/macOS use process groups + signal
+handlers)."
+
+- **Linux/macOS**: standard `setpgid` + a `SIGTERM` to the process
+  group on graceful shutdown; on SIGKILL the kernel does not
+  cascade -- the orphaned `zenohd` survives. Mitigation:
+  `prctl(PR_SET_PDEATHSIG, SIGTERM)` (Linux only) ties child
+  death to parent death. macOS has no clean equivalent; the
+  workaround there is a watchdog inside the child or process
+  groups + a wrapper script.
+- **Windows**: Job Objects (`CreateJobObjectW` +
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` +
+  `AssignProcessToJobObject`). When the parent's handle to the
+  job closes (which happens on parent termination, including
+  crash), the kernel kills all assigned processes. This is the
+  reliable solution but requires unsafe winapi calls.
+
+  The crate `shared_child = "1"` does NOT solve this; it only
+  manages handles for normal termination. The crate `windows
+  = "0.x"` exposes the Job Object API but the integration is
+  non-trivial (~30 LOC of unsafe).
+
+- **Verdict**: per-platform child-process cleanup is the kind of
+  thing that should be its own deliverable. Folding it into a
+  generic "sidecar lifecycle" task is fine; folding it INTO the
+  same task as the RPC client implementation is not.
+
+#### 5. Async runtime check (tokio-free in Single mode)
+
+- `ureq 3.x` is pure sync (blocking sockets via `std::net`); no
+  tokio. Confirmed via `cargo info ureq` features list and the
+  upstream README ("It uses blocking I/O instead of async I/O").
+- `tungstenite 0.21+` is also pure sync (when used directly, not
+  via `tokio-tungstenite`).
+- The existing `[Multi]` codepath in `variants/zenoh/src/zenoh.rs`
+  uses tokio (the `Runtime`, `mpsc`, `oneshot`). For Single mode
+  to be **provably** tokio-free, either:
+  - the existing tokio-rooted code paths must be `cfg`-gated out
+    (i.e. the binary has two flavors, "single-only" and
+    "multi-only"); or
+  - we accept that the BINARY contains tokio but the SINGLE-MODE
+    EXECUTION PATH does not call any tokio entry point.
+- `cargo tree -e features -p variant-zenoh` after a Path A
+  implementation will still show tokio as a transitive dep
+  (because `[Multi]` keeps it). The right verification is either
+  a cfg-gated WASM build (`cargo build --target wasm32-wasip1
+  --features wasm-single-only`) or a per-cfg call-graph audit.
+  Neither is in the brief's scope as a single step; both want
+  more design upfront.
+
+#### 6. Scope estimate
+
+Worst-case (`remote-api` WebSocket, runner-owned sidecar,
+cfg-gated tokio exclusion, full integration test, Windows Job
+Object handling): ~1500 LOC + 3 days of focused worker time.
+
+Best-case (`zenoh-plugin-rest` REST+SSE, variant-owned sidecar,
+non-strict tokio exclusion, smoke test only, best-effort child
+cleanup): ~600 LOC + 1.5 days of focused worker time.
+
+Either estimate exceeds the brief's "1 day of focused worker
+time" threshold that triggers a split recommendation.
+
+### Proposed split
+
+**T14.9a -- variants/zenoh: sidecar lifecycle for Single mode**
+
+Scope:
+- Variant-owned `zenohd` spawn / kill in `connect(Single)` /
+  `disconnect`.
+- Binary discovery: `ZENOHD_PATH` env > `which zenohd` > clear
+  error. Error path exercised BEFORE any I/O.
+- OS-level cleanup: Windows Job Object kill-on-close; Linux
+  `prctl(PR_SET_PDEATHSIG, SIGTERM)`; macOS best-effort.
+- Port allocation: fixed default with retry on bind-failure.
+- Configures `zenohd` to enable the chosen RPC plugin (default:
+  REST plugin at chosen port; left tweakable for T14.9b to swap
+  to remote-api).
+- Tests: unit tests for the discovery / port logic; an
+  integration test that spawns + kills `zenohd` and confirms the
+  port is freed.
+- Variant still declares `supported_threading_modes() = &[Multi]`
+  at the end of T14.9a (Single mode is connected but
+  publish/poll_receive on the Single path still error -- the
+  sidecar exists, the RPC client doesn't yet). T14.9a deliberately
+  leaves Single non-functional so the lifecycle work is testable
+  on its own.
+
+Scope estimate: ~250 LOC + 0.5 day.
+
+**T14.9b -- variants/zenoh: sync RPC client for Single mode**
+
+Depends on T14.9a.
+
+Scope:
+- Implement the sync RPC client (worker proposes
+  `zenoh-plugin-rest` HTTP+SSE via `ureq` for the first cut; the
+  T14.9a docs leave the door open to swap in `remote-api`/
+  WebSocket as a follow-up).
+- `publish` -> HTTP PUT on `http://localhost:<port>/<key>` with
+  the variant's existing encoded payload as the body.
+- `poll_receive` -> consume a long-lived SSE GET on the
+  subscriber wildcard; the SSE stream lives on a dedicated OS
+  thread (sync, no runtime), pushes decoded samples into an
+  `std::sync::mpsc` channel that the variant's main thread
+  `try_recv`s.
+- `try_publish` honours QoS Block/Drop semantics on the bridge
+  channel just like the existing Multi path does.
+- Variant FLIPS to declaring `supported_threading_modes() =
+  &[Single, Multi]` at the end of this task.
+- Tests: two-runner localhost regression at a modest workload
+  (e.g. 100 vps x 10 Hz x 2s) verifying clean operate + idle
+  detection exit + JSONL log integrity. NOT the high-rate
+  symmetric stress -- that's T15.11 territory.
+- Documentation: `variants/zenoh/CUSTOM.md` "Threading modes"
+  section rewritten to reflect Single being live, plus EPICS.md
+  E14 "Future work" promoted to a retrospective note.
+
+Scope estimate: ~350 LOC + 1 day.
+
+### Why this is Path B, not Path A
+
+Two of the three audit risks each individually trigger the
+brief's hard-stop conditions:
+
+> If `zenohd` binary distribution is a non-trivial integration
+> problem (e.g. requires a separate install step that breaks
+> `cargo build`): STOP after audit. File the install-story as a
+> sub-task.
+
+`cargo install zenohd` is exactly such an install step. It does
+not break `cargo build`, but it is not produced by `cargo build`
+either, and the variant has to discover the binary at runtime.
+
+> If the RPC surface options all pull in tokio: STOP after audit.
+
+The options do NOT all pull in tokio -- `ureq` is sync -- but
+the choice between REST and remote-api is not a clear winner
+without an explicit design decision (the WASM-fidelity vs
+install-complexity tradeoff). Worker's surface ranking above
+makes a recommendation but does not commit to it; that commit
+belongs in T14.9b's scoping.
+
+The scope estimate (~1.5 days best-case, ~3 days worst-case)
+also exceeds the brief's "1 day of focused worker time"
+threshold.
+
+Splitting into T14.9a (lifecycle) + T14.9b (RPC client) gives
+each sub-task a single bounded design decision, ~0.5-1 day of
+worker time each, and lets the orchestrator sequence them or
+reassign T14.9b's RPC choice independently of the lifecycle
+plumbing.
+
+### Files touched by this audit
+
+- `metak-orchestrator/STATUS.md` -- this section.
+- No code changes; the worker stopped at the audit per the
+  brief's Path B instruction.
+
+### Recommendation to the orchestrator
+
+1. File T14.9a + T14.9b per the proposed split above.
+2. Mark T14.9 in TASKS.md as "superseded by T14.9a+T14.9b; see
+   STATUS.md AUDIT".
+3. Decide ahead of T14.9b: REST+SSE first cut (faster) vs
+   remote-api/WebSocket first cut (WASM-true). Worker leans
+   REST+SSE for the first cut with a note in CUSTOM.md that
+   remote-api is the long-term path; orchestrator may overrule.
+4. Optionally schedule a follow-up T14.9c if/when the team
+   confirms a real WASM build target so the WebSocket path can
+   replace the REST one with minimal code churn (the variant's
+   trait surface is unaffected by the swap).
+
