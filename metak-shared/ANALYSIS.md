@@ -225,11 +225,22 @@ missing ones as errors.
 
 ### 5.2 Ordering
 
-For **QoS levels 2, 3, and 4** (all ordered modes): receives on a given
-runner from a given writer must arrive with non-decreasing sequence numbers
-(strictly increasing for levels 3 and 4). Out-of-order receives are flagged.
+For **QoS levels 3 and 4** (reliable-ordered, reliable-tcp): receives on
+a given runner from a given writer must arrive with strictly increasing
+sequence numbers. Out-of-order receives flag ``[FAIL: ordering]``.
 
-For **QoS level 1** (unordered): no ordering check.
+For **QoS levels 1 and 2** (best-effort, latest-value): no ordering
+guarantee by design. qos1 is best-effort datagram (no order, no retry);
+qos2 is latest-value datagram (newest write wins, no order). The
+WebRTC qos1/qos2 implementations carry data over an unreliable /
+unordered SCTP channel, so out-of-order receives are a normal feature
+of the protocol, not a failure. The analyzer still counts and reports
+``out_of_order`` so operators can see the absolute number, but the
+``[FAIL: ordering]`` annotation does NOT fire for qos1-2 rows.
+
+The post-2026-05-14 QoS-aware ordering rule was filed as a T14.17
+follow-up after WebRTC qos2 rows on the ``stress-e14`` dataset showed
+``[FAIL: ordering]`` despite the variant operating exactly as designed.
 
 ### 5.3 Duplicates
 
@@ -261,7 +272,7 @@ custom-udp-replication   run01   3    100.00%    0             0      0         
 custom-udp-replication   run01   4    100.00%    0             0      -                completed
 ```
 
-### 5.6 Timeout classification (T14.17, extended in T15.6 and T15.11)
+### 5.6 Timeout classification (T14.17, extended in T15.6, T15.11, and a 2026-05-14 follow-up)
 
 The `Timeout` column carries a per-spawn classification of the writer
 side's exit cause. Spawns that share a `(variant, run)` group but
@@ -271,7 +282,7 @@ that shares the writer.
 
 The classifier inspects the per-spawn JSONL events plus the runner's
 stderr capture (`<log_subdir>/<variant>-<runner>-stderr.txt`, per
-`runner/src/spawn.rs::stderr_capture_path`) and emits one of eight
+`runner/src/spawn.rs::stderr_capture_path`) and emits one of nine
 enum values, in the precedence below. The first matching rule wins.
 
 | Value | When | Operator reading |
@@ -282,7 +293,8 @@ enum values, in the precedence below. The first matching rule wins.
 | `eot_lost` | Writer logged `eot_sent` but never reached `phase=silent` | Legacy E12/E14 failure shape: writer published EOT but something on the other side prevented the spawn from completing cleanly. Suspect peer-side saturation if delivery throughput was close to the variant's headroom. |
 | `variant_rejected` | Writer never reached `phase=operate` and stderr capture is non-empty | The variant exited cleanly before operate, typically because the configured QoS / threading mode / port is unsupported. Substring matches against `does not support single-threaded mode`, `does not support QoS`, `port collision`, `unsupported` confirm known rejection paths. |
 | `variant_self_killed_idle` (T15.11) | Writer reached `phase=operate`, did NOT emit `eot_sent`, did NOT reach `phase=silent`, and stderr capture contains `watchdog: no progress` | The variant's in-process watchdog thread (`variant-base/src/watchdog.rs`) detected no progress on either counter for `--watchdog-secs` consecutive seconds during operate, flushed the JSONL, and called `std::process::exit(2)`. Distinct from `deadlock`: the watchdog flushes before exit, so the JSONL ends cleanly; the stderr line is the load-bearing signal. Distinct from `eot_lost`: the watchdog case has no `eot_sent`. The typical trigger is a wedged transport library (e.g. Zenoh qos3/qos4 multi under symmetric flood). |
-| `deadlock` | No `eot_sent`, no `phase=silent`, JSONL ends mid-record | The variant was killed mid-operate (timeout kill, crash, or hang) WITHOUT the watchdog firing. The truncated final line is the smoking gun. With T15.11 the watchdog converts most of these into `variant_self_killed_idle`; a remaining `deadlock` indicates either the watchdog was disabled (`--watchdog-secs 0`), the stall fired faster than the watchdog could observe it, or the runner safety-net beat the watchdog. |
+| `variant_crashed` (2026-05-14 follow-up) | Writer reached `phase=operate`, did NOT emit `eot_sent`, did NOT reach `phase=silent`, stderr capture LACKS the watchdog signature, AND the JSONL ends mid-record | The variant entered operate then crashed abnormally (typically a panic inside a transport library) too fast for T15.11's watchdog to fire. The Zenoh qos3 alice case under stress is the motivating example: variant exits within ~2s of operate, faster than the default 30s watchdog threshold, leaving a truncated JSONL with no stderr signature. Distinct from `variant_self_killed_idle` (which requires the watchdog signature) and from `deadlock` (which is reserved for pre-operate truncations or callers that omit `logs_dir`). |
+| `deadlock` | No `eot_sent`, no `phase=silent`, JSONL ends mid-record, AND either no `phase=operate` was reached OR `logs_dir` was unavailable for stderr reads | Killed mid-operate with neither the watchdog signature nor a `phase=operate` event in the JSONL. With T15.11 plus the 2026-05-14 `variant_crashed` rule, the post-operate crash cases are now siphoned off into `variant_self_killed_idle` / `variant_crashed`; `deadlock` remains the label for the legacy pre-operate truncation edge cases and the regression-test path where the caller omits `logs_dir`. |
 | `unknown` | No rule matched | Operator must inspect manually. Should be rare; if it fires repeatedly the classifier needs another rule. |
 
 Both `completed` and `runner_idle_terminated` are clean-exit
@@ -310,6 +322,25 @@ bearing signal; the classifier does not key on the exit code today
 (though `2` is the documented value -- see
 `variant-base/CUSTOM.md` "Internal-stall watchdog (T15.11)").
 
+**Precedence note (2026-05-14 follow-up).** `variant_crashed` sits
+between `variant_self_killed_idle` and `deadlock`. The three rules
+share the same JSONL-truncation precondition and run under the same
+`has_phase_operate` + `not has_eot_sent` + `not has_phase_silent`
+gate. The discriminator is the stderr signature:
+  - Signature present -> `variant_self_killed_idle` (slow stall).
+  - Signature absent -> `variant_crashed` (fast panic).
+  - `has_phase_operate` false OR `logs_dir` absent -> `deadlock`
+    (legacy fallthrough).
+
+Spawn-status caveat: ideally `variant_crashed` would also gate on
+the runner's `ChildOutcome::Failed(_)` (non-zero, non-timeout exit
+code), but the analysis pipeline has no access to that signal today
+-- the runner does not write a spawn-status sidecar. With T15.11
+active in practice the only path into this branch is a true variant
+crash; the runner safety-net normally triggers the watchdog first.
+If a future change writes a status sidecar, the rule can tighten by
+additionally requiring `status == failed`.
+
 Sub-tags are appended to the same row when applicable. Currently only
 one is defined:
 
@@ -322,11 +353,12 @@ one is defined:
 Stderr capture reads are lazy: the classifier only opens a stderr
 file when an `eot_lost` candidate needs the saturation sub-tag check,
 a `variant_rejected` candidate needs the non-empty check, or a
-`variant_self_killed_idle` candidate (post-T15.11) needs the
-watchdog signature check. Spawns that classify as `completed` /
-`runner_idle_terminated` / `eot_timeout_internal` / `deadlock` /
-`unknown` without first being a watchdog candidate never touch
-stderr.
+`variant_self_killed_idle` / `variant_crashed` candidate (post-T15.11
+and the 2026-05-14 follow-up) needs the watchdog signature check
+(present -> self-killed-idle, absent -> variant_crashed). Spawns
+that classify as `completed` / `runner_idle_terminated` /
+`eot_timeout_internal` / `deadlock` / `unknown` without first being
+a watchdog candidate never touch stderr.
 
 The rules treat events as monotonically additive: presence of an
 event is meaningful, absence is not (a still-running spawn would
