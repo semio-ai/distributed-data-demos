@@ -349,3 +349,83 @@ ordering is intentional: variants that need to issue a peer-side
 shutdown (e.g. send a close frame) want a still-live transport to
 do it from, so `stop_reader_threads` cannot itself tear the socket
 down.
+
+### Internal-stall watchdog (T15.11)
+
+A second variant-side monitor thread complements the T15.5 inline
+idle detector. The inline detector lives inside the operate loop and
+fires only when the driver thread reaches each iteration's bookkeeping
+check; if the driver thread is blocked inside a transport library
+call (the Zenoh qos3/qos4-multi failure mode under symmetric flood),
+the inline detector never runs. The watchdog runs on its OWN OS
+thread, polls the same `sent` / `received` counters the
+`ProgressEmitter` already maintains, and converts that wedged-driver
+shape from "runner kills the variant + truncated JSONL" to "variant
+self-exits cleanly + flushed JSONL".
+
+**Module**: `variant-base/src/watchdog.rs`.
+
+**Behaviour**:
+
+- Watches `ProgressEmitter`'s shared `(sent, received, phase)` state
+  via a cloned `Arc<ProgressState>`. No second bookkeeping path.
+- Wakes once per second. Captures a snapshot.
+- Gating: only fires when `phase == "operate"`. Outside operate, the
+  threshold timer is anchored to "now" each tick so a stabilize or
+  silent phase with frozen counters does not accumulate threshold.
+- Fire condition: BOTH `sent` and `received` unchanged for
+  `watchdog_secs` consecutive seconds during operate phase.
+- On fire: invoke the injected `on_fire` callback (the driver binds
+  this to `logger.flush()` -- see "Flush before exit" below), write
+  the line `[variant] watchdog: no progress in <N>s during operate
+  phase -- internal stall; self-exiting` to stderr, then call
+  `std::process::exit(WATCHDOG_EXIT_CODE)`.
+
+**CLI arg**: `--watchdog-secs <u32>` (default `60`, `0` disables).
+The default matches the typical runner `default_timeout_secs`
+headroom: a stalled variant self-exits cleanly well before the
+runner's safety-net kill would have produced a truncated JSONL.
+When `0`, no thread is spawned and `Watchdog::is_enabled()` returns
+false.
+
+**Exit-code choice**: `WATCHDOG_EXIT_CODE = 2`.
+
+- `0` is reserved for clean success.
+- `1` is the `eprintln + exit(1)` path in `variant_dummy.rs::main`'s
+  top-level error handler (and the same pattern in every other
+  variant binary). The watchdog must produce a DIFFERENT code so
+  the analysis classifier can disambiguate watchdog self-exits from
+  generic error exits without having to parse stderr to confirm.
+- `2` is the conventional "command-line misuse" code in many Unix
+  tools, but the variant binaries do not currently use it for
+  anything else. Reusing it for the watchdog keeps the meaningful
+  exit-code space small and matches the T15.11 task recommendation.
+
+The analysis pipeline (`analysis/timeout_classification.py`)
+substring-searches the stderr capture for `watchdog: no progress`
+to classify the row as `variant_self_killed_idle`. It does NOT key
+on the exit code today -- the stderr signature is the load-bearing
+signal -- so the exit code is an aid for operators reading the raw
+runner output, not part of the classifier's contract.
+
+**Flush before exit**: `std::process::exit` does NOT run
+destructors. The variant's `Logger` wraps a `BufWriter<File>` and
+has no `Drop` impl that would flush. Without an explicit flush, the
+watchdog would produce the EXACT truncation shape it is supposed
+to eliminate. The driver binds the watchdog's `on_fire` callback to
+`logger_handle.lock().flush()` so the JSONL is fully written to
+disk before the process exits. The watchdog module is intentionally
+decoupled from the logger -- it sees only a `FnMut()` callback --
+so logger evolution does not propagate into the monitor thread.
+
+**Why a second monitor thread instead of a flag-and-park approach
+on the driver thread?** A flag-and-park approach can only fire when
+the driver thread runs. The whole point of T15.11 is to detect the
+case where the driver thread has stopped running. A separate OS
+thread is the smallest correct design.
+
+**Why not Tokio / async?** The variant-base crate is sync-first
+(see "Variant Trait" above). Adding a runtime just for the watchdog
+would be disproportionate; `std::thread::Builder::new().spawn(...)`
+with a 1 Hz sleep loop is sufficient and matches the existing
+`ProgressEmitter` thread's style.

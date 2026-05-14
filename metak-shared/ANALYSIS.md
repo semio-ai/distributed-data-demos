@@ -261,7 +261,7 @@ custom-udp-replication   run01   3    100.00%    0             0      0         
 custom-udp-replication   run01   4    100.00%    0             0      -                completed
 ```
 
-### 5.6 Timeout classification (T14.17, extended in T15.6)
+### 5.6 Timeout classification (T14.17, extended in T15.6 and T15.11)
 
 The `Timeout` column carries a per-spawn classification of the writer
 side's exit cause. Spawns that share a `(variant, run)` group but
@@ -271,7 +271,7 @@ that shares the writer.
 
 The classifier inspects the per-spawn JSONL events plus the runner's
 stderr capture (`<log_subdir>/<variant>-<runner>-stderr.txt`, per
-`runner/src/spawn.rs::stderr_capture_path`) and emits one of seven
+`runner/src/spawn.rs::stderr_capture_path`) and emits one of eight
 enum values, in the precedence below. The first matching rule wins.
 
 | Value | When | Operator reading |
@@ -281,7 +281,8 @@ enum values, in the precedence below. The first matching rule wins.
 | `runner_idle_terminated` (T15.6) | Writer logged `eot_sent`, reached `phase=silent`, did NOT log `eot_timeout`, and NO peer logged `eot_received{writer=<this>}` | Healthy spawn that exited cleanly via the E15 variant-side idle-detection path (T15.5). No on-wire EOT handshake happens in E15, so the absence of a peer `eot_received` is expected, not a failure. No action required. |
 | `eot_lost` | Writer logged `eot_sent` but never reached `phase=silent` | Legacy E12/E14 failure shape: writer published EOT but something on the other side prevented the spawn from completing cleanly. Suspect peer-side saturation if delivery throughput was close to the variant's headroom. |
 | `variant_rejected` | Writer never reached `phase=operate` and stderr capture is non-empty | The variant exited cleanly before operate, typically because the configured QoS / threading mode / port is unsupported. Substring matches against `does not support single-threaded mode`, `does not support QoS`, `port collision`, `unsupported` confirm known rejection paths. |
-| `deadlock` | No `eot_sent`, no `phase=silent`, JSONL ends mid-record | The variant was killed mid-operate (timeout kill, crash, or hang). The truncated final line is the smoking gun. |
+| `variant_self_killed_idle` (T15.11) | Writer reached `phase=operate`, did NOT emit `eot_sent`, did NOT reach `phase=silent`, and stderr capture contains `watchdog: no progress` | The variant's in-process watchdog thread (`variant-base/src/watchdog.rs`) detected no progress on either counter for `--watchdog-secs` consecutive seconds during operate, flushed the JSONL, and called `std::process::exit(2)`. Distinct from `deadlock`: the watchdog flushes before exit, so the JSONL ends cleanly; the stderr line is the load-bearing signal. Distinct from `eot_lost`: the watchdog case has no `eot_sent`. The typical trigger is a wedged transport library (e.g. Zenoh qos3/qos4 multi under symmetric flood). |
+| `deadlock` | No `eot_sent`, no `phase=silent`, JSONL ends mid-record | The variant was killed mid-operate (timeout kill, crash, or hang) WITHOUT the watchdog firing. The truncated final line is the smoking gun. With T15.11 the watchdog converts most of these into `variant_self_killed_idle`; a remaining `deadlock` indicates either the watchdog was disabled (`--watchdog-secs 0`), the stall fired faster than the watchdog could observe it, or the runner safety-net beat the watchdog. |
 | `unknown` | No rule matched | Operator must inspect manually. Should be rare; if it fires repeatedly the classifier needs another rule. |
 
 Both `completed` and `runner_idle_terminated` are clean-exit
@@ -297,6 +298,18 @@ do not overlap: the new rule requires `phase=silent`, the legacy
 its top-of-list precedence so any spawn that explicitly logged a
 self-abort is never silently relabelled as a clean idle exit.
 
+**Precedence note (T15.11).** `variant_self_killed_idle` sits
+between `variant_rejected` and `deadlock` so the watchdog's explicit
+diagnostic substring wins over the generic truncation heuristic in
+the (currently empty) overlap case where both could match. It does
+NOT overlap with `eot_lost` (which requires `eot_sent`), nor with
+`runner_idle_terminated` (which requires both `eot_sent` and
+`phase=silent`), nor with `variant_rejected` (which requires the
+absence of `phase=operate`). The stderr signature is the load-
+bearing signal; the classifier does not key on the exit code today
+(though `2` is the documented value -- see
+`variant-base/CUSTOM.md` "Internal-stall watchdog (T15.11)").
+
 Sub-tags are appended to the same row when applicable. Currently only
 one is defined:
 
@@ -307,10 +320,13 @@ one is defined:
   dropped along with the data tail.
 
 Stderr capture reads are lazy: the classifier only opens a stderr
-file when an `eot_lost` candidate needs the saturation sub-tag check
-or a `variant_rejected` candidate needs the non-empty check. Spawns
-that classify as `completed` / `runner_idle_terminated` /
-`eot_timeout_internal` / `deadlock` / `unknown` never touch stderr.
+file when an `eot_lost` candidate needs the saturation sub-tag check,
+a `variant_rejected` candidate needs the non-empty check, or a
+`variant_self_killed_idle` candidate (post-T15.11) needs the
+watchdog signature check. Spawns that classify as `completed` /
+`runner_idle_terminated` / `eot_timeout_internal` / `deadlock` /
+`unknown` without first being a watchdog candidate never touch
+stderr.
 
 The rules treat events as monotonically additive: presence of an
 event is meaningful, absence is not (a still-running spawn would
