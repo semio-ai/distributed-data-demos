@@ -460,6 +460,64 @@ custom-udp-replication   run01   single  99,900      99,900         100.00%    1
 No metric is removed relative to pre-T11.5 output: the column ORDER
 and EMPHASIS shifts but every previously-reported value is preserved.
 
+### 6.8 Pivot tables (variant × workload)
+
+A pivot-tables section is appended to `--summary` after the three
+existing reports (Integrity, Performance, Resource). It re-pivots the
+PerformanceResult set onto a 2-D grid that lets the operator scan a
+single QoS level at a glance:
+
+- **Rows**: `(variant family, threading mode)` pairs in a canonical
+  order — `custom-udp-single`, `custom-udp-multi`, `hybrid-single`,
+  `hybrid-multi`, `websocket-single`, `websocket-multi`, `quic-multi`,
+  `webrtc-multi`, `zenoh-multi`. Families that lack a Single binary
+  (quic, webrtc, zenoh in the canonical config) appear only as
+  `*-multi`. If the dataset includes a row outside the canonical
+  ordering it is appended after the canonical rows so nothing is
+  hidden.
+- **Columns**: workload profile (`<vpt>x<hz>hz`) from the canonical
+  config: `1000x100hz`, `1000x10hz`, `100x1000hz`, `100x100hz`,
+  `100x10hz`, `10x100hz`, `10x1000hz`, plus the unbounded `max`
+  workload. Columns outside the canonical set are appended after.
+- **One table per QoS level** (1..4 in the canonical config; the table
+  set only emits a level if at least one spawn populated it).
+
+Every cell renders three sub-cell lines:
+
+1. **Delivery%** — `100 × receives_per_sec / writes_per_sec`. Same
+   formula as the flat performance table.
+2. **Ratio%** — `100 × receives_per_sec / expected_writes_per_sec`
+   where `expected_writes_per_sec = tick_rate_hz × values_per_tick`
+   parsed from the spawn name. This is the "expected 10k/s but got
+   5k/s = 50%" metric.
+   - For the **max-throughput** workload no nominal rate exists, so
+     this sub-cell is rendered as `n/a` (the other two sub-cells are
+     still shown).
+   - For **multicast** variants where the receiver also gets its own
+     loopback writes (e.g. custom-udp single-mode subscribes to its
+     own multicast group), the ratio can exceed 100%. This is
+     expected behaviour and not a bug — the ratio measures
+     receives-against-one-writer's-nominal-rate, and a multicast
+     loopback adds the local writer's traffic on top.
+3. **mean ± std (ms)** — sample mean and (ddof=1) sample standard
+   deviation of the per-message latency vector already stored on
+   `PerformanceResult.latency_samples_ms`. Renders as `-` when the
+   sample vector is empty (no deliveries, e.g. variant_self_killed_idle
+   cases with no completed writes).
+
+Empty cells (no spawn for the (family, mode, workload, qos) combination
+or capability-gated combinations like quic-single) render as a triple
+of dashes; the renderer does not crash on edge cases.
+
+### 6.9 CSV export
+
+`--csv-out <path>` writes a long-form CSV with one row per
+`(variant, run)` and columns covering both the new pivot-table fields
+and every existing PerformanceResult column. Operators can pivot this
+in Excel/Sheets if the built-in pivot-table layout doesn't match the
+desired slice. The CSV is well-formed even when the input is empty
+(header row always emitted).
+
 ## 7. Diagrams
 
 Comprehensive visual output for deeper comparison. All diagrams are saved to
