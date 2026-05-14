@@ -11,7 +11,7 @@ runner (per ``runner/src/spawn.rs::stderr_capture_path``).
 
 The classification taxonomy and rules are documented in
 ``metak-shared/ANALYSIS.md`` -- see the "Timeout classification" section.
-Seven values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
+Eight values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
 
 ``completed``
     Spawn ran to graceful exit (``phase=silent`` reached) and the
@@ -38,6 +38,18 @@ Seven values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
 ``variant_rejected``
     Variant exited before reaching ``phase=operate``; stderr capture
     is non-empty.
+``variant_self_killed_idle`` (T15.11)
+    Variant reached ``phase=operate`` but did NOT emit ``eot_sent``
+    and did NOT reach ``phase=silent``; the in-process watchdog
+    thread (T15.11) detected no progress on either counter for the
+    configured threshold and called ``std::process::exit`` after
+    flushing the JSONL. The stderr capture contains the
+    ``watchdog: no progress`` substring -- the load-bearing signal
+    that distinguishes a clean self-exit from a runner-side kill.
+    Mutually exclusive with ``deadlock`` (whose JSONL is truncated
+    mid-record) and ``eot_lost`` (which requires ``eot_sent`` to be
+    present). Precedence: above ``deadlock`` so the watchdog's
+    explicit diagnostic wins over the generic truncation heuristic.
 ``eot_timeout_internal``
     Variant emitted ``eot_sent`` AND ``eot_timeout`` -- decided to
     give up waiting for peer EOTs per the E12 EOT protocol. Post-E15
@@ -48,10 +60,12 @@ Seven values, plus an optional ``eot_lost_likely_saturation`` sub-tag:
 
 Stderr capture reads are LAZY: only spawns whose JSONL-derived state
 is ambiguous (``variant_rejected`` candidates, ``eot_lost`` candidates
-for the saturation sub-tag) trigger a read. Stderr files are not
-loaded unconditionally. Spawns that classify as ``completed`` /
+for the saturation sub-tag, and ``variant_self_killed_idle``
+candidates after T15.11) trigger a read. Stderr files are not loaded
+unconditionally. Spawns that classify as ``completed`` /
 ``runner_idle_terminated`` / ``eot_timeout_internal`` / ``deadlock`` /
-``unknown`` never touch stderr.
+``unknown`` without first being a watchdog candidate never touch
+stderr.
 """
 
 from __future__ import annotations
@@ -71,6 +85,7 @@ Classification = Literal[
     "deadlock",
     "eot_lost",
     "variant_rejected",
+    "variant_self_killed_idle",
     "eot_timeout_internal",
     "unknown",
 ]
@@ -89,6 +104,16 @@ KNOWN_REJECTION_PATTERNS: tuple[str, ...] = (
 #: sub-tag. Sourced from the user-reported failure on the
 #: ``custom-udp-1000x100hz-qos2-multi`` spawn that motivated T14.17.
 SATURATION_HINT_SUBSTRING: str = "reader channel full"
+
+#: Substring whose presence in the SAME spawn's stderr capture
+#: classifies the row as ``variant_self_killed_idle`` (T15.11). The
+#: variant-side watchdog (see ``variant-base/src/watchdog.rs``,
+#: ``WATCHDOG_STDERR_PREFIX``) writes a line starting with this exact
+#: prefix immediately before calling ``std::process::exit(2)``. The
+#: prefix is part of the analysis contract -- changing it on the
+#: variant side without updating this constant is a pipeline-breaking
+#: change.
+WATCHDOG_STDERR_SUBSTRING: str = "watchdog: no progress"
 
 #: Number of bytes from the END of a JSONL file to consider when
 #: deciding whether the file ends mid-record. 4 KiB is enough to
@@ -310,6 +335,19 @@ def _has_saturation_hint(stderr_text: str | None) -> bool:
     return stderr_text is not None and SATURATION_HINT_SUBSTRING in stderr_text
 
 
+def _has_watchdog_signature(stderr_text: str | None) -> bool:
+    """Return True if the stderr capture contains the T15.11 prefix.
+
+    The variant-side watchdog (``variant-base/src/watchdog.rs``) writes
+    a line starting with ``[variant] watchdog: no progress`` immediately
+    before calling ``std::process::exit(2)``. This helper checks for
+    the stable substring ``watchdog: no progress`` -- the leading
+    ``[variant]`` is dropped so other prefixes (e.g. a future
+    sidecar-emitted variant) can still match cleanly.
+    """
+    return stderr_text is not None and WATCHDOG_STDERR_SUBSTRING in stderr_text
+
+
 def _matches_known_rejection(stderr_text: str | None) -> bool:
     if stderr_text is None:
         return False
@@ -462,7 +500,42 @@ def classify_spawn(
                 classification="variant_rejected",
             )
 
-    # 6. deadlock: no eot_sent, no graceful silent, JSONL ends mid-record.
+    # 6. variant_self_killed_idle (T15.11): variant reached operate
+    #    but no eot_sent / no phase=silent, AND stderr capture
+    #    contains the watchdog's diagnostic substring -- the
+    #    variant's in-process watchdog thread observed no progress
+    #    on either counter and called `std::process::exit(2)` after
+    #    flushing the JSONL.
+    #
+    #    Mutually exclusive with `deadlock` below (which keys on
+    #    JSONL truncation): the watchdog flushes the buffer before
+    #    exit, so a clean self-exit produces a complete JSONL tail.
+    #    Placed BEFORE the deadlock rule so the explicit watchdog
+    #    signal wins over the generic truncation heuristic in the
+    #    edge case where both could match (e.g. a watchdog exit
+    #    racing with an unlikely partial flush failure).
+    #
+    #    This rule fires regardless of JSONL truncation state -- a
+    #    clean watchdog exit usually leaves a clean JSONL, but the
+    #    stderr signature is the load-bearing signal. Falls back to
+    #    the deadlock rule (then to ``unknown``) if no stderr file
+    #    exists.
+    if (
+        summary.has_phase_operate
+        and not summary.has_eot_sent
+        and not summary.has_phase_silent
+        and logs_dir is not None
+    ):
+        stderr_text = read_stderr_capture(_stderr_path(logs_dir, variant, runner))
+        if _has_watchdog_signature(stderr_text):
+            return SpawnClassification(
+                variant=variant,
+                run=run,
+                runner=runner,
+                classification="variant_self_killed_idle",
+            )
+
+    # 7. deadlock: no eot_sent, no graceful silent, JSONL ends mid-record.
     if not summary.has_eot_sent and not summary.has_phase_silent:
         if logs_dir is not None and jsonl_ends_mid_record(
             _jsonl_path(logs_dir, variant, run, runner)
@@ -474,7 +547,7 @@ def classify_spawn(
                 classification="deadlock",
             )
 
-    # 7. Fallthrough.
+    # 8. Fallthrough.
     return SpawnClassification(
         variant=variant,
         run=run,

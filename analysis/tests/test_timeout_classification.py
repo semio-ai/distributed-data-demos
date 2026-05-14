@@ -14,6 +14,7 @@ from helpers import events_to_lazy, make_event
 
 from timeout_classification import (
     SATURATION_HINT_SUBSTRING,
+    WATCHDOG_STDERR_SUBSTRING,
     classify_group,
     jsonl_ends_mid_record,
 )
@@ -555,6 +556,217 @@ class TestRunnerIdleTerminated:
         lazy = events_to_lazy(alice_events)
         result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
         assert result["alice"].classification == "runner_idle_terminated"
+
+
+def _alice_watchdog_stalled_events(*, run: str = "run01") -> list[dict]:
+    """Events for an alice spawn that the T15.11 watchdog self-exited.
+
+    Reaches operate (and emits a couple of writes), but the variant's
+    driver thread then wedges inside transport-library code. The
+    watchdog OS thread observes both counters frozen for the
+    configured threshold and calls ``std::process::exit(2)``. No
+    ``eot_sent`` event is emitted (the driver was stuck before idle
+    detection could run); the variant never reaches ``phase=silent``;
+    the JSONL is FLUSHED cleanly via the watchdog's explicit flush
+    callback.
+    """
+    return [
+        make_event("phase", runner="alice", run=run, phase="connect", offset_ms=0),
+        make_event("phase", runner="alice", run=run, phase="stabilize", offset_ms=10),
+        make_event("phase", runner="alice", run=run, phase="operate", offset_ms=100),
+        make_event(
+            "write",
+            runner="alice",
+            run=run,
+            seq=1,
+            path="/k",
+            qos=4,
+            bytes=8,
+            offset_ms=110,
+        ),
+        make_event(
+            "write",
+            runner="alice",
+            run=run,
+            seq=2,
+            path="/k",
+            qos=4,
+            bytes=8,
+            offset_ms=120,
+        ),
+        # Driver thread wedges here. No further events. Watchdog
+        # fires after `watchdog_secs` and the process self-exits with
+        # a clean JSONL tail.
+    ]
+
+
+class TestVariantSelfKilledIdle:
+    def test_watchdog_stderr_signature_classifies_self_killed(
+        self, tmp_path: Path
+    ) -> None:
+        """T15.11 rule: watchdog stderr signature + no eot_sent + clean JSONL."""
+        variant = "test-variant"
+        run = "run01"
+        alice_events = _alice_watchdog_stalled_events(run=run)
+        _write_jsonl_clean(tmp_path / f"{variant}-alice-{run}.jsonl", alice_events)
+        # The variant's watchdog wrote its diagnostic line right
+        # before exiting. The classifier substring-matches the stable
+        # ``watchdog: no progress`` token.
+        (tmp_path / f"{variant}-alice-stderr.txt").write_text(
+            f"[variant] {WATCHDOG_STDERR_SUBSTRING} in 60s during operate phase "
+            "-- internal stall; self-exiting\n",
+            encoding="utf-8",
+        )
+
+        lazy = events_to_lazy(alice_events)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "variant_self_killed_idle"
+        assert result["alice"].sub_tags == ()
+
+    def test_deadlock_wins_when_jsonl_truncated_without_watchdog_signature(
+        self, tmp_path: Path
+    ) -> None:
+        """Mutual exclusion: truncated JSONL + no stderr -> ``deadlock``.
+
+        The watchdog rule only matches when stderr carries the
+        diagnostic substring. A spawn that was hard-killed mid-record
+        with no stderr capture (or stderr lacking the watchdog line)
+        must still fall through to the legacy ``deadlock`` rule.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice_events = [
+            make_event("phase", runner="alice", run=run, phase="connect", offset_ms=0),
+            make_event(
+                "phase", runner="alice", run=run, phase="operate", offset_ms=100
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                run=run,
+                seq=1,
+                path="/k",
+                qos=4,
+                bytes=8,
+                offset_ms=110,
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                run=run,
+                seq=2,
+                path="/k",
+                qos=4,
+                bytes=8,
+                offset_ms=120,
+            ),
+        ]
+        # Mid-record kill (truncated JSONL) with NO stderr capture --
+        # the deadlock rule should still win.
+        _write_jsonl_truncated(
+            tmp_path / f"{variant}-alice-{run}.jsonl",
+            alice_events,
+            truncate_bytes=15,
+        )
+
+        lazy = events_to_lazy(alice_events)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "deadlock"
+
+    def test_runner_idle_terminated_wins_when_eot_sent_and_silent_reached(
+        self, tmp_path: Path
+    ) -> None:
+        """Mutual exclusion: ``eot_sent`` + ``phase=silent`` -> clean rule.
+
+        A spawn that reached the variant-side idle detection path
+        (T15.5) emits ``eot_sent`` AND ``phase=silent``. Even if its
+        stderr happens to contain the watchdog substring (which the
+        production watchdog would not write in that case but might
+        appear in a legacy capture), the classifier must prefer the
+        clean-exit rule because ``has_eot_sent`` is true.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice = _alice_idle_terminated_events(run=run)
+        # Self-loopback / single-runner: no peer confirms.
+        _write_jsonl_clean(tmp_path / f"{variant}-alice-{run}.jsonl", alice)
+        # Even with a spurious watchdog string in stderr the clean
+        # exit must win because eot_sent + phase=silent already proved
+        # the variant teared down through the normal path.
+        (tmp_path / f"{variant}-alice-stderr.txt").write_text(
+            f"[variant] {WATCHDOG_STDERR_SUBSTRING} stray line\n",
+            encoding="utf-8",
+        )
+
+        lazy = events_to_lazy(alice)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "runner_idle_terminated"
+
+    def test_eot_timeout_internal_wins_over_watchdog_signature(
+        self, tmp_path: Path
+    ) -> None:
+        """Mutual exclusion: ``eot_sent`` + ``eot_timeout`` keeps top precedence.
+
+        The classifier's first rule (``eot_timeout_internal``) MUST
+        win even if the stderr capture happens to contain the
+        watchdog substring -- that combination indicates the variant
+        ran the legacy on-wire EOT phase and self-aborted via the E12
+        protocol, not via the T15.11 watchdog. ``eot_sent`` is also
+        absent in the watchdog case by definition.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice_events = [
+            make_event(
+                "phase", runner="alice", run=run, phase="operate", offset_ms=100
+            ),
+            make_event("eot_sent", runner="alice", run=run, eot_id=1, offset_ms=200),
+            make_event(
+                "eot_timeout",
+                runner="alice",
+                run=run,
+                missing=["bob"],
+                wait_ms=5000,
+                offset_ms=5200,
+            ),
+        ]
+        _write_jsonl_clean(tmp_path / f"{variant}-alice-{run}.jsonl", alice_events)
+        (tmp_path / f"{variant}-alice-stderr.txt").write_text(
+            f"[variant] {WATCHDOG_STDERR_SUBSTRING} stray line\n",
+            encoding="utf-8",
+        )
+
+        lazy = events_to_lazy(alice_events)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "eot_timeout_internal"
+
+    def test_no_phase_operate_falls_through_to_variant_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        """A variant that died before operate keeps the variant_rejected label.
+
+        ``variant_self_killed_idle`` requires ``has_phase_operate``
+        to be true (the watchdog only fires inside operate). If the
+        variant exited earlier with a watchdog-shaped stderr (which
+        the production watchdog wouldn't produce, but a fuzzy fixture
+        might), the ``variant_rejected`` rule keeps precedence.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice_events = [
+            make_event("phase", runner="alice", run=run, phase="connect", offset_ms=0),
+            # No phase=operate.
+        ]
+        _write_jsonl_clean(tmp_path / f"{variant}-alice-{run}.jsonl", alice_events)
+        (tmp_path / f"{variant}-alice-stderr.txt").write_text(
+            f"[variant] {WATCHDOG_STDERR_SUBSTRING} should not match here\n",
+            encoding="utf-8",
+        )
+
+        lazy = events_to_lazy(alice_events)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        # variant_rejected wins because the spawn never reached operate.
+        assert result["alice"].classification == "variant_rejected"
 
 
 class TestUnknown:

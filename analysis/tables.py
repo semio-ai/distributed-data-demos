@@ -79,9 +79,10 @@ def format_integrity_table(
     w_dupes = 7
     w_gaps = 16
     w_bpskip = 12
-    # T14.17 / T15.6: ``Timeout`` column holds the longest enum value
-    # (``runner_idle_terminated`` = 22 chars) plus a little padding.
-    w_timeout = 24
+    # T14.17 / T15.6 / T15.11: ``Timeout`` column holds the longest
+    # enum value (``variant_self_killed_idle`` = 25 chars) plus a
+    # little padding.
+    w_timeout = 27
 
     header = (
         _pad("Variant", w_variant)
