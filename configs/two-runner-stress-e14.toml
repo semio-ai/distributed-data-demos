@@ -106,7 +106,7 @@ binary = "target/release/variant-quic.exe"
 
 [[variant]]
 name = "zenoh-1000x100hz"
-supported_modes = ["multi"]
+supported_modes = ["single", "multi"]
 binary = "target/release/variant-zenoh.exe"
   [variant.common]
   tick_rate_hz = 100
@@ -119,6 +119,7 @@ binary = "target/release/variant-zenoh.exe"
   log_dir = "./logs"
   [variant.specific]
   zenoh_mode = "peer"
+  zenoh_sidecar_base_port = 20100
 
 # â”€â”€â”€ WebRTC (Multi only, qos 1-2 unreliable mode is fine here) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 

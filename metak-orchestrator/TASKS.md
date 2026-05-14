@@ -7116,3 +7116,95 @@ together — same patch, same conceptual change.
 
 ---
 
+
+### T14.9c: variants/zenoh -- enable HTTP keep-alive in Single-mode ureq Agent
+
+**Repo**: `variants/zenoh/`.
+**Status**: pending, filed 2026-05-14 after stress fixture surfaced
+ephemeral port exhaustion in T14.9b's HTTP client.
+
+#### Background
+
+T14.9b shipped the sync RPC client via `ureq` for Zenoh Single mode.
+Manual smoke + low-rate two-runner integration test both passed
+(99.97% / 99.67% delivery at 1K msg/s). But the stress fixture
+(`configs/two-runner-stress-e14.toml`) at 100K msg/s qos2-4 Single
+failed within ~1 second with:
+
+```
+Error: HTTP PUT http://127.0.0.1:20100/bench/486 failed:
+  io: Only one usage of each socket address (protocol/network
+  address/port) is normally permitted. (os error 10048)
+```
+
+This is **WSAEADDRINUSE** — Windows' ephemeral port range is ~16K;
+at 100K msg/s every `publish()` opens a fresh TCP connection to
+zenohd, exhausting the pool. Linux has 28K range default, would hit
+the same wall around 30K msg/s.
+
+Root cause: T14.9b's `ureq::Agent` was configured with **keep-alive
+disabled**. With keep-alive enabled, the Agent pools and reuses
+connections to the same host:port; outbound TCP socket count drops
+to ~1 instead of N-per-publish. The qos1 single case (1K msg/s)
+fits in the port pool so it works; qos2-4 single (100K msg/s)
+exhaust immediately.
+
+#### Scope
+
+In `variants/zenoh/src/rest_client.rs`:
+
+- Construct the `ureq::Agent` with **keep-alive ENABLED** (or, more
+  precisely, don't explicitly disable it; the ureq default is on).
+- Verify via packet capture or log inspection that subsequent
+  `publish()` calls reuse the same TCP connection. The smoke test
+  should report "1 TCP connection observed" rather than N.
+- Document in `CUSTOM.md` (T14.9b section) the explicit reason for
+  keep-alive, and the empirical port-exhaustion failure mode that
+  motivated the fix.
+
+#### Tests
+
+- Existing T14.9b smoke + integration tests should continue passing.
+- Add an `#[ignore]`'d two-runner regression test at moderate-high
+  rate (e.g. 100 vpt × 100 Hz × 5 s = 50K total msgs/spawn, 10K
+  msg/s) in Single mode. Both runners should complete
+  `runner_idle_terminated` without `os error 10048`.
+- Worker considers whether to extend the existing two_runner
+  regression with a higher-rate parameterised case rather than a
+  brand-new test.
+
+#### Validation (MANDATORY)
+
+1. `cargo build --release -p variant-zenoh` clean.
+2. `cargo test --release -p variant-zenoh` all-green.
+3. `cargo test --release -p variant-zenoh -- --ignored` all-green.
+4. Clippy + fmt clean.
+5. **End-to-end repro (MANDATORY)**: re-run `configs/two-runner-stress-e14.toml`.
+   The 4 currently-failing Zenoh Single rows (qos2/qos3/qos4 + their
+   delivery numbers) should no longer fail with `os error 10048`.
+   Worker reports the actual delivery numbers in the completion
+   report.
+
+#### Acceptance criteria
+
+- [ ] `ureq::Agent` constructed with keep-alive enabled.
+- [ ] Empirical verification of connection reuse (worker picks
+      method: small unit test mocking a counted-connection server,
+      OR documented via Wireshark / netstat observation).
+- [ ] CUSTOM.md updated with the rationale + the os error 10048
+      failure mode.
+- [ ] Stress fixture's Zenoh Single rows no longer hit
+      WSAEADDRINUSE.
+- [ ] All existing tests pass.
+
+#### Out of scope
+
+- Tuning ureq pool size (the default should be fine).
+- Handling the case where keep-alive is forcibly closed by zenohd
+  (worker may need to handle "connection reset" → reconnect, but
+  that's reactive — start with just enabling keep-alive).
+- Whether the SSE reader thread (poll_receive) also needs
+  connection management — it's already long-lived, so a single
+  connection per spawn is the expected behaviour.
+
+---
