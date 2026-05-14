@@ -21,12 +21,22 @@ routing, and delivery.
 - **Crate type**: binary (`variant-zenoh`)
 - **Key dependencies**:
   - `variant-base` (path = `../../variant-base`) — Variant trait, types, CLI, driver
-  - `zenoh` — the pub/sub transport (use latest stable, currently ~1.9)
+  - `zenoh` — the pub/sub transport (use latest stable, currently ~1.9).
+    Reached only from the Multi-mode call graph.
   - `tokio` (`rt-multi-thread`, `sync`, `macros`, `time`) — the runtime
-    owned by `ZenohVariant` for the publish/receive bridge (see Design
-    Guidance below). Pulled in directly even though Zenoh already
-    depends on it, so the variant has a stable `tokio::runtime::Runtime`
-    handle and `tokio::sync::mpsc` API surface.
+    owned by `ZenohVariant` for the Multi-mode publish/receive bridge
+    (see Design Guidance below). Pulled in directly even though Zenoh
+    already depends on it, so the variant has a stable
+    `tokio::runtime::Runtime` handle and `tokio::sync::mpsc` API
+    surface. Reached only from the Multi-mode call graph.
+  - `ureq` (T14.9b, `default-features = false`) — sync HTTP client
+    powering Single mode's `publish`. Reached only from the
+    Single-mode call graph; verified tokio-free (see "Tokio-free
+    verification" below).
+  - `base64` (T14.9b) — standard-alphabet base64 decoder for the
+    zenoh-plugin-rest SSE envelope on the receive side.
+  - `serde_json` — used by the T14.9a sidecar config generation and
+    the T14.9b SSE JSON envelope decode.
   - `anyhow` — error handling
 - Follow `metak-shared/coding-standards.md`.
 
@@ -282,62 +292,255 @@ Tests covering this contract live in `src/zenoh.rs` `tests` mod:
   sanity case verifying the message is enqueued with the right `qos`
   tag for downstream cache routing.
 
-## Threading modes (T14.7)
+## Threading modes (T14.7 / T14.9)
 
-The Zenoh variant declares `supported_threading_modes() -> &[Multi]`. It
-does not support `ThreadingMode::Single` and `connect(Single)` returns
-an `Err` before any runtime, session, or subscriber setup. The runner
-consults this declaration (per T14.8) and silently skips any
-`<name>-qos<n>-single` spawn the matrix expansion would otherwise
-produce.
+The Zenoh variant declares
+`supported_threading_modes() -> &[Single, Multi]` as of T14.9b. The two
+modes use radically different code paths:
 
-### Why no Single mode (today)
+* **Multi** (the in-process zenoh crate, default and only mode pre-T14.9):
+  opens a `zenoh::Session` directly, drives it via a dedicated
+  multi-thread tokio runtime owned by `ZenohVariant`, and bridges the
+  variant's sync trait methods to the async API through two mpsc
+  channels (see "ZenohVariant" / "Zenoh API style" above). The zenoh
+  crate runs its own internal multi-threaded engine -- route
+  resolution, transport TX/RX, session management, scouting, the
+  storage backend all run as tokio tasks on a runtime the crate
+  owns -- so Multi mode is genuinely multi-threaded.
+* **Single** (T14.9b, see "T14.9b RPC client architecture" below): out-
+  of-process `zenohd` sidecar (spawned by T14.9a lifecycle) absorbs all
+  the concurrency. The variant's own call graph in Single mode is
+  tokio-free: sync HTTP PUT via `ureq` for publishes, one dedicated OS
+  thread reading SSE for receives, `std::sync::mpsc` bridge to the
+  variant's main thread.
 
-The zenoh crate runs its own internal multi-threaded engine:
-route resolution, transport TX/RX, session management, scouting, and
-the storage backend all run as tokio tasks on a runtime the crate
-owns. The public `zenoh::Session` API is async and there is no
-client-side hook to disable any of that. Even when we open exactly
-one Session and one Subscriber on a small fixed key-expression set,
-Zenoh's own tasks are still alive in the background -- declaring the
-variant single-threaded would be measurably untrue.
+### Why Multi mode is "really" multi-threaded
 
-This is fundamentally different from QUIC and WebRTC, where the
-crate is async but the boundary is sharper (one tokio runtime we
-build, one set of tasks we spawn). Zenoh's threading is internal to
-the crate and not under our control.
+The zenoh crate's threading is internal to the crate and not under our
+control. Even when we open exactly one Session and one Subscriber on a
+small fixed key-expression set, zenoh's own tasks are still alive in
+the background. This is fundamentally different from QUIC and WebRTC,
+where the crate is async but the boundary is sharper (one tokio
+runtime we build, one set of tasks we spawn).
 
-### Future: T14.9 (split into T14.9a + T14.9b after audit)
-
-Although the in-process zenoh client is multi-threaded, Zenoh's
-architecture naturally supports an **out-of-process router**
-(`zenohd`). A genuinely single-threaded, WASM-friendly Zenoh client
-would talk RPC to a sidecar `zenohd` process that absorbs all the
-concurrency, leaving the client surface sync and free of tokio.
+### Pre-T14.9b history
 
 T14.9 was filed in `metak-orchestrator/TASKS.md` and **split during
 its audit** into two sub-tasks (see STATUS.md "T14.9 -- AUDIT
 findings"):
 
-* **T14.9a (delivered, see "Single mode scaffolding" below)** — the
-  sidecar **lifecycle** only. Binary discovery, spawn at
-  `connect(Single)`, kill at `disconnect`, port allocation, and
-  per-platform child-process cleanup. Capability stays `[Multi]` —
-  the variant errors out of publish/poll_receive with a clear
-  T14.9b pointer.
-* **T14.9b (NOT YET DELIVERED)** — the sync RPC client over the
-  REST plugin's HTTP+SSE surface. When T14.9b lands, the variant's
-  `supported_threading_modes()` flips to
-  `[ThreadingMode::Single, ThreadingMode::Multi]` and Single-mode
-  publish/poll_receive route through the sidecar.
+* **T14.9a (delivered)** -- the sidecar **lifecycle** only. Binary
+  discovery, spawn at `connect(Single)`, kill at `disconnect`, port
+  allocation, and per-platform child-process cleanup. Capability
+  stayed `[Multi]` -- the variant errored out of publish/poll_receive
+  with a clear T14.9b pointer.
+* **T14.9b (delivered, this task)** -- the sync RPC client over the
+  REST plugin's HTTP+SSE surface. Capability flipped to
+  `[Single, Multi]` and Single-mode publish/poll_receive route
+  through the sidecar.
+
+## T14.9b RPC client architecture (Single mode)
+
+After T14.9a brought the `zenohd` sidecar up, T14.9b wires the
+variant's `publish` / `try_publish` / `poll_receive` through that
+sidecar's REST plugin so the variant's own call graph stays
+synchronous and tokio-free. Implementation lives in
+`variants/zenoh/src/rest_client.rs`.
+
+### publish / try_publish
+
+A sync `ureq::Agent` issues an HTTP PUT against
+`http://127.0.0.1:<rest_port>/<key>` with the encoded message body
+and `Content-Type: application/octet-stream`. The plugin stores the
+bytes as-is and forwards them to all matching subscribers.
+
+* **Why ureq**: sync, built on `std::net`, no tokio. Verified via
+  `cargo tree -e features -p variant-zenoh` (see "Tokio-free
+  verification" below). `default-features = false` strips out
+  rustls + gzip; the sidecar is bound to 127.0.0.1 so HTTP-only is
+  fine.
+* **Why `Content-Type: application/octet-stream`**: the plugin's
+  `write` path attaches the request's content-type as the sample
+  encoding. Without an explicit content-type the plugin defaults to
+  zenoh's "empty" encoding, which the REST SSE surface then tries to
+  treat as UTF-8/JSON and fails on our binary header. Explicit
+  octet-stream makes the plugin take the base64 SSE path -- the
+  same path the subscriber side is wired to decode.
+* **Keep-alive disabled** (`max_idle_connections = 0`,
+  `max_idle_connections_per_host = 0`): each PUT opens a fresh TCP
+  connection. The REST plugin on Windows localhost occasionally
+  drops a kept-alive connection silently, surfacing as a
+  `send_request` timeout; fresh connections sidestep this without
+  measurable throughput loss at the 1K msg/s scale the Single mode
+  targets.
+* **Retry-once on transport error**: a single in-method retry on
+  any send-side error before propagating to the variant. One retry
+  is sufficient: the failure modes seen on Windows localhost are
+  transient half-open-connection / ECONNRESET-during-shutdown
+  events; a genuinely wedged sidecar fails both attempts and the
+  driver propagates the error.
+* **`try_publish` delegates to `publish`** and returns `Ok(true)`
+  on success. The HTTP PUT path does not surface a backpressure
+  signal we can use to short-circuit (it's a blocking request).
+  This matches the Multi-mode reliable path's contract (QoS 3/4
+  also always returns `Ok(true)`).
+
+### poll_receive
+
+A dedicated OS thread (NOT tokio) opens a long-lived
+`GET http://127.0.0.1:<rest_port>/<SUBSCRIBER_WILDCARD>` request with
+`Accept: text/event-stream`. The plugin upgrades the connection to
+SSE and emits one event per sample matching the wildcard. The thread
+parses the chunked-transfer + SSE stream and pushes decoded
+`ReceivedUpdate`s onto a bounded `mpsc::sync_channel`. The variant's
+main thread drains via `try_recv` on every tick -- same pattern as
+the established log-from-reader (T14.10) and progress_coord (T15.3)
+threads.
+
+* **Raw `TcpStream`, not ureq**: ureq's response-body API doesn't
+  expose a per-read timeout, only the request-level `timeout_global`
+  / `timeout_recv_body` knobs. For a long-poll SSE stream the read
+  budget must be "no timeout on the stream, bounded timeout per
+  read" so the stop-flag check happens every ~500 ms regardless of
+  whether traffic is flowing. Issuing the HTTP/1.1 GET directly on
+  a `TcpStream` lets us set `set_read_timeout(Some(500ms))` and
+  loop on `WouldBlock` / `TimedOut` until either the stop flag
+  fires or a real event arrives.
+* **SSE event format**: `event:<kind>\ndata:<json>\n\n` per the
+  [SSE spec][sse-spec]. The `data:` payload is a JSON envelope:
+  ```json
+  {"key": "<keyexpr>", "value": "<base64>",
+   "encoding": "application/octet-stream",
+   "timestamp": "<hlc-or-null>"}
+  ```
+  `value` is standard (padded) base64 of the sample's bytes when
+  the encoding is not text / JSON -- which our binary
+  `MessageCodec` output always triggers. The reader unwraps the
+  JSON envelope, base64-decodes `value`, and feeds the raw bytes
+  to `MessageCodec::decode`. See `extract_payload_from_sse_data`
+  in `rest_client.rs` for the codec hook.
+* **NB on the audit URL**: the T14.9b task brief suggested
+  `GET /<key>?_method=SUB` as the subscription URL. Empirical
+  inspection of `zenoh-plugin-rest` 1.9.0 (and the upstream source
+  at the same revision) shows the real trigger is the
+  `Accept: text/event-stream` header; the `?_method=SUB` query
+  parameter is silently ignored. The audit prediction was
+  incorrect; the actual URL is plain `GET /<key_expr>` with the
+  Accept header.
+* **Chunked transfer**: the SSE response uses
+  `Transfer-Encoding: chunked`. The reader detects chunk-size
+  prefix lines (hex-only lines terminated by `\r\n`) and skips
+  them; everything else flows into the SSE parser. SSE blank
+  lines (event terminators) are NOT classified as chunk-size
+  lines -- the `is_chunk_size_line` helper carefully distinguishes
+  the two.
+* **Bounded channel + drop-on-full**: `sync_channel(4096)`. Same
+  drop semantics as the Multi-mode bridge: a backed-up consumer
+  produces JSONL receive gaps in the analysis, not unbounded
+  memory growth.
+
+[sse-spec]: https://html.spec.whatwg.org/multipage/server-sent-events.html
+
+### Inter-sidecar Zenoh peering (two-runner topology)
+
+`build_zenohd_config_json` accepts optional `listen_tcp` (host:port)
+and `connect_tcp` (list of host:port) parameters that configure
+inter-router Zenoh peering. Two per-runner sidecars on the same host
+need an explicit peer mesh (multicast scouting alone doesn't reliably
+deliver across two same-host routers in the default zenohd config):
+
+* Each sidecar listens on `127.0.0.1:<rest_port + 1000>` for inbound
+  Zenoh sessions. The +1000 offset partitions the REST and Zenoh
+  TCP port ranges trivially without an extra CLI knob.
+* Each sidecar dials out to every other peer's
+  `<peer_host>:<peer_rest_port + 1000>` derived from the sorted
+  `--peers` map (same convention this variant already uses for the
+  REST port). Solo runs without `--peers` leave the connect list
+  empty and the sidecar runs in standalone mode.
+
+`connect(Single)` builds this list once at startup and writes it
+into the per-spawn zenohd config file (see
+`Sidecar::spawn`).
+
+### connect(Single) flow
+
+1. Locate the `zenohd` binary (fail-fast actionable error if
+   missing -- contract unchanged from T14.9a).
+2. Compute the per-runner REST port + the inter-sidecar peer list.
+3. Spawn zenohd with a per-spawn config that enables the REST plugin
+   on the derived port AND configures Zenoh peering.
+4. Wait up to 5 s for the REST plugin to respond on
+   `/@/router/local` before considering the sidecar live.
+5. Build the `HttpPublisher` (ureq agent) targeting the REST port.
+6. Start the SSE reader thread (raw TcpStream + per-read timeout)
+   subscribed to `bench/**`.
+7. Record `connected_mode = Single` and return success.
+
+On any failure after the sidecar spawn the sidecar is killed before
+the error propagates -- no orphan `zenohd` from a half-failed
+connect.
+
+### disconnect flow
+
+1. Stop the SSE reader thread (atomic stop flag + drop the
+   receiver). The reader checks the flag between every per-read
+   timeout cycle, so worst-case shutdown latency is one
+   `SSE_READ_TIMEOUT` (500 ms).
+2. Drop the `HttpPublisher` (ureq agent releases its socket).
+3. Tear the sidecar down (T14.9a path: SIGTERM/kill +
+   per-platform cleanup).
+
+### Tokio-free verification
+
+`cargo tree -e features -p variant-zenoh` -- excerpt showing the
+Single-mode call graph reachable from `ureq` and the relevant
+direct-dep neighbourhood:
+
+```
+variant-zenoh
+├── ureq v3.3.0
+│   ├── base64 (default-features off via this crate's dep too)
+│   ├── log
+│   ├── percent-encoding
+│   ├── ureq-proto v0.6.0
+│   │   ├── httparse
+│   │   ├── base64
+│   │   ├── log
+│   │   └── http v1.4.0
+│   │       ├── bytes
+│   │       └── itoa
+│   └── utf8-zero
+├── base64 v0.22.1
+├── anyhow
+├── bytes
+├── clap
+├── num_cpus
+├── rand
+├── serde_json
+├── tokio        <-- direct dep, only Multi mode reaches it
+├── variant-base
+└── zenoh        <-- pulls tokio transitively, only Multi mode reaches it
+```
+
+Verification via the inverse-tree perspective (`cargo tree -e
+features -p variant-zenoh --invert tokio`) shows tokio is reachable
+ONLY through `zenoh`, `variant-zenoh`'s own direct `tokio` dep
+(Multi-mode runtime), and a handful of dev-time crates. ureq's
+subtree (the entire Single-mode RPC client surface) does NOT
+include tokio.
+
+The crates reachable from `connect(Single)` -> `publish` /
+`poll_receive` are: `ureq`, `ureq-proto`, `http`, `httparse`,
+`bytes`, `log`, `percent-encoding`, `utf8-zero`, `base64`,
+`serde_json`, plus `std`. All sync, all `std::net`-backed.
 
 ## Single mode scaffolding (T14.9a)
 
-T14.9a is shipped. The variant **declares `[Multi]` only** so the
-runner skips Single-mode spawns; the scaffolding exists for the
-post-T14.9b transition and for the manual smoke documented below.
-Tests + the manual smoke construct the variant directly with
-`--threading-mode single`.
+Historical context for the sidecar lifecycle now exercised by
+T14.9b. The variant **declares `[Single, Multi]`** as of T14.9b so
+the runner spawns Single-mode fixtures through this branch
+alongside Multi-mode. Tests + the manual smoke construct the variant
+directly with `--threading-mode single`.
 
 ### Installing `zenohd`
 
@@ -416,35 +619,35 @@ At `connect(ThreadingMode::Single)`:
 1. Locate the `zenohd` binary (fail-fast with the actionable error
    above if missing).
 2. Generate a per-spawn JSON config enabling the REST plugin on the
-   derived port. The plugin is bound to `127.0.0.1:<port>` so the
-   sidecar's RPC surface is not exposed beyond the local host.
+   derived port AND (T14.9b) the inter-sidecar Zenoh peer mesh.
+   The REST plugin is bound to `127.0.0.1:<port>` so the sidecar's
+   RPC surface is not exposed beyond the local host. The Zenoh
+   listen / connect endpoints (`tcp/<host>:<rest_port + 1000>`)
+   are derived from the runner-injected `--peers` map.
 3. `Command::spawn` with per-platform child-cleanup setup (below).
 4. Poll the REST admin space (`/@/router/local`) for up to 5 s. If
    the plugin never responds we kill the child and surface a clean
    error rather than letting the sidecar hang the connect path.
-5. Store the `Sidecar` handle on the variant; record
+5. Build the `HttpPublisher` (`ureq` agent) targeting the REST port
+   (T14.9b).
+6. Spawn the SSE reader thread subscribed to `bench/**` on the
+   REST port (T14.9b).
+7. Store all three handles on the variant; record
    `connected_mode = Single`.
 
-`publish` / `try_publish` / `poll_receive` in Single mode return
-the deliberate error:
-
-```
-zenoh Single mode RPC client not yet implemented; pending T14.9b.
-Sidecar is running but no client surface is wired up.
-```
-
-This is **intentional**: T14.9a establishes the lifecycle wiring so
-T14.9b can drop its sync RPC client into a known-good sidecar
-process; without the explicit error a silent no-op would mislead
-operators running the manual smoke.
+`publish` / `try_publish` / `poll_receive` route through the
+`HttpPublisher` + SSE reader -- see "T14.9b RPC client architecture"
+above for the wire formats.
 
 At `disconnect`:
 
-1. Send SIGTERM (Unix) / `Child::kill` (Windows) to the sidecar.
-2. Wait up to 500 ms for graceful exit; fall back to `kill()` for
+1. Stop the SSE reader thread (T14.9b).
+2. Drop the `HttpPublisher` (T14.9b).
+3. Send SIGTERM (Unix) / `Child::kill` (Windows) to the sidecar.
+4. Wait up to 500 ms for graceful exit; fall back to `kill()` for
    anything still alive.
-3. Remove the per-spawn temp config file.
-4. Drop the Job Object handle (Windows) -- belt-and-braces in case
+5. Remove the per-spawn temp config file.
+6. Drop the Job Object handle (Windows) -- belt-and-braces in case
    the explicit kill ever fails.
 
 ### Per-platform child-process cleanup
@@ -483,18 +686,12 @@ the higher-level `windows` crate. The required surface (Job Object
 `Win32_System_JobObjects` + `Win32_Security` features) is identical
 between the two crates.
 
-### Why `connect(Single)` runs at all when capability is `[Multi]`
+### Why `connect(Single)` is the production Single-mode path
 
-The runner consults `supported_threading_modes()` and skips Single
-spawns for variant-zenoh -- so the `connect(Single)` path is NOT
-exercised by production fixture spawns. The deliberate decision to
-keep `connect(Single)` functional regardless is so the
-manual-smoke `cargo test ... -- --ignored sidecar_lifecycle_smoke`
-flow + the operator-facing `variant-zenoh --threading-mode single`
-invocation are useful **before** T14.9b lands. After T14.9b the
-capability flips to `[Single, Multi]` and the runner will spawn
-Single fixtures for Zenoh through the same `connect(Single)`
-entry point.
+As of T14.9b the variant declares `[Single, Multi]` and the runner
+spawns Single fixtures through `connect(Single)`. The earlier
+T14.9a-only state where this branch was only exercised by tests +
+the manual smoke is historical.
 
 ### Manual smoke
 
@@ -504,12 +701,16 @@ After installing zenohd + dropping the plugin DLL alongside it (see
 ```
 cargo build --release -p variant-zenoh
 cargo test --release -p variant-zenoh -- --ignored sidecar_lifecycle_smoke
+cargo test --release -p variant-zenoh -- --ignored two_runner_regression_single_mode_t149b
 ```
 
-The test skips gracefully if zenohd is not found (printing a
-diagnostic) so it works on CI without zenohd installed.
+Both `#[ignore]` tests skip gracefully if zenohd is not found
+(printing a diagnostic) so they work on CI without zenohd
+installed. The two-runner test additionally requires the runner +
+variant-zenoh release binaries built at the workspace target dir.
 
-For a hand-driven smoke equivalent to the integration test:
+For a hand-driven solo smoke that exercises the full Single-mode
+path end-to-end:
 
 ```
 ./target/release/variant-zenoh \
@@ -521,20 +722,26 @@ For a hand-driven smoke equivalent to the integration test:
   -- --zenoh-sidecar-base-port 20100
 ```
 
-Expected output:
+Expected output (sample taken from a clean run, T14.9b):
 
 ```
 [zenoh] build: <sha>+dirty (rustc <version>)
-{"event":"progress",...}
-Error: zenoh Single mode RPC client not yet implemented; pending
-T14.9b. Sidecar is running but no client surface is wired up.
+{"eot_received":false,"eot_sent":false,"event":"progress","phase":"operate","received":7,"sent":8,...}
+{"eot_received":false,"eot_sent":false,"event":"progress","phase":"operate","received":17,"sent":18,...}
+{"eot_received":true,"eot_sent":true,"event":"progress","phase":"done","received":20,"sent":21,...}
 ```
 
-i.e. the variant brings the sidecar up, the driver runs through
-connect/operate, the first publish refuses, the disconnect path
-kills the sidecar, and the process exits non-zero with the T14.9b
-pointer. Inspect `Get-Process zenohd` (Windows) or `pgrep zenohd`
-(Unix) afterwards to confirm no orphan sidecar.
+i.e. the variant brings the sidecar up, the driver publishes 1 vpt
+× 10 Hz × 2 s = ~20 messages, the SSE reader delivers them all
+back to the variant's main thread, the driver emits `eot_sent` via
+T15.5 idle detection, and the process exits cleanly. Inspect
+`Get-Process zenohd` (Windows) or `pgrep zenohd` (Unix) afterwards
+to confirm no orphan sidecar.
+
+Pre-T14.9b the same command surfaced the explicit
+`"Single mode RPC client not yet implemented; pending T14.9b"`
+error -- that path is gone now that publish/poll_receive are wired
+to the REST plugin.
 
 ### `--recv-buffer-kb`
 
