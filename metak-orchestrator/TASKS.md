@@ -5946,13 +5946,19 @@ finds a small UDP fix.
 
 ---
 
-### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar (DEFERRED)
+### T14.9: variants/zenoh -- single-threaded client via Zenoh-router sidecar
 
-**Repo**: `variants/zenoh/`, plus a small runner-side sidecar-spawn
-mechanism.
-**Status**: deferred. Filed as a skeleton; not part of the E14 sprint.
-Spawn only after E14 (T14.1 - T14.8) lands and the team confirms a
-real WASM use case for Zenoh.
+**Repo**: `variants/zenoh/`, plus possibly a small runner-side
+sidecar-spawn mechanism.
+**Status**: active 2026-05-14 (un-deferred). The primary motivation
+is the team's WASM compilation target (single-threaded sync variant
+client + multi-threaded router living in a separate process). A
+secondary effect is that the Zenoh qos3/qos4 deadlock under
+symmetric flood would be isolated inside the router process rather
+than the variant — but T15.11 (variant-side watchdog) is a much
+smaller fix for the deadlock specifically, so T14.9 should be
+scoped purely around the WASM-client architecture, not as a fix for
+the qos3/qos4 stall.
 
 #### Background
 
@@ -6881,6 +6887,120 @@ greenlights.
       architecture.
 - [ ] Test inventory documented in STATUS.md (which tests were
       updated vs removed).
+
+---
+
+### T15.11: variant-base -- watchdog thread for internal-stall self-exit
+
+**Repo**: `variant-base/`.
+**Status**: pending, filed 2026-05-14 after the post-T15.10 stress
+analysis showed Zenoh qos3/qos4 multi still classifying as `deadlock`
+because alice's variant process wedges inside Zenoh's library code
+and gets killed by the runner's safety-net (JSONL truncated mid-record).
+
+#### Background
+
+T15.5 added variant-side idle detection inside the protocol driver's
+operate loop. But if the driver thread itself is BLOCKED inside a
+transport library call (e.g. Zenoh's internal async runtime
+deadlocking under symmetric flood), the idle detector never runs --
+the driver loop doesn't tick. T15.1's `ProgressEmitter` runs on its
+own thread so progress lines keep going out, just with frozen
+counters. The runner eventually trips the `max_spawn_secs` safety
+net and `TerminateProcess`/`SIGKILL`s the variant, leaving JSONL
+truncated mid-record. T14.17 classifies the outcome as `deadlock`.
+
+A small watchdog thread inside `variant-base` can convert this
+failure mode from "runner kills the variant + truncated JSONL" to
+"variant self-exits cleanly with a clear diagnostic + JSONL flushed
+via Drop impls":
+
+#### Scope
+
+- New OS thread spawned at variant connect time, parented by the
+  protocol driver. Lives until `disconnect`.
+- The watchdog reads the same monotonic counters the
+  `ProgressEmitter` already exposes (sent / received).
+- Every 1 second (configurable), the watchdog checks:
+  - Is the current phase `operate`?
+  - Has either counter changed since the last check?
+  - If `operate` AND no progress for `watchdog_secs` (default 60),
+    fire.
+- On fire:
+  - Log to stderr: `[variant] watchdog: no progress in <N>s during
+    operate phase -- internal stall; self-exiting`.
+  - Call `std::process::exit(2)` (or whatever the chosen
+    self-stall exit code is). Drop impls run on the way out so
+    JSONL is flushed cleanly.
+- New CLI arg `--watchdog-secs <u32>` (default 60; 0 disables the
+  watchdog).
+- Variants don't need to do anything special. The watchdog is
+  variant-base-only.
+
+#### Tests
+
+- Unit: stub variant whose counters intentionally don't advance for
+  >watchdog_secs in operate phase; assert `std::process::exit` is
+  called (mock the exit fn or use a process-level integration test).
+- Unit: stub variant whose counters DO advance; assert watchdog
+  doesn't fire.
+- Unit: `--watchdog-secs 0` disables the watchdog.
+- Integration: a synthetic variant that calls `std::thread::park()`
+  inside `try_publish` to deadlock; runner spawns it; variant
+  self-exits via watchdog after ~60s; runner observes a clean exit
+  with a non-zero exit code; JSONL ends cleanly (not truncated).
+
+#### Analysis side (T14.17 classifier extension)
+
+Add a new classification value `variant_self_killed_idle`. Rule:
+- spawn `status=failed` with the watchdog's exit code (worker picks
+  exit code, documents in CUSTOM.md, T14.17 reads it)
+- variant's JSONL ends cleanly (last line parses) with no
+  `eot_sent` event
+- variant's stderr capture contains the
+  `watchdog: no progress in <N>s` line
+
+This classification is **mutually exclusive** with `deadlock` (which
+requires JSONL truncated mid-record) and `eot_lost` (which requires
+peer-side EOT failure).
+
+Whether T15.11 ships the T14.17 rule too, or files it as a small
+analysis follow-up, is the worker's call. Recommendation: ship it
+together — same patch, same conceptual change.
+
+#### Validation (MANDATORY)
+
+- `cargo build --release -p variant-base` clean.
+- `cargo test --release -p variant-base` all-green.
+- `cargo test --release --workspace` no regression.
+- Clippy + fmt clean.
+- **End-to-end repro (MANDATORY)**: rebuild, re-run the stress
+  fixture `configs/two-runner-stress-e14.toml`. The 2 currently-
+  `deadlock`-classifying Zenoh qos3/qos4 multi spawns should now
+  classify as `variant_self_killed_idle` (or whatever name lands)
+  instead. Capture the post-T15.11 classifier output for those rows
+  in the completion report.
+
+#### Acceptance criteria
+
+- [ ] Watchdog thread implemented in `variant-base`.
+- [ ] `--watchdog-secs` CLI arg.
+- [ ] Watchdog converts deadlocked variants to clean self-exit with
+      flushed JSONL.
+- [ ] T14.17 classifier recognises the new outcome (either in this
+      patch or a sibling follow-up).
+- [ ] Stress fixture's Zenoh qos3/qos4 multi rows reclassify away
+      from `deadlock`.
+- [ ] All existing tests pass.
+
+#### Out of scope
+
+- Actually fixing Zenoh's internal deadlock (that's T14.9 territory
+  if WASM compat is wanted; otherwise it stays as an honest cliff).
+- Making the watchdog phase-aware beyond "fire only in operate".
+  Stabilize / silent phases have well-defined durations; the
+  watchdog doesn't need to interfere with them.
+- Tuning `watchdog_secs` adaptively. Static default is fine.
 
 ---
 
