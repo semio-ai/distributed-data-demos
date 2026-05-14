@@ -32,6 +32,7 @@ from correlate import correlate_lazy
 from incomplete_warnings import emit_incomplete_warnings
 from integrity import IntegrityResult, integrity_for_group
 from performance import PerformanceResult, performance_for_group
+from pivot_tables import export_csv, format_pivot_section
 from tables import format_integrity_table, format_performance_table
 
 
@@ -152,6 +153,15 @@ def build_parser() -> argparse.ArgumentParser:
         "steady-state pipeline stays instrumentation-free.",
     )
     parser.add_argument(
+        "--csv-out",
+        type=Path,
+        default=None,
+        help="Write a long-form CSV (one row per (variant, run)) with the "
+        "pivot-table columns plus all existing PerformanceResult columns. "
+        "Operators can pivot this in Excel/Sheets if they want a custom "
+        "slice that the built-in pivot tables don't cover.",
+    )
+    parser.add_argument(
         "--log-throughput",
         action="store_true",
         help="Render the throughput panels of comparison.png on a log "
@@ -262,10 +272,24 @@ def main(argv: list[str] | None = None) -> int:
             print("No events found in log files.", file=sys.stderr)
             return 1
 
-        # Step 2: per-(variant, run) lazy analysis.
+        # Step 2: per-(variant, run) lazy analysis. Force-enable the
+        # integrity computation when --csv-out is requested without
+        # --summary so the CSV gets the same data the pivot tables
+        # would. Actually the CSV is computed from performance_results
+        # alone (which is always populated), so no force is needed --
+        # this comment documents the intent.
         integrity_results, performance_results = run_analysis(
             logs_dir, do_summary=do_summary
         )
+
+        # T-pivot.4: long-form CSV export. Emitted before the summary
+        # tables so that piping the CLI output to a file still leaves
+        # the CSV file intact regardless of stdout truncation.
+        if args.csv_out is not None:
+            csv_text = export_csv(performance_results)
+            args.csv_out.parent.mkdir(parents=True, exist_ok=True)
+            args.csv_out.write_text(csv_text, encoding="utf-8")
+            print(f"CSV export written to: {args.csv_out}", file=sys.stderr)
 
         # Step 3: summary tables.
         if do_summary:
@@ -284,6 +308,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             print(format_performance_table(performance_results))
+
+            # T-pivot.3: variant x workload pivot tables, one per QoS
+            # level. Rendered after the three flat reports so the
+            # operator gets the existing scan first and then a
+            # cross-cut view at the bottom.
+            print(format_pivot_section(performance_results))
 
             # T14.21: surface job-run cases with incomplete samples
             # (non-completed spawn / delivery shortfall / late tail)
