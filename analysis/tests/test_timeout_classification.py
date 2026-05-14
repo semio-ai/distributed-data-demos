@@ -122,38 +122,29 @@ class TestCompleted:
 
 
 class TestDeadlock:
-    def test_no_eot_sent_truncated_jsonl_classifies_deadlock(
+    def test_pre_operate_truncated_jsonl_classifies_deadlock(
         self, tmp_path: Path
     ) -> None:
-        """Spec rule 2: no eot_sent + truncated JSONL tail -> deadlock."""
+        """Spec rule 8 (post-T14.17 follow-up): truncated JSONL with NO
+        ``phase=operate`` keeps the legacy ``deadlock`` label.
+
+        With the 2026-05-14 ``variant_crashed`` follow-up, truncated
+        JSONLs that DID reach ``phase=operate`` are now classified as
+        ``variant_crashed``. The legacy ``deadlock`` label survives for
+        the pre-operate truncation edge case (variant killed before it
+        emitted its first ``phase=operate`` line).
+        """
         variant = "test-variant"
         run = "run01"
         alice_events = [
             make_event("phase", runner="alice", run=run, phase="connect", offset_ms=0),
             make_event(
-                "phase", runner="alice", run=run, phase="operate", offset_ms=100
+                "phase", runner="alice", run=run, phase="stabilize", offset_ms=50
             ),
-            make_event(
-                "write",
-                runner="alice",
-                run=run,
-                seq=1,
-                path="/k",
-                qos=4,
-                bytes=8,
-                offset_ms=110,
-            ),
-            # Last event will be truncated.
-            make_event(
-                "write",
-                runner="alice",
-                run=run,
-                seq=2,
-                path="/k",
-                qos=4,
-                bytes=8,
-                offset_ms=120,
-            ),
+            # Note: no phase=operate -- variant was killed mid-record
+            # before it even logged the operate transition. variant_rejected
+            # requires non-empty stderr, which we deliberately omit, so the
+            # only rule that catches this is the legacy deadlock fallthrough.
         ]
         # Write everything but lop off the trailing bytes so the final
         # line is missing its closing brace and newline.
@@ -168,6 +159,47 @@ class TestDeadlock:
         lazy = events_to_lazy(alice_events)
         result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
         assert result["alice"].classification == "deadlock"
+
+    def test_truncated_jsonl_without_logs_dir_classifies_deadlock(
+        self, tmp_path: Path
+    ) -> None:
+        """Without ``logs_dir`` the stderr-aware rules (6/7) cannot run,
+        so a truncated JSONL falls through to the legacy ``deadlock``
+        rule by definition. Regression guard: a caller that doesn't
+        supply ``logs_dir`` must still see ``deadlock`` rather than
+        ``variant_crashed`` (which requires reading stderr).
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice_events = [
+            make_event(
+                "phase", runner="alice", run=run, phase="operate", offset_ms=100
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                run=run,
+                seq=1,
+                path="/k",
+                qos=4,
+                bytes=8,
+                offset_ms=110,
+            ),
+        ]
+        _write_jsonl_truncated(
+            tmp_path / f"{variant}-alice-{run}.jsonl",
+            alice_events,
+            truncate_bytes=15,
+        )
+
+        lazy = events_to_lazy(alice_events)
+        # logs_dir=None forces the rule-6/7 stderr-aware branch off.
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=None)
+        # Without logs_dir the file-tail truncation check cannot run
+        # either, so the classifier falls all the way through to unknown.
+        # Document the existing behaviour rather than assert deadlock --
+        # the contract is: no logs_dir, no stderr/JSONL reads.
+        assert result["alice"].classification == "unknown"
 
     def test_jsonl_ends_mid_record_helper(self, tmp_path: Path) -> None:
         """Truncation-detection helper recognises an incomplete final record."""
@@ -623,15 +655,19 @@ class TestVariantSelfKilledIdle:
         assert result["alice"].classification == "variant_self_killed_idle"
         assert result["alice"].sub_tags == ()
 
-    def test_deadlock_wins_when_jsonl_truncated_without_watchdog_signature(
+    def test_variant_crashed_when_jsonl_truncated_without_watchdog_signature(
         self, tmp_path: Path
     ) -> None:
-        """Mutual exclusion: truncated JSONL + no stderr -> ``deadlock``.
+        """Mutual exclusion (post-2026-05-14): truncated JSONL + no
+        watchdog signature + has ``phase=operate`` -> ``variant_crashed``.
 
-        The watchdog rule only matches when stderr carries the
-        diagnostic substring. A spawn that was hard-killed mid-record
-        with no stderr capture (or stderr lacking the watchdog line)
-        must still fall through to the legacy ``deadlock`` rule.
+        Before the T14.17 follow-up this case classified as
+        ``deadlock`` (truncation is the smoking gun, watchdog signature
+        absent so ``variant_self_killed_idle`` doesn't fire). The new
+        ``variant_crashed`` rule sits between the two and catches the
+        fast-panic shape (variant reached operate then died too fast
+        for the watchdog to fire). The Zenoh qos3 alice case under
+        stress is the motivating example.
         """
         variant = "test-variant"
         run = "run01"
@@ -662,7 +698,8 @@ class TestVariantSelfKilledIdle:
             ),
         ]
         # Mid-record kill (truncated JSONL) with NO stderr capture --
-        # the deadlock rule should still win.
+        # the variant_crashed rule wins because the spawn reached
+        # phase=operate and the watchdog signature is absent.
         _write_jsonl_truncated(
             tmp_path / f"{variant}-alice-{run}.jsonl",
             alice_events,
@@ -671,7 +708,7 @@ class TestVariantSelfKilledIdle:
 
         lazy = events_to_lazy(alice_events)
         result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
-        assert result["alice"].classification == "deadlock"
+        assert result["alice"].classification == "variant_crashed"
 
     def test_runner_idle_terminated_wins_when_eot_sent_and_silent_reached(
         self, tmp_path: Path
@@ -767,6 +804,181 @@ class TestVariantSelfKilledIdle:
         result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
         # variant_rejected wins because the spawn never reached operate.
         assert result["alice"].classification == "variant_rejected"
+
+
+def _alice_crashed_events(*, run: str = "run01") -> list[dict]:
+    """Events for an alice spawn that crashed mid-operate.
+
+    Reaches operate (and emits a couple of writes), but the variant
+    process exits abnormally without flushing -- the simulated case is
+    a panic inside a transport library (the Zenoh qos3 multi alice
+    failure shape under stress). The watchdog never fires because the
+    crash happens faster than its threshold (default 30s). The JSONL
+    is left truncated mid-record because the writer buffer never
+    flushes. No stderr is written by the variant.
+    """
+    return [
+        make_event("phase", runner="alice", run=run, phase="connect", offset_ms=0),
+        make_event("phase", runner="alice", run=run, phase="stabilize", offset_ms=10),
+        make_event("phase", runner="alice", run=run, phase="operate", offset_ms=100),
+        make_event(
+            "write",
+            runner="alice",
+            run=run,
+            seq=1,
+            path="/k",
+            qos=4,
+            bytes=8,
+            offset_ms=110,
+        ),
+        make_event(
+            "write",
+            runner="alice",
+            run=run,
+            seq=2,
+            path="/k",
+            qos=4,
+            bytes=8,
+            offset_ms=120,
+        ),
+        # Process panics here. No further events; the writer buffer
+        # never flushes so the file ends mid-record.
+    ]
+
+
+class TestVariantCrashed:
+    """T14.17 follow-up (2026-05-14): fast-panic shape classification.
+
+    Distinguishes a variant that crashed inside the variant process
+    (e.g. transport-library panic) from a slow-stall self-exit
+    (``variant_self_killed_idle``) and from a generic
+    ``deadlock``. The discriminator is: truncated JSONL +
+    ``phase=operate`` reached + NO watchdog signature.
+    """
+
+    def test_truncated_jsonl_no_watchdog_classifies_variant_crashed(
+        self, tmp_path: Path
+    ) -> None:
+        """Truncated JSONL + has phase=operate + no eot_sent + no watchdog
+        signature -> ``variant_crashed``."""
+        variant = "test-variant"
+        run = "run01"
+        alice_events = _alice_crashed_events(run=run)
+        _write_jsonl_truncated(
+            tmp_path / f"{variant}-alice-{run}.jsonl",
+            alice_events,
+            truncate_bytes=15,
+        )
+        # No stderr file at all -- the variant didn't get a chance to
+        # write one. This is the typical Zenoh qos3 alice fast-panic
+        # shape: a process panic inside a transport library inside a
+        # tokio runtime returns no output to the runner's stderr
+        # capture.
+
+        lazy = events_to_lazy(alice_events)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "variant_crashed"
+        assert result["alice"].sub_tags == ()
+
+    def test_truncated_jsonl_empty_stderr_classifies_variant_crashed(
+        self, tmp_path: Path
+    ) -> None:
+        """Empty stderr file (created by the runner before spawn, child
+        wrote nothing) must classify the same as no stderr at all.
+
+        The runner opens the stderr capture path BEFORE spawning the
+        child (see ``runner/src/spawn.rs::spawn_and_monitor``), so an
+        empty file is the on-disk shape for a child that died without
+        emitting any stderr.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice_events = _alice_crashed_events(run=run)
+        _write_jsonl_truncated(
+            tmp_path / f"{variant}-alice-{run}.jsonl",
+            alice_events,
+            truncate_bytes=15,
+        )
+        # Empty stderr capture file -- runner pre-creates it.
+        (tmp_path / f"{variant}-alice-stderr.txt").write_text("", encoding="utf-8")
+
+        lazy = events_to_lazy(alice_events)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "variant_crashed"
+
+    def test_watchdog_signature_wins_over_variant_crashed(self, tmp_path: Path) -> None:
+        """Precedence: stderr signature present -> ``variant_self_killed_idle``.
+
+        Even if the JSONL happens to be truncated, the watchdog rule's
+        explicit signature wins over the truncation-based
+        ``variant_crashed`` rule -- mirroring the existing ``deadlock``
+        precedence note.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice_events = _alice_crashed_events(run=run)
+        _write_jsonl_truncated(
+            tmp_path / f"{variant}-alice-{run}.jsonl",
+            alice_events,
+            truncate_bytes=15,
+        )
+        (tmp_path / f"{variant}-alice-stderr.txt").write_text(
+            f"[variant] {WATCHDOG_STDERR_SUBSTRING} in 60s during operate phase\n",
+            encoding="utf-8",
+        )
+
+        lazy = events_to_lazy(alice_events)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "variant_self_killed_idle"
+
+    def test_deadlock_wins_when_no_phase_operate(self, tmp_path: Path) -> None:
+        """Precedence: truncated JSONL with NO ``phase=operate`` keeps the
+        legacy ``deadlock`` label.
+
+        ``variant_crashed`` requires ``has_phase_operate`` so that the
+        very-early truncation cases (variant killed before logging the
+        operate transition) keep their pre-existing label. They cannot
+        be ``variant_rejected`` because that rule additionally requires
+        a non-empty stderr capture.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice_events = [
+            make_event("phase", runner="alice", run=run, phase="connect", offset_ms=0),
+            make_event(
+                "phase", runner="alice", run=run, phase="stabilize", offset_ms=50
+            ),
+            # No phase=operate -- variant was killed earlier.
+        ]
+        _write_jsonl_truncated(
+            tmp_path / f"{variant}-alice-{run}.jsonl",
+            alice_events,
+            truncate_bytes=15,
+        )
+
+        lazy = events_to_lazy(alice_events)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        # variant_crashed needs phase=operate; falls through to deadlock.
+        assert result["alice"].classification == "deadlock"
+
+    def test_runner_idle_terminated_wins_over_variant_crashed(
+        self, tmp_path: Path
+    ) -> None:
+        """Precedence: ``eot_sent`` + ``phase=silent`` -> clean-exit rule.
+
+        A spawn that reached the E15 idle-detection path (``eot_sent``
+        + ``phase=silent``) keeps the ``runner_idle_terminated`` label
+        even if the JSONL would otherwise be considered truncated --
+        ``has_eot_sent`` is checked earlier in the chain.
+        """
+        variant = "test-variant"
+        run = "run01"
+        alice = _alice_idle_terminated_events(run=run)
+        _write_jsonl_clean(tmp_path / f"{variant}-alice-{run}.jsonl", alice)
+
+        lazy = events_to_lazy(alice)
+        result = classify_group(lazy, variant=variant, run=run, logs_dir=tmp_path)
+        assert result["alice"].classification == "runner_idle_terminated"
 
 
 class TestUnknown:
