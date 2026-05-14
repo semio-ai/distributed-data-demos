@@ -77,7 +77,8 @@ fn rest_responds(port: u16, timeout: Duration) -> bool {
     };
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))
+        if let Ok(mut stream) =
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))
         {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
             let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
@@ -102,7 +103,9 @@ fn rest_responds(port: u16, timeout: Duration) -> bool {
 /// (a small grace window for the OS to fully release it after the
 /// listening process exits).
 fn port_freed(port: u16, timeout: Duration) -> bool {
-    let addr = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>().unwrap();
+    let addr = format!("127.0.0.1:{port}")
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
