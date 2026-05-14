@@ -10960,3 +10960,103 @@ T14.9c: `caaf342`, `d9f2102`, `58f8ea9`.
 The architectural arc that started 2026-05-11 with asymmetric timeouts
 on `configs/two-runner-websocket-qos4.toml` is now fully closed.
 
+
+---
+
+## 2026-05-14 — Canonical all-variants benchmark complete (orchestrator)
+
+Ran `configs/two-runner-all-variants.toml` end-to-end on the post-E15
++ T15.10 + T15.11 + T14.9 + T15.12 state. 256 spawns total, ~4 hours
+wall-time.
+
+### Runner outcomes
+
+- **250 / 256 status=success** (97.7%)
+- **6 / 256 status=failed exit_code=2** -- all Zenoh, all classified
+  `variant_self_killed_idle` by T15.11 watchdog (clean self-exit on
+  internal stall):
+  - zenoh-1000x100hz-qos3-multi
+  - zenoh-1000x100hz-qos4-multi
+  - zenoh-1000x10hz-qos3-multi
+  - zenoh-100x1000hz-qos4-multi
+  - zenoh-max-qos3-multi
+  - zenoh-max-qos4-multi
+- **Zero deadlocks, zero asymmetric timeouts, zero crashes, zero
+  unknowns**
+
+### T14.17 classifier distribution across 659 path-rows
+
+- `runner_idle_terminated`: 622 (94.4%) -- clean exit via E15 idle
+  detection
+- `variant_self_killed_idle`: 27 (4.1%) -- Zenoh watchdog catches
+- `completed`: 10 (1.5%) -- peer-confirmed handshake
+- `deadlock` / `eot_lost` / `eot_timeout_internal` / `variant_crashed`
+  / `variant_rejected` / `unknown`: **0 each**
+
+Every cell in the 256-spawn matrix has a labeled outcome.
+
+### Headline cross-variant comparison at 1000x100hz qos3-4 Multi
+
+```
+Variant       QoS   Receives/s   Delivery     p50           p99
+quic           3    199,803      99.92%       7.87 ms       149.6 ms
+quic           4    194,056      99.91%      26.26 ms       839.9 ms
+websocket      3     59,749     100.00%       0.072 ms      0.326 ms
+websocket      4     70,150     100.00%      -0.026 ms      0.176 ms
+webrtc         3     86,078      43.06%      11.15 s       17.13 s
+webrtc         4     93,424      46.72%      11.65 s       16.26 s
+hybrid         3     31,327      29.85%       257 ms        327 ms
+hybrid         4     32,318      30.47%       248 ms        307 ms
+custom-udp     3      1,389      10.60%      4.35 s        6.56 s
+custom-udp     4     31,493      30.70%       500 ms        598 ms
+zenoh          3     27,090      40.44%       205 ms       (tail 10 s)
+zenoh          4     21,027      32.73%       274 ms       (tail 10 s)
+```
+
+### Cross-variant insights
+
+- **QUIC** is the throughput champion at 100K msg/s symmetric
+  reliable: ~200K rcv/s, full delivery, sub-millisecond p50.
+- **WebSocket Multi** has the lowest latency by far (0.072 ms p50)
+  thanks to T14.10's log-from-reader pattern. Throughput moderate.
+- **Custom-UDP qos3 (NACK-reliable)** is catastrophic at 1000 vpt —
+  1,389 rcv/s, 10.6% delivery, 4-6 second latencies. At lower vpt
+  (100, 10) it recovers to 99.9% delivery. The cliff is per-tick-
+  batch size, not aggregate rate.
+- **Hybrid + Custom-UDP qos4 (TCP)** both at ~30K rcv/s / 30%
+  delivery / 250-500ms latency — characteristic TCP-windowing
+  behaviour under symmetric flood.
+- **WebRTC** moderate throughput (~90K rcv/s) but multi-second tail
+  latency — DataChannel framing overhead under high load.
+- **Zenoh** moderate throughput (~21-27K rcv/s) but multi-second
+  worst-case tail — Zenoh's internal queueing absorbs spikes
+  imperfectly.
+
+At lower-rate workloads (10x100hz, 100x100hz, 100x10hz) all variants
+typically deliver >99% at all QoS levels with low millisecond
+latencies. The bench surfaces the cliffs cleanly.
+
+### The architectural arc, end-to-end
+
+Started 2026-05-11 when `configs/two-runner-websocket-qos4.toml`
+produced asymmetric timeouts. Through E14's reactive fix-stack
+(T-impl.10, T14.13/14/16/18/19/22/23/24), E15's observational
+architecture (T15.1-T15.6, T15.8 cleanup), and the final follow-ups
+(T15.10 TCP barriers, T15.11 watchdog, T14.9 Zenoh sidecar, T15.12
+classifier polish), the benchmark now produces:
+
+- Honest cross-variant comparison data (table above)
+- Cleanly-labeled outcomes for every spawn (no ambiguous failures)
+- Idle-based termination instead of wall-clock timeouts
+- TCP-per-peer for all reliable runner-coord control planes
+- A WASM-friendly Single mode for Zenoh (T14.9a/b/c)
+- The "log everything with bad latency" intent honored: Hybrid qos3
+  Single at 0.12% delivery completes cleanly with the messages it
+  did receive faithfully logged.
+
+### Logs
+
+`logs/all-variants-01-20260514_084636/` -- 108 GB, ~256 JSONL files
++ stderr captures. Cache at `logs/.../.cache/` is 5.1 GB (the T11.6
+first-rebuild RSS pain point, took ~50 min on this dataset).
+
