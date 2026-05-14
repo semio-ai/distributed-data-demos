@@ -852,3 +852,87 @@ fn two_runner_regression_single_mode_t149b() {
          ({bob_pct:.2}%) from alice; below the 80% T14.9b regression threshold"
     );
 }
+
+/// T14.9c regression: at 10K msg/s (100 vpt x 100 Hz x 5 s = 50K
+/// total msgs/spawn), both runners must complete cleanly without
+/// `WSAEADDRINUSE` (`os error 10048`). Pre-T14.9c the variant's
+/// `ureq::Agent` was configured with keep-alive disabled, so every
+/// publish opened a fresh TCP connection and at this rate Windows'
+/// ~16K ephemeral port pool exhausted within ~1 s. With keep-alive
+/// on (ureq defaults) the variant pools the localhost connection
+/// and the failure mode is gone.
+///
+/// **Acceptance bar**: both runners exit success (status code 0)
+/// and neither stderr contains "os error 10048". Cross-peer
+/// delivery percentage is NOT asserted -- the REST surface's
+/// internal back-pressure at 10K msg/s is documented as
+/// catastrophic but in-scope for the variant per CUSTOM.md
+/// "Keep-alive ENABLED" section.
+#[test]
+#[ignore]
+fn two_runner_regression_single_mode_t149c_no_port_exhaustion() {
+    let _guard = serialize_tests().lock().unwrap_or_else(|p| p.into_inner());
+    let test_name = "single-t149c";
+    if check_binaries_or_skip(test_name) {
+        return;
+    }
+    if check_zenohd_or_skip(test_name) {
+        return;
+    }
+    let fixture = repo_root()
+        .join("variants")
+        .join("zenoh")
+        .join("tests")
+        .join("fixtures")
+        .join("two-runner-zenoh-single-t149c.toml");
+
+    // Distinct base port from the other tests so a parallel run
+    // (cargo test runs ignored tests in parallel) doesn't collide.
+    let base_port: u16 = 29576;
+    let result = drive_two_runners(
+        &fixture,
+        // Fixture declares `threading_modes = ["single"]` -- a
+        // single-element array -- so the spawn-name expansion
+        // does NOT append the `-single` suffix.
+        "zenoh-t149c-single",
+        "zenoh-t149c-single",
+        test_name,
+        base_port,
+    );
+
+    let alice_writes = result.alice.writes_in_window();
+    let bob_writes = result.bob.writes_in_window();
+
+    println!(
+        "[T14.9c-zenoh] alice writes={alice_writes}, bob writes={bob_writes}, wall={:.2}s",
+        result.wall_time.as_secs_f64()
+    );
+
+    // The PRIMARY acceptance check: no WSAEADDRINUSE in stderr.
+    assert!(
+        !result.combined_stderr.contains("os error 10048"),
+        "single-t149c: combined stderr contained `os error 10048` \
+         (WSAEADDRINUSE) -- T14.9c keep-alive fix is NOT in effect. \
+         stderr was:\n{}",
+        result.combined_stderr
+    );
+    // Secondary check: no panics.
+    assert!(
+        !result.combined_stderr.contains("panic"),
+        "single-t149c: combined stderr contained `panic`:\n{}",
+        result.combined_stderr
+    );
+    // The runners must reach `done` (operate -> eot_sent) on both
+    // sides. The `drive_two_runners` helper already asserted both
+    // exit codes are 0; the JSONL `eot_sent_ts` (parsed by
+    // `parse_jsonl`) implicitly confirms the operate window
+    // closed cleanly.
+    assert!(
+        alice_writes > 0,
+        "single-t149c: alice produced zero writes; runner did not reach operate"
+    );
+    assert!(
+        bob_writes > 0,
+        "single-t149c: bob produced zero writes; runner did not reach operate"
+    );
+}

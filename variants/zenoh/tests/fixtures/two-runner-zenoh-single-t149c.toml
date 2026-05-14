@@ -1,0 +1,39 @@
+# T14.9c two-runner regression fixture. Higher publish rate than
+# the T14.9b fixture (10 vpt x 100 Hz = 1K msg/s) so it exercises
+# the keep-alive path under enough pressure to reproduce the
+# pre-T14.9c WSAEADDRINUSE if keep-alive were ever re-disabled.
+#
+# Workload: 100 vpt x 100 Hz x 5 s = 50K total msgs/spawn = 10K
+# msg/s. Comfortably above the ~1K msg/s "modest" load T14.9b
+# targeted, but still inside the rate Single mode can publish
+# without saturating the REST plugin. The acceptance bar for this
+# test is process-completion (`runner_idle_terminated`-equivalent
+# clean exit), not delivery percentage; cross-peer drop semantics
+# at 10K msg/s on the REST surface are documented separately.
+#
+# The two sidecars listen on per-runner REST ports derived from
+# `--zenoh-sidecar-base-port`: alice -> 20400, bob -> 20401 via
+# `runner_index * runner_stride` (stride = 1).
+
+run = "zenoh-t149c-single"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-t149c-single"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 1
+  threading_modes = ["single"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+  zenoh_sidecar_base_port = 20400
