@@ -9,6 +9,7 @@ pub mod seq;
 pub mod socket;
 pub mod types;
 pub mod variant_trait;
+pub mod watchdog;
 pub mod workload;
 
 // Re-export primary types for convenient access.
@@ -21,4 +22,5 @@ pub use seq::SeqGenerator;
 pub use socket::{tune_udp_buffers, tune_udp_buffers_std};
 pub use types::{Phase, Qos, ReceivedUpdate, ThreadingMode, ThreadingModeParseError};
 pub use variant_trait::Variant;
+pub use watchdog::{Watchdog, WATCHDOG_EXIT_CODE, WATCHDOG_STDERR_PREFIX};
 pub use workload::{create_workload, ScalarFlood, Workload, WriteOp};

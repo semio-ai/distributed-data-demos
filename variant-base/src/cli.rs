@@ -34,6 +34,22 @@ pub const DEFAULT_PROGRESS_STDOUT_INTERVAL_MS: u32 = 1000;
 /// `operate_secs` transition fires (pre-E15 behaviour).
 pub const DEFAULT_OPERATE_IDLE_SECS: u32 = 5;
 
+/// Default value for `--watchdog-secs` when the runner does not inject
+/// one. Matches the T15.11 design: when the variant's driver thread is
+/// blocked inside a transport library call (no progress on either the
+/// `sent` or `received` counter) for this many seconds during the
+/// operate phase, a separate watchdog OS thread self-exits the process
+/// with the documented exit code so the JSONL log can be flushed
+/// cleanly via `logger.flush()` rather than truncated by an external
+/// runner kill.
+///
+/// `0` disables the watchdog: no monitor thread is spawned and no
+/// self-exit can fire (pre-T15.11 behaviour). The default of `60`
+/// matches the runner's typical `default_timeout_secs` headroom: a
+/// stalled spawn self-exits cleanly well before the runner trips its
+/// safety-net kill.
+pub const DEFAULT_WATCHDOG_SECS: u32 = 60;
+
 /// Validate that `kb` falls within the documented `--recv-buffer-kb`
 /// range. Returned by clap's `value_parser`.
 fn parse_recv_buffer_kb(s: &str) -> Result<u32, String> {
@@ -168,6 +184,35 @@ pub struct CliArgs {
     /// `5` matches the runner-side `operate_idle_secs` default.
     #[arg(long, default_value_t = DEFAULT_OPERATE_IDLE_SECS)]
     pub operate_idle_secs: u32,
+
+    /// Internal-stall watchdog threshold in seconds (see T15.11).
+    ///
+    /// A separate OS thread in the variant samples the `sent` and
+    /// `received` counters once per second. If BOTH counters remain
+    /// flat for this many consecutive seconds while the variant's
+    /// phase is `operate`, the watchdog flushes the JSONL logger and
+    /// calls `std::process::exit(2)` (the documented
+    /// "internal-stall self-exit" code). The runner observes a clean
+    /// `failed` outcome with a flushed JSONL and stderr containing
+    /// the substring `watchdog: no progress`; analysis classifies the
+    /// row as `variant_self_killed_idle`.
+    ///
+    /// Unlike `operate_idle_secs` (the inline T15.5 detector that runs
+    /// on the driver thread), the watchdog runs on its OWN thread and
+    /// remains effective when the driver thread is blocked inside a
+    /// transport library call. The two detectors are complementary:
+    /// `operate_idle_secs` covers the cooperative case (transport
+    /// returns control), `watchdog_secs` covers the wedged case
+    /// (transport never returns).
+    ///
+    /// `0` disables the watchdog entirely: no monitor thread is
+    /// spawned and no self-exit can fire (pre-T15.11 behaviour).
+    /// Default `60` matches the typical runner `default_timeout_secs`
+    /// headroom: a stalled variant self-exits cleanly well before
+    /// the runner's safety-net kill would have produced a truncated
+    /// JSONL.
+    #[arg(long, default_value_t = DEFAULT_WATCHDOG_SECS)]
+    pub watchdog_secs: u32,
 
     // -- Variant-specific pass-through arguments --
     /// Additional variant-specific arguments (collected as trailing args).

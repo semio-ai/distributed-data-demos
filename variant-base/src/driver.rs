@@ -10,6 +10,7 @@ use crate::resource::ResourceMonitor;
 use crate::seq::SeqGenerator;
 use crate::types::{Phase, Qos, ThreadingMode};
 use crate::variant_trait::Variant;
+use crate::watchdog::Watchdog;
 use crate::workload::create_workload;
 
 /// Thin proxy that exposes the `Logger` event API on top of a
@@ -173,6 +174,37 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // `log_phase` call a few lines below; any background tick that
     // fires before the driver advances the phase will see `connect`.
     let mut progress = ProgressEmitter::new(config.progress_stdout_interval_ms, Phase::Connect);
+
+    // Internal-stall watchdog (T15.11).
+    //
+    // Spawns a second monitor thread (the first is the progress
+    // emitter above) that polls the SAME counters via
+    // `ProgressEmitter::shared_state` and self-exits the process with
+    // a clean JSONL flush when no progress is observed for
+    // `watchdog_secs` consecutive seconds during the operate phase.
+    // This is the complement of the T15.5 inline idle detector
+    // further below: T15.5 catches stalls where the driver thread is
+    // still cooperative; T15.11 catches stalls where the driver
+    // thread is blocked inside a transport library call and the
+    // inline detector cannot run. When `watchdog_secs == 0` (CLI
+    // default's only override path), the returned handle holds no
+    // thread and the Drop is a cheap no-op.
+    //
+    // The on_fire callback flushes the logger BEFORE the watchdog
+    // calls `std::process::exit`. Without this the BufWriter's tail
+    // would be lost -- `std::process::exit` does NOT run destructors,
+    // and `Logger` has no Drop impl that would flush. See the
+    // watchdog module docstring for the full rationale.
+    let logger_for_watchdog = logger_handle.clone();
+    let _watchdog = Watchdog::start(&progress, config.watchdog_secs, move || {
+        if let Ok(mut g) = logger_for_watchdog.inner().lock() {
+            // Best-effort flush -- if it errors there is nothing we
+            // can do at this point (we are about to exit the
+            // process), and the error log path itself uses the same
+            // writer.
+            let _ = g.flush();
+        }
+    });
 
     // -- Phase 1: Connect --
     //
@@ -528,6 +560,10 @@ mod tests {
             // by default. Tests that exercise the new T15.5 path
             // override this explicitly.
             operate_idle_secs: 0,
+            // Disable the T15.11 internal-stall watchdog in driver
+            // unit tests by default. Tests that exercise the new
+            // watchdog path override this explicitly.
+            watchdog_secs: 0,
             extra: vec!["--peers".to_string(), peers.to_string()],
         }
     }

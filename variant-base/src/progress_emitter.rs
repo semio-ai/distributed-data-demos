@@ -70,12 +70,12 @@ pub struct ProgressSnapshot {
 /// `Mutex<String>` because the value is a short identifier the
 /// emitter thread reads once per interval. Mutex contention is
 /// negligible at the 1 Hz default cadence.
-struct ProgressState {
-    phase: Mutex<String>,
-    sent: AtomicU64,
-    received: AtomicU64,
-    eot_sent: AtomicBool,
-    eot_received: AtomicBool,
+pub(crate) struct ProgressState {
+    pub(crate) phase: Mutex<String>,
+    pub(crate) sent: AtomicU64,
+    pub(crate) received: AtomicU64,
+    pub(crate) eot_sent: AtomicBool,
+    pub(crate) eot_received: AtomicBool,
     /// Set to `true` to ask the emitter thread to exit on its next
     /// wake-up. Used by [`ProgressEmitter::stop`] / `Drop`.
     stop: AtomicBool,
@@ -89,7 +89,7 @@ struct ProgressState {
 }
 
 impl ProgressState {
-    fn new(initial_phase: Phase) -> Self {
+    pub(crate) fn new(initial_phase: Phase) -> Self {
         Self {
             phase: Mutex::new(initial_phase.as_str().to_string()),
             sent: AtomicU64::new(0),
@@ -102,7 +102,7 @@ impl ProgressState {
         }
     }
 
-    fn snapshot(&self) -> ProgressSnapshot {
+    pub(crate) fn snapshot(&self) -> ProgressSnapshot {
         let phase = self
             .phase
             .lock()
@@ -239,6 +239,16 @@ impl ProgressEmitter {
     /// tests and for the emitter thread itself.
     pub fn snapshot(&self) -> ProgressSnapshot {
         self.state.snapshot()
+    }
+
+    /// Clone the shared state handle for cross-thread observers
+    /// (currently the T15.11 internal-stall watchdog). The returned
+    /// `Arc` shares the SAME counters / phase that
+    /// `inc_sent` / `inc_received` / `set_phase` update, so observers
+    /// see exactly what the emitter sees -- there is no second
+    /// bookkeeping path to keep in sync.
+    pub(crate) fn shared_state(&self) -> Arc<ProgressState> {
+        Arc::clone(&self.state)
     }
 
     /// Signal the background thread to exit and join it. Idempotent.

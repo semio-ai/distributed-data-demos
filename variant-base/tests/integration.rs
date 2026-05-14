@@ -88,6 +88,10 @@ fn test_args_with_mode(log_dir: &str, threading_mode: ThreadingMode) -> CliArgs 
         // Disable variant-side idle detection (T15.5) for these
         // protocol-shape tests so the operate phase is purely time-bounded.
         operate_idle_secs: 0,
+        // Disable the watchdog (T15.11) in these short integration
+        // tests -- no internal-stall risk and we want zero extra
+        // background threads.
+        watchdog_secs: 0,
         // Single-runner self-loopback peers list -> empty expected set
         // -> EOT phase terminates immediately with no `eot_timeout`.
         extra: vec!["--peers".to_string(), "test-runner=127.0.0.1".to_string()],
