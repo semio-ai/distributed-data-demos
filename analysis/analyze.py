@@ -29,10 +29,14 @@ from pathlib import Path
 
 from cache import discover_groups, scan_group, update_cache
 from correlate import correlate_lazy
-from incomplete_warnings import emit_incomplete_warnings
+from incomplete_warnings import (
+    collect_incomplete_warnings,
+    emit_incomplete_warnings,
+    format_incomplete_warnings,
+)
 from integrity import IntegrityResult, integrity_for_group
 from performance import PerformanceResult, performance_for_group
-from pivot_tables import export_csv, format_pivot_section
+from pivot_tables import export_csv, format_pivot_for_qos, format_pivot_section
 from tables import format_integrity_table, format_performance_table
 
 
@@ -162,6 +166,14 @@ def build_parser() -> argparse.ArgumentParser:
         "slice that the built-in pivot tables don't cover.",
     )
     parser.add_argument(
+        "--dump",
+        action="store_true",
+        help="Write the full --summary output to a set of markdown files in "
+        "the output directory (one file per section: integrity, performance, "
+        "pivot per QoS, warnings, and an index). Implies --summary "
+        "computation (the stdout summary print is unchanged).",
+    )
+    parser.add_argument(
         "--log-throughput",
         action="store_true",
         help="Render the throughput panels of comparison.png on a log "
@@ -239,6 +251,120 @@ def run_analysis(
     return integrity_results, performance_results
 
 
+def _md_section(title: str, context: str, body: str) -> str:
+    """Render a single dump-file body: H1 title, context paragraph, fenced body.
+
+    The body is wrapped in a ``text``-fenced code block so the existing
+    monospace ASCII alignment renders correctly in markdown viewers
+    without losing column information.
+    """
+    return f"# {title}\n\n{context}\n\n```text\n{body}\n```\n"
+
+
+def _write_dump_files(
+    *,
+    output_dir: Path,
+    logs_dir: Path,
+    integrity_results: list[IntegrityResult],
+    performance_results: list[PerformanceResult],
+    late_tail_groups: set[tuple[str, str]],
+) -> list[Path]:
+    """Write the per-section markdown dump files into ``output_dir``.
+
+    Returns the list of paths written, in the canonical order used by
+    ``summary_index.md``. The summary stdout print is the caller's
+    responsibility; this function only re-renders the same content into
+    files (using the same formatter helpers) so the dump matches stdout
+    byte-for-byte modulo the markdown frame.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+
+    integrity_body = format_integrity_table(
+        integrity_results, late_tail_groups=late_tail_groups
+    )
+    performance_body = format_performance_table(performance_results)
+
+    integrity_ctx = (
+        f"Dataset: `{logs_dir}`\n\n"
+        f"Generated: {timestamp}\n\n"
+        f"Rows: {len(integrity_results)}"
+    )
+    performance_ctx = (
+        f"Dataset: `{logs_dir}`\n\n"
+        f"Generated: {timestamp}\n\n"
+        f"Rows: {len(performance_results)}"
+    )
+
+    integrity_path = output_dir / "summary_integrity.md"
+    integrity_path.write_text(
+        _md_section("Integrity Report", integrity_ctx, integrity_body),
+        encoding="utf-8",
+    )
+
+    performance_path = output_dir / "summary_performance.md"
+    performance_path.write_text(
+        _md_section("Performance Report", performance_ctx, performance_body),
+        encoding="utf-8",
+    )
+
+    pivot_paths: list[Path] = []
+    for qos in (1, 2, 3, 4):
+        pivot_body = format_pivot_for_qos(performance_results, qos)
+        pivot_ctx = (
+            f"Dataset: `{logs_dir}`\n\nGenerated: {timestamp}\n\nQoS level: {qos}"
+        )
+        pivot_path = output_dir / f"summary_pivot_qos{qos}.md"
+        pivot_path.write_text(
+            _md_section(f"Pivot Table (QoS {qos})", pivot_ctx, pivot_body),
+            encoding="utf-8",
+        )
+        pivot_paths.append(pivot_path)
+
+    # Warnings: re-use the same formatter the stderr emitter uses so the
+    # dump always matches what was (or would have been) shown to the
+    # operator. When no warnings fire, the file carries a single
+    # explicit "no incomplete samples" line so the operator knows the
+    # dump was generated and the run was clean (vs the file just being
+    # missing).
+    warnings = collect_incomplete_warnings(integrity_results, performance_results)
+    warning_lines = format_incomplete_warnings(warnings)
+    if not warning_lines:
+        warnings_body = "No incomplete samples."
+    else:
+        warnings_body = "\n".join(warning_lines)
+    warnings_ctx = (
+        f"Dataset: `{logs_dir}`\n\n"
+        f"Generated: {timestamp}\n\n"
+        f"Total cases: {warnings.total_cases}"
+    )
+    warnings_path = output_dir / "summary_warnings.md"
+    warnings_path.write_text(
+        _md_section("Incomplete Sample Warnings", warnings_ctx, warnings_body),
+        encoding="utf-8",
+    )
+
+    # Index file: title, brief context, bullet list of relative links.
+    ordered_paths: list[Path] = [
+        integrity_path,
+        performance_path,
+        *pivot_paths,
+        warnings_path,
+    ]
+    bullets = "\n".join(f"- [{p.name}](./{p.name})" for p in ordered_paths)
+    index_body = (
+        f"# Summary Index\n\n"
+        f"Dataset: `{logs_dir}`\n\n"
+        f"Generated: {timestamp}\n\n"
+        f"## Sections\n\n"
+        f"{bullets}\n"
+    )
+    index_path = output_dir / "summary_index.md"
+    index_path.write_text(index_body, encoding="utf-8")
+    ordered_paths.append(index_path)
+    return ordered_paths
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the analysis tool."""
     parser = build_parser()
@@ -254,6 +380,15 @@ def main(argv: list[str] | None = None) -> int:
     any_flag = args.summary or args.diagrams
     do_summary = args.summary or not any_flag
     do_diagrams = args.diagrams or not any_flag
+
+    # --dump is additive: it requires the summary computation but does
+    # NOT suppress diagrams. If the user invoked --diagrams alone, we
+    # still need to compute the summary so the dump has something to
+    # write. The stdout summary print still gates on the original
+    # ``do_summary`` decision (see below) so we don't regress the
+    # diagrams-only behaviour for stdout output.
+    if args.dump:
+        do_summary = True
 
     output_dir: Path = args.output.resolve() if args.output else logs_dir / "analysis"
 
@@ -320,6 +455,28 @@ def main(argv: list[str] | None = None) -> int:
             # on stderr so the operator doesn't have to scan the
             # tables row-by-row. Exit code unchanged.
             emit_incomplete_warnings(integrity_results, performance_results)
+
+        # Step 3.5: markdown dump. Runs after the stdout summary print
+        # (when applicable) so a regression in the dump cannot block
+        # the operator from seeing the tables. Always lands in
+        # ``output_dir`` (same dir as ``comparison.png``).
+        if args.dump:
+            late_tail_groups_for_dump: set[tuple[str, str]] = {
+                (p.variant, p.run)
+                for p in performance_results
+                if p.late_receives_tail_pct > 0
+            }
+            dump_paths = _write_dump_files(
+                output_dir=output_dir,
+                logs_dir=logs_dir,
+                integrity_results=integrity_results,
+                performance_results=performance_results,
+                late_tail_groups=late_tail_groups_for_dump,
+            )
+            print(
+                f"Dump written: {len(dump_paths)} files in {output_dir}",
+                file=sys.stderr,
+            )
 
         # Step 4: diagrams.
         if do_diagrams:

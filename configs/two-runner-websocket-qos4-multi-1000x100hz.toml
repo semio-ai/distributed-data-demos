@@ -1,0 +1,26 @@
+run = "websocket-tImpl14_2-e2e-1000x100hz-multi"
+runners = ["alice", "bob"]
+default_timeout_secs = 240
+
+# T14.2 end-to-end validation: single-spawn copy of the first variant
+# in `configs/two-runner-websocket-qos4.toml` with `threading_modes =
+# ["multi"]` added. This file is a transient validation artifact and
+# should be removed once the e2e repro is documented.
+
+[[variant]]
+name = "websocket-1000x100hz"
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = [4]
+  threading_modes = ["multi"]
+  log_dir = "./logs/t14_2_e2e"
+
+  [variant.specific]
+  ws_base_port = 19960

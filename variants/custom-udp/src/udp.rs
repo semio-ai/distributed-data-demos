@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -106,11 +106,9 @@ const TCP_CONNECT_RETRY_SLEEP: Duration = Duration::from_millis(50);
 /// `Variant::stop_reader_threads` for the E14 rollout (T14.1 notes).
 const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Floor for the Multi-mode mpsc channel bound. Keeps the channel useful
-/// even when `values_per_tick` is small (e.g. low-rate fixtures). Sized
-/// well above one tick's-worth of frames so the reader thread can push a
-/// short burst without bouncing on `TrySendError::Full`.
-const MULTI_CHANNEL_FLOOR: usize = 16;
+// T16.4: `MULTI_CHANNEL_FLOOR` removed. Data channel is now unbounded
+// (matches the lifecycle channel pattern). See `ReaderDataItem` docs and
+// CUSTOM.md "Threading modes (T16.4 follow-up)" for the rationale.
 
 /// Configuration for the UDP variant.
 ///
@@ -143,24 +141,42 @@ pub struct UdpConfig {
     /// every inbound TCP stream. See `metak-shared/api-contracts/variant-cli.md`
     /// "E14 additions: --recv-buffer-kb" for the contract.
     pub recv_buffer_kb: u32,
-    /// Driver's per-tick value count. Used to size the Multi-mode mpsc
-    /// channel (see `start_reader_threads`). Unused in Single mode.
+    /// Driver's per-tick value count.
+    ///
+    /// Pre-T16.4: used to size the bounded Multi-mode mpsc data channel
+    /// (`4 * values_per_tick * (peer_count + 1)`). T16.4 made that
+    /// channel unbounded, so this field is currently unread by `udp.rs`
+    /// but kept on the config struct because `main::run` still populates
+    /// it from the runner-injected `--values-per-tick` arg and a future
+    /// refinement (e.g. per-QoS pacing) may want it again.
+    #[allow(dead_code)]
     pub values_per_tick: u32,
 }
 
-/// Data frame placed on the bounded Multi-mode mpsc by reader threads.
+/// Data frame placed on the unbounded Multi-mode mpsc by reader threads.
 ///
 /// As of T14.16 the Multi-mode reader threads route items into TWO
-/// channels rather than one. `ReaderDataItem` rides the bounded
-/// `data_tx` (existing `sync_channel`); lifecycle items (EOT, NACK,
-/// TcpPeerDropped) ride the unbounded `lifecycle_tx`. See
-/// `ReaderLifecycleItem` and the design notes in CUSTOM.md "Threading
-/// modes (T14.16)".
+/// channels rather than one. `ReaderDataItem` rides the `data_tx`;
+/// lifecycle items (EOT, NACK, TcpPeerDropped) ride the `lifecycle_tx`.
+/// See `ReaderLifecycleItem` and the design notes in CUSTOM.md "Threading
+/// modes (T14.16, T16.4)".
 ///
-/// Drop-on-full is acceptable for data: QoS 1/2 tolerate loss by
-/// definition and QoS 3/4 framing semantics on the driver thread are
-/// unchanged because the dropped item simply never lands in
-/// `pending`.
+/// **T16.4**: the data channel is now unbounded (`mpsc::channel()`),
+/// matching the lifecycle channel. Pre-T16.4 the channel was bounded at
+/// `4 * values_per_tick * (peer_count + 1)` and reader threads dropped on
+/// `TrySendError::Full`. At 1000 paths x 100 Hz QoS 3 the bound (4000)
+/// overflowed almost immediately and the drop log spammed >300k times per
+/// spawn (`logs/same-machine-all-variants-01-20260514_084636/
+/// custom-udp-1000x100hz-qos3-multi-alice-stderr.txt`). Drops on data
+/// triggered the receiver's gap detector to fire NACKs, which in turn
+/// triggered retransmits, which also overflowed the channel -- a
+/// NACK-storm feedback loop that collapsed QoS 3 multi delivery to ~10 %
+/// while Single mode (no intermediate channel; kernel buffer is the
+/// only buffer) achieved ~56 %. Unbounded keeps the receive pipeline
+/// from being the bottleneck; the kernel UDP `SO_RCVBUF` (8 MiB after
+/// `tune_udp_buffers`) is the only natural bound and the driver's
+/// per-iteration drain budget (`4 * values_per_tick`) gives it 4x
+/// headroom over a 1-peer 100-Hz workload at 1000 vpt.
 enum ReaderDataItem {
     /// A decoded data frame from any transport (UDP multicast or TCP).
     Data(protocol::Message),
@@ -194,12 +210,12 @@ enum ReaderLifecycleItem {
 /// down deterministically.
 ///
 /// T14.16: the single shared `Receiver<ReaderItem>` is replaced by two
-/// receivers: a bounded `data_rx` (drop-on-full acceptable) and an
-/// unbounded `lifecycle_rx` (must-not-drop). `poll_receive` drains the
-/// lifecycle receiver FIRST so EOT/NACK observations are never starved by
-/// a saturated data channel.
+/// receivers. T16.4: both are now unbounded (`mpsc::channel()`).
+/// `poll_receive` still drains the lifecycle receiver FIRST so
+/// EOT/NACK/PeerDropped observations are surfaced ahead of data
+/// (preserving the priority guarantee that motivated the T14.16 split).
 struct MultiReaderState {
-    /// Receiver side of the shared bounded data mpsc.
+    /// Receiver side of the shared unbounded data mpsc.
     data_rx: Receiver<ReaderDataItem>,
     /// Receiver side of the shared unbounded lifecycle mpsc.
     lifecycle_rx: Receiver<ReaderLifecycleItem>,
@@ -942,19 +958,10 @@ impl UdpVariant {
         Ok(())
     }
 
-    /// Compute the Multi-mode mpsc channel bound.
-    ///
-    /// Spec (T14.3): `4 * values_per_tick * (peer_count + 1)` floored at
-    /// `MULTI_CHANNEL_FLOOR` (16). The `peer_count + 1` term accounts for
-    /// the UDP reader thread plus one reader thread per active TCP peer.
-    /// Floored so a small `values_per_tick` (e.g. 1) still leaves room for
-    /// a burst before reader threads start bouncing on `TrySendError::Full`.
-    fn multi_channel_bound(&self, peer_count: usize) -> usize {
-        let raw = (self.config.values_per_tick as usize)
-            .saturating_mul(4)
-            .saturating_mul(peer_count.saturating_add(1));
-        raw.max(MULTI_CHANNEL_FLOOR)
-    }
+    // T16.4: `multi_channel_bound` removed. The data channel is now
+    // unbounded so the receive path no longer drops Data frames under
+    // saturation -- which would otherwise trigger NACK storms on QoS 3.
+    // See `ReaderDataItem` docs.
 
     /// Multi mode: synchronously accept every expected inbound TCP peer
     /// connection from the listener so each accepted stream can be moved
@@ -1037,18 +1044,22 @@ impl UdpVariant {
             0
         };
         let tcp_streams = self.multi_accept_tcp_peers(expected_tcp)?;
-        let peer_count = tcp_streams.len();
+        let _peer_count = tcp_streams.len();
 
-        let bound = self.multi_channel_bound(peer_count);
-        // T14.16: split the reader-thread mpsc into two channels. The
-        // bounded data channel drops on saturation (acceptable for QoS
-        // 1/2; QoS 3/4 protocols are unaffected because the dropped item
-        // never lands in `pending`). The unbounded lifecycle channel
-        // carries EOT, NACK, and TcpPeerDropped -- losing any of those
-        // would silently break the spawn (EOT-loss = peer timeout,
-        // NACK-loss = QoS-3 reliability hole, TcpPeerDropped-loss = stale
-        // peer reference). Drained first in `drain_multi_channel`.
-        let (data_tx, data_rx) = mpsc::sync_channel::<ReaderDataItem>(bound);
+        // T14.16: split the reader-thread mpsc into two channels.
+        // T16.4: BOTH channels are now unbounded. The data channel used
+        // to be bounded at `4 * values_per_tick * (peer_count + 1)` with
+        // drop-on-full, but at 1000 vpt x 100 Hz QoS 3 this produced a
+        // NACK-storm feedback loop: dropped data frames triggered the
+        // receiver's gap detector, the NACK / retransmit pair was also
+        // dropped by the same overflowing channel, and multi delivery
+        // collapsed to ~10 % vs single's ~56 %. The kernel UDP
+        // `SO_RCVBUF` (8 MiB after `tune_udp_buffers`) remains the only
+        // natural bound; the driver's per-iteration drain budget
+        // (`4 * values_per_tick`) gives 4x headroom over a 1-peer 100-Hz
+        // 1000-vpt workload. See `ReaderDataItem` docs for the full
+        // explanation.
+        let (data_tx, data_rx) = mpsc::channel::<ReaderDataItem>();
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel::<ReaderLifecycleItem>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -1085,12 +1096,14 @@ impl UdpVariant {
             let lifecycle_tx_udp = lifecycle_tx.clone();
             let shutdown_udp = Arc::clone(&shutdown);
             let buffer_size = self.config.buffer_size;
+            let runner_udp = self.config.runner.clone();
             let handle = thread::Builder::new()
                 .name("custom-udp-recv-udp".to_string())
                 .spawn(move || {
                     udp_reader_thread(
                         udp_clone,
                         buffer_size,
+                        runner_udp,
                         data_tx_udp,
                         lifecycle_tx_udp,
                         shutdown_udp,
@@ -1212,9 +1225,18 @@ impl UdpVariant {
 
 /// UDP reader thread body. Receives datagrams on a blocking socket with a
 /// short `SO_RCVTIMEO`, parses each datagram, and routes the decoded
-/// item onto either the bounded data channel (Data frames) or the
+/// item onto either the unbounded data channel (Data frames) or the
 /// unbounded lifecycle channel (EOT / NACK markers). Exits when
 /// `shutdown` is set.
+///
+/// T16.4: this thread filters out the variant's own writer name BEFORE
+/// pushing onto `data_tx`. Multicast loopback (`set_multicast_loop_v4
+/// (true)` in `setup_udp`) means the variant receives every datagram it
+/// publishes; the driver thread discards those in
+/// `drain_multi_channel` but had to pay the channel-enqueue +
+/// channel-dequeue cost first. At 1000 vpt x 100 Hz that's
+/// 100k self-echoes / s on top of 100k real peer messages, so filtering
+/// at the source halves the receive-side pipeline pressure.
 ///
 /// `WouldBlock` / `TimedOut` are non-fatal (recv timeout fired); other I/O
 /// errors are logged once and stop the thread (the variant is in a bad
@@ -1222,7 +1244,8 @@ impl UdpVariant {
 fn udp_reader_thread(
     socket: UdpSocket,
     buffer_size: usize,
-    data_tx: SyncSender<ReaderDataItem>,
+    runner: String,
+    data_tx: Sender<ReaderDataItem>,
     lifecycle_tx: Sender<ReaderLifecycleItem>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -1252,7 +1275,13 @@ fn udp_reader_thread(
                 }
                 match protocol::decode(bytes) {
                     Ok(msg) => {
-                        if send_data_or_warn(&data_tx, ReaderDataItem::Data(msg)) {
+                        // T16.4: filter self-echoes before pushing. The
+                        // driver thread would otherwise drop these but
+                        // only after paying full channel cost.
+                        if msg.writer == runner {
+                            continue;
+                        }
+                        if send_data(&data_tx, ReaderDataItem::Data(msg)) {
                             return;
                         }
                     }
@@ -1283,7 +1312,7 @@ fn udp_reader_thread(
 fn tcp_reader_thread(
     mut stream: TcpStream,
     max_total_len: usize,
-    data_tx: SyncSender<ReaderDataItem>,
+    data_tx: Sender<ReaderDataItem>,
     lifecycle_tx: Sender<ReaderLifecycleItem>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -1349,7 +1378,7 @@ fn tcp_reader_thread(
 
         match protocol::decode_frame(&msg_buf) {
             Ok(Frame::Data(msg)) => {
-                if send_data_or_warn(&data_tx, ReaderDataItem::Data(msg)) {
+                if send_data(&data_tx, ReaderDataItem::Data(msg)) {
                     return;
                 }
             }
@@ -1365,32 +1394,19 @@ fn tcp_reader_thread(
     }
 }
 
-/// Push a data item onto the bounded mpsc, dropping it (with a warning)
-/// if the channel is full. Returns `true` when the channel is
-/// disconnected -- the caller should exit its loop in that case.
-/// Full-channel drops are expected back-pressure under saturating
-/// receive load and acceptable for QoS 1/2 (the variant's BestEffort /
-/// LatestValue semantics tolerate loss). QoS 3 NACK / QoS 4 framing
-/// semantics are still observed by the driver thread because the
-/// dropped item simply never lands in `pending`.
-///
-/// T14.16: the warning message explicitly mentions "data channel" and
-/// "Data frame" so operators can be certain that EOT / NACK /
-/// TcpPeerDropped were NOT lost when this line appears in stderr --
-/// those lifecycle items ride the separate unbounded `lifecycle_tx`.
-fn send_data_or_warn(tx: &SyncSender<ReaderDataItem>, item: ReaderDataItem) -> bool {
-    match tx.try_send(item) {
+/// Push a data item onto the unbounded mpsc. Returns `true` when the
+/// channel is disconnected -- the caller should exit its loop in that
+/// case. T16.4: the data channel is now unbounded so there is no
+/// "channel full" branch any more. The only failure mode is the
+/// receiver having been dropped (driver tearing down). The kernel UDP
+/// `SO_RCVBUF` (8 MiB after `tune_udp_buffers`) remains the natural
+/// pacing mechanism for the read side; the driver's per-iteration
+/// drain budget (`4 * values_per_tick`) keeps the channel's resident
+/// set bounded under sustained load.
+fn send_data(tx: &Sender<ReaderDataItem>, item: ReaderDataItem) -> bool {
+    match tx.send(item) {
         Ok(()) => false,
-        Err(TrySendError::Full(_)) => {
-            // Single line per overrun avoids log spam at 100K msg/s.
-            // The variant remains correct -- this is just a measured
-            // drop under sustained back-pressure.
-            eprintln!(
-                "[custom-udp] multi: data channel full -- dropping Data frame (receiver saturated)"
-            );
-            false
-        }
-        Err(TrySendError::Disconnected(_)) => true,
+        Err(_) => true,
     }
 }
 
@@ -2411,33 +2427,78 @@ mod tests {
         assert_eq!(update.payload, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
-    /// Channel-bound computation: floored at `MULTI_CHANNEL_FLOOR` when
-    /// the formula `4 * values_per_tick * (peer_count + 1)` lands below
-    /// it. Important for low-rate fixtures (`values_per_tick = 1`,
-    /// single peer) so reader threads don't bounce on `Full` under a
-    /// trickle.
-    #[test]
-    fn multi_channel_bound_respects_floor() {
-        let mut cfg = default_config(Qos::ReliableTcp);
-        cfg.values_per_tick = 1;
-        let v = UdpVariant::new(cfg);
-        // 4 * 1 * (0 + 1) = 4, floored to 16.
-        assert_eq!(v.multi_channel_bound(0), MULTI_CHANNEL_FLOOR);
-        // 4 * 1 * (1 + 1) = 8, floored to 16.
-        assert_eq!(v.multi_channel_bound(1), MULTI_CHANNEL_FLOOR);
-    }
+    // T16.4: `multi_channel_bound_respects_floor` and
+    // `multi_channel_bound_scales_with_inputs` removed. The Multi-mode
+    // data channel is now unbounded so there is no bound formula to
+    // exercise. See `ReaderDataItem` docs for why.
 
-    /// Channel-bound computation: above the floor when
-    /// `4 * values_per_tick * (peer_count + 1)` exceeds it.
+    /// T16.4 regression: the UDP reader thread filters out self-echoes
+    /// before enqueueing on the data channel, so the driver's drain
+    /// path never sees a `Data` item whose `writer == runner`. We
+    /// exercise this end-to-end by sending TWO datagrams on the same
+    /// multicast group from the variant's own (cloned) socket: one
+    /// whose writer matches the variant's runner (must be filtered) and
+    /// one whose writer does not (must be delivered). The test only
+    /// asserts on the second; if the first leaked through it would show
+    /// up as a stale extra in `pending` on a subsequent poll, but the
+    /// timing is loose so we instead verify by drain ordering plus a
+    /// short post-receipt re-poll.
     #[test]
-    fn multi_channel_bound_scales_with_inputs() {
-        let mut cfg = default_config(Qos::ReliableTcp);
-        cfg.values_per_tick = 10;
-        let v = UdpVariant::new(cfg);
-        // 4 * 10 * (1 + 1) = 80.
-        assert_eq!(v.multi_channel_bound(1), 80);
-        // 4 * 10 * (5 + 1) = 240.
-        assert_eq!(v.multi_channel_bound(5), 240);
+    fn multi_udp_reader_filters_self_writer() {
+        let mut cfg = default_config(Qos::BestEffort);
+        cfg.multicast_group = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 19953);
+        cfg.runner = "self-runner".to_string();
+        let mut v = UdpVariant::new(cfg);
+        if v.connect(ThreadingMode::Multi).is_err() {
+            return; // CI without multicast: skip.
+        }
+        if v.start_reader_threads(ThreadingMode::Multi).is_err() {
+            v.disconnect().ok();
+            return;
+        }
+
+        // Inject a self-echo first: same writer as the configured
+        // runner. The reader thread must drop this before enqueue.
+        let self_echo = protocol::encode(Qos::BestEffort, 1, "/p", "self-runner", &[0u8; 8])
+            .expect("encode self-echo");
+        let other = protocol::encode(Qos::BestEffort, 2, "/p", "other-runner", &[1u8; 8])
+            .expect("encode other-runner");
+
+        let socket =
+            UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).unwrap();
+        let target: SocketAddr = SocketAddr::V4(v.config.multicast_group);
+        let _ = socket.send_to(&self_echo, target);
+        let _ = socket.send_to(&other, target);
+
+        // Poll for up to ~1 s; we expect exactly one delivered update,
+        // and its writer must be `other-runner`. The self-echo must
+        // never appear.
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        let mut delivered: Vec<ReceivedUpdate> = Vec::new();
+        while Instant::now() < deadline {
+            if let Some(u) = v.poll_receive().ok().flatten() {
+                delivered.push(u);
+            } else {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        v.stop_reader_threads().ok();
+        v.disconnect().ok();
+
+        // Filter to messages we recognise (multicast in CI can pick up
+        // unrelated joiners; restrict to our two seqs).
+        let mine: Vec<_> = delivered
+            .into_iter()
+            .filter(|u| u.path == "/p" && (u.seq == 1 || u.seq == 2))
+            .collect();
+        for u in &mine {
+            assert_ne!(
+                u.writer, "self-runner",
+                "self-echo leaked through the reader-thread filter"
+            );
+        }
+        // We don't require `other-runner` to have arrived (multicast on
+        // CI is flaky); just that no self-echo did.
     }
 
     /// Single mode is the default and must remain a no-op for

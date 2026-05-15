@@ -1,0 +1,29 @@
+# T16.4 verification fixture: custom-udp QoS 3 at 1000 paths x 10 Hz, both
+# threading modes. Reproduces the multi-mode regression where multi
+# delivery (16.1%) was catastrophically below single (64.0%) at this
+# workload prior to T16.4. After the fix, multi must reach at least 90%
+# of single's delivery on the same workload, and ideally exceed it.
+
+run = "t16-4-custom-udp"
+runners = ["alice", "bob"]
+default_timeout_secs = 120
+
+[[variant]]
+name = "custom-udp-1000x10hz-qos3"
+binary = "target/release/variant-custom-udp.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 3
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs/t16_4_verify"
+
+  [variant.specific]
+  multicast_group = "239.77.66.91:17900"
+  buffer_size = 4194304
+  tcp_base_port = 19800

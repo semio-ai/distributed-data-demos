@@ -270,6 +270,53 @@ task) and awaits `publisher.put(...).await` against it.
   always returns `Ok(true)` on the reliable path -- no seq gap, no
   `backpressure_skipped` events.
 
+**T16.10 — QoS 3/4 ordering preservation**
+
+T16.5's `publisher_task` originally `tokio::spawn`-ed every put as an
+independent task (bounded by a 4096-slot semaphore) to eliminate
+head-of-line blocking at 1 000 paths. That fix is correct for QoS 1/2
+(BestEffort/LatestValue; ordering is not contractually required) but
+broke reliable-ordered delivery for QoS 3/4: with
+`CongestionControl::Block`, two concurrent `publisher.put(...).await`
+futures for the *same key* can complete in arbitrary order because the
+first put's Block-queue wait yields, the second put runs, and the
+samples reach the wire reversed. The E16 smoke showed ~17 000
+out-of-order receives per direction on 51 000 receives for the
+1000x10hz QoS 3 reproducer.
+
+The T16.10 fix: in `publisher_task`, branch on `reliable =
+matches!(qos, Qos::ReliableUdp | Qos::ReliableTcp)`:
+
+- **QoS 1/2 (`Drop`)**: keep T16.5's spawn-per-put + semaphore. The
+  drain loop acquires an `inflight` permit, `tokio::spawn`s the
+  `publisher.put(...).await`, and immediately moves to the next
+  message. Cross-key head-of-line blocking stays eliminated.
+- **QoS 3/4 (`Block`)**: do **not** spawn. The drain loop awaits
+  `publisher.put(encoded).await` inline. Because the publisher_task is
+  a single task, every sample for every key is serialised in send
+  order — exactly what ordered delivery requires. Per-key parallelism
+  across *different* keys is given up on the reliable path, but
+  T16.5's own verification (STATUS.md 2026-05-14) showed Zenoh's
+  per-publisher Block queue at 1 000 keys on localhost is already the
+  rate-limiting factor, so the spawn-per-put bought no meaningful
+  additional throughput on this workload — only unordered delivery.
+
+Both paths share the same `publishers_drop` / `publishers_block`
+Arc-wrapped caches built in `connect`; the only difference is whether
+the `put` is awaited inline or on a sub-task. The `inflight`
+semaphore therefore gates QoS 1/2 traffic only (see
+`PUBLISH_INFLIGHT_LIMIT` docstring for the updated scope note).
+
+Verification fixtures:
+- `variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos3-repro.toml`
+- `variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos4-repro.toml`
+  (added in T16.10)
+
+Both reproducers show `Out-of-order 0` across all four (writer ->
+receiver) directions; classifications are `runner_idle_terminated`
+(driver-side, end-of-test phase) with no `variant_self_killed_idle`
+(the internal-stall watchdog from T15.5).
+
 **Exact Zenoh API path used**
 
 Per-publisher congestion control is configured at declare time via

@@ -1,0 +1,35 @@
+# T16.10 QoS 4 ordering reproducer (companion to the QoS 3 fixture).
+#
+# Same shape as `two-runner-zenoh-1000x10hz-qos3-repro.toml`, but
+# `qos = 4` (`ReliableTcp`) to exercise the second reliable-ordered
+# congestion-control path. Both QoS 3 and QoS 4 share the same
+# `CongestionControl::Block` publisher cache on the Zenoh side, so a
+# regression in either path is detectable on the other; this fixture
+# confirms the T16.10 fix (inline-await for reliable QoS) holds for
+# QoS 4 too.
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos4-repro.toml
+#   target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos4-repro.toml
+
+run = "zenoh-t1610-1000x10hz-qos4-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-1000x10hz-qos4-repro"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 5
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 4
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+  # debug_trace = true   # uncomment to emit `[zenoh-trace] ...` lines on stderr.

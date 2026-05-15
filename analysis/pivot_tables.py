@@ -433,6 +433,39 @@ def format_pivot_table(table: PivotTable) -> str:
     return "\n".join(lines)
 
 
+_PIVOT_SECTION_HEADER: str = "Pivot Tables (variant x workload, one per QoS)"
+_PIVOT_SECTION_LEGEND: str = (
+    "Each cell: line 1 = Delivery%, line 2 = Ratio% (receives/expected; "
+    "may exceed 100% for multicast loopback), line 3 = latency mean+/-std ms"
+)
+
+
+def format_pivot_for_qos(results: list[PerformanceResult], qos: int) -> str:
+    """Render the pivot block for a single QoS level.
+
+    Returns the same header + legend used by :func:`format_pivot_section`
+    followed by the one :class:`PivotTable` whose ``qos`` matches the
+    argument. When no spawn in ``results`` matches the requested QoS
+    level a placeholder ``(no data)`` block is returned so the caller
+    (e.g. the ``--dump`` writer) always produces a well-formed file.
+    """
+    tables = build_pivot_tables(results)
+    table = next((t for t in tables if t.qos == qos), None)
+
+    lines: list[str] = []
+    lines.append(_PIVOT_SECTION_HEADER)
+    lines.append(_PIVOT_SECTION_LEGEND)
+    lines.append("")
+    if table is None:
+        lines.append(f"QoS {qos}")
+        lines.append("(no data)")
+        lines.append("")
+        return "\n".join(lines)
+    lines.append(format_pivot_table(table))
+    lines.append("")
+    return "\n".join(lines)
+
+
 def format_pivot_section(results: list[PerformanceResult]) -> str:
     """Render the full pivot-tables section: one table per QoS level.
 
@@ -445,11 +478,8 @@ def format_pivot_section(results: list[PerformanceResult]) -> str:
         return "Pivot Tables (variant x workload, one per QoS)\n(no data)\n"
 
     lines: list[str] = []
-    lines.append("Pivot Tables (variant x workload, one per QoS)")
-    lines.append(
-        "Each cell: line 1 = Delivery%, line 2 = Ratio% (receives/expected; "
-        "may exceed 100% for multicast loopback), line 3 = latency mean+/-std ms"
-    )
+    lines.append(_PIVOT_SECTION_HEADER)
+    lines.append(_PIVOT_SECTION_LEGEND)
     lines.append("")
     for table in tables:
         lines.append(format_pivot_table(table))

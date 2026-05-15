@@ -109,6 +109,28 @@ The trait is the core of this crate. It must be:
 - Ships as `variant-dummy` binary that the runner can spawn like any other
   variant.
 
+### Write timestamp capture (T16.2)
+
+The driver's operate-phase loop captures `write_ts = Utc::now()`
+**before** calling `variant.try_publish(...)`, then passes that
+timestamp to `Logger::log_write_at(...)` after the publish returns
+`Ok(true)`. The capture order is load-bearing on same-host benchmarks:
+multi-mode reader threads (websocket-multi, hybrid-multi, custom-udp-multi)
+share a single QPC-backed `Utc::now()` source machine-wide with the
+peer's writer thread. If `write_ts` is captured AFTER `try_publish`
+returns, the peer's reader thread can read the bytes off the loopback
+socket and log `receive_ts` for ~50% of seqs **before** the writer
+thread reaches `log_write`, producing `receive_ts < write_ts` on the
+analysis side and violating the schema contract that
+`receive_ts >= write_ts`. The `Ok(false)` (backpressure-skip) and
+error paths intentionally do NOT reuse the pre-publish `write_ts` --
+those events are correctly timestamped at-event-time, not
+at-attempt-time. `Logger::log_write` is preserved as a thin wrapper
+around `log_write_at(Utc::now(), ...)` for any non-driver caller that
+does not need pre-publish ordering. See
+`metak-shared/api-contracts/jsonl-log-schema.md` for the
+externally-visible contract.
+
 ### Test Protocol Driver
 
 The driver is a function (not a trait) that takes a `&dyn Variant` (or

@@ -499,6 +499,18 @@ Every cell renders three sub-cell lines:
      expected behaviour and not a bug — the ratio measures
      receives-against-one-writer's-nominal-rate, and a multicast
      loopback adds the local writer's traffic on top.
+   - For **Zenoh** specifically, the ratio can reach **~400%** at low
+     path-count workloads (e.g. `100x100hz qos1 multi`). This is also
+     expected: each message is reflected back twice — once from the
+     local in-process data board, and once again from the Zenoh
+     fabric subscription that the variant declares on its own keys.
+     Combined with the 200% baseline from two-runner multicast, the
+     total per-receiver count can hit 4x the writer's nominal rate.
+     This is a measurement artefact of how Zenoh's subscription
+     topology interacts with our single-writer per-subtree model;
+     it does not indicate duplicate data delivery to the application.
+     If/when a future Zenoh variant change deduplicates self-echoes,
+     this ratio will drop back into the 200% range.
 3. **mean ± std (ms)** — sample mean and (ddof=1) sample standard
    deviation of the per-message latency vector already stored on
    `PerformanceResult.latency_samples_ms`. Renders as `-` when the

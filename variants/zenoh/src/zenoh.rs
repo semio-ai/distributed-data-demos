@@ -1,12 +1,13 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinSet;
 use zenoh::handlers::FifoChannelHandler;
 use zenoh::pubsub::{Publisher, Subscriber};
@@ -283,6 +284,72 @@ fn values_per_tick_from_env() -> Option<u32> {
 /// is exactly what the analysis tool measures.
 const RECEIVE_CHANNEL_CAPACITY: usize = 16384;
 
+/// T16.5: maximum number of in-flight `publisher.put(...).await` futures
+/// the publisher task allows to run concurrently. Each pending put holds
+/// one permit from a `Semaphore`; the task acquires a permit before
+/// spawning the put as an independent tokio task and releases it on
+/// completion.
+///
+/// **Scope (T16.10)**: this limit applies to the **QoS 1/2 (Drop) path
+/// only**. T16.5 originally spawned every put unconditionally, but that
+/// broke reliable-ordered delivery for QoS 3/4: concurrent puts on the
+/// same key could complete out of order (the receiver's
+/// `MessageCodec::decode` then surfaced ~17 000 out-of-order arrivals
+/// per direction on the 1000x10hz QoS 3 reproducer). For QoS 3/4 the
+/// drain loop now awaits each put inline so the single-task pipeline
+/// preserves per-key ordering naturally. The semaphore therefore only
+/// gates QoS 1/2 traffic, which has no ordering contract anyway.
+///
+/// **Why this exists**: prior to T16.5 `publisher_task` drained the
+/// outbound mpsc on a single async task and `await`-ed each put inline
+/// for *every* QoS. At 1000 distinct keys x 100 Hz that's 100 K msg/s
+/// squeezed through one sequential await chain; if even one publisher's
+/// `put().await` blocked (CC=Block) or merely paid a route-resolution
+/// cost, every subsequent message — *for unrelated keys* — waited
+/// behind it. The observed failure pattern was extreme asymmetry: one
+/// peer would drain its bridge channel at line rate while the other
+/// peer's publisher task stalled, filled its bridge channel within
+/// ~20 ms (QoS 1 Drop) or blocked at ~1500 writes (QoS 3 Block), and
+/// ultimately tripped the 30 s internal-stall watchdog
+/// (`variant_self_killed_idle`). The spawn-per-put fix solved this for
+/// QoS 1/2; QoS 3/4 falls back to the original serial drain in T16.10.
+///
+/// **Why bounded**: unbounded `tokio::spawn` would let memory grow without
+/// limit if puts genuinely back up. 4096 is comfortably above the bridge
+/// channel capacity (1024), so the steady-state hot path never blocks on
+/// the semaphore — the bridge channel is the real backpressure surface
+/// for QoS 1/2. The semaphore is just a safety net against pathological
+/// queue growth.
+const PUBLISH_INFLIGHT_LIMIT: usize = 4096;
+
+/// T16.5: how long `connect()` sleeps after declaring subscribers,
+/// pre-declaring publishers, and spawning the bridge tasks but before
+/// returning to the driver. This gives Zenoh's peer discovery + key
+/// expression interest propagation time to settle for the full
+/// `bench/0..N-1` key set before the driver enters `stabilize`/`operate`.
+///
+/// **Why this exists**: with 1000 distinct keys per tick, the interest
+/// declaration from each peer's subscriber must reach the other peer's
+/// router/publisher state *before* the first publish, or the publisher
+/// has no route for that key and the message is silently dropped at the
+/// transport layer. The 1000-path full-matrix run on
+/// `logs/same-machine-all-variants-01-20260514_084636/` showed 0.00 %
+/// delivery on alice->bob (and reversed on qos4) consistent with the
+/// subscriber not having declared interest by the time alice's first
+/// tick fired. The stabilize phase exists for exactly this kind of
+/// propagation but it runs *after* `connect` returns, and the
+/// `stabilize_secs` budget is workload-controlled (often 1-3 s) which
+/// proved insufficient for 1000 keys on the failing rig. Adding this
+/// fixed in-connect delay guarantees a minimum settle window
+/// regardless of fixture configuration.
+///
+/// Sized to be long enough for 1000 keys to propagate on localhost
+/// (empirically a few hundred ms suffices) but short enough not to
+/// dominate any production fixture's `connect` budget. The runner's
+/// existing `default_timeout_secs` (typically 30-60 s) easily absorbs
+/// this.
+const CONNECT_PROPAGATION_SETTLE_MS: u64 = 500;
+
 /// Zenoh-specific CLI arguments parsed from the `extra` pass-through args.
 pub struct ZenohArgs {
     pub mode: String,
@@ -426,10 +493,18 @@ enum OutboundMessage {
 ///   3/4 (ReliableUdp, ReliableTcp). `publisher.put(...).await` blocks
 ///   inside Zenoh until queue space is available, so the reliable path
 ///   never produces a seq gap. `try_publish` returns `Ok(true)`.
+///
+/// T16.5: `Publisher<'static>` is wrapped in `Arc` so the publisher task
+/// can clone the handle, hand the clone to a spawned `put` task, and
+/// keep the cached entry alive for the next message. The original
+/// design held one `Publisher` per cache entry and awaited each put
+/// inline on the drain loop, which serialised the entire outbound path.
+/// Arc-wrapping is the minimal change to let independent puts proceed
+/// in parallel without touching the per-key cache semantics.
 struct PublisherState {
     session: zenoh::Session,
-    publishers_drop: HashMap<String, Publisher<'static>>,
-    publishers_block: HashMap<String, Publisher<'static>>,
+    publishers_drop: HashMap<String, Arc<Publisher<'static>>>,
+    publishers_block: HashMap<String, Arc<Publisher<'static>>>,
 }
 
 /// Zenoh variant implementing the `Variant` trait.
@@ -799,6 +874,14 @@ async fn publisher_task(
     mut send_rx: mpsc::Receiver<OutboundMessage>,
     trace: bool,
 ) {
+    // T16.5: bounded in-flight permit pool. Each parallel `put().await`
+    // task holds one permit for its lifetime, which both caps memory
+    // growth under pathological backpressure (Zenoh's CC=Block can
+    // wedge a put indefinitely if the peer is gone) and gives us a
+    // clean "drain at shutdown" semantic: closing the channel + waiting
+    // for all permits to be returned reproduces the old serial-task
+    // teardown.
+    let inflight = Arc::new(Semaphore::new(PUBLISH_INFLIGHT_LIMIT));
     while let Some(msg) = send_rx.recv().await {
         match msg {
             OutboundMessage::Data {
@@ -827,23 +910,90 @@ async fn publisher_task(
                 };
                 // Standard hot path: publisher was pre-declared in
                 // `connect` from the workload's known path set, so this
-                // lookup is a HashMap hit and the put runs on a routine
-                // tokio worker. The lazy-declare fallback below covers
-                // workloads outside the standard `bench/0..N-1` scheme;
-                // a missing entry on the standard fixture is unexpected
-                // and surfaces as a trace warning so we notice if the
-                // pre-declare contract drifts.
-                if let Some(publisher) = cache.get(&key) {
-                    if let Err(e) = publisher.put(encoded).await {
-                        if trace {
-                            trace_now!(
-                                "publisher_task: put failed cc={} seq={} key={} err={}",
-                                cc_label,
-                                seq,
-                                key,
-                                e
-                            );
+                // lookup is a HashMap hit.
+                //
+                // T16.5: for QoS 1/2 we clone the Arc<Publisher> and
+                // spawn the put on its own task so the drain loop can
+                // immediately receive the next message instead of
+                // waiting on this put. This was the T16.5 fix for the
+                // 1000-path asymmetric collapse: without it, one slow
+                // `put().await` head-of-line blocked every other key.
+                //
+                // T16.10: that pattern is **only valid for QoS 1/2**
+                // (CongestionControl::Drop, where ordering is *not*
+                // contractually required -- BestEffort/LatestValue
+                // both permit drops + reorders). For QoS 3/4 (Block,
+                // reliable-ordered) spawning lets multiple
+                // `put().await` futures for the same key race: the
+                // first put's Block-queue wait can let a later put
+                // for the same key complete first, and the receiver
+                // sees out-of-order samples (~17 000 OOO / 51 000 on
+                // the 1000x10hz QoS 3 reproducer, per the T16.10
+                // task brief).
+                //
+                // The fix: for reliable QoS, do *not* spawn -- await
+                // the put inline on the drain loop. The single-task
+                // pipeline naturally serialises every key, which is
+                // exactly what ordered delivery requires. Cross-key
+                // parallelism is given up on the reliable path, but
+                // T16.5's own verification (STATUS.md 2026-05-14)
+                // showed Zenoh's per-publisher Block queue at 1000
+                // keys on localhost is already the rate-limiting
+                // factor (1000 writes/10s observed for the slower
+                // peer) -- spawning never bought meaningful
+                // additional throughput on this workload, only
+                // unordered delivery.
+                let publisher = cache.get(&key).cloned();
+                if let Some(publisher) = publisher {
+                    if reliable {
+                        // T16.10: inline await preserves per-key
+                        // ordering for QoS 3/4. No semaphore is needed
+                        // because there's at most one outstanding put
+                        // from this task at a time (the drain loop is
+                        // single-task).
+                        if let Err(e) = publisher.put(encoded).await {
+                            if trace {
+                                trace_now!(
+                                    "publisher_task: put failed cc={} seq={} key={} err={}",
+                                    cc_label,
+                                    seq,
+                                    key,
+                                    e
+                                );
+                            }
                         }
+                    } else {
+                        // QoS 1/2 (Drop): preserve T16.5 spawn-per-put so
+                        // a slow downstream link cannot head-of-line
+                        // block unrelated keys. Acquire the in-flight
+                        // permit *before* spawning so a truly stuck
+                        // publisher actually backs the drain loop up at
+                        // the semaphore (rather than spawning infinite
+                        // tasks that pile up on the runtime).
+                        let permit = match inflight.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => {
+                                // Semaphore closed -- task is shutting down.
+                                break;
+                            }
+                        };
+                        let trace_for_spawn = trace;
+                        let key_for_spawn = key.clone();
+                        let cc_label_for_spawn = cc_label;
+                        tokio::spawn(async move {
+                            if let Err(e) = publisher.put(encoded).await {
+                                if trace_for_spawn {
+                                    trace_now!(
+                                        "publisher_task: put failed cc={} seq={} key={} err={}",
+                                        cc_label_for_spawn,
+                                        seq,
+                                        key_for_spawn,
+                                        e
+                                    );
+                                }
+                            }
+                            drop(permit);
+                        });
                     }
                 } else {
                     // Lazy fallback: declare on first sight. This used to
@@ -867,16 +1017,48 @@ async fn publisher_task(
                         .await
                     {
                         Ok(publisher) => {
-                            if let Err(e) = publisher.put(encoded).await {
-                                if trace {
-                                    trace_now!(
-                                        "publisher_task: put failed cc={} seq={} key={} err={}",
-                                        cc_label,
-                                        seq,
-                                        key,
-                                        e
-                                    );
+                            let publisher = Arc::new(publisher);
+                            // T16.5 / T16.10: mirror the hot-path
+                            // branching. The declare is awaited inline
+                            // (lazy path, infrequent); the put is then
+                            // either spawned (QoS 1/2, Drop) or awaited
+                            // inline (QoS 3/4, Block — preserves
+                            // per-key ordering).
+                            if reliable {
+                                if let Err(e) = publisher.put(encoded).await {
+                                    if trace {
+                                        trace_now!(
+                                            "publisher_task: put failed cc={} seq={} key={} err={}",
+                                            cc_label,
+                                            seq,
+                                            key,
+                                            e
+                                        );
+                                    }
                                 }
+                            } else {
+                                let permit = match inflight.clone().acquire_owned().await {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                };
+                                let publisher_for_spawn = Arc::clone(&publisher);
+                                let trace_for_spawn = trace;
+                                let key_for_spawn = key.clone();
+                                let cc_label_for_spawn = cc_label;
+                                tokio::spawn(async move {
+                                    if let Err(e) = publisher_for_spawn.put(encoded).await {
+                                        if trace_for_spawn {
+                                            trace_now!(
+                                                "publisher_task: put failed cc={} seq={} key={} err={}",
+                                                cc_label_for_spawn,
+                                                seq,
+                                                key_for_spawn,
+                                                e
+                                            );
+                                        }
+                                    }
+                                    drop(permit);
+                                });
                             }
                             cache.insert(key, publisher);
                         }
@@ -918,6 +1100,23 @@ async fn publisher_task(
         }
     }
 
+    // T16.5: wait for all in-flight `put` tasks to release their
+    // permits before tearing down publishers / closing the session.
+    // Acquiring all PUBLISH_INFLIGHT_LIMIT permits guarantees every
+    // spawned put has finished (or errored) and dropped its
+    // Arc<Publisher>, so the `Arc::try_unwrap` below can succeed for
+    // the typical case where the variant's main thread shut down
+    // cleanly. We close the semaphore first so any future
+    // `acquire_owned()` returns Err and the drain loop bails fast.
+    inflight.close();
+    let acquire_all = inflight.acquire_many(PUBLISH_INFLIGHT_LIMIT as u32).await;
+    // `acquire_many` on a closed semaphore returns Err once no permits
+    // remain free; we don't care about the result, only that we've
+    // waited for outstanding holders to release. Drop the guard so the
+    // permits are released back; Zenoh's session close will undeclare
+    // anyway as a fallback.
+    drop(acquire_all);
+
     // Channel closed: drain both publisher caches. Undeclaring
     // explicitly gives consistent teardown timing and surfaces errors
     // via the trace log; without this the publishers would
@@ -930,6 +1129,14 @@ async fn publisher_task(
         .drain()
         .chain(state.publishers_block.drain())
     {
+        // T16.5: try to unwrap the Arc; if a put task is somehow
+        // still holding the Publisher (e.g. an `await` wedged in
+        // Zenoh's queue past the semaphore-drain window above) fall
+        // back to letting the session-close handle the undeclare.
+        let publisher = match Arc::try_unwrap(publisher) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
         if let Err(e) = publisher.undeclare().await {
             if trace {
                 trace_now!("publisher_task: undeclare failed: {}", e);
@@ -1223,9 +1430,14 @@ impl Variant for ZenohVariant {
                 // publisher caches before the publisher task starts
                 // draining the publish channel, so the operate phase
                 // sees zero declares for the standard fixture.
-                let mut publishers_drop: HashMap<String, Publisher<'static>> =
+                // T16.5: caches now hold `Arc<Publisher<'static>>` so the
+                // publisher task can clone the handle per outbound message
+                // and spawn the `put().await` as a parallel sub-task. The
+                // pre-declare path constructs the publishers and wraps
+                // each one in an Arc before insertion.
+                let mut publishers_drop: HashMap<String, Arc<Publisher<'static>>> =
                     HashMap::with_capacity(pre_declare_count as usize);
-                let mut publishers_block: HashMap<String, Publisher<'static>> =
+                let mut publishers_block: HashMap<String, Arc<Publisher<'static>>> =
                     HashMap::with_capacity(pre_declare_count as usize);
                 if pre_declare_count > 0 {
                     let mut set: JoinSet<(
@@ -1253,10 +1465,10 @@ impl Variant for ZenohVariant {
                         match res {
                             Ok(publisher) => match cc {
                                 CongestionControl::Drop => {
-                                    publishers_drop.insert(key, publisher);
+                                    publishers_drop.insert(key, Arc::new(publisher));
                                 }
                                 CongestionControl::Block => {
-                                    publishers_block.insert(key, publisher);
+                                    publishers_block.insert(key, Arc::new(publisher));
                                 }
                             },
                             Err(e) => {
@@ -1319,6 +1531,27 @@ impl Variant for ZenohVariant {
             eot_shutdown_rx,
             trace,
         ));
+
+        // T16.5: hold the connect path open for a fixed window so the
+        // 1000-key subscriber/publisher declarations have a chance to
+        // propagate to the peer's session state before the driver enters
+        // stabilize/operate. Without this, the 1000-path full-matrix
+        // run reproducibly showed 0.00 % one-direction delivery for both
+        // QoS 1 (Drop) and QoS 4 (Block) -- the publishers had no route
+        // for the freshly-declared keys at the moment the first tick
+        // fired. See CONNECT_PROPAGATION_SETTLE_MS docstring for full
+        // rationale.
+        let settle_ms = CONNECT_PROPAGATION_SETTLE_MS;
+        if settle_ms > 0 {
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+            });
+            trace_if!(
+                trace,
+                "connect: settled {} ms for declaration propagation",
+                settle_ms
+            );
+        }
 
         self.runtime = Some(runtime);
         self.send_tx = Some(send_tx);

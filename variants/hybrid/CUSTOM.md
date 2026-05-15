@@ -174,6 +174,22 @@ Same compact binary header as custom-udp:
     measure for the benchmark; bypassing it (e.g. with non-blocking
     writes plus app-side retry-and-drop) would distort the comparison
     against `custom-udp`'s NACK approach.
+  - **Single mode only (T16.3)**: in addition to the blocking-write
+    semantics above, the write handle gets a `SO_SNDTIMEO` of
+    `SINGLE_WRITE_TIMEOUT` (5 s, see `tcp.rs`). This caps the
+    worst-case write block under symmetric saturation so the spawn
+    cannot deadlock when both peers spend the publish phase inside
+    `write_all` while neither drains the recv buffer (the exact
+    websocket-variant T14.19 wedge, applied to hybrid). A wedged
+    write surfaces as `TimedOut` (Windows) / `WouldBlock` (Unix);
+    `TcpTransport::broadcast` already drops the offending peer on
+    any write error (per "TCP read loop — per-peer fault tolerance"
+    below). The 5 s figure is far longer than any realistic
+    transient on a healthy LAN; a timeout firing means the peer is
+    genuinely stuck. Multi mode does NOT install the write timeout
+    (the per-peer reader thread drains in parallel and the wedge
+    does not occur; a stale `SO_SNDTIMEO` there would only invite
+    spurious peer drops under transient back-pressure).
   - To make reads pollable without flipping the socket-wide `FIONBIO`
     flag, the read handle (obtained via `try_clone`) gets a short
     `SO_RCVTIMEO` via `TcpStream::set_read_timeout` (~1 ms). Reads then
@@ -193,6 +209,27 @@ Same compact binary header as custom-udp:
   protects against accidental future regressions of the blocking flag.
 - Set `TCP_NODELAY` on every connection to disable Nagle — critical for
   latency.
+
+### TCP read — buffered-frame fast path (T16.3)
+
+`TcpPeer::try_recv_framed` extracts a buffered frame from
+`read_buf` **before** issuing another `read()` syscall. Each
+read syscall costs up to `READ_POLL_TIMEOUT` (1 ms) of wall
+clock when the kernel recv buffer is empty (because the read
+handle has `SO_RCVTIMEO`); doing that syscall while we already
+have a complete frame in the internal buffer was burning 1 ms
+per buffered message under load. At 1 000 msg/s symmetric on
+QoS 3/4 in Single mode this capped the drain at ~1 000
+calls/s and starved the receive path — the exact mechanism
+behind the original T16.3 catastrophic-delivery report
+(2.62 % at 100x100hz pre-fix). With the fast path, the driver
+drains a batch of frames the kernel delivered in a single
+read in microseconds and returns to publish promptly.
+
+The slow path (read more from the kernel first when the
+internal buffer is empty or only holds a partial frame) is
+unchanged. The frame-extraction code is shared between both
+paths via the `take_buffered_frame` helper.
 
 ### TCP read loop — per-peer fault tolerance
 
@@ -469,6 +506,38 @@ on `ConnectionRefused` / `TimedOut` / `WouldBlock` for a bounded
 5 s budget (mirrors the websocket variant's `ws_client_connect`).
 Without this retry, the qos4-multi spawn flakes ~50% of the time
 on Windows even on localhost.
+
+### Single-mode TCP achievable ceiling (T16.3)
+
+After the T16.3 fixes (SO_SNDTIMEO on Single-mode writes plus the
+buffered-frame fast path in `try_recv_framed`), Single mode at QoS
+3 / QoS 4 on localhost-symmetric two-runner workloads achieves
+the following on Windows (numbers from
+`variants/hybrid/tests/fixtures/two-runner-hybrid-t16-3-stress.toml`):
+
+| Workload          | Symmetric rate | Delivery (single)   | Notes                                                      |
+| ----------------- | -------------- | ------------------- | ---------------------------------------------------------- |
+| `10x100hz`-qos3   | 1 K msg/s      | 100 %               | p50 ~0.2 ms; spawn idle-exits quickly.                     |
+| `100x100hz`-qos3  | 10 K msg/s     | 100 %               | p50 ~3-4 ms; runs the full operate window.                 |
+| `1000x100hz`-qos3 | 100 K msg/s    | 80-95 % of *sent*   | Throughput throttles to ~1-2 K msg/s; below the requested  |
+|                   |                |                     | rate because the single-thread driver cannot interleave    |
+|                   |                |                     | 1 000 blocking TCP writes per tick with poll_receive. Of   |
+|                   |                |                     | what was actually published, delivery is 80-95 %. The      |
+|                   |                |                     | acceptable-ceiling case — Multi mode is the recommended    |
+|                   |                |                     | configuration for high-rate symmetric workloads.           |
+
+Pre-T16.3 the same workloads catastrophically wedged: 0.12-24 %
+delivery with multi-second tail latencies, requiring the runner
+to forcibly terminate the spawn.
+
+The 1000x100hz throughput shortfall is not a deadlock — the
+SO_SNDTIMEO never fires at 5 s — but a true single-thread
+saturation: each blocking TCP write at this rate blocks ~ms while
+the peer drains, and with the single driver thread also serving
+poll_receive, the effective tick rate falls to 1-2 Hz. Multi mode
+(per-peer reader thread) handles the full 100 K msg/s with ~30 %
+delivery (kernel buffer pressure, not driver-scheduling) and
+100 % at 10 K msg/s.
 
 ### Testing
 

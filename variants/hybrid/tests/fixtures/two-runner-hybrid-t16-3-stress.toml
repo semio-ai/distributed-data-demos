@@ -1,0 +1,96 @@
+# T16.3 reproducer fixture: high-rate symmetric Hybrid QoS 3 in Single
+# mode at the workload that catastrophically wedges pre-T16.3 (100 vpt x
+# 100 Hz = 10K msg/s symmetric, plus 1000 vpt x 100 Hz = 100K msg/s for
+# ceiling characterization).
+#
+# Pre-T16.3: in Single mode at QoS 3/4, both runners simultaneously
+# `write_all` into TCP while neither calls `poll_receive` to drain the
+# kernel recv buffer. The kernel TCP send buffers fill on both sides;
+# `write_all` blocks indefinitely. Delivery hovers around 0-25% with
+# multi-second tail latencies.
+#
+# Post-T16.3: `TcpPeer::from_stream` installs `SO_SNDTIMEO = 5s` on
+# the write handle whenever the variant runs in Single mode. A wedged
+# write surfaces as `TimedOut` (Windows) or `WouldBlock` (Unix);
+# `TcpTransport::broadcast` already drops the offending peer on any
+# write error (per the per-peer fault-tolerance rule documented in
+# `variants/hybrid/CUSTOM.md` "TCP read loop — per-peer fault
+# tolerance"). With the peer gone, the publish loop exits cleanly.
+#
+# Acceptance:
+#   - hybrid-single-qos3 at  10x100hz reaches >= 99% delivery.
+#   - hybrid-single-qos3 at 100x100hz reaches >= 80% delivery.
+#   - 1000x100hz may stay below threshold for hardware reasons;
+#     achievable ceiling is documented in CUSTOM.md.
+#
+# Multi mode is exercised side-by-side for the regression-protect
+# (must remain >= 99%) at the same workloads.
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/hybrid/tests/fixtures/two-runner-hybrid-t16-3-stress.toml
+#   target/release/runner --name bob   --config variants/hybrid/tests/fixtures/two-runner-hybrid-t16-3-stress.toml
+
+run = "hybrid-t16-3-stress"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+# 10x100hz = 1K msg/s symmetric (acceptance >= 99% delivery for single).
+[[variant]]
+name = "hybrid-t16-3-10x100hz"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 10
+  qos = 3
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19743"
+  tcp_base_port = 28160
+
+# 100x100hz = 10K msg/s symmetric (acceptance >= 80% delivery for single).
+[[variant]]
+name = "hybrid-t16-3-100x100hz"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 3
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19744"
+  tcp_base_port = 28170
+
+# 1000x100hz = 100K msg/s symmetric (acceptable ceiling; documented in
+# CUSTOM.md if delivery < threshold for hardware reasons).
+[[variant]]
+name = "hybrid-t16-3-1000x100hz"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 3
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19745"
+  tcp_base_port = 28180

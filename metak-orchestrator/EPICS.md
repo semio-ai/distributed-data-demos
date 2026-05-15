@@ -1057,3 +1057,129 @@ is downstream (T11.5 already does it from JSONL `writer` fields).
 - T14.18, T14.20: invalidated. T14.20 cancelled in favour of E15;
   T14.18 stays landed but its code is targeted for removal in T15.8.
 
+---
+
+## E16: Diagnostic Cleanup from 2026-05-14 Full-Matrix Analysis
+
+**Repos**: `analysis/`, `variants/hybrid/`, `variants/websocket/`,
+`variants/custom-udp/`, `variants/zenoh/`, plus doc updates in
+`metak-shared/`.
+
+**Status**: filed 2026-05-14 by the orchestrator after a `--dump`
+summary run of the 112 GB
+`logs/same-machine-all-variants-01-20260514_084636/` dataset surfaced
+267 incomplete-sample warnings, four classes of variant-side
+regression, and one analysis-tool noise issue. See
+`logs/same-machine-all-variants-01-20260514_084636/analysis/analyze_report.md`
+for the source observations.
+
+### Motivation
+
+The first end-to-end matrix run that exercises the threading-mode
+dimension (E14) plus the runner-idle termination (E15) plus all six
+active variants on every workload × QoS combination produced a clear
+ranking of pre-existing weaknesses:
+
+1. **Measurement integrity bug** in `websocket-multi`: negative p50
+   latencies on QoS 3/4 (e.g. `-0.025 ms` on `100x100hz qos3`). Writes
+   are appearing in the analysis pipeline with `write_ts > receive_ts`.
+   This blocks T11.5's receive-throughput headline from being trusted
+   as the project's headline metric.
+2. **Single-threaded hybrid TCP is non-functional under load** at QoS
+   3/4. 0.1–24.7 % delivery at rates as low as 1 000 msg/s. Single-mode
+   is the WASM-compatible path; this defeats the WASM goal for hybrid.
+3. **Zenoh at 1 000-path workloads collapses asymmetrically.** One
+   peer keeps writing, the other gives up (~500 000 backpressure-skip
+   events) and one direction of delivery goes to 0 %. Nine spawns
+   terminate via `variant_self_killed_idle`.
+4. **Custom-UDP multi regresses below single** at high path counts.
+5. **Analysis tool emits warnings on values that round to 100 %.**
+   ~30 false-positive lines clutter the warning list.
+
+### Scope (T16.x sub-tasks)
+
+- **T16.1** — analysis: tolerance fix in `incomplete_warnings.py` so
+  rows whose delivery rounds to `100.00 %` (i.e. raw >= 99.995 %) do
+  not emit a "<100.0%" warning. Keep the `[FAIL: completeness]`
+  annotation on the integrity row (that's correct), only the
+  user-visible warning line is suppressed when the rounded display
+  equals 100. Unit test in `analysis/tests/`.
+- **T16.2** — `variants/websocket/`: diagnose and fix the negative
+  latency observed in `multi` mode. Inspect when `write_ts` is
+  captured relative to the publish call and the multi-thread reader's
+  `receive_ts` capture site. Hypothesis: the multi reader records
+  `receive_ts` on the reader thread *before* the writer thread takes
+  its `write_ts` after returning from the non-blocking send. Fix the
+  ts-capture ordering so `write_ts` is taken *before* the send completes
+  (or use a single time source consistently). Validate with the
+  existing `tests/fixtures/two-runner-websocket-qos4.toml` reproducer.
+- **T16.3** — `variants/hybrid/`: restore TCP back-pressure handling
+  in single-threaded mode (audit whether T14.19's SO_SNDTIMEO is
+  actually in the single-mode path, or only the multi-mode path).
+  Acceptance: hybrid-single QoS 3/4 reaches >=99 % delivery on
+  `10x100hz` and >=80 % on `100x100hz`. The `1000x100hz` cell may
+  stay below threshold for hardware reasons; document the achievable
+  ceiling in `variants/hybrid/CUSTOM.md`.
+- **T16.4** — `variants/custom-udp/`: investigate why multi mode is
+  worse than single mode at `1000x10hz qos3` (16.1 % vs 64.0 %) and
+  `1000x100hz qos3` (10.6 % vs 55.8 %). Suspect reader-thread
+  contention on the NACK feedback path; instrument and confirm
+  before changing code. Reproducer config likely small.
+- **T16.5** — `variants/zenoh/`: investigate the asymmetric
+  1000-path collapse. Symptom: one peer writes ~3 M messages, the
+  other writes ~2 000 and accumulates ~500 000 `backpressure_skipped`
+  events; one delivery direction reads 0 %. Look at Zenoh declaration
+  propagation timing for 1000 paths. The variant's
+  `bench/__eot__/<writer>` key path and declaration order may matter.
+  Acceptance: symmetric writer counts (delta < 10 %) on a small
+  1000-path reproducer; one-direction delivery > 50 % at QoS 1/2,
+  > 90 % at QoS 3/4.
+- **T16.6** — `metak-shared/ANALYSIS.md`: docs-only. Add a paragraph
+  to the pivot-table section explaining why `zenoh-multi` shows
+  ~400 % multicast loopback ratio (Zenoh's subscription topology
+  reflects each message back from both the local data board AND the
+  Zenoh fabric subscription, doubling the 200 % convention seen in
+  the other multicast variants).
+- **T16.7** — analysis: in `incomplete_warnings.py`, when emitting a
+  `delivery shortfall` line, also emit the Ratio% from the pivot
+  parser (writer-side shortfall) so operators see *both* numbers.
+  Example: `delivery 100.0% (ratio 9.3% — writer-side shortfall)`.
+  Cosmetic improvement; no behaviour change.
+
+### Out of scope
+
+- The known WebRTC 1-peer limit (T3g.2). 67–82 % delivery on
+  `1000x100hz qos3/4` is the design ceiling, not a regression.
+- The `1000x100hz` writer-side bottleneck across all variants. This
+  is a hardware/workload characterisation, not a bug. T16.7 surfaces
+  it; it does not get fixed.
+- A full-matrix 112 GB re-run between fixes. Each task uses a
+  targeted reproducer config so the fix loop stays under 10 minutes.
+- Cross-machine validation. Stays user-owned.
+
+### Acceptance gates
+
+- T16.1: re-running analyze on the same dataset shows ~30 fewer
+  warning lines and zero `100.0% (<100.0%)` lines.
+- T16.2: websocket-multi p50 on any QoS 3/4 cell is positive.
+  Latency monotonically non-decreasing across p50 → p95 → p99 → max.
+- T16.3: hybrid-single QoS 3/4 reaches the threshold listed above
+  on the reproducer fixture.
+- T16.4: custom-udp multi mode is at least as good as single mode
+  on `1000x10hz qos3` reproducer.
+- T16.5: zenoh-multi `1000x10hz qos3` reproducer shows symmetric
+  writer counts and >=90 % delivery in both directions.
+- T16.6: a code reviewer reading ANALYSIS.md understands the 400 %
+  ratio without seeing the source code.
+- T16.7: the warnings file emits the Ratio% column for every
+  delivery-shortfall line.
+
+### Dependencies
+
+- E1 (Variant trait + protocol driver): T16.2, T16.3 may touch.
+- E3a/b/e/f: T16.2, T16.3, T16.4, T16.5 each touch one variant.
+- E4/E11 (analysis): T16.1, T16.6, T16.7 each touch one analysis
+  module.
+- E14 / E15: this epic is downstream of both. The dataset under
+  analysis is the first one to exercise both together.
+

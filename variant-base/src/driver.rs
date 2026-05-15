@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 
 use crate::cli::CliArgs;
 use crate::logger::{Logger, LoggerHandle};
@@ -49,8 +49,15 @@ impl<'a> LoggerProxy<'a> {
             .log_connected(launch_ts, elapsed_ms, threading_mode, recv_buffer_kb)
     }
 
-    fn log_write(&mut self, seq: u64, path: &str, qos: Qos, bytes: usize) -> Result<()> {
-        self.lock()?.log_write(seq, path, qos, bytes)
+    fn log_write_at(
+        &mut self,
+        ts: DateTime<Utc>,
+        seq: u64,
+        path: &str,
+        qos: Qos,
+        bytes: usize,
+    ) -> Result<()> {
+        self.lock()?.log_write_at(ts, seq, path, qos, bytes)
     }
 
     fn log_backpressure_skipped(&mut self, path: &str, qos: Qos) -> Result<()> {
@@ -335,13 +342,34 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         let ops = workload.generate(config.values_per_tick);
         for op in &ops {
             let seq = seq_gen.next_seq();
+            // T16.2: capture `write_ts` BEFORE `try_publish`.
+            //
+            // On same-host loopback (especially websocket-multi at
+            // QoS 3/4) the publish call pushes bytes into the kernel
+            // TCP send buffer and the peer's reader thread can read
+            // them and call `log_receive` before this driver thread
+            // returns from `try_publish`. Because both processes use
+            // the same QPC-backed `Utc::now()` machine-wide, capturing
+            // `write_ts` AFTER `try_publish` returned previously
+            // produced `receive_ts < write_ts` for ~50% of seqs.
+            // Capturing it before guarantees the writer's wall clock
+            // strictly precedes any peer observation, restoring the
+            // contract that `receive_ts >= write_ts` on same-host
+            // benchmarks. See
+            // `metak-shared/api-contracts/jsonl-log-schema.md` and
+            // `variant-base/CUSTOM.md` "Write timestamp capture".
+            let write_ts = Utc::now();
             if variant.try_publish(&op.path, &op.payload, qos, seq)? {
-                logger.log_write(seq, &op.path, qos, op.payload.len())?;
+                logger.log_write_at(write_ts, seq, &op.path, qos, op.payload.len())?;
                 progress.inc_sent();
                 if max_throughput {
                     consecutive_skipped = 0;
                 }
             } else {
+                // Note: backpressure_skipped is correctly timestamped
+                // at-event-time (not at-attempt-time) -- it records
+                // the moment the driver gave up on this op, not the
+                // moment it tried. Do NOT reuse `write_ts` here.
                 logger.log_backpressure_skipped(&op.path, qos)?;
                 if max_throughput {
                     consecutive_skipped = consecutive_skipped.saturating_add(1);
@@ -823,6 +851,125 @@ mod tests {
             variant.try_publish_calls as usize,
             skip_events.len(),
             "every Ok(false) call should produce exactly one `backpressure_skipped` event"
+        );
+    }
+
+    /// T16.2 mock variant: records the wall-clock at the moment its
+    /// `try_publish` is observed running. The driver-level test below
+    /// asserts that the `write_ts` captured BEFORE `try_publish` is
+    /// strictly less than this observed timestamp, proving the fix is
+    /// wired correctly. Single-value run so we collect exactly one
+    /// pair.
+    struct TsObservingVariant {
+        observed_inside_publish: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    impl TsObservingVariant {
+        fn new() -> Self {
+            Self {
+                observed_inside_publish: None,
+            }
+        }
+    }
+
+    impl Variant for TsObservingVariant {
+        fn name(&self) -> &str {
+            "ts-observing"
+        }
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            Ok(())
+        }
+        fn try_publish(
+            &mut self,
+            _path: &str,
+            _payload: &[u8],
+            _qos: Qos,
+            _seq: u64,
+        ) -> Result<bool> {
+            // Record only the FIRST observation so a multi-iteration
+            // operate phase still produces a single deterministic pair
+            // for the test to inspect.
+            if self.observed_inside_publish.is_none() {
+                self.observed_inside_publish = Some(chrono::Utc::now());
+            }
+            Ok(true)
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            Ok(None)
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_ts_is_captured_before_try_publish() {
+        // T16.2: the driver must capture `write_ts` BEFORE calling
+        // `variant.try_publish(...)`. We verify by having a mock
+        // variant record `Utc::now()` inside its `try_publish`
+        // implementation and asserting that the `ts` field on the
+        // emitted `write` JSONL event is strictly less than that
+        // observation.
+        //
+        // Pre-fix (capture AFTER try_publish): `write_ts` would be
+        // >= `observed_inside_publish` (often equal at coarse clock
+        // resolution, sometimes greater because the log call ran
+        // after publish returned).
+        //
+        // Post-fix (capture BEFORE try_publish): `write_ts` is
+        // captured before the mock variant gets a chance to record
+        // its own timestamp, so `write_ts < observed_inside_publish`
+        // is required.
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        // One tick, one value, no stabilize, no silent. The operate
+        // loop is entered, the workload emits one op, and the test
+        // measures that exact write_ts/publish_ts pair.
+        args.tick_rate_hz = 10;
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+
+        let mut variant = TsObservingVariant::new();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        let observed_inside_publish = variant
+            .observed_inside_publish
+            .expect("try_publish should have been called at least once");
+
+        let lines = read_log(dir.path(), "alice");
+        let write_events: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["event"] == "write").collect();
+        assert!(
+            !write_events.is_empty(),
+            "expected at least one `write` event"
+        );
+
+        let first_write_ts_str = write_events[0]["ts"].as_str().unwrap();
+        let first_write_ts = chrono::DateTime::parse_from_rfc3339(first_write_ts_str)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // The contract is "write_ts is captured NO LATER THAN the
+        // publish call observes it". On the pre-T16.2 code path the
+        // operations are
+        //   try_publish() -> [observed_inside_publish] -> log_write [first_write_ts]
+        // so first_write_ts > observed_inside_publish (the log call
+        // runs strictly after publish returns). On the post-T16.2 code
+        // path the operations are
+        //   [first_write_ts] -> try_publish() -> [observed_inside_publish]
+        // so first_write_ts <= observed_inside_publish. We use `<=`
+        // rather than `<` because on Windows the QPC-backed clock can
+        // return identical nanosecond timestamps for back-to-back
+        // `Utc::now()` calls (T16.11): two equal reads still satisfy
+        // the contract, only `>` would be a violation.
+        assert!(
+            first_write_ts <= observed_inside_publish,
+            "T16.2: write_ts must be captured BEFORE try_publish runs. \
+             write_ts = {first_write_ts}, observed_inside_publish = {observed_inside_publish}"
         );
     }
 

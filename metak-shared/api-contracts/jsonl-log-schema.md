@@ -63,6 +63,17 @@ Logged by the writer each time a value is written during the operate phase.
 | `qos` | integer | QoS level (1-4) |
 | `bytes` | integer | Serialized size of the value in bytes |
 
+The `ts` common field on `write` events is the wall-clock timestamp
+captured by the driver **immediately before** calling the variant's
+`try_publish()`. This is intentionally taken before the send so that on
+same-host benchmarks the writer's `ts` is monotonically before any
+peer's reader thread can observe the bytes -- without this ordering,
+multi-mode reader threads on the same machine (which share a
+QPC-backed `Utc::now()` source) can log a `receive` event whose `ts`
+precedes the corresponding `write.ts`, violating the contract that
+`receive_ts >= write_ts`. Changes the previous semantic (captured
+after `try_publish` returned) introduced under T16.2 (2026-05-14).
+
 ### `backpressure_skipped`
 
 Logged by the writer when the driver's per-tick value loop calls

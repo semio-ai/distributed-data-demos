@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use crate::types::{Phase, Qos, ThreadingMode};
@@ -50,7 +50,16 @@ impl Logger {
 
     /// Generate the current timestamp in RFC 3339 with nanosecond precision.
     fn now_ts() -> String {
-        Utc::now().format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string()
+        Self::format_ts(Utc::now())
+    }
+
+    /// Format a caller-supplied `DateTime<Utc>` as RFC 3339 with
+    /// nanosecond precision. Used by `log_write_at` so the driver can
+    /// capture `write_ts` before the variant's `try_publish` call (T16.2)
+    /// and have it serialised through the same code path that produces
+    /// every other `ts` field.
+    fn format_ts(ts: DateTime<Utc>) -> String {
+        ts.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string()
     }
 
     /// Write a JSON line to the log file.
@@ -109,9 +118,35 @@ impl Logger {
     }
 
     /// Log a `write` event.
+    ///
+    /// Captures the timestamp at the moment of this call. Equivalent to
+    /// `log_write_at(Utc::now(), ...)`. Most callers in variant-base use
+    /// [`Self::log_write_at`] instead so the driver can capture the
+    /// timestamp BEFORE the variant's `try_publish` call (T16.2) and
+    /// prevent same-host loopback races where a peer's reader thread
+    /// observes the bytes before the writer thread reaches this method.
     pub fn log_write(&mut self, seq: u64, path: &str, qos: Qos, bytes: usize) -> Result<()> {
+        self.log_write_at(Utc::now(), seq, path, qos, bytes)
+    }
+
+    /// Log a `write` event with a caller-supplied timestamp.
+    ///
+    /// The driver captures `ts` immediately BEFORE calling
+    /// `Variant::try_publish` (T16.2) so on same-host benchmarks the
+    /// writer's `write_ts` is monotonically before any peer's reader
+    /// thread can observe the bytes. See
+    /// `metak-shared/api-contracts/jsonl-log-schema.md` for the
+    /// contract.
+    pub fn log_write_at(
+        &mut self,
+        ts: DateTime<Utc>,
+        seq: u64,
+        path: &str,
+        qos: Qos,
+        bytes: usize,
+    ) -> Result<()> {
         let entry = json!({
-            "ts": Self::now_ts(),
+            "ts": Self::format_ts(ts),
             "variant": self.variant,
             "runner": self.runner,
             "run": self.run,
@@ -454,6 +489,57 @@ mod tests {
         assert_eq!(line["path"], "/sensors/lidar");
         assert_eq!(line["qos"], 1);
         assert_eq!(line["bytes"], 256);
+    }
+
+    #[test]
+    fn test_log_write_at_emits_supplied_ts_unchanged() {
+        // T16.2: the driver captures `write_ts` BEFORE calling
+        // `try_publish` and passes it to `log_write_at`. The emitted
+        // `ts` must exactly equal the supplied timestamp (rendered in
+        // RFC 3339 with nanosecond precision), not whatever `Utc::now()`
+        // returns at log time.
+        let (mut logger, _dir) = create_test_logger();
+        let supplied = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:34:56.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        logger
+            .log_write_at(supplied, 99, "/bench/7", Qos::ReliableTcp, 128)
+            .unwrap();
+        logger.flush().unwrap();
+
+        let lines = read_lines(&logger);
+        let line = &lines[0];
+        assert_eq!(line["event"], "write");
+        assert_eq!(line["seq"], 99);
+        assert_eq!(line["path"], "/bench/7");
+        assert_eq!(line["qos"], 4);
+        assert_eq!(line["bytes"], 128);
+        assert_eq!(line["ts"], "2026-05-14T12:34:56.123456789Z");
+    }
+
+    #[test]
+    fn test_log_write_delegates_to_log_write_at() {
+        // `log_write` is now a thin wrapper that captures `Utc::now()`
+        // and forwards to `log_write_at`. Sanity check that the
+        // resulting line has the same shape (all the write fields
+        // present) as the explicit-ts variant.
+        let (mut logger, _dir) = create_test_logger();
+        let before = Utc::now();
+        logger.log_write(1, "/path", Qos::BestEffort, 16).unwrap();
+        let after = Utc::now();
+        logger.flush().unwrap();
+
+        let lines = read_lines(&logger);
+        let line = &lines[0];
+        assert_eq!(line["event"], "write");
+        let ts = chrono::DateTime::parse_from_rfc3339(line["ts"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            ts >= before && ts <= after,
+            "log_write should capture a ts inside the call window: \
+             before={before} ts={ts} after={after}"
+        );
     }
 
     #[test]

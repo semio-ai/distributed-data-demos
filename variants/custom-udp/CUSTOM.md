@@ -327,17 +327,29 @@ frames but the peer's `Eot` marker, forcing the peer's driver to wait
 the full `eot_timeout` and exit with `status=timeout`. T14.16 splits
 the reader-thread mpsc into two channels so EOT can never be dropped:
 
-- **Data channel** (`data_tx` / `data_rx`): bounded
-  `mpsc::sync_channel` carrying `ReaderDataItem::Data(Message)` only.
-  Bound: `4 * values_per_tick * (peer_count + 1)` floored at
-  `MULTI_CHANNEL_FLOOR` (16). Drop-on-full is acceptable here -- UDP
-  is best-effort by definition, and QoS 3/4 protocols on the driver
-  thread are unchanged because the dropped item simply never lands in
-  `pending`. Reader threads use `try_send`; on `TrySendError::Full`
-  the warning line is
-  `[custom-udp] multi: data channel full -- dropping Data frame (receiver saturated)`
-  (renamed from the pre-T14.16 wording so operators can be sure that
-  EOT was NOT lost when this line appears).
+- **Data channel** (`data_tx` / `data_rx`): **T16.4 made this
+  unbounded** (`mpsc::channel`). Pre-T16.4 it was a bounded
+  `sync_channel` of size `4 * values_per_tick * (peer_count + 1)` with
+  drop-on-full. The drop-on-full rationale was "QoS 3/4 protocols on
+  the driver thread are unchanged because the dropped item simply
+  never lands in `pending`", but that reasoning was incomplete: at
+  1000 paths x 100 Hz QoS 3 the bound (4000) overflowed almost
+  immediately, dropped data frames triggered the receiver's gap
+  detector to fire NACKs, and the resulting retransmits ALSO
+  overflowed the same channel -- a NACK-storm feedback loop that
+  collapsed multi delivery to ~10 % vs single's ~56 % (logs
+  `same-machine-all-variants-01-20260514_084636/`, T16.4). After T16.4
+  the channel is unbounded; the kernel UDP `SO_RCVBUF` (8 MiB after
+  `tune_udp_buffers`) remains the only natural bound on the receive
+  side, and the driver's per-iteration drain budget
+  (`4 * values_per_tick`) keeps the channel's resident set bounded
+  under sustained load (~4x headroom over a 1-peer 100-Hz 1000-vpt
+  workload). The reader thread additionally filters out self-echoes
+  (writer == runner) before enqueueing, removing ~50 % of channel
+  pressure caused by multicast loopback. The
+  `[custom-udp] multi: data channel full -- dropping Data frame` log
+  line no longer exists; no replacement log line is added because the
+  failure mode it indicated is gone.
 - **Lifecycle channel** (`lifecycle_tx` / `lifecycle_rx`): unbounded
   `std::sync::mpsc::channel` carrying `ReaderLifecycleItem::Eot`,
   `Nack`, and `TcpPeerDropped`. Unbounded is safe because lifecycle
@@ -364,8 +376,10 @@ guarantee uniform across `Eot`, `Nack`, and `TcpPeerDropped`.
   items are rare, drain to empty), then drains `data_rx.try_recv()`
   bounded by "first staged update". This keeps the
   one-update-per-`poll_receive`-call shape used by Single mode while
-  guaranteeing EOT / NACK / PeerDropped observations are never starved
-  by a saturated data channel.
+  guaranteeing EOT / NACK / PeerDropped observations are surfaced
+  ahead of data. Post-T16.4 the priority guarantee is unchanged --
+  even though the data channel can no longer overflow, lifecycle
+  draining FIRST still costs nothing and matches the T14.16 wiring.
 - `stop_reader_threads` sets an `AtomicBool` flag, drops BOTH
   receivers (closes the channels so reader threads observe
   `Disconnected`), and joins each reader thread with a 2 s deadline

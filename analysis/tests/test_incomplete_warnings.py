@@ -55,6 +55,8 @@ def _ok_perf(
     variant: str = "v",
     run: str = "r",
     late_pct: float = 0.0,
+    expected_writes_per_sec: float | None = None,
+    receives_to_expected_ratio_pct: float | None = None,
 ) -> PerformanceResult:
     """Build a PerformanceResult with sensible defaults for a clean row."""
     return PerformanceResult(
@@ -72,6 +74,8 @@ def _ok_perf(
         jitter_p95_ms=0.2,
         loss_pct=0.0,
         late_receives_tail_pct=late_pct,
+        expected_writes_per_sec=expected_writes_per_sec,
+        receives_to_expected_ratio_pct=receives_to_expected_ratio_pct,
     )
 
 
@@ -153,7 +157,7 @@ class TestDeliveryShortfall:
         assert len(lines) == 2
         case_line, agg_line = lines
         assert f"qos{qos}" in case_line
-        assert "87.3%" in case_line
+        assert "87.30%" in case_line
         assert "1 delivery shortfall" in agg_line
 
     def test_shortfall_includes_loss_tolerant_qos1(
@@ -186,6 +190,195 @@ class TestDeliveryShortfall:
         # Two per-row warnings + aggregate.
         assert len(lines) == 3
         assert "2 delivery shortfall" in lines[-1]
+
+    def test_rounds_to_100_does_not_trigger(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """T16.1: rows that round to ``100.00%`` at 2-decimal display
+        precision are treated as complete; no warning is emitted.
+
+        99.999% rounds to ``100.00%`` in the integrity table, so the
+        warning ``delivery 100.0% (<100.0%)`` would be pure noise.
+        """
+        ints = [_ok_integrity(qos=3, delivery_pct=99.999)]
+        perfs = [_ok_perf()]
+
+        warnings = emit_incomplete_warnings(ints, perfs)
+        lines = _warn_lines(capsys.readouterr().err)
+
+        assert len(warnings.delivery_shortfall) == 0
+        assert lines == []
+
+    def test_99_pct_still_triggers(self, capsys: pytest.CaptureFixture) -> None:
+        """T16.1: well below the new threshold still fires (regression
+        guard against an over-eager threshold lift)."""
+        ints = [_ok_integrity(qos=3, delivery_pct=99.0)]
+        perfs = [_ok_perf()]
+
+        warnings = emit_incomplete_warnings(ints, perfs)
+        lines = _warn_lines(capsys.readouterr().err)
+
+        assert len(warnings.delivery_shortfall) == 1
+        # Per-row warning + aggregate.
+        assert len(lines) == 2
+        assert "99.00%" in lines[0]
+
+    def test_threshold_boundary(self, capsys: pytest.CaptureFixture) -> None:
+        """Just under 99.995 triggers; at/above does not."""
+        # Just below threshold -> warn.
+        ints_below = [_ok_integrity(qos=3, delivery_pct=99.994)]
+        warnings_below = emit_incomplete_warnings(ints_below, [_ok_perf()])
+        capsys.readouterr()  # drain.
+        assert len(warnings_below.delivery_shortfall) == 1
+
+        # Exactly at threshold -> no warn (it would round to 100.00%).
+        ints_at = [_ok_integrity(qos=3, delivery_pct=99.995)]
+        warnings_at = emit_incomplete_warnings(ints_at, [_ok_perf()])
+        capsys.readouterr()
+        assert len(warnings_at.delivery_shortfall) == 0
+
+
+class TestDeliveryShortfallRatioAnnotation:
+    """T16.7: surface writer-side Ratio% on delivery-shortfall warnings."""
+
+    def test_ratio_below_50_annotates(self, capsys: pytest.CaptureFixture) -> None:
+        """Spawn parses, ratio < 50% -> annotation appears on the line."""
+        ints = [
+            _ok_integrity(
+                variant="websocket-1000x100hz-qos3-multi",
+                run="all-variants-01",
+                qos=3,
+                delivery_pct=99.50,
+            ),
+        ]
+        perfs = [
+            _ok_perf(
+                variant="websocket-1000x100hz-qos3-multi",
+                run="all-variants-01",
+                expected_writes_per_sec=100_000.0,
+                receives_to_expected_ratio_pct=9.3,
+            ),
+        ]
+
+        emit_incomplete_warnings(ints, perfs)
+        lines = _warn_lines(capsys.readouterr().err)
+
+        case_line = lines[0]
+        assert "delivery 99.50% (<100%)" in case_line
+        assert "ratio 9.3%" in case_line
+        assert "writer-side shortfall" in case_line
+
+    def test_ratio_at_or_above_50_no_annotation(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Spawn parses, ratio >= 50% -> NO annotation (avoid noise)."""
+        ints = [
+            _ok_integrity(
+                variant="custom-udp-100x100hz-qos3-multi",
+                run="r",
+                qos=3,
+                delivery_pct=95.00,
+            ),
+        ]
+        perfs = [
+            _ok_perf(
+                variant="custom-udp-100x100hz-qos3-multi",
+                run="r",
+                expected_writes_per_sec=10_000.0,
+                receives_to_expected_ratio_pct=87.5,
+            ),
+        ]
+
+        emit_incomplete_warnings(ints, perfs)
+        lines = _warn_lines(capsys.readouterr().err)
+
+        case_line = lines[0]
+        assert "delivery 95.00% (<100%)" in case_line
+        assert "writer-side shortfall" not in case_line
+        assert "ratio" not in case_line
+
+    def test_ratio_exactly_50_no_annotation(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Boundary: ratio == 50% -> NO annotation (strict ``<`` cutoff)."""
+        ints = [
+            _ok_integrity(
+                variant="custom-udp-100x100hz-qos3-multi",
+                run="r",
+                qos=3,
+                delivery_pct=95.00,
+            ),
+        ]
+        perfs = [
+            _ok_perf(
+                variant="custom-udp-100x100hz-qos3-multi",
+                run="r",
+                expected_writes_per_sec=10_000.0,
+                receives_to_expected_ratio_pct=50.0,
+            ),
+        ]
+
+        emit_incomplete_warnings(ints, perfs)
+        lines = _warn_lines(capsys.readouterr().err)
+
+        assert "writer-side shortfall" not in lines[0]
+
+    def test_max_throughput_spawn_no_annotation(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """``max-throughput`` workload has no nominal rate -> no annotation.
+
+        ``receives_to_expected_ratio_pct`` is ``None`` for max-throughput
+        spawns (see performance.py); the formatter must NOT render
+        ``ratio n/a`` (per the T16.7 spec: omit entirely).
+        """
+        ints = [
+            _ok_integrity(
+                variant="custom-udp-max-qos3-multi",
+                run="r",
+                qos=3,
+                delivery_pct=50.0,
+            ),
+        ]
+        perfs = [
+            _ok_perf(
+                variant="custom-udp-max-qos3-multi",
+                run="r",
+                expected_writes_per_sec=None,
+                receives_to_expected_ratio_pct=None,
+            ),
+        ]
+
+        emit_incomplete_warnings(ints, perfs)
+        lines = _warn_lines(capsys.readouterr().err)
+
+        case_line = lines[0]
+        assert "delivery 50.00% (<100%)" in case_line
+        assert "ratio" not in case_line
+        assert "writer-side shortfall" not in case_line
+        assert "n/a" not in case_line
+
+    def test_unparsable_spawn_no_annotation(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Legacy / unparsable spawn name + no perf ratio -> no annotation."""
+        ints = [
+            _ok_integrity(variant="legacy-spawn", run="r", qos=3, delivery_pct=70.0),
+        ]
+        perfs = [
+            _ok_perf(
+                variant="legacy-spawn",
+                run="r",
+                expected_writes_per_sec=None,
+                receives_to_expected_ratio_pct=None,
+            ),
+        ]
+
+        emit_incomplete_warnings(ints, perfs)
+        lines = _warn_lines(capsys.readouterr().err)
+
+        assert "ratio" not in lines[0]
+        assert "writer-side shortfall" not in lines[0]
 
 
 class TestLateTail:

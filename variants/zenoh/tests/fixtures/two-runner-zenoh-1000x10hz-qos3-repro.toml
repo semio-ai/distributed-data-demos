@@ -1,0 +1,38 @@
+# T16.5 Zenoh 1000-path asymmetric collapse reproducer.
+#
+# At 1000-path workloads the full-matrix run on
+# `logs/same-machine-all-variants-01-20260514_084636/` showed:
+#  * 1000x10hz qos3: alice=1914 writes, bob=1560 writes, alice->bob 13%,
+#    bob->alice 0.26%, both peers classified `variant_self_killed_idle`.
+#  * 1000x100hz qos1: alice=3M writes, bob=2020 writes, 500K
+#    `backpressure_skipped`, alice->bob 0.00%.
+#
+# This fixture is the smaller of the two (1000 paths x 10 Hz x 10s
+# operate) and reproduces both the watchdog-driven self-kill and the
+# extreme write/delivery asymmetry deterministically on localhost.
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos3-repro.toml
+#   target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos3-repro.toml
+
+run = "zenoh-t165-1000x10hz-qos3-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-1000x10hz-qos3-repro"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 5
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 3
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
+  # debug_trace = true   # uncomment to emit `[zenoh-trace] ...` lines on stderr.

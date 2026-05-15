@@ -11,9 +11,13 @@ row-by-row:
    ``(variant, run, writer)`` spawn -- a single non-completed spawn
    is reported once even if the integrity table has multiple
    ``(writer -> receiver)`` rows for it.
-2. **Delivery shortfall**: ``IntegrityResult.delivery_pct < 100.0``,
-   *including* loss-tolerant QoS 1 and 2. Granularity: per
-   ``(variant, run, writer, receiver)`` integrity row.
+2. **Delivery shortfall**: ``IntegrityResult.delivery_pct < 99.995``
+   (i.e. anything that would round to ``100.00%`` at 2-decimal display
+   precision is treated as complete for warning purposes; the
+   ``[FAIL: completeness]`` annotation on the integrity table row is
+   unaffected by this threshold). *Including* loss-tolerant QoS 1 and
+   2. Granularity: per ``(variant, run, writer, receiver)`` integrity
+   row.
 3. **Late tail present**: ``PerformanceResult.late_receives_tail_pct
    > 0``. Granularity: per ``(variant, run)``.
 
@@ -50,6 +54,13 @@ class _DeliveryShortfallWarning:
     receiver: str
     qos: int
     delivery_pct: float
+    # T16.7: writer-side shortfall (Ratio%) parsed from the spawn name.
+    # ``100 * receives_per_sec / expected_writes_per_sec`` where
+    # ``expected_writes_per_sec = tick_rate_hz * values_per_tick``.
+    # ``None`` when the spawn name does not parse (e.g. the
+    # ``max-throughput`` workload has no nominal rate) -- the formatter
+    # omits the annotation entirely in that case.
+    ratio_pct: float | None
 
 
 @dataclass(frozen=True)
@@ -84,9 +95,25 @@ def collect_incomplete_warnings(
     spawn produces at most one ``not_completed`` warning even if the
     integrity table contains multiple ``(writer -> receiver)`` rows for
     the same writer-side spawn.
+
+    Rule 2 (T16.7) attaches the writer-side Ratio% parsed from the
+    matching ``PerformanceResult`` (one per ``(variant, run)``). When
+    no matching ``PerformanceResult`` exists or its
+    ``receives_to_expected_ratio_pct`` is ``None`` (e.g. max-throughput
+    workload), the ratio annotation is dropped by the formatter.
     """
     not_completed: dict[tuple[str, str, str], _NotCompletedWarning] = {}
     delivery_shortfall: list[_DeliveryShortfallWarning] = []
+
+    # Build a (variant, run) -> ratio_pct lookup so the per-integrity-row
+    # delivery shortfall can pick up the writer-side Ratio% without
+    # duplicating the pivot-table formula. ``PerformanceResult`` already
+    # carries ``receives_to_expected_ratio_pct`` computed from the same
+    # spawn-name parser used by ``pivot_tables`` (see performance.py).
+    ratio_by_group: dict[tuple[str, str], float | None] = {
+        (p.variant, p.run): p.receives_to_expected_ratio_pct
+        for p in performance_results
+    }
 
     # Both "completed" (peer-confirmed E12 handshake) and the new
     # "runner_idle_terminated" (T15.6; E15 variant-side idle-detection
@@ -111,7 +138,14 @@ def collect_incomplete_warnings(
             )
 
         # Rule 2: delivery shortfall on ANY QoS (including 1, 2).
-        if r.delivery_pct < 100.0:
+        # Threshold is 99.995% (not 100.0%) so rows that round to
+        # ``100.00%`` at 2-decimal display precision -- e.g.
+        # 99.99988% (875999/876000) -- don't fire a warning that would
+        # be reported alongside an integrity table row already showing
+        # ``100.00%`` (T16.1). The integrity table's
+        # ``[FAIL: completeness]`` annotation is independent and
+        # unaffected.
+        if r.delivery_pct < 99.995:
             delivery_shortfall.append(
                 _DeliveryShortfallWarning(
                     variant=r.variant,
@@ -120,6 +154,7 @@ def collect_incomplete_warnings(
                     receiver=r.receiver,
                     qos=r.qos,
                     delivery_pct=r.delivery_pct,
+                    ratio_pct=ratio_by_group.get((r.variant, r.run)),
                 )
             )
 
@@ -185,10 +220,28 @@ def format_incomplete_warnings(warnings: IncompleteWarnings) -> list[str]:
             (w for w in warnings.delivery_shortfall if _group_key(w) == group),
             key=lambda x: (x.writer, x.receiver, x.qos),
         ):
-            lines.append(
+            # Format with 2 decimals to match the integrity table's
+            # display precision -- a 1-decimal format would render a
+            # legitimate ``99.99%`` row as the misleading ``100.0%
+            # (<100.0%)`` (T16.1). The trigger threshold (99.995%)
+            # already suppresses rows that round to ``100.00%`` here.
+            #
+            # T16.7: append the writer-side Ratio% when it parses AND is
+            # low enough to be load-bearing context. A low ratio means
+            # the writer didn't attempt the requested rate, which is a
+            # qualitatively different failure mode from a transport
+            # losing packets at line rate. We only annotate below 50%
+            # so healthy-but-shy-of-100% rows don't get a noisy ``ratio
+            # 99.x%`` tag. ``None`` ratio (unparsable spawn name or
+            # max-throughput workload with no nominal rate) -> omit
+            # entirely (no ``ratio n/a`` noise).
+            line = (
                 f"WARN: [{w.variant} / {w.run}] {w.writer}->{w.receiver} qos{w.qos} "
-                f"delivery {w.delivery_pct:.1f}% (<100.0%)"
+                f"delivery {w.delivery_pct:.2f}% (<100%)"
             )
+            if w.ratio_pct is not None and w.ratio_pct < 50.0:
+                line += f" ratio {w.ratio_pct:.1f}% (writer-side shortfall)"
+            lines.append(line)
         for w in sorted(
             (w for w in warnings.late_tail if _group_key(w) == group),
             key=lambda x: x.late_tail_pct,

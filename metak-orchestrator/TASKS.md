@@ -7208,3 +7208,191 @@ In `variants/zenoh/src/rest_client.rs`:
   connection per spawn is the expected behaviour.
 
 ---
+
+---
+
+## E16 — Diagnostic Cleanup from 2026-05-14 Full-Matrix Analysis
+
+Filed 2026-05-14. Source: 
+`logs/same-machine-all-variants-01-20260514_084636/analysis/analyze_report.md`.
+
+### T16.1 — Analysis: suppress `<100.0%` warnings on rows that round to 100% [low]
+
+**Repo**: `analysis/`
+**Owner**: orchestrator → spawn worker.
+**Goal**: Remove ~30 false-positive lines like `bob->alice qos3 delivery 100.0% (<100.0%)` from the `emit_incomplete_warnings` and `format_incomplete_warnings` paths. Underlying value is e.g. 99.99988% (875999/876000); display rounds to 100.00 but the comparison uses the raw float.
+
+**Implementation hint**: in `analysis/incomplete_warnings.py`, change the delivery-shortfall trigger from `delivery_pct < 100.0` to `delivery_pct < 99.995` (i.e. anything that would round-down-to-display as 100.0% is treated as 100%). The `[FAIL: completeness]` annotation on the integrity table row should remain unchanged.
+
+**Tests**: add a fixture row at 99.999% and assert it no longer triggers a warning; keep the existing test for 99.0% so it does trigger.
+
+**Acceptance**: re-running analyze on the 2026-05-14 dataset emits zero `100.0% (<100.0%)` lines. Warning total drops from 267 to ~235.
+
+### T16.2 — Websocket-multi: fix negative latencies [high]
+
+**Repo**: `variants/websocket/`
+**Owner**: orchestrator → spawn worker.
+**Goal**: `websocket-multi` reports negative mean latencies on QoS 3/4 cells (e.g. `p50 = -0.0253 ms` on `100x100hz qos3`, several others around `-0.01`..`-0.06 ms`). The writer's `write_ts` is being captured after the receive thread logs `receive_ts` for the loopback receive on the same machine. This violates the schema contract that `receive_ts >= write_ts` and blocks T11.5 from using receive throughput as the headline metric.
+
+**Investigation steps**:
+1. Identify where `write_ts` is captured in the websocket variant's publish path. Look for any non-blocking dispatch that returns to the caller before the timestamp is taken.
+2. Identify where `receive_ts` is captured in the multi-mode reader thread. Look for `Instant::now()` calls that may happen before the writer's timestamp is taken.
+3. Hypothesis to validate: `write_ts` should be captured *before* the message is handed to the WS send path. `receive_ts` should be captured at the first point after the bytes are pulled from the socket into user space.
+
+**Fix**: ensure both timestamps are taken from the same monotonic clock (variant-base helper if there is one) and that `write_ts` is taken before any inter-thread handoff in the send path.
+
+**Reproducer**: `variants/websocket/tests/fixtures/two-runner-websocket-qos4.toml` (already in tree) or the freshly added `two-runner-websocket-t14-20-stress.toml`.
+
+**Acceptance**: re-running the reproducer shows non-negative p50/mean for every QoS 3/4 cell on websocket-multi; latency percentiles are monotonically non-decreasing (p50 ≤ p95 ≤ p99 ≤ max).
+
+### T16.3 — Hybrid-single TCP back-pressure under load [high]
+
+**Repo**: `variants/hybrid/`
+**Owner**: orchestrator → spawn worker.
+**Goal**: `hybrid-single` QoS 3/4 fails catastrophically (0.1–24.7% delivery, multi-second tail latency) at workloads as low as `10x100hz` (1 000 msg/s). The multi-thread version of hybrid is fine on the same workloads — so the regression is single-mode specific.
+
+**Investigation steps**:
+1. Read `variants/hybrid/CUSTOM.md` for the historical context on blocking writes / SO_SNDTIMEO.
+2. Read T14.4 (Hybrid multi) and T14.19 (TCP single-mode SO_SNDTIMEO) in this TASKS.md file for what was supposed to land.
+3. Audit whether the single-mode code path actually configures SO_SNDTIMEO and uses blocking writes for TCP. Common regression: the back-pressure handling code is gated on `ThreadingMode::Multi` when it should apply to both modes.
+4. Check CPU% in the failing runs (`logs/same-machine-all-variants-01-20260514_084636/analysis/summary_performance.md` shows hybrid-single QoS 3/4 spawns pegged at 99% — one thread blocking on TCP write).
+
+**Fix**: apply SO_SNDTIMEO + blocking-write semantics to TCP in single mode (matching multi mode).
+
+**Reproducer**: a small two-runner-hybrid-qos4 config at `10x100hz` or `100x100hz`. If none exists, create one as `variants/hybrid/tests/fixtures/two-runner-hybrid-single-qos4-repro.toml`.
+
+**Acceptance**: hybrid-single QoS 3/4 reaches >=99% delivery on the `10x100hz` reproducer and >=80% on `100x100hz`.
+
+### T16.4 — Custom-UDP multi vs single regression [medium]
+
+**Repo**: `variants/custom-udp/`
+**Owner**: orchestrator → spawn worker (after T16.2, T16.3, T16.5 are running).
+**Goal**: `custom-udp-multi` shows worse delivery than `custom-udp-single` at high path counts:
+- `1000x10hz qos3`: single 64.0%, multi 16.1%
+- `1000x100hz qos3`: single 55.8%, multi 10.6%
+
+This contradicts the expected behaviour that multi-mode should be at least as good as single-mode. Likely a reader-thread contention or socket-buffer mismanagement on the NACK feedback path.
+
+**Investigation steps**:
+1. Inspect the per-socket recv thread setup in custom-udp multi mode.
+2. Check whether the NACK feedback path goes through the multi-thread reader or a separate thread.
+3. Profile the multi-mode reproducer to see where the bottleneck is.
+
+**Fix**: likely a reader-thread coordination issue; could be socket buffer too small per-thread or a lock contention on the NACK state.
+
+**Acceptance**: custom-udp-multi reaches at least 90% of custom-udp-single delivery on the `1000x10hz qos3` reproducer.
+
+### T16.5 — Zenoh 1000-path asymmetric collapse [high]
+
+**Repo**: `variants/zenoh/`
+**Owner**: orchestrator → spawn worker.
+**Goal**: At 1 000-path workloads, Zenoh shows extreme asymmetry: one peer writes ~3 M messages, the other writes ~2 000 and accumulates ~500 000 `backpressure_skipped` events. Nine spawns terminate via `variant_self_killed_idle`. One direction of delivery reads 0%.
+
+**Investigation steps**:
+1. Inspect the Zenoh declaration/subscription propagation for 1 000 keys (vs 10-100 keys which work).
+2. Look at the variant's `bench/__eot__/<writer>` keyspace usage — does declaration order matter?
+3. Check if Zenoh's congestion-control / drop-when-pushing-on-network mode applies and how the variant handles a `Push` returning a drop.
+
+**Reproducer**: a small 1 000-path Zenoh config (could be `configs/two-runner-zenoh-1000x10hz-qos3.toml` — check if it exists, otherwise create).
+
+**Acceptance**: symmetric writer counts (delta < 10%) on the reproducer; one-direction delivery > 50% at QoS 1/2 and > 90% at QoS 3/4. Zero `variant_self_killed_idle` on the reproducer.
+
+### T16.6 — Document Zenoh 400% multicast loopback ratio [low]
+
+**Repo**: `metak-shared/` (docs only)
+**Owner**: orchestrator.
+**Goal**: Add a paragraph to `metak-shared/ANALYSIS.md` pivot-table section explaining why `zenoh-multi` shows ~400% multicast loopback ratio (vs 200% for other multicast variants). The ratio is correct, but operators reading the pivot tables for the first time may flag it as a bug.
+
+**Acceptance**: a code reviewer understands the 400% ratio after reading the doc.
+
+### T16.7 — Surface Ratio% alongside Delivery% in warnings [low]
+
+**Repo**: `analysis/`
+**Owner**: orchestrator → spawn worker.
+**Goal**: When emitting a delivery-shortfall warning, include the Ratio% (writer-side shortfall) so operators see both numbers. Example: `delivery 100.0% (ratio 9.3% — writer-side shortfall)`.
+
+**Acceptance**: warning lines for groups with `ratio_pct < 50%` include the ratio annotation.
+
+---
+
+
+### T16.8 — Runner progress events undercount multi-mode receives [low]
+
+**Repo**: `variant-base/` (most likely the progress-emission path inside the protocol driver / multi-mode reader thread).
+**Owner**: orchestrator → spawn worker once T16.3 / T16.5 settle.
+
+Observed during T16.2 verification (see STATUS.md 2026-05-14):
+- Multi-mode spawn final progress: `sent=30100 received=0` (RUNNER stdout).
+- Same spawn's JSONL has 30 100 receive events that analyze tallies as 100% delivery.
+- Single-mode spawn on the same workload reports `sent=20400 received=19800` correctly.
+
+The variant's receive counter (used to emit the periodic progress JSON to stdout) does not see the multi-mode reader thread's receives. Likely the counter is owned by the driver thread and the reader threads don't increment it. The fix is to switch the counter to an `Arc<AtomicU64>` or an mpsc-counted channel that the reader threads bump.
+
+**Acceptance**: re-running the T16.2 reproducer shows `received` matching `sent` (modulo 1 drop) in the runner's multi-mode progress line.
+
+**Out of scope**: any behaviour change in the runner. This is variant-side only.
+
+
+### T16.9 — Cleanup: dead_code on LoggerProxy::log_write after T16.2 [low]
+
+**Repo**: `variant-base/`
+**Owner**: orchestrator → spawn worker.
+
+Pre-existing clippy `dead_code` error flagged by the T16.5 worker after a workspace build with `-D warnings`. After T16.2 the driver call site uses `log_write_at` and the legacy `LoggerProxy::log_write` (if it's the proxy variant) is no longer reachable. Either delete the dead method or annotate `#[allow(dead_code)]` if it's part of the public API surface the contract requires.
+
+**Acceptance**: `cargo clippy --release --workspace --all-targets -- -D warnings` is clean.
+
+
+### T16.10 — Zenoh QoS 3/4 ordering regression after T16.5 [high]
+
+**Repo**: `variants/zenoh/`
+**Status**: filed 2026-05-15 00:39 by orchestrator after the E16 verification smoke.
+
+**Symptom**: On the E16 smoke fixture `zenoh-1000x10hz-qos3-multi`, the integrity report shows ~17 000 out-of-order receives per (writer→receiver) direction on 51 000 receives, with `[FAIL: ordering]` annotated on all four directions. QoS 3 is the reliable-ordered tier — out-of-order arrivals violate the contract.
+
+**Likely cause**: T16.5 changed `publisher_task` from a single async loop that awaits each `publisher.put(...).await` inline to one that clones the `Arc<Publisher>` and `tokio::spawn`s each put independently (bounded by a 4096-slot semaphore). With ordered QoS this is wrong — concurrent `put` calls on the same key/publisher can complete in any order, and the receiver sees them out of sequence.
+
+**Evidence**:
+- Pre-T16.5: in `logs/same-machine-all-variants-01-20260514_084636/`, `zenoh-100x100hz-qos3-multi` rows had `Out-of-order 0` across the board.
+- Post-T16.5 (this smoke): all four directions show 16 000-17 000 out-of-order on 51 000.
+- Pre-T16.5 the variant could not reach 100% delivery at 1000 paths, but it WAS preserving ordering when delivery did happen. T16.5 traded ordering for throughput.
+
+**Fix direction (for the worker — do not act on this without re-reading the trade-off carefully)**:
+- For QoS 1/2 (best-effort / latest-value): the per-publish `tokio::spawn` is fine. Keep it.
+- For QoS 3/4 (reliable-ordered): publishes on the same key must be serialised. Either:
+  - Maintain a per-key sequential queue (mpsc per key) inside `publisher_task`, OR
+  - Keep the original sequential inline `await` for QoS 3/4 publishers, OR
+  - Use Zenoh's own ordering primitive if one exists for parallel publish.
+- The 500 ms post-spawn settle from T16.5 should be preserved.
+
+**Reproducer**: same as T16.5 — `variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos3-repro.toml`.
+
+**Acceptance**:
+- `zenoh-1000x10hz qos3` and `qos4` reproducers show Out-of-order 0 across all four (writer→receiver) directions.
+- Delivery and writer-symmetry results from T16.5 are preserved (≥90% delivery in both directions, no `variant_self_killed_idle`).
+- QoS 1/2 throughput improvements from T16.5 are preserved.
+
+**Out of scope**: QoS 1/2 throughput characterisation. They are best-effort/latest-value; ordering is not contractually required there.
+
+
+### T16.11 — Flake in T16.2 test write_ts_is_captured_before_try_publish [low]
+
+**Repo**: `variant-base/`
+**Owner**: orchestrator → spawn worker.
+
+Filed 2026-05-15 by T16.9 worker. The T16.2 regression guard
+`driver::tests::write_ts_is_captured_before_try_publish` asserts
+`first_write_ts < observed_inside_publish` (strict less-than) between
+two `Utc::now()` reads. On Windows the QPC-backed clock can return
+identical nanosecond timestamps for back-to-back calls. Test flakes.
+
+**Fix**: relax to `<=` (the contract is "write_ts is captured no later
+than the publish call observes it"), OR insert a `std::hint::spin_loop`
+between the two ts captures inside the mock so the second clock read
+strictly advances. `<=` is cleaner and matches the actual semantic
+guarantee.
+
+**Acceptance**: 100 iterations of `cargo test --release -p variant-base
+driver::tests::write_ts_is_captured_before_try_publish` pass without
+flake.
+

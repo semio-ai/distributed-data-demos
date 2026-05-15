@@ -1,0 +1,32 @@
+# T16.5 Zenoh 1000-path asymmetric collapse reproducer (QoS 1 / CC=Drop).
+#
+# The full-matrix run on `logs/same-machine-all-variants-01-20260514_084636/`
+# showed extreme write/delivery asymmetry on this QoS:
+#  * alice = 3 001 000 writes, bob = 2 020 writes, 500 980
+#    `backpressure_skipped` events on bob.
+#  * alice->bob 0.00 %, bob->alice 50.69 %, alice->alice 100 %.
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos1-repro.toml
+#   target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos1-repro.toml
+
+run = "zenoh-t165-1000x100hz-qos1-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-1000x100hz-qos1-repro"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 5
+  operate_secs = 8
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"

@@ -315,8 +315,11 @@ impl Variant for HybridVariant {
         self.udp = Some(udp);
 
         // Set up TCP listener for QoS 3-4 on the runner-/qos-derived
-        // port.
-        let mut tcp = TcpTransport::new(self.config.tcp_listen_addr)
+        // port. T16.3: the transport needs the threading mode so it
+        // can install `SO_SNDTIMEO` on Single-mode peer streams (and
+        // skip it in Multi mode, where the reader-thread drain
+        // breaks the wedge anyway).
+        let mut tcp = TcpTransport::new(self.config.tcp_listen_addr, threading_mode)
             .context("failed to set up TCP transport")?;
 
         // Connect to each peer (excluding self -- already filtered in main).
@@ -688,7 +691,13 @@ mod tests {
         let mut v = HybridVariant::new("test-runner", cfg);
         // Splice in a TCP transport with no peers. broadcast() over an
         // empty peer set is a no-op that still returns Ok.
-        v.tcp = Some(TcpTransport::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap());
+        v.tcp = Some(
+            TcpTransport::new(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                ThreadingMode::Single,
+            )
+            .unwrap(),
+        );
 
         let payload = vec![0u8; 64];
         for seq in 0..100u64 {
@@ -710,7 +719,13 @@ mod tests {
         let mut cfg = dummy_config();
         cfg.qos = Qos::ReliableTcp;
         let mut v = HybridVariant::new("test-runner", cfg);
-        v.tcp = Some(TcpTransport::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap());
+        v.tcp = Some(
+            TcpTransport::new(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                ThreadingMode::Single,
+            )
+            .unwrap(),
+        );
 
         let payload = vec![0u8; 64];
         for seq in 0..100u64 {

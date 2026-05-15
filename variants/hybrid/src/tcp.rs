@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use socket2::SockRef;
+use variant_base::types::ThreadingMode;
 
 /// Wall-clock budget for the TCP write `WouldBlock` retry loop. Used as
 /// a safety net in case the socket *is* somehow non-blocking — under
@@ -56,6 +57,38 @@ const TCP_WRITE_RETRY_BUDGET: Duration = Duration::from_secs(10);
 /// flight. The poll loop iterates over all peers per tick; each peer's
 /// read can spend up to this long waiting before yielding back.
 const READ_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// T16.3: write-side timeout for Single-mode outbound TCP streams.
+///
+/// At catastrophic symmetric load (>= 1 000 msg/s on QoS 3/4) Single
+/// mode wedges: both peers spend the publish phase inside the
+/// blocking `write_all` while neither calls `poll_receive` to drain
+/// the kernel TCP recv buffer. The kernel TCP send buffers fill on
+/// both sides and `write_all` blocks indefinitely. Without a write
+/// timeout the variant deadlocks until the runner kills it. This is
+/// the exact analogue of the websocket variant's T14.19 wedge and
+/// follows the same fix pattern.
+///
+/// Installing `SO_SNDTIMEO` turns the wedge into a typed `TimedOut`
+/// (Windows) / `WouldBlock` (Unix) error from `TcpStream::write`.
+/// `TcpTransport::broadcast` already drops a peer on any write
+/// error (per the per-peer fault-tolerance rule documented in
+/// `CUSTOM.md` "TCP read loop — per-peer fault tolerance"). With the
+/// peer gone, the operate phase exits its publish loop naturally and
+/// the spawn completes cleanly via the runner-coordinated termination
+/// state machine.
+///
+/// Applied to Single mode only. Multi mode runs a per-peer reader
+/// thread that drains in parallel with the publisher; the wedge does
+/// not occur there and `SO_SNDTIMEO` would only invite spurious
+/// peer-drops under transient back-pressure. The blocking write
+/// behaviour (back-pressure as the benchmark signal — see CUSTOM.md
+/// "TCP connection management") is preserved in Multi mode.
+///
+/// 5 s is far longer than any realistic transient on a healthy LAN
+/// (TCP_NODELAY + buffered recv); a timeout firing means the peer is
+/// genuinely stuck.
+const SINGLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A single TCP peer connection.
 ///
@@ -85,7 +118,14 @@ impl TcpPeer {
     /// `SO_RCVTIMEO` so reads can be polled; writes inherit the socket's
     /// blocking behaviour and apply true back-pressure on send-buffer
     /// fill. See module docs.
-    fn from_stream(stream: TcpStream, addr: SocketAddr) -> Result<Self> {
+    ///
+    /// `threading_mode == Single` additionally installs
+    /// `SO_SNDTIMEO = SINGLE_WRITE_TIMEOUT` on the write handle so
+    /// the publish loop cannot deadlock under symmetric saturation
+    /// (T16.3). Multi mode leaves writes truly blocking — the
+    /// per-peer reader thread drains in parallel and the wedge does
+    /// not occur.
+    fn from_stream(stream: TcpStream, addr: SocketAddr, mode: ThreadingMode) -> Result<Self> {
         // Clone gives us two independent handles to the same socket. The
         // socket itself stays in blocking mode (we never call
         // `set_nonblocking(true)`), so writes through the write handle
@@ -106,6 +146,13 @@ impl TcpPeer {
         read_stream
             .set_read_timeout(Some(READ_POLL_TIMEOUT))
             .with_context(|| format!("failed to set TCP read timeout for {addr}"))?;
+
+        // T16.3: Single mode gets a write timeout so a wedged publish
+        // surfaces as a typed I/O error and the broadcast loop drops
+        // the offending peer instead of deadlocking. Multi mode keeps
+        // writes truly blocking — the per-peer reader thread drains
+        // in parallel and the wedge cannot occur there.
+        apply_single_mode_write_timeout(&write_stream, mode, addr);
 
         Ok(Self {
             addr,
@@ -141,6 +188,17 @@ impl TcpPeer {
     /// `ConnectionReset`, unexpected EOF, malformed framing) — the caller
     /// is expected to drop this peer and continue with the others rather
     /// than failing the whole spawn.
+    ///
+    /// **T16.3**: when the internal `read_buf` already holds a complete
+    /// frame, extract and return it WITHOUT first doing another
+    /// `read()` syscall. The read syscall has `SO_RCVTIMEO = 1 ms`, so
+    /// re-entering it when the kernel recv buffer is empty (but we
+    /// have buffered frames) would waste 1 ms per buffered message.
+    /// At 1 000 msg/s symmetric on QoS 3/4 in Single mode, that 1 ms
+    /// per call was capping the drain at ~1 000 calls/s and starving
+    /// the receive path. Extracting buffered frames first lets the
+    /// driver's drain loop chew through a batch of frames in
+    /// microseconds and return to publish.
     pub fn try_recv_framed(&mut self) -> Result<Option<Vec<u8>>> {
         // Multi mode `take_read_stream()`s the read clone, so polling
         // is only valid when we still own it (Single mode).
@@ -148,6 +206,16 @@ impl TcpPeer {
             Some(r) => r,
             None => return Ok(None),
         };
+
+        // T16.3: fast path — if a complete frame is already buffered
+        // from a previous large `read()`, return it without another
+        // syscall. The kernel may have delivered many frames at once
+        // (especially on localhost / TCP_NODELAY) and we'd otherwise
+        // wedge for `READ_POLL_TIMEOUT` per buffered frame.
+        if let Some(msg) = take_buffered_frame(&mut self.read_buf) {
+            return Ok(Some(msg));
+        }
+
         // Read whatever is available into the buffer.
         let mut tmp = [0u8; 65536];
         match read.read(&mut tmp) {
@@ -182,21 +250,9 @@ impl TcpPeer {
             }
         }
 
-        // Try to extract a complete frame: 4-byte length prefix + payload.
-        if self.read_buf.len() < 4 {
-            return Ok(None);
-        }
-        let msg_len = u32::from_be_bytes(self.read_buf[0..4].try_into().unwrap()) as usize;
-        let total = 4 + msg_len;
-        if self.read_buf.len() < total {
-            return Ok(None);
-        }
-
-        // Extract the message and shrink the buffer.
-        let msg = self.read_buf[4..total].to_vec();
-        self.read_buf.drain(..total);
-
-        Ok(Some(msg))
+        // Try to extract a complete frame from the (possibly enlarged)
+        // buffer.
+        Ok(take_buffered_frame(&mut self.read_buf))
     }
 
     /// Shut down both directions of the underlying socket so the peer
@@ -213,11 +269,19 @@ pub struct TcpTransport {
     outbound: Vec<TcpPeer>,
     /// Inbound connections accepted from peers.
     inbound: Vec<TcpPeer>,
+    /// Threading mode for this spawn (T16.3). Determines whether
+    /// newly built `TcpPeer`s get `SO_SNDTIMEO` installed on the
+    /// write handle.
+    threading_mode: ThreadingMode,
 }
 
 impl TcpTransport {
     /// Create a TCP listener on the given address.
-    pub fn new(listen_addr: SocketAddr) -> Result<Self> {
+    ///
+    /// `threading_mode` is stashed so subsequent `connect_to_peer` /
+    /// `accept_pending` calls can install (or skip) the T16.3 write
+    /// timeout on newly built peer streams.
+    pub fn new(listen_addr: SocketAddr, threading_mode: ThreadingMode) -> Result<Self> {
         let listener = TcpListener::bind(listen_addr)
             .with_context(|| format!("failed to bind TCP listener on {}", listen_addr))?;
         listener
@@ -228,6 +292,7 @@ impl TcpTransport {
             listener,
             outbound: Vec::new(),
             inbound: Vec::new(),
+            threading_mode,
         })
     }
 
@@ -262,7 +327,7 @@ impl TcpTransport {
         if let Some(kb) = recv_buffer_kb {
             apply_tcp_recv_buffer(&stream, kb, addr)?;
         }
-        let peer = TcpPeer::from_stream(stream, addr)?;
+        let peer = TcpPeer::from_stream(stream, addr, self.threading_mode)?;
         self.outbound.push(peer);
         Ok(())
     }
@@ -284,7 +349,7 @@ impl TcpTransport {
                     if let Some(kb) = recv_buffer_kb {
                         apply_tcp_recv_buffer(&stream, kb, addr)?;
                     }
-                    let peer = TcpPeer::from_stream(stream, addr)?;
+                    let peer = TcpPeer::from_stream(stream, addr, self.threading_mode)?;
                     self.inbound.push(peer);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -433,6 +498,48 @@ fn connect_with_retry(addr: SocketAddr, budget: Duration) -> Result<TcpStream> {
     }
 }
 
+/// T16.3: extract a single complete length-prefixed frame from
+/// `buf` if one is available, draining the consumed bytes. Returns
+/// `None` when `buf` does not yet hold a complete `[u32 length |
+/// payload]` frame.
+///
+/// Pulled out of `TcpPeer::try_recv_framed` so the fast path
+/// (buffered-frame-already-available) and the slow path (read more
+/// from the kernel first) share the same extraction code.
+fn take_buffered_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let msg_len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+    let total = 4 + msg_len;
+    if buf.len() < total {
+        return None;
+    }
+    let msg = buf[4..total].to_vec();
+    buf.drain(..total);
+    Some(msg)
+}
+
+/// T16.3: install `SO_SNDTIMEO = SINGLE_WRITE_TIMEOUT` on a TCP
+/// stream when running in Single mode. Multi mode leaves the write
+/// timeout unset (the per-peer reader thread drains in parallel and
+/// the wedge does not occur). Failure is logged but never fatal:
+/// without the timeout the Single-mode spawn reverts to the pre-T16.3
+/// deadlock under symmetric saturation but the spawn does not break.
+fn apply_single_mode_write_timeout(stream: &TcpStream, mode: ThreadingMode, addr: SocketAddr) {
+    if mode != ThreadingMode::Single {
+        return;
+    }
+    if let Err(e) = stream.set_write_timeout(Some(SINGLE_WRITE_TIMEOUT)) {
+        eprintln!(
+            "[variant-hybrid] T16.3: set_write_timeout({:?}) failed for {addr}: {e}; \
+             continuing without write-side timeout (Single mode may deadlock under \
+             extreme load)",
+            SINGLE_WRITE_TIMEOUT
+        );
+    }
+}
+
 /// Apply `SO_RCVBUF = kb * 1024` to a `TcpStream` (T14.1 / T14.4).
 /// Emits a single `eprintln!` warning when the achieved size lands
 /// below the requested value (e.g. Windows silently clamping).
@@ -473,6 +580,13 @@ impl ByteWrite for TcpStream {
 /// budget is exhausted while still hitting `WouldBlock`, or if the write
 /// fails with any other error. A budget exhaustion is the back-pressure
 /// signal — the caller surfaces it instead of silently dropping data.
+///
+/// **T16.3**: `TimedOut` is treated as a fatal error and surfaces
+/// immediately. On Windows it is what `SO_SNDTIMEO` raises when the
+/// kernel send buffer stays full for `SINGLE_WRITE_TIMEOUT` — i.e.
+/// the deadlocked-publish signal we explicitly want to escape in
+/// Single mode. Treating it as transient and retrying would just
+/// re-arm the same 5 s wait on the very next call.
 fn write_with_retry<W: ByteWrite>(writer: &mut W, data: &[u8]) -> Result<()> {
     let deadline = Instant::now() + TCP_WRITE_RETRY_BUDGET;
     let mut written = 0usize;
@@ -573,7 +687,11 @@ mod tests {
 
         // The TcpTransport under test owns its own listener (which we won't
         // use in this test) and dials `listener_a` and `listener_b`.
-        let mut transport = TcpTransport::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut transport = TcpTransport::new(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            ThreadingMode::Single,
+        )
+        .unwrap();
         transport.connect_to_peer(addr_a, None).unwrap();
         transport.connect_to_peer(addr_b, None).unwrap();
 
@@ -633,7 +751,11 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let mut transport = TcpTransport::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut transport = TcpTransport::new(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            ThreadingMode::Single,
+        )
+        .unwrap();
         transport.connect_to_peer(addr, None).unwrap();
 
         let (peer_stream, _) = listener.accept().unwrap();
@@ -749,5 +871,115 @@ mod tests {
         };
         write_with_retry(&mut w, b"abcdef").unwrap();
         assert_eq!(&w.written, b"abcdef");
+    }
+
+    /// T16.3: `TimedOut` must surface as a fatal error (not retried).
+    /// This is the SO_SNDTIMEO signal in Windows; the broadcast loop
+    /// uses it to drop the wedged peer and break the deadlock.
+    struct AlwaysTimedOutWriter {
+        attempts: u32,
+    }
+    impl ByteWrite for AlwaysTimedOutWriter {
+        fn write_once(&mut self, _data: &[u8]) -> io::Result<usize> {
+            self.attempts += 1;
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        }
+    }
+
+    #[test]
+    fn write_with_retry_surfaces_timedout_immediately() {
+        let mut writer = AlwaysTimedOutWriter { attempts: 0 };
+        let err = write_with_retry(&mut writer, b"x")
+            .expect_err("TimedOut must surface as a fatal write error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("TCP write error"), "got: {msg}");
+        assert_eq!(
+            writer.attempts, 1,
+            "TimedOut must not be retried within the loop; got {} attempts",
+            writer.attempts
+        );
+    }
+
+    /// T16.3: in Single mode, `TcpPeer::from_stream` installs a
+    /// non-`None` write timeout on the underlying socket. Multi mode
+    /// leaves the write timeout cleared.
+    #[test]
+    fn from_stream_installs_write_timeout_in_single_mode() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (_server_side, _) = listener.accept().unwrap();
+
+        let peer =
+            TcpPeer::from_stream(client, addr, ThreadingMode::Single).expect("from_stream Single");
+        let to = peer
+            .write_stream
+            .write_timeout()
+            .expect("read back write_timeout");
+        assert!(
+            to.is_some(),
+            "Single mode must install SO_SNDTIMEO; got None"
+        );
+        assert_eq!(to.unwrap(), SINGLE_WRITE_TIMEOUT);
+    }
+
+    /// T16.3: `take_buffered_frame` extracts exactly one frame and
+    /// drains its bytes from the buffer. Multiple frames stay
+    /// independently extractable.
+    #[test]
+    fn take_buffered_frame_handles_multiple_frames() {
+        // Encode two length-prefixed frames into a single buffer.
+        let frame_a = b"hello";
+        let frame_b = b"world!!";
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&(frame_a.len() as u32).to_be_bytes());
+        buf.extend_from_slice(frame_a);
+        buf.extend_from_slice(&(frame_b.len() as u32).to_be_bytes());
+        buf.extend_from_slice(frame_b);
+        let total_bytes = buf.len();
+
+        let m1 = take_buffered_frame(&mut buf).expect("first frame must be extractable");
+        assert_eq!(m1.as_slice(), frame_a);
+        assert_eq!(buf.len(), total_bytes - 4 - frame_a.len());
+
+        let m2 = take_buffered_frame(&mut buf).expect("second frame must be extractable");
+        assert_eq!(m2.as_slice(), frame_b);
+        assert!(buf.is_empty());
+
+        // Empty buffer => None.
+        assert!(take_buffered_frame(&mut buf).is_none());
+    }
+
+    /// T16.3: `take_buffered_frame` returns None when the buffer
+    /// holds only a partial frame (length-prefix without enough
+    /// payload bytes).
+    #[test]
+    fn take_buffered_frame_returns_none_on_partial_payload() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&10u32.to_be_bytes()); // claim 10 bytes payload
+        buf.extend_from_slice(b"abc"); // only 3 bytes present
+        assert!(take_buffered_frame(&mut buf).is_none());
+        // Buffer is untouched -- subsequent reads can complete the frame.
+        assert_eq!(buf.len(), 4 + 3);
+    }
+
+    #[test]
+    fn from_stream_skips_write_timeout_in_multi_mode() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (_server_side, _) = listener.accept().unwrap();
+
+        let peer =
+            TcpPeer::from_stream(client, addr, ThreadingMode::Multi).expect("from_stream Multi");
+        let to = peer
+            .write_stream
+            .write_timeout()
+            .expect("read back write_timeout");
+        assert!(
+            to.is_none(),
+            "Multi mode must NOT install SO_SNDTIMEO; got {:?}",
+            to
+        );
     }
 }

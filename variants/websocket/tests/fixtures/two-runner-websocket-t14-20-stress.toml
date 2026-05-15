@@ -1,0 +1,50 @@
+﻿# T14.20 regression fixture: high-rate symmetric WebSocket qos4 in
+# Single mode at the workload that previously classified
+# `eot_timeout_internal` post-T14.19 (1000 vpt x 100 Hz = 100K msg/s
+# symmetric).
+#
+# Pre-T14.20: with SO_SNDTIMEO in place (T14.19), the wedge no longer
+# deadlocked the spawn, but the data WS still couldn't ferry the EOT
+# marker through; the spawn exited `status=success` after `eot_timeout`
+# on both sides. T14.17's classifier marked the spawn
+# `eot_timeout_internal` because eot_received was missing.
+#
+# Post-T14.20: a per-peer-pair TCP control connection (QoS-independent)
+# routes the EOT marker on a dedicated TCP socket that does NOT carry
+# data traffic. The control connection cannot fill / wedge under
+# data-WS saturation; both runners observe the peer's EOT and the
+# T14.17 classifier marks the spawn `completed`.
+#
+# Delivery is expected to remain catastrophic (~17%) because the
+# DATA path is still wedged by the kernel back-pressure from
+# symmetric saturation -- that's the honest measurement of
+# WebSocket's behaviour at 100K msg/s symmetric on localhost, not a
+# T14.20 regression.
+
+run = "websocket-t14-20"
+runners = ["alice", "bob"]
+# Generous budget: stabilize (1s) + operate (8s) + EOT (5s) + silent
+# (1s) + teardown.
+default_timeout_secs = 45
+
+[[variant]]
+name = "websocket-t14-20-stress"
+supported_modes = ["single"]
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 8
+  silent_secs = 1
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 4
+  log_dir = "./logs"
+  threading_modes = ["single"]
+  # Bound the EOT wait so a regression (the control channel not
+  # delivering for any reason) doesn't run the full default
+  # `max(3 * operate_secs, 30) = 30s` timeout.
+
+  [variant.specific]
+  ws_base_port = 19972
