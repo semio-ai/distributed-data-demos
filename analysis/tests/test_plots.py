@@ -29,7 +29,15 @@ def _make_result(
     p95: float = 5.0,
     p99: float = 10.0,
     latency_samples_ms: list[float] | None = None,
+    receives_per_sec: float | None = None,
+    loss_pct: float = 0.0,
 ) -> PerformanceResult:
+    # ``receives_per_sec`` defaults to ``writes_per_sec`` so existing
+    # tests that do not care about the receive-rate distinction stay
+    # working. T16.14 added the explicit override so the comparison-
+    # plot regression test can pin the chart to the receive value.
+    if receives_per_sec is None:
+        receives_per_sec = writes_per_sec
     return PerformanceResult(
         variant=variant,
         run=run,
@@ -40,10 +48,10 @@ def _make_result(
         latency_p99_ms=p99,
         latency_max_ms=p99 + 5.0,
         writes_per_sec=writes_per_sec,
-        receives_per_sec=writes_per_sec,
+        receives_per_sec=receives_per_sec,
         jitter_ms=0.5,
         jitter_p95_ms=1.0,
-        loss_pct=0.0,
+        loss_pct=loss_pct,
         latency_samples_ms=latency_samples_ms or [],
     )
 
@@ -521,6 +529,86 @@ class TestGenerateComparisonPlot:
         assert r.latency_p95_ms - r.latency_p50_ms >= 0
         assert r.latency_p99_ms - r.latency_p95_ms >= 0
 
+    def test_throughput_bar_pinned_to_receives_per_sec(self, tmp_path: Path) -> None:
+        """T16.14: throughput bar reads ``receives_per_sec``, not ``writes_per_sec``.
+
+        Regression guard against silently flipping the headline metric
+        back to write rate. The test builds a single spawn where
+        ``writes_per_sec`` and ``receives_per_sec`` disagree (1000 vs
+        500); the rendered bar height must match the receive value.
+        """
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result(
+                "custom-udp-10x100hz-qos1-multi",
+                writes_per_sec=1000.0,
+                receives_per_sec=500.0,
+            ),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
+        assert tp_axes, "expected a throughput axis labelled with receives/s"
+        bars = list(tp_axes[0].patches)
+        assert len(bars) == 1, f"expected 1 bar, got {len(bars)}"
+        assert bars[0].get_height() == 500.0, (
+            f"expected bar height to match receives_per_sec=500, "
+            f"got {bars[0].get_height()} (would be 1000 if reading writes_per_sec)"
+        )
+        for f in captured:
+            original_close(f)
+
+    def test_throughput_axis_label_uses_receives(self, tmp_path: Path) -> None:
+        """T16.14: y-axis label says ``receives/s``, title says ``Receive throughput``."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [_make_result("custom-udp-10x100hz-qos1-multi")]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
+        assert tp_axes, "expected a throughput axis labelled with receives/s"
+        ax_tp = tp_axes[0]
+        assert "writes/s" not in (ax_tp.get_ylabel() or ""), (
+            f"axis label leaked 'writes/s': {ax_tp.get_ylabel()!r}"
+        )
+        title = ax_tp.get_title() or ""
+        assert "Receive throughput" in title, (
+            f"expected title to say 'Receive throughput', got {title!r}"
+        )
+        for f in captured:
+            original_close(f)
+
     def test_log_throughput_off_keeps_linear_yscale(self, tmp_path: Path) -> None:
         """Default (``log_throughput=False``) keeps throughput on linear scale."""
         import matplotlib.pyplot as plt
@@ -546,7 +634,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes, "expected at least one throughput axis"
         for ax in tp_axes:
             assert ax.get_yscale() == "linear", (
@@ -599,7 +687,7 @@ class TestGenerateComparisonPlot:
             f"expected 4 figures for 4 QoS levels, got {len(captured)}"
         )
         for fig in captured:
-            tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+            tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
             lat_axes = [
                 ax for ax in fig.axes if "latency" in (ax.get_ylabel() or "").lower()
             ]
@@ -678,7 +766,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes, "expected a throughput axis"
         heights = [b.get_height() for b in tp_axes[0].patches]
         assert any(math.isnan(h) for h in heights), (
@@ -717,7 +805,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes, "expected at least one throughput axis"
         ax_tp = tp_axes[0]
         # axhline objects are constant-y Line2Ds with both ydata points
@@ -757,7 +845,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes, "expected at least one throughput axis"
         ax_tp = tp_axes[0]
         horizontal_ys = [
@@ -800,7 +888,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes
         ax_tp = tp_axes[0]
         si_pattern = re.compile(r"^\d+(\.\d+)?\s*[KMG]/s$")
@@ -838,7 +926,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes, "expected at least one throughput axis"
         ax_tp = tp_axes[0]
         star_texts = [t for t in ax_tp.texts if t.get_text() == "*"]
@@ -883,7 +971,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes
         ax_tp = tp_axes[0]
         triple_star_texts = [t for t in ax_tp.texts if t.get_text() == "***"]
@@ -918,7 +1006,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes
         ax_tp = tp_axes[0]
         star_only_texts = [
@@ -957,7 +1045,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes
         ax_tp = tp_axes[0]
         assert ax_tp.get_yscale() == "log"
@@ -1045,7 +1133,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes
         # Two slots, one bar each.
         bars = list(tp_axes[0].patches)
@@ -1088,7 +1176,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes
         bars = list(tp_axes[0].patches)
         assert len(bars) == 2, f"expected 2 paired bars, got {len(bars)}"
@@ -1128,7 +1216,7 @@ class TestGenerateComparisonPlot:
 
         assert captured
         fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        tp_axes = [ax for ax in fig.axes if "receives/s" in (ax.get_ylabel() or "")]
         assert tp_axes
         bars = list(tp_axes[0].patches)
         assert len(bars) == 1

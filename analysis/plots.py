@@ -7,8 +7,17 @@ figure with one row per QoS" layout, this expanded to ~256 bars in a
 single image and the chart became unreadable -- T16.13.
 
 The current layout splits the chart into **N_qos PNGs**, one per
-observed QoS level. Each PNG is a 1 row x 2 cols figure: throughput
-on the left, latency on the right. Within each plot the bars are the
+observed QoS level. Each PNG is a 1 row x 2 cols figure: **receive
+throughput** on the left, latency on the right. Per T16.14 the
+throughput column reads ``PerformanceResult.receives_per_sec`` (not
+``writes_per_sec``) -- the project headline metric per
+``metak-shared/overview.md``. The target-rate horizontal lines and
+tier markers continue to encode the *intended* write rate, so the gap
+between a bar and its target line is the visible delivery shortfall.
+A parallel ``generate_drop_rate_plot`` emits a third chart family
+(``drop-rate-qos<N>.png``) that plots ``loss_pct`` per slot.
+
+Within each plot the bars are the
 (transport, workload) *slots* for that QoS, arranged by transport
 family then by workload load-intensity. Each slot holds either:
 
@@ -603,8 +612,13 @@ def _generate_comparison_plot_for_qos(
 
     Slots are (transport, workload) pairs in family-block x
     load-intensity order. Each slot holds 1-2 bars: single (lighter
-    tone) and/or multi (darker tone). Returns the path of the PNG
-    written.
+    tone) and/or multi (darker tone). The throughput column reads
+    ``PerformanceResult.receives_per_sec`` -- per T16.14 the project
+    headline metric is *receive* throughput, not write throughput.
+    The target-rate horizontal lines and tier markers still encode
+    the intended *write* rate; the gap between a bar (receives) and
+    its target line (writes) is the visible delivery shortfall.
+    Returns the path of the PNG written.
 
     Figure-width formula: ``max(14.0, 0.55 * n_slots + 4.0)``. The
     coefficient is tuned for the post-E14 6-family x 8-workload (~48
@@ -667,11 +681,19 @@ def _generate_comparison_plot_for_qos(
             bar_x = slot_centre + off
             color = _threading_color(transport, mode)
             r = parsed.get((transport, workload, qos, mode))
-            # Throughput
+            # Throughput -- T16.14 reads receives_per_sec, not
+            # writes_per_sec. Receive throughput is the headline metric
+            # per metak-shared/overview.md: writers ship at the
+            # requested rate almost always (kernel send buffer absorbs
+            # back-pressure), but the receiver-side drain rate is what
+            # decides whether peers are in sync. With the bars now
+            # showing receive rate, the gap between a bar and the
+            # target-rate line below becomes the visible
+            # delivery-shortfall indicator.
             if r is None:
                 tp_val = float("nan")
             else:
-                tp_val = float(r.writes_per_sec)
+                tp_val = float(r.receives_per_sec)
             if log_throughput and (np.isnan(tp_val) or tp_val <= 0.0):
                 tp_val = float("nan")
             tp_x.append(bar_x)
@@ -730,9 +752,11 @@ def _generate_comparison_plot_for_qos(
         ax.set_xticks(x_centres)
         ax.set_xticklabels(slot_tick_labels, rotation=45, ha="right", fontsize=7)
 
-    # Throughput axis cosmetics.
-    ax_tp.set_ylabel(f"{qos_label} - writes/s")
-    ax_tp.set_title(f"{qos_label} - Throughput (writes/s)")
+    # Throughput axis cosmetics. T16.14: bars carry receives_per_sec;
+    # the label / title call that out so the gap between a bar and its
+    # write-rate target line is unambiguous.
+    ax_tp.set_ylabel(f"{qos_label} - receives/s")
+    ax_tp.set_title(f"{qos_label} - Receive throughput (receives/s)")
     if log_throughput:
         ax_tp.set_yscale("log")
         ax_tp.yaxis.grid(True, which="both", linestyle="--", alpha=0.5)
@@ -883,7 +907,7 @@ def generate_comparison_plot(
         Directory where the PNGs will be saved (created if needed).
     log_throughput:
         When True, render the throughput panels on a log y-axis. Bars
-        with non-positive ``writes_per_sec`` are dropped to NaN
+        with non-positive ``receives_per_sec`` are dropped to NaN
         (matching the latency-panel convention) so the bar disappears
         rather than being clamped to a misleading visible floor. The
         per-QoS filenames carry an extra ``-log`` suffix so the

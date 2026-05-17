@@ -179,9 +179,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Render the throughput panels of comparison.png on a log "
         "y-axis. Useful when one variant (e.g. WebRTC max-qos4 at "
-        "~400 K writes/s) dwarfs slower transports (e.g. custom-udp "
-        "qos4 at ~10 K writes/s) in the same panel. Bars with zero "
-        "writes are skipped (NaN) rather than clamped. Default off.",
+        "~400 K receives/s) dwarfs slower transports (e.g. custom-udp "
+        "qos4 at ~10 K receives/s) in the same panel. Bars with zero "
+        "receives are skipped (NaN) rather than clamped. Default off.",
     )
     return parser
 
