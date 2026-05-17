@@ -15,7 +15,9 @@ throughput column reads ``PerformanceResult.receives_per_sec`` (not
 tier markers continue to encode the *intended* write rate, so the gap
 between a bar and its target line is the visible delivery shortfall.
 A parallel ``generate_drop_rate_plot`` emits a third chart family
-(``drop-rate-qos<N>.png``) that plots ``loss_pct`` per slot.
+(``drop-rate-qos<N>.png``) that renders ``loss_pct`` as an annotated
+heatmap matrix: rows are ``(transport, threading_mode)`` pairs and
+columns are workloads (T16.15, replacing the T16.14 bar layout).
 
 Within each plot the bars are the
 (transport, workload) *slots* for that QoS, arranged by transport
@@ -954,179 +956,231 @@ def generate_comparison_plot(
     return paths
 
 
+# Drop-rate heatmap colormap (T16.15). ``RdYlGn_r`` runs green -> yellow
+# -> red, so when used as the cell-fill colormap with the data range
+# locked to [0, 100] loss %, "low loss is good (green)" and "high loss
+# is bad (red)" matches the operator's intuition without any extra
+# annotation. The reversed (``_r``) variant is the one that puts green
+# at the *low* end -- matplotlib's base ``RdYlGn`` runs red -> green
+# which is the wrong direction for a "lower is better" metric.
+_DROP_RATE_CMAP: str = "RdYlGn_r"
+
+# Drop-rate heatmap missing-cell rendering (T16.15). Cells with no
+# observation for the (row, workload, qos) tuple render with a light-
+# grey fill and a diagonal hatch pattern, plus the literal text
+# ``n/a``. The hatch makes the missing-data state legible at a glance
+# even if the viewer's eye reads the grey as "neutral colour from the
+# bottom of the colormap"; the explicit ``n/a`` text removes any
+# residual ambiguity.
+_DROP_RATE_MISSING_FILL: str = "#dddddd"
+_DROP_RATE_MISSING_HATCH: str = "///"
+
+# Drop-rate heatmap luminance threshold for picking annotation text
+# colour (T16.15). The threshold is computed from the cell's RGBA fill
+# colour via the standard Rec. 601 luma weights
+# (``0.299 R + 0.587 G + 0.114 B``). Values brighter than 0.55 get
+# black text, darker than 0.55 get white text. The threshold is
+# slightly above 0.5 so the bright yellow midband of ``RdYlGn_r``
+# (~0.7-0.85 luminance) reliably picks black, and the saturated red
+# top end (~0.4 luminance) reliably picks white. Picking from
+# luminance -- not a hard-coded percentage cutoff -- keeps the
+# behaviour correct if the colormap is swapped later.
+_DROP_RATE_TEXT_LUMA_THRESHOLD: float = 0.55
+
+
+def _drop_rate_row_order(
+    parsed_keys: list[tuple[str, str, int | None, str | None]],
+    qos: int | None,
+) -> list[tuple[str, str | None]]:
+    """Return the ordered list of ``(transport, threading_mode)`` rows for a QoS.
+
+    Rows follow ``TRANSPORT_FAMILIES`` order (with ``other`` appended
+    when present). Within a family the threading modes that exist for
+    that family are listed ``single`` before ``multi`` so a family
+    that has both shows ``<family>-single`` above ``<family>-multi`` as
+    adjacent rows. A multi-only family (QUIC / WebRTC / Zenoh per E14)
+    contributes a single row whose mode is ``"multi"``. Legacy spawns
+    with ``threading_mode=None`` contribute a row labelled ``legacy``
+    placed after both threading rows for the family.
+    """
+    observed: dict[str, set[str | None]] = {}
+    for transport, _workload, q, mode in parsed_keys:
+        if q != qos:
+            continue
+        observed.setdefault(transport, set()).add(mode)
+
+    ordered: list[tuple[str, str | None]] = []
+    transport_lookup = list(TRANSPORT_FAMILIES) + ["other"]
+    for transport in transport_lookup:
+        if transport not in observed:
+            continue
+        modes_present = observed[transport]
+        for mode in ("single", "multi", None):
+            if mode in modes_present:
+                ordered.append((transport, mode))
+    return ordered
+
+
+def _row_label(transport: str, mode: str | None) -> str:
+    """Format a row label as ``<transport>-<mode>`` with a ``legacy`` fallback."""
+    if mode is None:
+        return f"{transport}-legacy"
+    return f"{transport}-{mode}"
+
+
+def _relative_luminance(rgba: tuple[float, ...]) -> float:
+    """Return the Rec. 601 relative luminance of an RGBA colour in [0, 1]."""
+    r, g, b = rgba[0], rgba[1], rgba[2]
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
 def _generate_drop_rate_plot_for_qos(
     *,
     qos: int | None,
     parsed: dict[tuple[str, str, int | None, str | None], PerformanceResult],
-    transport_order: list[str],
     workload_order: list[str],
+    parsed_keys: list[tuple[str, str, int | None, str | None]],
     output_dir: Path,
 ) -> Path:
-    """Render the drop-rate chart for a single QoS level (T16.14).
+    """Render the drop-rate heatmap for a single QoS level (T16.15).
 
-    Mirrors the comparison chart's per-slot layout (paired single/multi
-    half-bars, full-width for natively-multi-only transports) and reuses
-    the family colourmap / threading-tone convention. Bars carry
-    ``PerformanceResult.loss_pct``.
+    Rows are ``(transport, threading_mode)`` pairs in
+    ``TRANSPORT_FAMILIES`` order with ``single`` listed above ``multi``
+    within each family. Columns are observed workloads in
+    ``_workload_load_rank`` order. Cells encode
+    ``PerformanceResult.loss_pct`` (0-100 linear) via the
+    ``RdYlGn_r`` colormap -- green at 0 % loss, yellow in the middle,
+    red at 100 % -- with the percentage stamped inside each cell as
+    ``XX.X%``. Missing (row, workload) cells render as a grey hatched
+    patch with the literal text ``n/a``; they are *not* drawn as 0 %
+    (which would falsely suggest a successful spawn).
 
-    Y-axis: **linear 0-100** (loss %). A linear scale is the right
-    default here -- the user's eye reads a 0 -> 100 % range natively,
-    and the QoS 3/4 expectation that drop rate should sit at 0
-    translates to "bars hug the bottom" which is immediately legible.
-    A log scale would expand the near-zero noise floor and compress
-    the rare 80-100 % failure regime, which is the inverse of what the
-    operator wants to see. Bars whose ``loss_pct`` is exactly 0 still
-    render as a flat sliver at the axis baseline (NaN bars are dropped
-    only for slots with no observation at all -- a genuine zero-loss
-    cell is not a missing cell).
-
-    For QoS 3 and QoS 4 the expected drop rate is 0%; a thin grey
-    dashed reference line at y=0 emphasises that baseline. QoS 1 / 2 /
-    qosNA skip the reference line because those tiers are loss-tolerant
-    by design (the bottom of the axis already serves as the visual
-    floor; no dedicated baseline expectation applies).
+    Text colour is auto-selected per cell from the cell's relative
+    luminance: black on cells brighter than
+    ``_DROP_RATE_TEXT_LUMA_THRESHOLD``, white on darker cells. This
+    keeps the threshold tied to the colormap rather than to a fixed
+    percentage cutoff, so the labels remain legible even if the
+    colormap is later swapped.
     """
     out_filename = _qos_filename("drop-rate", qos, log_throughput=False)
     qos_label = f"qos{qos}" if qos is not None else "n/a"
 
-    slots: list[tuple[str, str]] = []
-    slot_layouts: list[tuple[list[str | None], list[float]]] = []
-    for t in transport_order:
-        for w in workload_order:
-            modes, offsets = _slot_layout(t, w, qos, parsed)
-            if modes:
-                slots.append((t, w))
-                slot_layouts.append((modes, offsets))
+    rows = _drop_rate_row_order(parsed_keys, qos)
+    cols = [
+        w for w in workload_order if any((t, w, qos, m) in parsed for (t, m) in rows)
+    ]
 
-    if not slots:
+    if not rows or not cols:
         return _empty_plot(output_dir, filename=out_filename)
 
-    n_slots = len(slots)
-    x_centres = np.arange(n_slots, dtype=float)
+    n_rows = len(rows)
+    n_cols = len(cols)
 
-    # Single-axis figure; width grows with slot count using the same
-    # coefficient as the comparison chart so per-QoS PNGs stay
-    # visually consistent when stacked vertically in the markdown
-    # summary.
-    fig_width = max(14.0, 0.55 * n_slots + 4.0)
-    plot_height = 4.0
-    legend_band_height = 1.4
-    fig_height = plot_height + legend_band_height
-    fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
-
-    bar_x: list[float] = []
-    bar_y: list[float] = []
-    bar_colors: list[tuple[float, float, float, float]] = []
-    bar_widths: list[float] = []
-
-    for (transport, workload), (modes, offsets) in zip(slots, slot_layouts):
-        bar_w = _bar_width_for_slot(len(modes))
-        slot_idx = slots.index((transport, workload))
-        slot_centre = x_centres[slot_idx]
-        for mode, off in zip(modes, offsets):
-            x_pos = slot_centre + off
-            color = _threading_color(transport, mode)
+    # Build the value matrix. NaN marks "no observation" -- the
+    # missing-cell rendering pass paints those slots with the grey
+    # hatched patch and the ``n/a`` label.
+    data = np.full((n_rows, n_cols), np.nan, dtype=float)
+    for i, (transport, mode) in enumerate(rows):
+        for j, workload in enumerate(cols):
             r = parsed.get((transport, workload, qos, mode))
-            if r is None:
-                # No observation for this (slot, mode) -- render as
-                # NaN so the bar disappears. Matches the gap-not-zero
-                # convention used by the comparison chart.
-                y_val = float("nan")
-            else:
-                y_val = float(r.loss_pct)
-            bar_x.append(x_pos)
-            bar_y.append(y_val)
-            bar_colors.append(color)
-            bar_widths.append(bar_w)
+            if r is not None:
+                data[i, j] = float(r.loss_pct)
 
-    ax.bar(
-        bar_x,
-        bar_y,
-        bar_widths,
-        color=bar_colors,
-        edgecolor="black",
-        linewidth=0.3,
+    # Figure size: ~0.8 in per column for the heatmap body plus 3 in
+    # of slack for row labels and the colour-bar; ~0.4 in per row plus
+    # 1 in for the title and column labels. Matches the suggested
+    # cell-aspect target (cell ~80 px wide, ~30 px tall at 150 dpi).
+    fig_width = 0.8 * n_cols + 3.0
+    fig_height = 0.4 * n_rows + 1.5
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    cmap = plt.get_cmap(_DROP_RATE_CMAP)
+    norm = matplotlib.colors.Normalize(vmin=0.0, vmax=100.0)
+    masked = np.ma.masked_invalid(data)
+    im = ax.imshow(
+        masked,
+        cmap=cmap,
+        norm=norm,
+        aspect="auto",
+        origin="upper",
+        interpolation="nearest",
     )
 
-    slot_tick_labels = [w if w else t for t, w in slots]
-    ax.set_xticks(x_centres)
-    ax.set_xticklabels(slot_tick_labels, rotation=45, ha="right", fontsize=7)
+    # Axis ticks: column labels on the bottom, row labels on the
+    # left. Column labels are rotated 45 degrees to match the
+    # comparison-chart convention; row labels stay horizontal so the
+    # ``<transport>-<mode>`` text is easy to scan top-to-bottom.
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels(cols, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_yticklabels([_row_label(t, m) for (t, m) in rows], fontsize=8)
 
-    # Linear 0-100 axis -- see docstring. Lock the upper bound so
-    # downstream visual comparison across QoS PNGs uses the same
-    # vertical scale; a sparse QoS panel auto-fitting to a 0-3% range
-    # would otherwise visually amplify near-zero noise.
-    ax.set_ylim(0.0, 100.0)
-    ax.set_ylabel(f"{qos_label} - loss %")
-    ax.set_title(f"{qos_label} - Drop rate (loss %)")
-    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
-    ax.set_axisbelow(True)
+    # Thin grid between cells: emphasise the matrix structure without
+    # competing with the in-cell text.
+    ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=1)
+    ax.tick_params(which="minor", bottom=False, left=False)
 
-    # Reference baseline at y=0 for QoS tiers with a zero-loss
-    # expectation (QoS 3 / 4). The bottom of the axis is already at 0,
-    # so this is visual emphasis -- a thin grey dashed line riding the
-    # baseline makes the "bars hugging zero" reading explicit.
-    if qos in (3, 4):
-        ax.axhline(
-            y=0.0,
-            color="grey",
-            linestyle="--",
-            linewidth=0.8,
-            alpha=0.6,
-            zorder=1,
-        )
-
-    # Legend: same per-(transport, threading_mode) entries as the
-    # comparison chart. Reuse the comparison-chart code path verbatim
-    # for visual consistency.
-    legend_handles: list[matplotlib.patches.Patch] = []
-    seen_legend_keys: set[tuple[str, str | None]] = set()
-    for transport in transport_order:
-        for mode in ("single", "multi", None):
-            key = (transport, mode)
-            if key in seen_legend_keys:
-                continue
-            present = any(
-                t == transport and mode in modes
-                for (t, _w), (modes, _off) in zip(slots, slot_layouts)
-            )
-            if not present:
-                continue
-            color = _threading_color(transport, mode)
-            label_mode = mode if mode is not None else "legacy"
-            legend_handles.append(
-                matplotlib.patches.Patch(
-                    facecolor=color,
+    # Per-cell annotation pass. Each cell is stamped with either the
+    # ``XX.X%`` value (over the colormap fill from ``imshow``) or, for
+    # missing cells, a grey hatched overlay patch plus the literal
+    # ``n/a`` text.
+    for i in range(n_rows):
+        for j in range(n_cols):
+            val = data[i, j]
+            if np.isnan(val):
+                # Missing cell: overlay a grey hatched patch on top of
+                # whatever ``imshow`` rendered for the masked entry,
+                # then stamp ``n/a``. The hatch's edge stays visible
+                # in black for clarity even at small sizes.
+                patch = matplotlib.patches.Rectangle(
+                    (j - 0.5, i - 0.5),
+                    1.0,
+                    1.0,
+                    facecolor=_DROP_RATE_MISSING_FILL,
                     edgecolor="black",
-                    linewidth=0.3,
-                    label=f"{transport} / {label_mode}",
+                    linewidth=0.0,
+                    hatch=_DROP_RATE_MISSING_HATCH,
+                    zorder=2,
                 )
+                ax.add_patch(patch)
+                ax.text(
+                    j,
+                    i,
+                    "n/a",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="black",
+                    zorder=3,
+                )
+                continue
+            cell_rgba = cmap(norm(val))
+            luma = _relative_luminance(cell_rgba)
+            text_colour = "black" if luma > _DROP_RATE_TEXT_LUMA_THRESHOLD else "white"
+            ax.text(
+                j,
+                i,
+                f"{val:.1f}%",
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=text_colour,
+                zorder=3,
             )
-            seen_legend_keys.add(key)
 
-    legend_ncol = max(3, min(6, (len(legend_handles) + 2) // 3))
-    legend_rows = (len(legend_handles) + legend_ncol - 1) // legend_ncol
-    row_height_in = 0.22
-    legend_band_in = max(0.6, 0.4 + row_height_in * legend_rows)
-    bottom_reserve = min(0.4, legend_band_in / fig_height)
-    fig.legend(
-        handles=legend_handles,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.005),
-        ncol=legend_ncol,
-        frameon=True,
-        fontsize=8,
-        title="Transport / threading",
-        title_fontsize=9,
-    )
+    ax.set_title(f"{qos_label} - Drop rate (loss %)")
 
-    top_reserve = max(0.6, fig_height - 0.4) / fig_height
-    fig.subplots_adjust(
-        bottom=bottom_reserve,
-        top=top_reserve,
-        left=0.07,
-        right=0.98,
-    )
+    # Colour-bar to the right with explicit 0/25/50/75/100 ticks. Size
+    # the bar narrowly so the heatmap body stays the dominant visual
+    # element.
+    cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
+    cbar.set_ticks([0, 25, 50, 75, 100])
+    cbar.set_ticklabels(["0%", "25%", "50%", "75%", "100%"])
+    cbar.ax.tick_params(labelsize=8)
+
+    fig.tight_layout()
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / out_filename
@@ -1138,16 +1192,22 @@ def _generate_drop_rate_plot_for_qos(
 def generate_drop_rate_plot(
     results: list[PerformanceResult], output_dir: Path
 ) -> list[Path]:
-    """Generate one drop-rate PNG per observed QoS level (T16.14).
+    """Generate one drop-rate heatmap PNG per observed QoS level (T16.15).
 
     Filename convention: ``drop-rate-qos<N>.png`` (or
     ``drop-rate-qosNA.png`` for legacy spawns with no qos suffix).
-    Per-slot layout mirrors ``generate_comparison_plot`` exactly --
-    paired single/multi half-bars where both modes exist, full-width
-    single bar for natively-multi-only transports (QUIC / WebRTC /
-    Zenoh per E14), gap (NaN) when a slot has no observation. Bars
-    carry ``PerformanceResult.loss_pct`` on a linear 0-100 y-axis;
-    see the per-QoS helper's docstring for the scale-choice rationale.
+    Each PNG is an annotated heatmap: rows are
+    ``(transport, threading_mode)`` pairs in ``TRANSPORT_FAMILIES``
+    order with ``single`` listed above ``multi`` within each family;
+    columns are workloads ordered by ``_workload_load_rank``; cells
+    encode ``PerformanceResult.loss_pct`` via the ``RdYlGn_r``
+    colormap with the value stamped inside each cell as ``XX.X%``.
+    Missing ``(row, workload, qos)`` combinations render as a grey
+    hatched cell with the literal text ``n/a``; they are *not* drawn
+    as a green 0 % cell (which would falsely imply a successful
+    spawn). This is the visual analogue of the
+    ``summary_pivot_qos<N>.md`` pivot tables, restricted to the
+    drop-rate metric.
 
     Returns
     -------
@@ -1167,8 +1227,8 @@ def generate_drop_rate_plot(
         return [_empty_plot(output_dir, filename=out_filename)]
 
     parsed_keys = list(parsed.keys())
-    transport_order, workload_order, qos_order = _collect_layout_orders(parsed_keys)
-    if not transport_order or not workload_order or not qos_order:
+    _transport_order, workload_order, qos_order = _collect_layout_orders(parsed_keys)
+    if not workload_order or not qos_order:
         out_filename = _qos_filename("drop-rate", None, log_throughput=False)
         return [_empty_plot(output_dir, filename=out_filename)]
 
@@ -1177,8 +1237,8 @@ def generate_drop_rate_plot(
         out_path = _generate_drop_rate_plot_for_qos(
             qos=q,
             parsed=parsed,
-            transport_order=transport_order,
             workload_order=workload_order,
+            parsed_keys=parsed_keys,
             output_dir=output_dir,
         )
         paths.append(out_path)

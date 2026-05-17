@@ -581,10 +581,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
             # T16.13: comparison + CDF plots now return one PNG per
-            # observed QoS level. T16.14 adds the drop-rate family
-            # alongside them. Print each path so the operator sees
-            # the full set without having to inspect the analysis/
-            # directory.
+            # observed QoS level. T16.14 added a drop-rate family
+            # alongside them; T16.15 reshaped that family from paired
+            # bars into an annotated heatmap (same filenames, so the
+            # embedding logic and markdown summary stay unchanged).
+            # Print each path so the operator sees the full set
+            # without having to inspect the analysis/ directory.
             comparison_paths = generate_comparison_plot(
                 performance_results,
                 output_dir,

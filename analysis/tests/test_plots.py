@@ -1520,13 +1520,16 @@ class TestGenerateLatencyCdfPlot:
 
 
 class TestGenerateDropRatePlot:
-    """T16.14: drop-rate chart family (drop-rate-qos<N>.png).
+    """T16.15: drop-rate heatmap family (drop-rate-qos<N>.png).
 
-    Scale choice: linear 0-100. A log scale would compress the rare
-    80-100 % failure regime that operators most want to see; the
-    near-zero noise floor is not informative enough to deserve the
-    visual expansion. See ``_generate_drop_rate_plot_for_qos``
-    docstring for the full reasoning.
+    Rows are ``(transport, threading_mode)`` pairs in
+    ``TRANSPORT_FAMILIES`` order (``single`` above ``multi`` within a
+    family). Columns are workloads in ``_workload_load_rank`` order.
+    Cells encode ``PerformanceResult.loss_pct`` (0-100 linear) via the
+    ``RdYlGn_r`` colormap with the value stamped inside each cell.
+    Missing ``(row, workload)`` cells render with a grey hatched
+    overlay plus the literal text ``n/a`` -- never as a green 0 %
+    cell.
     """
 
     def test_creates_one_png_per_observed_qos(self, tmp_path: Path) -> None:
@@ -1595,15 +1598,100 @@ class TestGenerateDropRatePlot:
         assert paths[0].exists()
         assert paths[0].name == "drop-rate-qosNA.png"
 
-    def test_zero_loss_renders_visible_bar_not_gap(self, tmp_path: Path) -> None:
-        """A row with loss_pct=0 must still produce a finite (zero-height) bar.
+    def test_heatmap_has_correct_cell_count(self, tmp_path: Path) -> None:
+        """A 3-row x 4-workload synthetic input fills a 3x4 heatmap matrix.
 
-        Zero loss is data, not a missing observation -- the chart must
-        not silently drop it as NaN. The bar will sit flat at the
-        baseline, which is the correct "perfect delivery" reading.
+        Rows: three (transport, mode) pairs (custom-udp-multi,
+        hybrid-single, hybrid-multi). Columns: four observed workloads.
+        The heatmap's ``imshow`` array therefore has shape (3, 4).
         """
-        import math
+        import matplotlib.pyplot as plt
 
+        import plots as plots_module
+
+        workloads = ["10x100hz", "100x100hz", "1000x100hz", "max"]
+        results: list[PerformanceResult] = []
+        for w in workloads:
+            results.append(_make_result(f"custom-udp-{w}-qos1-multi", loss_pct=1.0))
+            results.append(_make_result(f"hybrid-{w}-qos1-single", loss_pct=2.0))
+            results.append(_make_result(f"hybrid-{w}-qos1-multi", loss_pct=3.0))
+
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_drop_rate_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        ax = fig.axes[0]
+        images = ax.get_images()
+        assert images, "heatmap must render an imshow image on the axis"
+        arr = images[0].get_array()
+        assert arr.shape == (3, 4), (
+            f"expected a 3x4 heatmap matrix, got shape {arr.shape}"
+        )
+        # Axis labels reflect the matrix dimensions.
+        assert len(ax.get_xticklabels()) == 4
+        assert len(ax.get_yticklabels()) == 3
+        for f in captured:
+            original_close(f)
+
+    def test_missing_cell_renders_as_na_not_zero(self, tmp_path: Path) -> None:
+        """A row missing one workload column renders ``n/a``, not ``0.0%``.
+
+        Hybrid-single is observed only at ``10x100hz`` while
+        hybrid-multi covers both ``10x100hz`` and ``100x100hz``. The
+        hybrid-single row for ``100x100hz`` must render as a grey
+        hatched cell with the literal text ``n/a`` -- a green 0 %
+        cell there would falsely suggest a successful spawn.
+        """
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("hybrid-10x100hz-qos1-single", loss_pct=1.0),
+            _make_result("hybrid-10x100hz-qos1-multi", loss_pct=2.0),
+            _make_result("hybrid-100x100hz-qos1-multi", loss_pct=3.0),
+            # NO hybrid-100x100hz-qos1-single -> that cell must be n/a.
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_drop_rate_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        ax = fig.axes[0]
+        texts = [t.get_text() for t in ax.texts]
+        assert "n/a" in texts, (
+            f"expected an 'n/a' label for the missing cell, got texts {texts}"
+        )
+        # The corresponding numeric value must not appear as 0.0%.
+        assert texts.count("0.0%") == 0, (
+            f"a missing cell must not render as 0.0%; got texts {texts}"
+        )
+        for f in captured:
+            original_close(f)
+
+    def test_zero_percent_cell_is_annotated(self, tmp_path: Path) -> None:
+        """A cell with loss_pct=0.0 carries the literal text ``0.0%``."""
         import matplotlib.pyplot as plt
 
         import plots as plots_module
@@ -1627,16 +1715,13 @@ class TestGenerateDropRatePlot:
         assert captured
         fig = captured[-1]
         ax = fig.axes[0]
-        bars = list(ax.patches)
-        assert len(bars) == 1
-        height = bars[0].get_height()
-        assert not math.isnan(height), (
-            f"zero-loss bar should be a finite 0.0 height, got NaN ({height})"
+        texts = [t.get_text() for t in ax.texts]
+        assert "0.0%" in texts, (
+            f"a zero-loss cell must be annotated with '0.0%', got texts {texts}"
         )
-        assert height == 0.0
 
-    def test_full_loss_renders_at_axis_top(self, tmp_path: Path) -> None:
-        """A 100 % loss row renders a bar that reaches the top of the axis."""
+    def test_full_loss_cell_is_annotated(self, tmp_path: Path) -> None:
+        """A cell with loss_pct=100.0 carries the literal text ``100.0%``."""
         import matplotlib.pyplot as plt
 
         import plots as plots_module
@@ -1660,46 +1745,13 @@ class TestGenerateDropRatePlot:
         assert captured
         fig = captured[-1]
         ax = fig.axes[0]
-        bars = list(ax.patches)
-        assert len(bars) == 1
-        assert bars[0].get_height() == 100.0
-        ymin, ymax = ax.get_ylim()
-        # The axis lock is exactly [0, 100] so a 100 % bar fills the axis.
-        assert ymin == 0.0
-        assert ymax == 100.0
+        texts = [t.get_text() for t in ax.texts]
+        assert "100.0%" in texts, (
+            f"a 100 % loss cell must be annotated with '100.0%', got texts {texts}"
+        )
 
-    def test_y_axis_is_linear_0_to_100(self, tmp_path: Path) -> None:
-        """Drop-rate y-axis is linear, locked to [0, 100] for cross-QoS comparison."""
-        import matplotlib.pyplot as plt
-
-        import plots as plots_module
-
-        results = [
-            _make_result("custom-udp-10x100hz-qos1-multi", loss_pct=0.1),
-            _make_result("zenoh-10x100hz-qos1-multi", loss_pct=3.0),
-        ]
-        original_close = plt.close
-        captured: list = []
-
-        def capture_close(fig=None) -> None:
-            if fig is not None:
-                captured.append(fig)
-
-        plt.close = capture_close  # type: ignore[assignment]
-        try:
-            plots_module.generate_drop_rate_plot(results, tmp_path)
-        finally:
-            plt.close = original_close  # type: ignore[assignment]
-
-        assert captured
-        fig = captured[-1]
-        ax = fig.axes[0]
-        assert ax.get_yscale() == "linear"
-        ymin, ymax = ax.get_ylim()
-        assert ymin == 0.0 and ymax == 100.0
-
-    def test_axis_label_and_title_carry_loss_text(self, tmp_path: Path) -> None:
-        """The y-axis label and title must mention loss / Drop rate."""
+    def test_title_carries_drop_rate_text(self, tmp_path: Path) -> None:
+        """The heatmap title mentions ``Drop rate``."""
         import matplotlib.pyplot as plt
 
         import plots as plots_module
@@ -1721,17 +1773,47 @@ class TestGenerateDropRatePlot:
         assert captured
         fig = captured[-1]
         ax = fig.axes[0]
-        assert "loss %" in (ax.get_ylabel() or "")
         assert "Drop rate" in (ax.get_title() or "")
 
-    def test_multi_only_transport_renders_full_width_bar(self, tmp_path: Path) -> None:
-        """Natively-multi-only families render one full-slot bar per slot."""
+    def test_row_ordering_single_above_multi(self, tmp_path: Path) -> None:
+        """Within a family, the ``single`` row sits above the ``multi`` row."""
         import matplotlib.pyplot as plt
 
         import plots as plots_module
 
         results = [
-            _make_result("quic-10x100hz-qos1-multi", loss_pct=0.0),
+            _make_result("hybrid-10x100hz-qos1-single", loss_pct=1.0),
+            _make_result("hybrid-10x100hz-qos1-multi", loss_pct=2.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_drop_rate_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        ax = fig.axes[0]
+        labels = [t.get_text() for t in ax.get_yticklabels()]
+        assert labels == ["hybrid-single", "hybrid-multi"], (
+            f"expected single above multi for hybrid, got {labels}"
+        )
+
+    def test_multi_only_family_has_single_row(self, tmp_path: Path) -> None:
+        """A natively-multi-only family contributes a single ``-multi`` row."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("quic-10x100hz-qos1-multi", loss_pct=0.5),
             _make_result("quic-100x100hz-qos1-multi", loss_pct=1.5),
         ]
         original_close = plt.close
@@ -1750,24 +1832,23 @@ class TestGenerateDropRatePlot:
         assert captured
         fig = captured[-1]
         ax = fig.axes[0]
-        bars = list(ax.patches)
-        assert len(bars) == 2, (
-            f"expected 2 bars (1 per multi-only QUIC slot), got {len(bars)}"
-        )
-        widths = sorted({round(b.get_width(), 3) for b in bars})
-        assert widths == [0.78], (
-            f"expected full-slot bar width 0.78 for multi-only slots, got {widths}"
+        labels = [t.get_text() for t in ax.get_yticklabels()]
+        assert labels == ["quic-multi"], (
+            f"expected one quic-multi row for the multi-only family, got {labels}"
         )
 
-    def test_paired_single_multi_renders_two_half_bars(self, tmp_path: Path) -> None:
-        """A transport with both single and multi gets paired half-width bars."""
+    def test_column_order_follows_workload_load_rank(self, tmp_path: Path) -> None:
+        """Columns are ordered by load intensity with ``max`` last."""
         import matplotlib.pyplot as plt
 
         import plots as plots_module
 
+        # Build results in deliberately scrambled workload order.
         results = [
-            _make_result("hybrid-10x100hz-qos1-single", loss_pct=4.0),
-            _make_result("hybrid-10x100hz-qos1-multi", loss_pct=2.5),
+            _make_result("custom-udp-max-qos1-multi", loss_pct=10.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", loss_pct=1.0),
+            _make_result("custom-udp-1000x100hz-qos1-multi", loss_pct=5.0),
+            _make_result("custom-udp-100x100hz-qos1-multi", loss_pct=2.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -1785,110 +1866,7 @@ class TestGenerateDropRatePlot:
         assert captured
         fig = captured[-1]
         ax = fig.axes[0]
-        bars = list(ax.patches)
-        assert len(bars) == 2, f"expected 2 paired bars, got {len(bars)}"
-        widths = sorted({round(b.get_width(), 3) for b in bars})
-        assert widths == [0.4], f"expected paired-bar width 0.40, got {widths}"
-        colours = {tuple(b.get_facecolor()) for b in bars}
-        assert len(colours) == 2, (
-            f"single/multi bars must have distinct colours, got {colours}"
-        )
-
-    def test_qos3_qos4_carry_zero_reference_line(self, tmp_path: Path) -> None:
-        """QoS 3/4 panels carry a thin grey dashed reference line at y=0."""
-        import matplotlib.pyplot as plt
-
-        import plots as plots_module
-
-        results = [
-            _make_result("custom-udp-10x100hz-qos3-multi", loss_pct=0.0),
-            _make_result("custom-udp-10x100hz-qos4-multi", loss_pct=0.0),
-            _make_result("custom-udp-10x100hz-qos1-multi", loss_pct=5.0),
-            _make_result("custom-udp-10x100hz-qos2-multi", loss_pct=4.0),
-        ]
-        original_close = plt.close
-        captured: list = []
-
-        def capture_close(fig=None) -> None:
-            if fig is not None:
-                captured.append(fig)
-
-        plt.close = capture_close  # type: ignore[assignment]
-        try:
-            plots_module.generate_drop_rate_plot(results, tmp_path)
-        finally:
-            plt.close = original_close  # type: ignore[assignment]
-
-        # Captured figures are emitted in ascending QoS order; index by
-        # the matching y-axis label which carries the qos tag.
-        assert len(captured) == 4
-        for fig in captured:
-            ax = fig.axes[0]
-            label = ax.get_ylabel() or ""
-            zero_lines = [
-                line
-                for line in ax.lines
-                if len(line.get_ydata()) >= 2
-                and float(line.get_ydata()[0]) == 0.0
-                and float(line.get_ydata()[-1]) == 0.0
-            ]
-            if "qos3" in label or "qos4" in label:
-                assert zero_lines, f"expected y=0 reference line on {label}, found none"
-            else:
-                assert not zero_lines, (
-                    f"qos1/2 must not carry a y=0 reference line; "
-                    f"got {len(zero_lines)} on {label}"
-                )
-        for f in captured:
-            original_close(f)
-
-    def test_missing_observation_is_nan_gap(self, tmp_path: Path) -> None:
-        """A slot with no observation for the requested mode renders as NaN.
-
-        Note: the layout code only emits a bar slot when at least one
-        mode for the (transport, workload, qos) tuple is observed. So
-        the NaN case is exercised by a paired slot where only one of
-        single/multi is present.
-        """
-        import math
-
-        import matplotlib.pyplot as plt
-
-        import plots as plots_module
-
-        # Hybrid (paired-mode transport) has single AND multi for one
-        # workload, and single ONLY for another. The single-only slot
-        # still allocates a multi half because the layout code, when
-        # the transport supports both modes, treats the absence as a
-        # gap. Confirm at least one NaN bar appears.
-        results = [
-            _make_result("hybrid-10x100hz-qos1-single", loss_pct=1.0),
-            _make_result("hybrid-10x100hz-qos1-multi", loss_pct=2.0),
-            _make_result("hybrid-100x100hz-qos1-single", loss_pct=3.0),
-            # NO hybrid-100x100hz-qos1-multi -> that half-slot is NaN
-        ]
-        original_close = plt.close
-        captured: list = []
-
-        def capture_close(fig=None) -> None:
-            if fig is not None:
-                captured.append(fig)
-
-        plt.close = capture_close  # type: ignore[assignment]
-        try:
-            plots_module.generate_drop_rate_plot(results, tmp_path)
-        finally:
-            plt.close = original_close  # type: ignore[assignment]
-
-        assert captured
-        fig = captured[-1]
-        ax = fig.axes[0]
-        heights = [b.get_height() for b in ax.patches]
-        # The 100x100hz slot only has single -> the multi half is
-        # absent from the layout (single mode renders alone at the
-        # ``single`` x-offset), so we actually see 3 bars, not 4.
-        # Confirm that count plus the three finite values.
-        finite_heights = sorted(h for h in heights if not math.isnan(h))
-        assert finite_heights == [1.0, 2.0, 3.0], (
-            f"expected three finite bars at 1/2/3 %, got {finite_heights}"
+        col_labels = [t.get_text() for t in ax.get_xticklabels()]
+        assert col_labels == ["10x100hz", "100x100hz", "1000x100hz", "max"], (
+            f"expected columns ordered by load rank with 'max' last, got {col_labels}"
         )
