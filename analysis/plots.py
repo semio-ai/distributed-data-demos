@@ -76,8 +76,20 @@ _FAMILY_COLORMAPS: dict[str, str] = {
 # pure black on dark colormaps.
 _TONE_RANGE: tuple[float, float] = (0.4, 0.95)
 
-# QoS suffix matcher applied to variant names.
+# QoS suffix matcher applied to variant names (after the optional
+# threading suffix has been stripped). Post-E14 variant names end in
+# ``-single`` or ``-multi`` (e.g. ``custom-udp-100x100hz-qos1-multi``);
+# the qos regex therefore must run against the *base* name with the
+# threading suffix removed, otherwise it never matches a post-E14 name
+# and every spawn falls into the qos=None bucket -- see T16.13.
 _QOS_SUFFIX_RE = re.compile(r"-qos(\d+)$")
+
+# Threading-mode suffix matcher. The post-E14 canonical shape is
+# ``<transport>-<workload>-qos<N>-(single|multi)``. Legacy datasets
+# (pre-E14) have no threading suffix; ``_split_variant_name`` returns
+# ``threading_mode=None`` for those so callers can detect and render
+# them with a documented fallback (currently: treat as ``multi``).
+_THREADING_SUFFIX_RE = re.compile(r"-(single|multi)$")
 
 # Workload <vps>x<hz> matcher. The product (vps * hz) is the
 # load-intensity rank used to order workloads inside a family.
@@ -185,34 +197,56 @@ def _format_target_rate_label(target: float) -> str:
     return f"{scaled:g} {suffix}"
 
 
-def _split_variant_name(name: str) -> tuple[str, str, int | None]:
-    """Split a variant name into ``(transport, workload, qos)``.
+def _split_variant_name(
+    name: str,
+) -> tuple[str, str, int | None, str | None]:
+    """Split a variant name into ``(transport, workload, qos, threading_mode)``.
 
-    The post-E9 canonical shape is ``<transport>-<workload>-qos<N>`` where
-    ``transport`` is one of ``TRANSPORT_FAMILIES`` (some of which contain
-    hyphens, e.g. ``custom-udp``). ``qos`` may be absent on legacy single-
-    QoS runs, in which case it is returned as ``None``. Names that do not
-    start with any known transport prefix are surfaced as
-    ``transport="other"`` with the full pre-qos string as the workload, so
-    plotting never crashes on a renamed variant.
+    The post-E14 canonical shape is
+    ``<transport>-<workload>-qos<N>-(single|multi)`` where ``transport``
+    is one of ``TRANSPORT_FAMILIES`` (some of which contain hyphens,
+    e.g. ``custom-udp``). ``qos`` may be absent on legacy single-QoS
+    runs, in which case it is returned as ``None``. ``threading_mode``
+    is one of ``"single"``/``"multi"`` for post-E14 names; legacy
+    (pre-E14) names yield ``None`` so the caller can apply a documented
+    fallback (currently rendered as if ``multi``).
+
+    The parser strips the threading suffix *first*, then the qos
+    suffix. Doing it in the other order means a post-E14 name like
+    ``custom-udp-100x100hz-qos1-multi`` never matches the qos regex
+    (the regex anchors at end of string) and the spawn collapses into
+    the ``qos=None`` bucket -- the symptom that produced the
+    unreadable monolithic chart in T16.13.
+
+    Names that do not start with any known transport prefix are
+    surfaced as ``transport="other"`` with the full pre-qos string as
+    the workload, so plotting never crashes on a renamed variant.
 
     Examples
     --------
+    >>> _split_variant_name("custom-udp-1000x100hz-qos1-multi")
+    ('custom-udp', '1000x100hz', 1, 'multi')
+    >>> _split_variant_name("hybrid-100x10hz-qos4-single")
+    ('hybrid', '100x10hz', 4, 'single')
     >>> _split_variant_name("custom-udp-1000x100hz-qos1")
-    ('custom-udp', '1000x100hz', 1)
+    ('custom-udp', '1000x100hz', 1, None)
     >>> _split_variant_name("zenoh-max")
-    ('zenoh', 'max', None)
-    >>> _split_variant_name("hybrid-100x10hz-qos4")
-    ('hybrid', '100x10hz', 4)
+    ('zenoh', 'max', None, None)
     >>> _split_variant_name("weird-name")
-    ('other', 'weird-name', None)
+    ('other', 'weird-name', None, None)
     """
-    qos: int | None = None
+    threading_mode: str | None = None
     base = name
-    m = _QOS_SUFFIX_RE.search(name)
-    if m is not None:
-        qos = int(m.group(1))
-        base = name[: m.start()]
+    m_thr = _THREADING_SUFFIX_RE.search(base)
+    if m_thr is not None:
+        threading_mode = m_thr.group(1)
+        base = base[: m_thr.start()]
+
+    qos: int | None = None
+    m_qos = _QOS_SUFFIX_RE.search(base)
+    if m_qos is not None:
+        qos = int(m_qos.group(1))
+        base = base[: m_qos.start()]
 
     # Match the longest known transport prefix first so that, e.g.,
     # ``custom-udp-...`` is matched as ``custom-udp`` rather than
@@ -222,11 +256,11 @@ def _split_variant_name(name: str) -> tuple[str, str, int | None]:
         prefix = transport + "-"
         if base.startswith(prefix):
             workload = base[len(prefix) :]
-            return transport, workload, qos
+            return transport, workload, qos, threading_mode
         if base == transport:
-            return transport, "", qos
+            return transport, "", qos, threading_mode
 
-    return "other", base, qos
+    return "other", base, qos, threading_mode
 
 
 def _workload_load_rank(workload: str) -> tuple[int, int, str]:
@@ -357,7 +391,7 @@ def generate_comparison_plot(
     # runs by taking the first one encountered).
     parsed: dict[tuple[str, str, int | None], PerformanceResult] = {}
     for r in results:
-        transport, workload, qos = _split_variant_name(r.variant)
+        transport, workload, qos, _threading = _split_variant_name(r.variant)
         key = (transport, workload, qos)
         parsed.setdefault(key, r)
 
@@ -735,7 +769,7 @@ def generate_latency_cdf_plot(
     # entry per key (matches the comparison plot's collapse rule).
     parsed: dict[tuple[str, str, int | None], PerformanceResult] = {}
     for r in results:
-        transport, workload, qos = _split_variant_name(r.variant)
+        transport, workload, qos, _threading = _split_variant_name(r.variant)
         key = (transport, workload, qos)
         parsed.setdefault(key, r)
 

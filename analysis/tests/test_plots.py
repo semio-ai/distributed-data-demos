@@ -49,42 +49,45 @@ def _make_result(
 
 
 class TestSplitVariantName:
-    def test_custom_udp_with_qos(self) -> None:
+    def test_custom_udp_with_qos_legacy(self) -> None:
         from plots import _split_variant_name
 
         assert _split_variant_name("custom-udp-1000x100hz-qos1") == (
             "custom-udp",
             "1000x100hz",
             1,
+            None,
         )
 
-    def test_hybrid_with_qos(self) -> None:
+    def test_hybrid_with_qos_legacy(self) -> None:
         from plots import _split_variant_name
 
         assert _split_variant_name("hybrid-100x10hz-qos4") == (
             "hybrid",
             "100x10hz",
             4,
+            None,
         )
 
-    def test_quic_with_qos(self) -> None:
+    def test_quic_with_qos_legacy(self) -> None:
         from plots import _split_variant_name
 
         assert _split_variant_name("quic-10x100hz-qos2") == (
             "quic",
             "10x100hz",
             2,
+            None,
         )
 
-    def test_zenoh_with_qos(self) -> None:
+    def test_zenoh_with_qos_legacy(self) -> None:
         from plots import _split_variant_name
 
-        assert _split_variant_name("zenoh-max-qos3") == ("zenoh", "max", 3)
+        assert _split_variant_name("zenoh-max-qos3") == ("zenoh", "max", 3, None)
 
     def test_no_qos_legacy_shape(self) -> None:
         from plots import _split_variant_name
 
-        assert _split_variant_name("zenoh-max") == ("zenoh", "max", None)
+        assert _split_variant_name("zenoh-max") == ("zenoh", "max", None, None)
 
     def test_unknown_prefix_falls_back_to_other(self) -> None:
         from plots import _split_variant_name
@@ -93,12 +96,127 @@ class TestSplitVariantName:
             "other",
             "weird-name",
             1,
+            None,
         )
 
     def test_unknown_prefix_no_qos(self) -> None:
         from plots import _split_variant_name
 
-        assert _split_variant_name("standalone") == ("other", "standalone", None)
+        assert _split_variant_name("standalone") == (
+            "other",
+            "standalone",
+            None,
+            None,
+        )
+
+    # T16.13: post-E14 variant names end in ``-single`` or ``-multi``.
+    # The threading suffix must be stripped *before* the qos regex
+    # runs, otherwise every post-E14 spawn collapses into the
+    # ``qos=None`` bucket and the per-QoS chart row layout breaks.
+
+    def test_custom_udp_single_post_e14(self) -> None:
+        from plots import _split_variant_name
+
+        assert _split_variant_name("custom-udp-100x100hz-qos1-single") == (
+            "custom-udp",
+            "100x100hz",
+            1,
+            "single",
+        )
+
+    def test_custom_udp_multi_post_e14(self) -> None:
+        from plots import _split_variant_name
+
+        assert _split_variant_name("custom-udp-100x100hz-qos1-multi") == (
+            "custom-udp",
+            "100x100hz",
+            1,
+            "multi",
+        )
+
+    def test_hybrid_single_post_e14(self) -> None:
+        from plots import _split_variant_name
+
+        assert _split_variant_name("hybrid-10x100hz-qos3-single") == (
+            "hybrid",
+            "10x100hz",
+            3,
+            "single",
+        )
+
+    def test_hybrid_multi_post_e14(self) -> None:
+        from plots import _split_variant_name
+
+        assert _split_variant_name("hybrid-10x100hz-qos3-multi") == (
+            "hybrid",
+            "10x100hz",
+            3,
+            "multi",
+        )
+
+    def test_websocket_single_post_e14(self) -> None:
+        from plots import _split_variant_name
+
+        assert _split_variant_name("websocket-max-qos2-single") == (
+            "websocket",
+            "max",
+            2,
+            "single",
+        )
+
+    def test_websocket_multi_post_e14(self) -> None:
+        from plots import _split_variant_name
+
+        assert _split_variant_name("websocket-max-qos2-multi") == (
+            "websocket",
+            "max",
+            2,
+            "multi",
+        )
+
+    # Natively-multi-only transports (QUIC, WebRTC, Zenoh per E14) only
+    # ship in ``-multi`` form. The parser does not special-case them;
+    # the layout code handles the single-bar-per-slot rendering.
+    def test_quic_multi_post_e14(self) -> None:
+        from plots import _split_variant_name
+
+        assert _split_variant_name("quic-1000x100hz-qos4-multi") == (
+            "quic",
+            "1000x100hz",
+            4,
+            "multi",
+        )
+
+    def test_zenoh_multi_post_e14(self) -> None:
+        from plots import _split_variant_name
+
+        assert _split_variant_name("zenoh-max-qos1-multi") == (
+            "zenoh",
+            "max",
+            1,
+            "multi",
+        )
+
+    def test_webrtc_multi_post_e14(self) -> None:
+        from plots import _split_variant_name
+
+        assert _split_variant_name("webrtc-100x10hz-qos2-multi") == (
+            "webrtc",
+            "100x10hz",
+            2,
+            "multi",
+        )
+
+    def test_threading_suffix_only_no_qos(self) -> None:
+        """Pathological but legal: threading suffix without a qos."""
+        from plots import _split_variant_name
+
+        assert _split_variant_name("custom-udp-max-multi") == (
+            "custom-udp",
+            "max",
+            None,
+            "multi",
+        )
 
 
 class TestWorkloadLoadOrdering:
