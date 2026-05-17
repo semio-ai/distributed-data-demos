@@ -954,6 +954,237 @@ def generate_comparison_plot(
     return paths
 
 
+def _generate_drop_rate_plot_for_qos(
+    *,
+    qos: int | None,
+    parsed: dict[tuple[str, str, int | None, str | None], PerformanceResult],
+    transport_order: list[str],
+    workload_order: list[str],
+    output_dir: Path,
+) -> Path:
+    """Render the drop-rate chart for a single QoS level (T16.14).
+
+    Mirrors the comparison chart's per-slot layout (paired single/multi
+    half-bars, full-width for natively-multi-only transports) and reuses
+    the family colourmap / threading-tone convention. Bars carry
+    ``PerformanceResult.loss_pct``.
+
+    Y-axis: **linear 0-100** (loss %). A linear scale is the right
+    default here -- the user's eye reads a 0 -> 100 % range natively,
+    and the QoS 3/4 expectation that drop rate should sit at 0
+    translates to "bars hug the bottom" which is immediately legible.
+    A log scale would expand the near-zero noise floor and compress
+    the rare 80-100 % failure regime, which is the inverse of what the
+    operator wants to see. Bars whose ``loss_pct`` is exactly 0 still
+    render as a flat sliver at the axis baseline (NaN bars are dropped
+    only for slots with no observation at all -- a genuine zero-loss
+    cell is not a missing cell).
+
+    For QoS 3 and QoS 4 the expected drop rate is 0%; a thin grey
+    dashed reference line at y=0 emphasises that baseline. QoS 1 / 2 /
+    qosNA skip the reference line because those tiers are loss-tolerant
+    by design (the bottom of the axis already serves as the visual
+    floor; no dedicated baseline expectation applies).
+    """
+    out_filename = _qos_filename("drop-rate", qos, log_throughput=False)
+    qos_label = f"qos{qos}" if qos is not None else "n/a"
+
+    slots: list[tuple[str, str]] = []
+    slot_layouts: list[tuple[list[str | None], list[float]]] = []
+    for t in transport_order:
+        for w in workload_order:
+            modes, offsets = _slot_layout(t, w, qos, parsed)
+            if modes:
+                slots.append((t, w))
+                slot_layouts.append((modes, offsets))
+
+    if not slots:
+        return _empty_plot(output_dir, filename=out_filename)
+
+    n_slots = len(slots)
+    x_centres = np.arange(n_slots, dtype=float)
+
+    # Single-axis figure; width grows with slot count using the same
+    # coefficient as the comparison chart so per-QoS PNGs stay
+    # visually consistent when stacked vertically in the markdown
+    # summary.
+    fig_width = max(14.0, 0.55 * n_slots + 4.0)
+    plot_height = 4.0
+    legend_band_height = 1.4
+    fig_height = plot_height + legend_band_height
+    fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
+
+    bar_x: list[float] = []
+    bar_y: list[float] = []
+    bar_colors: list[tuple[float, float, float, float]] = []
+    bar_widths: list[float] = []
+
+    for (transport, workload), (modes, offsets) in zip(slots, slot_layouts):
+        bar_w = _bar_width_for_slot(len(modes))
+        slot_idx = slots.index((transport, workload))
+        slot_centre = x_centres[slot_idx]
+        for mode, off in zip(modes, offsets):
+            x_pos = slot_centre + off
+            color = _threading_color(transport, mode)
+            r = parsed.get((transport, workload, qos, mode))
+            if r is None:
+                # No observation for this (slot, mode) -- render as
+                # NaN so the bar disappears. Matches the gap-not-zero
+                # convention used by the comparison chart.
+                y_val = float("nan")
+            else:
+                y_val = float(r.loss_pct)
+            bar_x.append(x_pos)
+            bar_y.append(y_val)
+            bar_colors.append(color)
+            bar_widths.append(bar_w)
+
+    ax.bar(
+        bar_x,
+        bar_y,
+        bar_widths,
+        color=bar_colors,
+        edgecolor="black",
+        linewidth=0.3,
+    )
+
+    slot_tick_labels = [w if w else t for t, w in slots]
+    ax.set_xticks(x_centres)
+    ax.set_xticklabels(slot_tick_labels, rotation=45, ha="right", fontsize=7)
+
+    # Linear 0-100 axis -- see docstring. Lock the upper bound so
+    # downstream visual comparison across QoS PNGs uses the same
+    # vertical scale; a sparse QoS panel auto-fitting to a 0-3% range
+    # would otherwise visually amplify near-zero noise.
+    ax.set_ylim(0.0, 100.0)
+    ax.set_ylabel(f"{qos_label} - loss %")
+    ax.set_title(f"{qos_label} - Drop rate (loss %)")
+    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
+
+    # Reference baseline at y=0 for QoS tiers with a zero-loss
+    # expectation (QoS 3 / 4). The bottom of the axis is already at 0,
+    # so this is visual emphasis -- a thin grey dashed line riding the
+    # baseline makes the "bars hugging zero" reading explicit.
+    if qos in (3, 4):
+        ax.axhline(
+            y=0.0,
+            color="grey",
+            linestyle="--",
+            linewidth=0.8,
+            alpha=0.6,
+            zorder=1,
+        )
+
+    # Legend: same per-(transport, threading_mode) entries as the
+    # comparison chart. Reuse the comparison-chart code path verbatim
+    # for visual consistency.
+    legend_handles: list[matplotlib.patches.Patch] = []
+    seen_legend_keys: set[tuple[str, str | None]] = set()
+    for transport in transport_order:
+        for mode in ("single", "multi", None):
+            key = (transport, mode)
+            if key in seen_legend_keys:
+                continue
+            present = any(
+                t == transport and mode in modes
+                for (t, _w), (modes, _off) in zip(slots, slot_layouts)
+            )
+            if not present:
+                continue
+            color = _threading_color(transport, mode)
+            label_mode = mode if mode is not None else "legacy"
+            legend_handles.append(
+                matplotlib.patches.Patch(
+                    facecolor=color,
+                    edgecolor="black",
+                    linewidth=0.3,
+                    label=f"{transport} / {label_mode}",
+                )
+            )
+            seen_legend_keys.add(key)
+
+    legend_ncol = max(3, min(6, (len(legend_handles) + 2) // 3))
+    legend_rows = (len(legend_handles) + legend_ncol - 1) // legend_ncol
+    row_height_in = 0.22
+    legend_band_in = max(0.6, 0.4 + row_height_in * legend_rows)
+    bottom_reserve = min(0.4, legend_band_in / fig_height)
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.005),
+        ncol=legend_ncol,
+        frameon=True,
+        fontsize=8,
+        title="Transport / threading",
+        title_fontsize=9,
+    )
+
+    top_reserve = max(0.6, fig_height - 0.4) / fig_height
+    fig.subplots_adjust(
+        bottom=bottom_reserve,
+        top=top_reserve,
+        left=0.07,
+        right=0.98,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / out_filename
+    fig.savefig(str(out_path), dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def generate_drop_rate_plot(
+    results: list[PerformanceResult], output_dir: Path
+) -> list[Path]:
+    """Generate one drop-rate PNG per observed QoS level (T16.14).
+
+    Filename convention: ``drop-rate-qos<N>.png`` (or
+    ``drop-rate-qosNA.png`` for legacy spawns with no qos suffix).
+    Per-slot layout mirrors ``generate_comparison_plot`` exactly --
+    paired single/multi half-bars where both modes exist, full-width
+    single bar for natively-multi-only transports (QUIC / WebRTC /
+    Zenoh per E14), gap (NaN) when a slot has no observation. Bars
+    carry ``PerformanceResult.loss_pct`` on a linear 0-100 y-axis;
+    see the per-QoS helper's docstring for the scale-choice rationale.
+
+    Returns
+    -------
+    List of paths to the generated PNGs, one per observed QoS, in
+    ascending QoS order (``None`` last for legacy spawns). When
+    ``results`` is empty a single placeholder PNG is generated and
+    returned in a one-element list so callers (and the CLI status
+    print) keep working.
+    """
+    if not results:
+        out_filename = _qos_filename("drop-rate", None, log_throughput=False)
+        return [_empty_plot(output_dir, filename=out_filename)]
+
+    parsed = _index_parsed_results(results)
+    if not parsed:
+        out_filename = _qos_filename("drop-rate", None, log_throughput=False)
+        return [_empty_plot(output_dir, filename=out_filename)]
+
+    parsed_keys = list(parsed.keys())
+    transport_order, workload_order, qos_order = _collect_layout_orders(parsed_keys)
+    if not transport_order or not workload_order or not qos_order:
+        out_filename = _qos_filename("drop-rate", None, log_throughput=False)
+        return [_empty_plot(output_dir, filename=out_filename)]
+
+    paths: list[Path] = []
+    for q in qos_order:
+        out_path = _generate_drop_rate_plot_for_qos(
+            qos=q,
+            parsed=parsed,
+            transport_order=transport_order,
+            workload_order=workload_order,
+            output_dir=output_dir,
+        )
+        paths.append(out_path)
+    return paths
+
+
 def _generate_latency_cdf_plot_for_qos(
     *,
     qos: int | None,
