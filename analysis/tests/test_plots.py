@@ -303,116 +303,155 @@ class TestFamilyPalette:
 
 
 class TestGenerateComparisonPlot:
-    def test_creates_png(self, tmp_path: Path) -> None:
+    def test_creates_one_png_per_observed_qos(self, tmp_path: Path) -> None:
+        """T16.13: comparison plot returns one Path per observed QoS."""
         from plots import generate_comparison_plot
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=50.0),
-            _make_result("custom-udp-max-qos1", writes_per_sec=500.0),
-            _make_result("zenoh-10x100hz-qos1", writes_per_sec=45.0),
-            _make_result("zenoh-max-qos1", writes_per_sec=480.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", writes_per_sec=50.0),
+            _make_result("custom-udp-max-qos1-multi", writes_per_sec=500.0),
+            _make_result("zenoh-10x100hz-qos1-multi", writes_per_sec=45.0),
+            _make_result("zenoh-max-qos1-multi", writes_per_sec=480.0),
         ]
-        out = generate_comparison_plot(results, tmp_path / "output")
-        assert out.exists()
-        assert out.name == "comparison.png"
-        assert out.parent == tmp_path / "output"
-        assert out.stat().st_size > 1000
+        paths = generate_comparison_plot(results, tmp_path / "output")
+        assert isinstance(paths, list)
+        assert len(paths) == 1, f"expected 1 PNG for single QoS, got {len(paths)}"
+        for p in paths:
+            assert p.exists(), f"missing PNG: {p}"
+            assert p.parent == tmp_path / "output"
+            assert p.stat().st_size > 1000
+        assert paths[0].name == "comparison-qos1.png"
+
+    def test_creates_four_pngs_for_four_qos_levels(self, tmp_path: Path) -> None:
+        """T16.13: 4 QoS levels -> 4 PNG files with the expected names."""
+        from plots import generate_comparison_plot
+
+        results: list[PerformanceResult] = []
+        for q in (1, 2, 3, 4):
+            results.append(
+                _make_result(
+                    f"custom-udp-10x100hz-qos{q}-multi",
+                    writes_per_sec=100.0 * q,
+                )
+            )
+            results.append(
+                _make_result(
+                    f"custom-udp-10x100hz-qos{q}-single",
+                    writes_per_sec=90.0 * q,
+                )
+            )
+        paths = generate_comparison_plot(results, tmp_path)
+        assert len(paths) == 4
+        names = sorted(p.name for p in paths)
+        assert names == [
+            "comparison-qos1.png",
+            "comparison-qos2.png",
+            "comparison-qos3.png",
+            "comparison-qos4.png",
+        ]
+        for p in paths:
+            assert p.exists()
+            assert p.stat().st_size > 1000
 
     def test_creates_output_dir(self, tmp_path: Path) -> None:
         from plots import generate_comparison_plot
 
         nested = tmp_path / "a" / "b" / "c"
-        results = [_make_result("zenoh-max-qos1")]
-        out = generate_comparison_plot(results, nested)
+        results = [_make_result("zenoh-max-qos1-multi")]
+        paths = generate_comparison_plot(results, nested)
         assert nested.is_dir()
-        assert out.exists()
+        assert paths
+        for p in paths:
+            assert p.exists()
 
     def test_empty_results(self, tmp_path: Path) -> None:
         from plots import generate_comparison_plot
 
-        out = generate_comparison_plot([], tmp_path / "empty")
-        assert out.exists()
+        paths = generate_comparison_plot([], tmp_path / "empty")
+        assert isinstance(paths, list)
+        assert len(paths) == 1
+        assert paths[0].exists()
 
     def test_single_variant(self, tmp_path: Path) -> None:
         from plots import generate_comparison_plot
 
-        results = [_make_result("quic-100x100hz-qos2")]
-        out = generate_comparison_plot(results, tmp_path)
-        assert out.exists()
+        results = [_make_result("quic-100x100hz-qos2-multi")]
+        paths = generate_comparison_plot(results, tmp_path)
+        assert len(paths) == 1
+        assert paths[0].exists()
+        assert paths[0].name == "comparison-qos2.png"
 
     def test_legacy_no_qos_still_renders(self, tmp_path: Path) -> None:
+        """Pre-E14 spawns with no qos/threading suffix render under qosNA."""
         from plots import generate_comparison_plot
 
         results = [
             _make_result("custom-udp-10x100hz", writes_per_sec=50.0),
             _make_result("zenoh-max", writes_per_sec=480.0),
         ]
-        out = generate_comparison_plot(results, tmp_path)
-        assert out.exists()
-        assert out.stat().st_size > 1000
+        paths = generate_comparison_plot(results, tmp_path)
+        assert len(paths) == 1
+        assert paths[0].exists()
+        assert paths[0].stat().st_size > 1000
+        assert paths[0].name == "comparison-qosNA.png"
 
     def test_with_qos_expansion_data(self, tmp_path: Path) -> None:
-        """Synthetic 4 transports x 2 workloads x 4 qos = 32 entries."""
+        """Synthetic 4 transports x 2 workloads x 4 qos x 2 threading = 64 entries."""
         from plots import generate_comparison_plot
 
         transports = ["custom-udp", "hybrid", "quic", "zenoh"]
         workloads = ["10x100hz", "1000x100hz"]
         qos_levels = [1, 2, 3, 4]
+        modes = ["single", "multi"]
 
         results: list[PerformanceResult] = []
         for t in transports:
             for w in workloads:
                 for q in qos_levels:
-                    results.append(
-                        _make_result(
-                            f"{t}-{w}-qos{q}",
-                            writes_per_sec=100.0 + q * 10.0,
-                            p50=0.5 * q,
-                            p95=2.0 * q,
-                            p99=5.0 * q,
+                    for mode in modes:
+                        results.append(
+                            _make_result(
+                                f"{t}-{w}-qos{q}-{mode}",
+                                writes_per_sec=100.0 + q * 10.0,
+                                p50=0.5 * q,
+                                p95=2.0 * q,
+                                p99=5.0 * q,
+                            )
                         )
-                    )
 
-        assert len(results) == 32
-        out = generate_comparison_plot(results, tmp_path)
-        assert out.exists()
-        assert out.stat().st_size > 5000
+        assert len(results) == 64
+        paths = generate_comparison_plot(results, tmp_path)
+        assert len(paths) == 4
+        for p in paths:
+            assert p.exists()
+            assert p.stat().st_size > 5000
 
     def test_handles_missing_qos(self, tmp_path: Path) -> None:
-        """A subset of (transport, workload, qos) combinations should
-        render as gaps without exception."""
+        """Only PNGs for QoS levels with at least one spawn are emitted."""
         from plots import generate_comparison_plot
 
-        # Only qos3 and qos4 for one variant; full set for another.
+        # Only qos3 and qos4 across the input.
         results = [
-            _make_result("custom-udp-10x100hz-qos3", writes_per_sec=50.0),
-            _make_result("custom-udp-10x100hz-qos4", writes_per_sec=55.0),
-            _make_result("zenoh-10x100hz-qos1", writes_per_sec=80.0),
-            _make_result("zenoh-10x100hz-qos2", writes_per_sec=82.0),
-            _make_result("zenoh-10x100hz-qos3", writes_per_sec=85.0),
-            _make_result("zenoh-10x100hz-qos4", writes_per_sec=86.0),
+            _make_result("custom-udp-10x100hz-qos3-multi", writes_per_sec=50.0),
+            _make_result("custom-udp-10x100hz-qos4-multi", writes_per_sec=55.0),
+            _make_result("zenoh-10x100hz-qos3-multi", writes_per_sec=85.0),
+            _make_result("zenoh-10x100hz-qos4-multi", writes_per_sec=86.0),
         ]
-        out = generate_comparison_plot(results, tmp_path)
-        assert out.exists()
-        assert out.stat().st_size > 1000
+        paths = generate_comparison_plot(results, tmp_path)
+        names = sorted(p.name for p in paths)
+        assert names == ["comparison-qos3.png", "comparison-qos4.png"]
+        for p in paths:
+            assert p.exists()
+            assert p.stat().st_size > 1000
 
     def test_legend_outside_axes(self, tmp_path: Path) -> None:
         """The shared legend should live on the figure, not on either axis."""
         import matplotlib.pyplot as plt
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1"),
-            _make_result("zenoh-10x100hz-qos1"),
+            _make_result("custom-udp-10x100hz-qos1-multi"),
+            _make_result("zenoh-10x100hz-qos1-multi"),
         ]
-        # We need the figure object that ``generate_comparison_plot``
-        # produced; since it closes its figure, we re-render here using
-        # the same code path then inspect the latest figure on the
-        # plt-managed stack via a side-effect probe. Instead, peek at
-        # the image content by rendering and reopening, OR -- simpler --
-        # render once, then re-create a probe figure and assert the
-        # plots module's intent by reading the saved bytes is
-        # impractical. Use a manual reproduction of the call here so we
-        # have a live figure to inspect.
         import plots as plots_module
 
         # Re-run via an internal hook: monkey-patch ``plt.close`` so the
@@ -448,8 +487,8 @@ class TestGenerateComparisonPlot:
         import plots as plots_module
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1", p50=0.1, p95=0.3, p99=0.6),
-            _make_result("zenoh-10x100hz-qos1", p50=5.0, p95=20.0, p99=40.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", p50=0.1, p95=0.3, p99=0.6),
+            _make_result("zenoh-10x100hz-qos1-multi", p50=5.0, p95=20.0, p99=40.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -489,8 +528,8 @@ class TestGenerateComparisonPlot:
         import plots as plots_module
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=50.0),
-            _make_result("zenoh-10x100hz-qos1", writes_per_sec=480.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", writes_per_sec=50.0),
+            _make_result("zenoh-10x100hz-qos1-multi", writes_per_sec=480.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -516,26 +555,28 @@ class TestGenerateComparisonPlot:
         for f in captured:
             original_close(f)
 
-    def test_log_throughput_on_sets_log_yscale_on_throughput_axes_only(
-        self, tmp_path: Path
-    ) -> None:
-        """``log_throughput=True`` switches throughput panels to log; latency stays log."""
+    def test_log_throughput_on_sets_log_yscale_per_file(self, tmp_path: Path) -> None:
+        """``log_throughput=True`` switches throughput to log on every per-QoS PNG.
+
+        Post-T16.13: each PNG covers one QoS so has exactly one
+        throughput axis and one latency axis. With four QoS levels we
+        capture four figures end-to-end and check the scale on each.
+        """
         import matplotlib.pyplot as plt
 
         import plots as plots_module
 
-        # Four QoS rows -> four throughput axes and four latency axes.
         results = []
         for q in (1, 2, 3, 4):
             results.append(
                 _make_result(
-                    f"custom-udp-10x100hz-qos{q}",
+                    f"custom-udp-10x100hz-qos{q}-multi",
                     writes_per_sec=50.0 * q,
                 )
             )
             results.append(
                 _make_result(
-                    f"zenoh-10x100hz-qos{q}",
+                    f"zenoh-10x100hz-qos{q}-multi",
                     writes_per_sec=480.0 * q,
                 )
             )
@@ -554,55 +595,57 @@ class TestGenerateComparisonPlot:
         finally:
             plt.close = original_close  # type: ignore[assignment]
 
-        assert captured
-        fig = captured[-1]
-        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
-        lat_axes = [
-            ax for ax in fig.axes if "latency" in (ax.get_ylabel() or "").lower()
-        ]
-        assert len(tp_axes) == 4, f"expected 4 throughput axes, got {len(tp_axes)}"
-        assert len(lat_axes) == 4, f"expected 4 latency axes, got {len(lat_axes)}"
-        for ax in tp_axes:
-            assert ax.get_yscale() == "log", (
-                f"throughput axis should be log with log_throughput=True, "
-                f"got {ax.get_yscale()}"
+        assert len(captured) == 4, (
+            f"expected 4 figures for 4 QoS levels, got {len(captured)}"
+        )
+        for fig in captured:
+            tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+            lat_axes = [
+                ax for ax in fig.axes if "latency" in (ax.get_ylabel() or "").lower()
+            ]
+            assert len(tp_axes) == 1, (
+                f"expected 1 throughput axis per per-QoS file, got {len(tp_axes)}"
             )
-        for ax in lat_axes:
-            assert ax.get_yscale() == "log", (
-                f"latency axis should remain log, got {ax.get_yscale()}"
+            assert len(lat_axes) == 1, (
+                f"expected 1 latency axis per per-QoS file, got {len(lat_axes)}"
             )
+            for ax in tp_axes:
+                assert ax.get_yscale() == "log"
+            for ax in lat_axes:
+                assert ax.get_yscale() == "log"
         for f in captured:
             original_close(f)
 
     def test_log_throughput_filename_suffix(self, tmp_path: Path) -> None:
-        """``log_throughput`` toggles the output filename so both flavours coexist.
+        """``log_throughput`` toggles a ``-log`` suffix so both flavours coexist.
 
-        Without the suffix the log-scale run would overwrite the linear-scale
-        ``comparison.png`` in the same ``--output`` dir. The returned ``Path``
-        must reflect the filename actually written, since the CLI prints it.
+        Without the suffix the log-scale run would overwrite the
+        linear-scale ``comparison-qos<N>.png`` in the same output dir.
         """
         from plots import generate_comparison_plot
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=50.0),
-            _make_result("zenoh-10x100hz-qos1", writes_per_sec=480.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", writes_per_sec=50.0),
+            _make_result("zenoh-10x100hz-qos1-multi", writes_per_sec=480.0),
         ]
 
-        linear_out = generate_comparison_plot(
+        linear_paths = generate_comparison_plot(
             results, tmp_path / "out", log_throughput=False
         )
-        assert linear_out.name == "comparison.png"
-        assert linear_out.exists()
+        assert len(linear_paths) == 1
+        assert linear_paths[0].name == "comparison-qos1.png"
+        assert linear_paths[0].exists()
 
-        log_out = generate_comparison_plot(
+        log_paths = generate_comparison_plot(
             results, tmp_path / "out", log_throughput=True
         )
-        assert log_out.name == "comparison-log.png"
-        assert log_out.exists()
+        assert len(log_paths) == 1
+        assert log_paths[0].name == "comparison-qos1-log.png"
+        assert log_paths[0].exists()
 
         # Both files coexist in the same directory.
-        assert linear_out.parent == log_out.parent
-        assert linear_out.exists()
+        assert linear_paths[0].parent == log_paths[0].parent
+        assert linear_paths[0].exists()
 
     def test_log_throughput_zero_writes_skipped_not_clamped(
         self, tmp_path: Path
@@ -615,8 +658,8 @@ class TestGenerateComparisonPlot:
         import plots as plots_module
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=0.0),
-            _make_result("zenoh-10x100hz-qos1", writes_per_sec=480.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", writes_per_sec=0.0),
+            _make_result("zenoh-10x100hz-qos1-multi", writes_per_sec=480.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -649,22 +692,15 @@ class TestGenerateComparisonPlot:
             original_close(f)
 
     def test_target_lines_drawn_at_unique_workload_rates(self, tmp_path: Path) -> None:
-        """One horizontal line per unique ``vpt * hz`` target rate.
-
-        Three synthesized workloads at 10x100hz, 100x100hz, 1000x100hz
-        produce targets {1_000, 10_000, 100_000}. The throughput
-        subplot should carry exactly those three axhline objects --
-        same set on every QoS row, but here we only have one row so
-        we inspect that single throughput axis.
-        """
+        """One horizontal line per unique ``vpt * hz`` target rate."""
         import matplotlib.pyplot as plt
 
         import plots as plots_module
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=900.0),
-            _make_result("custom-udp-100x100hz-qos1", writes_per_sec=9_500.0),
-            _make_result("custom-udp-1000x100hz-qos1", writes_per_sec=95_000.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", writes_per_sec=900.0),
+            _make_result("custom-udp-100x100hz-qos1-multi", writes_per_sec=9_500.0),
+            _make_result("custom-udp-1000x100hz-qos1-multi", writes_per_sec=95_000.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -703,9 +739,8 @@ class TestGenerateComparisonPlot:
 
         import plots as plots_module
 
-        # Only a max-workload result. No target rate should be derived.
         results = [
-            _make_result("custom-udp-max-qos1", writes_per_sec=400_000.0),
+            _make_result("custom-udp-max-qos1-multi", writes_per_sec=400_000.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -746,9 +781,9 @@ class TestGenerateComparisonPlot:
         import plots as plots_module
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=900.0),
-            _make_result("custom-udp-100x100hz-qos1", writes_per_sec=9_500.0),
-            _make_result("custom-udp-1000x100hz-qos1", writes_per_sec=95_000.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", writes_per_sec=900.0),
+            _make_result("custom-udp-100x100hz-qos1-multi", writes_per_sec=9_500.0),
+            _make_result("custom-udp-1000x100hz-qos1-multi", writes_per_sec=95_000.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -769,10 +804,6 @@ class TestGenerateComparisonPlot:
         assert tp_axes
         ax_tp = tp_axes[0]
         si_pattern = re.compile(r"^\d+(\.\d+)?\s*[KMG]/s$")
-        # Pull all text artists on the axis with content matching the
-        # SI suffix pattern; group by the integer y position so the
-        # assertion does not depend on the order matplotlib stored
-        # them in.
         si_label_ys: set[float] = set()
         for txt in ax_tp.texts:
             if si_pattern.match(txt.get_text() or ""):
@@ -784,17 +815,13 @@ class TestGenerateComparisonPlot:
             original_close(f)
 
     def test_tier_markers_one_star_for_1k_target(self, tmp_path: Path) -> None:
-        """A 10x100hz workload targets 1 K/s -> the throughput bar carries ``*``.
-
-        Single bar -> exactly one ``*`` text artist on the qos1
-        throughput axis. The latency axis must not be annotated.
-        """
+        """A 10x100hz workload targets 1 K/s -> the throughput bar carries ``*``."""
         import matplotlib.pyplot as plt
 
         import plots as plots_module
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1", writes_per_sec=900.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", writes_per_sec=900.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -839,7 +866,7 @@ class TestGenerateComparisonPlot:
         import plots as plots_module
 
         results = [
-            _make_result("custom-udp-1000x100hz-qos1", writes_per_sec=95_000.0),
+            _make_result("custom-udp-1000x100hz-qos1-multi", writes_per_sec=95_000.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -874,7 +901,7 @@ class TestGenerateComparisonPlot:
         import plots as plots_module
 
         results = [
-            _make_result("custom-udp-max-qos1", writes_per_sec=400_000.0),
+            _make_result("custom-udp-max-qos1-multi", writes_per_sec=400_000.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -911,7 +938,7 @@ class TestGenerateComparisonPlot:
         import plots as plots_module
 
         results = [
-            _make_result("custom-udp-1000x100hz-qos1", writes_per_sec=95_000.0),
+            _make_result("custom-udp-1000x100hz-qos1-multi", writes_per_sec=95_000.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -943,20 +970,14 @@ class TestGenerateComparisonPlot:
             original_close(f)
 
     def test_nonpositive_p95_renders_as_nan_bar(self, tmp_path: Path) -> None:
-        """A percentile <= 0 (clock-noise artifact) is dropped to NaN.
-
-        Regression test for the relaxed epsilon clamp: previously a
-        non-positive p95 was clamped to ``_LATENCY_EPSILON_MS`` and
-        rendered as a visible "1 us" bar that misled the reader. After
-        the relaxation it should disappear entirely (height NaN).
-        """
+        """A percentile <= 0 (clock-noise artifact) is dropped to NaN."""
         import matplotlib.pyplot as plt
 
         import plots as plots_module
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1", p50=-1.0, p95=-0.5, p99=0.0),
-            _make_result("zenoh-10x100hz-qos1", p50=1.0, p95=2.0, p99=3.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", p50=-1.0, p95=-0.5, p99=0.0),
+            _make_result("zenoh-10x100hz-qos1-multi", p50=1.0, p95=2.0, p99=3.0),
         ]
         original_close = plt.close
         captured: list = []
@@ -991,6 +1012,183 @@ class TestGenerateComparisonPlot:
         )
         for f in captured:
             original_close(f)
+
+    # T16.13: paired single/multi bars and natively-multi-only slot
+    # rendering. These tests pin the new layout convention so a
+    # regression that, e.g., reintroduces an empty "single half" for
+    # QUIC fails loudly.
+
+    def test_multi_only_transport_renders_one_bar_per_slot(
+        self, tmp_path: Path
+    ) -> None:
+        """QUIC-only-multi input -> the slot carries one bar, not two."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("quic-10x100hz-qos1-multi", writes_per_sec=100.0),
+            _make_result("quic-100x100hz-qos1-multi", writes_per_sec=900.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes
+        # Two slots, one bar each.
+        bars = list(tp_axes[0].patches)
+        assert len(bars) == 2, (
+            f"expected 2 bars (1 per slot for multi-only QUIC), got {len(bars)}"
+        )
+        # And the bar widths should be the "full-slot" width, not the
+        # half-slot width used in paired layouts.
+        widths = sorted({round(b.get_width(), 3) for b in bars})
+        assert widths == [0.78], (
+            f"expected full-slot bar width 0.78 for multi-only slots, got {widths}"
+        )
+        for f in captured:
+            original_close(f)
+
+    def test_paired_single_multi_renders_two_bars_per_slot(
+        self, tmp_path: Path
+    ) -> None:
+        """Hybrid with both single and multi -> two bars per slot, distinct colours."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result("hybrid-10x100hz-qos1-single", writes_per_sec=900.0),
+            _make_result("hybrid-10x100hz-qos1-multi", writes_per_sec=1100.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes
+        bars = list(tp_axes[0].patches)
+        assert len(bars) == 2, f"expected 2 paired bars, got {len(bars)}"
+        # Both bars should be roughly half-slot wide.
+        widths = sorted({round(b.get_width(), 3) for b in bars})
+        assert widths == [0.4], f"expected paired-bar width 0.40, got {widths}"
+        # Distinct colours: single (lighter) vs multi (darker).
+        colours = {tuple(b.get_facecolor()) for b in bars}
+        assert len(colours) == 2, (
+            f"expected single/multi bars to have distinct colours, got {colours}"
+        )
+        for f in captured:
+            original_close(f)
+
+    def test_legacy_no_threading_falls_back_to_multi_tone(self, tmp_path: Path) -> None:
+        """Pre-E14 spawns render with the multi-tone colour (documented fallback)."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+        from plots import _threading_color
+
+        results = [
+            _make_result("custom-udp-10x100hz", writes_per_sec=900.0),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_comparison_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        tp_axes = [ax for ax in fig.axes if "writes/s" in (ax.get_ylabel() or "")]
+        assert tp_axes
+        bars = list(tp_axes[0].patches)
+        assert len(bars) == 1
+        expected = _threading_color("custom-udp", "multi")
+        actual = tuple(bars[0].get_facecolor())
+        # _threading_color returns RGBA tuples; matplotlib stores
+        # face colours as RGBA tuples too. Compare exactly.
+        assert tuple(round(c, 6) for c in actual) == tuple(
+            round(c, 6) for c in expected
+        ), f"legacy bar should use the multi tone; expected {expected}, got {actual}"
+        for f in captured:
+            original_close(f)
+
+    def test_mixed_legacy_and_post_e14_does_not_crash(self, tmp_path: Path) -> None:
+        """Mixing legacy + post-E14 spawns renders without exception."""
+        from plots import generate_comparison_plot
+
+        results = [
+            _make_result("custom-udp-10x100hz", writes_per_sec=50.0),  # legacy
+            _make_result("custom-udp-10x100hz-qos1-single", writes_per_sec=900.0),
+            _make_result("custom-udp-10x100hz-qos1-multi", writes_per_sec=950.0),
+            _make_result("zenoh-max-qos1-multi", writes_per_sec=480.0),
+        ]
+        paths = generate_comparison_plot(results, tmp_path)
+        # Two distinct QoS buckets: qos1 (post-E14) and qosNA (legacy).
+        names = sorted(p.name for p in paths)
+        assert names == ["comparison-qos1.png", "comparison-qosNA.png"]
+        for p in paths:
+            assert p.exists()
+            assert p.stat().st_size > 1000
+
+    def test_threading_colour_single_lighter_than_multi(self) -> None:
+        """``_threading_color`` returns a lighter single tone than multi tone.
+
+        Pins the tone-position convention from T16.13 so the legend
+        reading order (single = lighter, multi = darker) cannot
+        silently flip.
+        """
+        from plots import _threading_color
+
+        for transport in (
+            "custom-udp",
+            "hybrid",
+            "quic",
+            "zenoh",
+            "websocket",
+            "webrtc",
+        ):
+            single = _threading_color(transport, "single")
+            multi = _threading_color(transport, "multi")
+            # Sequential colormaps map a higher position to a darker
+            # colour. ``Greys`` aside, the darker colour has lower
+            # cumulative RGB. Use the simple sum of the RGB channels
+            # as a brightness proxy: single should be brighter.
+            brightness_single = sum(single[:3])
+            brightness_multi = sum(multi[:3])
+            assert brightness_single > brightness_multi, (
+                f"{transport}: expected single brighter than multi, "
+                f"got single={single}, multi={multi}"
+            )
 
 
 class TestEmpiricalCdf:
@@ -1054,13 +1252,13 @@ class TestEmpiricalCdf:
 
 
 class TestGenerateLatencyCdfPlot:
-    def test_creates_png(self, tmp_path: Path) -> None:
+    def test_creates_one_png_per_qos(self, tmp_path: Path) -> None:
+        """T16.13: CDF plot returns one Path per observed QoS."""
         from plots import generate_latency_cdf_plot
 
-        # Ten samples per result; enough to draw a visible CDF.
         results = [
             _make_result(
-                "custom-udp-10x100hz-qos1",
+                "custom-udp-10x100hz-qos1-multi",
                 latency_samples_ms=[
                     0.001,
                     0.002,
@@ -1075,7 +1273,7 @@ class TestGenerateLatencyCdfPlot:
                 ],
             ),
             _make_result(
-                "zenoh-10x100hz-qos1",
+                "zenoh-10x100hz-qos1-multi",
                 latency_samples_ms=[
                     0.5,
                     1.0,
@@ -1090,46 +1288,74 @@ class TestGenerateLatencyCdfPlot:
                 ],
             ),
         ]
-        out = generate_latency_cdf_plot(results, tmp_path / "out")
-        assert out.exists()
-        assert out.name == "latency_cdf.png"
-        assert out.stat().st_size > 1000
+        paths = generate_latency_cdf_plot(results, tmp_path / "out")
+        assert isinstance(paths, list)
+        assert len(paths) == 1
+        assert paths[0].exists()
+        assert paths[0].name == "latency-cdf-qos1.png"
+        assert paths[0].stat().st_size > 1000
 
     def test_creates_output_dir(self, tmp_path: Path) -> None:
         from plots import generate_latency_cdf_plot
 
         nested = tmp_path / "a" / "b"
-        out = generate_latency_cdf_plot(
-            [_make_result("zenoh-max-qos1", latency_samples_ms=[0.1, 0.2, 0.3])],
+        paths = generate_latency_cdf_plot(
+            [_make_result("zenoh-max-qos1-multi", latency_samples_ms=[0.1, 0.2, 0.3])],
             nested,
         )
         assert nested.is_dir()
-        assert out.exists()
+        assert paths
+        assert paths[0].exists()
 
     def test_empty_results(self, tmp_path: Path) -> None:
         from plots import generate_latency_cdf_plot
 
-        out = generate_latency_cdf_plot([], tmp_path)
-        assert out.exists()
-        assert out.name == "latency_cdf.png"
+        paths = generate_latency_cdf_plot([], tmp_path)
+        assert len(paths) == 1
+        assert paths[0].exists()
+        assert paths[0].name == "latency-cdf-qosNA.png"
 
-    def test_no_samples_renders_placeholder_per_row(self, tmp_path: Path) -> None:
-        """A QoS row with no positive samples still renders without crashing."""
+    def test_no_samples_renders_placeholder(self, tmp_path: Path) -> None:
+        """A QoS with no positive samples still renders without crashing."""
         from plots import generate_latency_cdf_plot
 
         results = [
-            _make_result("custom-udp-10x100hz-qos1", latency_samples_ms=[]),
+            _make_result("custom-udp-10x100hz-qos1-multi", latency_samples_ms=[]),
             _make_result(
-                "zenoh-10x100hz-qos1",
+                "zenoh-10x100hz-qos1-multi",
                 latency_samples_ms=[0.1, 0.2, 0.5, 1.0],
             ),
         ]
-        out = generate_latency_cdf_plot(results, tmp_path)
-        assert out.exists()
-        assert out.stat().st_size > 1000
+        paths = generate_latency_cdf_plot(results, tmp_path)
+        assert len(paths) == 1
+        assert paths[0].exists()
+        assert paths[0].stat().st_size > 1000
 
-    def test_multi_qos_rows(self, tmp_path: Path) -> None:
-        """Four QoS rows should render four subplots."""
+    def test_creates_four_pngs_for_four_qos(self, tmp_path: Path) -> None:
+        """Four QoS levels -> four ``latency-cdf-qos<N>.png`` files."""
+        from plots import generate_latency_cdf_plot
+
+        results = []
+        for q in (1, 2, 3, 4):
+            results.append(
+                _make_result(
+                    f"custom-udp-10x100hz-qos{q}-multi",
+                    latency_samples_ms=[0.001 * q, 0.01 * q, 0.1 * q, 1.0 * q],
+                )
+            )
+        paths = generate_latency_cdf_plot(results, tmp_path)
+        names = sorted(p.name for p in paths)
+        assert names == [
+            "latency-cdf-qos1.png",
+            "latency-cdf-qos2.png",
+            "latency-cdf-qos3.png",
+            "latency-cdf-qos4.png",
+        ]
+        for p in paths:
+            assert p.exists()
+
+    def test_per_file_axis_scale(self, tmp_path: Path) -> None:
+        """Each per-QoS CDF file has one axis with log-x and [0, 1] y."""
         import matplotlib.pyplot as plt
 
         import plots as plots_module
@@ -1138,7 +1364,7 @@ class TestGenerateLatencyCdfPlot:
         for q in (1, 2, 3, 4):
             results.append(
                 _make_result(
-                    f"custom-udp-10x100hz-qos{q}",
+                    f"custom-udp-10x100hz-qos{q}-multi",
                     latency_samples_ms=[0.001 * q, 0.01 * q, 0.1 * q, 1.0 * q],
                 )
             )
@@ -1156,13 +1382,50 @@ class TestGenerateLatencyCdfPlot:
         finally:
             plt.close = original_close  # type: ignore[assignment]
 
-        assert captured
-        fig = captured[-1]
-        # Four QoS rows -> four subplot axes (legend lives on fig, not ax).
-        assert len(fig.axes) == 4
-        for ax in fig.axes:
+        assert len(captured) == 4
+        for fig in captured:
+            assert len(fig.axes) == 1
+            ax = fig.axes[0]
             assert ax.get_xscale() == "log"
             ymin, ymax = ax.get_ylim()
             assert ymin == 0.0 and ymax == 1.0
+        for f in captured:
+            original_close(f)
+
+    def test_single_vs_multi_use_different_linestyles(self, tmp_path: Path) -> None:
+        """Single curves are dashed, multi/legacy curves are solid."""
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        results = [
+            _make_result(
+                "custom-udp-10x100hz-qos1-single",
+                latency_samples_ms=[0.1, 0.2, 0.5, 1.0],
+            ),
+            _make_result(
+                "custom-udp-10x100hz-qos1-multi",
+                latency_samples_ms=[0.05, 0.1, 0.3, 0.7],
+            ),
+        ]
+        original_close = plt.close
+        captured: list = []
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_latency_cdf_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+
+        assert captured
+        fig = captured[-1]
+        ax = fig.axes[0]
+        styles = {line.get_linestyle() for line in ax.lines}
+        assert "--" in styles, f"expected dashed line for single, got {styles}"
+        assert "-" in styles, f"expected solid line for multi, got {styles}"
         for f in captured:
             original_close(f)

@@ -1,26 +1,46 @@
 """Comparison bar chart generation for benchmark analysis.
 
-The figure layout for the post-E9 ``<transport>-<workload>-qos<N>``
-variant naming is **N_qos rows x 2 cols**: one row per observed QoS
-level, throughput on the left column and latency on the right column.
-Within each row the bars are the (transport, workload) combinations for
-that QoS, arranged by transport family then by workload load-intensity.
-Each transport family gets its own sequential matplotlib colormap
-(Oranges/Purples/Blues/Greens/Reds/YlOrBr) and within a family the
-workload tone tracks the load-intensity ranking. The latency y-axis is
-log-scaled so reliable sub-millisecond transports (qos3/qos4) and high-
-rate lossy transports (qos1/qos2) remain legible. Missing (transport,
-workload, qos) combinations are rendered as gaps -- not zero-height
-bars -- so a qos3-only entry does not collapse the y-axis at qos1/qos2.
+The post-E14 ``<transport>-<workload>-qos<N>-(single|multi)`` naming
+introduced a threading-mode dimension on top of the existing
+transport x workload x QoS matrix. Crammed into the previous "one
+figure with one row per QoS" layout, this expanded to ~256 bars in a
+single image and the chart became unreadable -- T16.13.
 
-Rationale for the per-QoS row layout: the previous single-row layout
-collapsed all QoS levels into x-axis groups, which became unreadable
-once 6+ transport families x 8 workloads x 4 QoS levels were drawn into
-the same two cells. Splitting QoS levels into separate rows keeps each
-cell to a single bar group, restores legibility, and still allows
-cross-family comparisons row-by-row. A single shared legend at the
-bottom of the figure carries the (transport, workload) colour key for
-every row.
+The current layout splits the chart into **N_qos PNGs**, one per
+observed QoS level. Each PNG is a 1 row x 2 cols figure: throughput
+on the left, latency on the right. Within each plot the bars are the
+(transport, workload) *slots* for that QoS, arranged by transport
+family then by workload load-intensity. Each slot holds either:
+
+* one full-width bar (``multi`` only), for natively-multi-only
+  transport families like QUIC, WebRTC, Zenoh -- they have no
+  single-threaded mode per E14, so the slot is not a paired half-and-
+  half layout (a future reader should not infer a missing ``single``
+  half from this); or
+* two paired half-width bars, ``single`` on the left and ``multi`` on
+  the right, for transports that exist in both modes.
+
+Each transport family gets its own sequential matplotlib colormap
+(Oranges/Purples/Blues/Greens/Reds/YlOrBr). Within a family the
+*threading mode* picks the colormap tone: ``single`` at 0.55 (lighter)
+and ``multi`` at 0.85 (darker). Workload distinction comes from the
+slot's x-position and tick label; it is not encoded in colour. The
+latency y-axis is log-scaled so reliable sub-millisecond transports
+(qos3/qos4) and high-rate lossy transports (qos1/qos2) remain legible.
+Missing (transport, workload, threading, qos) combinations are
+rendered as gaps -- not zero-height bars -- so a partial slot does not
+collapse the y-axis on the QoS panel.
+
+A legacy spawn (pre-E14, no threading suffix) renders as if it were
+``multi`` -- the same tone position. This is a documented best-effort
+fallback so old datasets do not crash; they just won't show a paired
+single/multi distinction.
+
+Filename convention: ``comparison-qos<N>.png`` (or
+``comparison-qos<N>-log.png`` when ``log_throughput`` is set). The
+parallel CDF generator emits ``latency-cdf-qos<N>.png``. The old
+monolithic ``comparison.png`` / ``comparison-log.png`` /
+``latency_cdf.png`` outputs are no longer produced.
 """
 
 from __future__ import annotations
@@ -73,8 +93,31 @@ _FAMILY_COLORMAPS: dict[str, str] = {
 
 # Range over which workload tones are sampled within a family colormap.
 # 0.4 keeps the lightest tone visible against white; 0.95 stops short of
-# pure black on dark colormaps.
+# pure black on dark colormaps. Kept for the legacy ``_family_palette``
+# helper, which is still exported and used by tests; the per-QoS plot
+# code uses ``_THREADING_TONES`` for its single/multi distinction.
 _TONE_RANGE: tuple[float, float] = (0.4, 0.95)
+
+# Per-threading-mode tone positions within a family colormap. The
+# ``single`` tone sits at 0.55 (a mid-light shade) and the ``multi``
+# tone at 0.85 (a near-saturated shade). Legacy spawns with no
+# threading suffix render with the ``multi`` tone -- documented
+# fallback so unknown-mode bars stay visible against the
+# transport-family colour while still being distinguishable from a
+# definite ``single`` in the same slot.
+_THREADING_TONES: dict[str | None, float] = {
+    "single": 0.55,
+    "multi": 0.85,
+    None: 0.85,
+}
+
+# Natively-multi-only transport families. Per E14 these transports do
+# not have a single-threaded mode -- their slots therefore render a
+# single full-width ``multi`` bar instead of a paired single/multi
+# layout. A legacy ``-single`` spawn for one of these (shouldn't exist
+# in any post-E14 dataset, but we don't crash on it) still renders as
+# the ``single`` half of a paired slot for visibility.
+_MULTI_ONLY_TRANSPORTS: frozenset[str] = frozenset({"quic", "webrtc", "zenoh"})
 
 # QoS suffix matcher applied to variant names (after the optional
 # threading suffix has been stripped). Post-E14 variant names end in
@@ -319,6 +362,22 @@ def _empty_plot(output_dir: Path, filename: str = "comparison.png") -> Path:
     return out_path
 
 
+def _threading_color(
+    transport: str, threading_mode: str | None
+) -> tuple[float, float, float, float]:
+    """Return the RGBA fill colour for a (transport, threading_mode) pair.
+
+    The colour is sampled from the family's sequential colormap at the
+    position fixed by ``_THREADING_TONES`` -- ``single`` at 0.55,
+    ``multi`` at 0.85. A legacy spawn with ``threading_mode=None``
+    renders at the ``multi`` tone (documented fallback).
+    """
+    cmap_name = _FAMILY_COLORMAPS.get(transport, _FAMILY_COLORMAPS["other"])
+    cmap = plt.get_cmap(cmap_name)
+    pos = _THREADING_TONES.get(threading_mode, _THREADING_TONES[None])
+    return tuple(cmap(pos))
+
+
 def empirical_cdf(samples: list[float] | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Compute the empirical CDF over ``samples``.
 
@@ -349,354 +408,430 @@ def empirical_cdf(samples: list[float] | np.ndarray) -> tuple[np.ndarray, np.nda
     return x, y
 
 
-def generate_comparison_plot(
-    results: list[PerformanceResult],
-    output_dir: Path,
-    *,
-    log_throughput: bool = False,
-) -> Path:
-    """Generate the comparison bar chart PNG.
+def _qos_filename(prefix: str, qos: int | None, *, log_throughput: bool) -> str:
+    """Build the per-QoS PNG filename.
 
-    Parameters
-    ----------
-    results:
-        Performance results to visualise.
-    output_dir:
-        Directory where the PNG will be saved (created if needed).
-    log_throughput:
-        When True, render the throughput panels on a log y-axis. Bars
-        with non-positive ``writes_per_sec`` (a spawn that produced
-        zero writes, e.g. ``websocket-max-qos4`` rows in dense runs)
-        cannot be plotted on a log axis; those entries are dropped to
-        NaN -- matching the latency-panel convention -- so the bar
-        disappears rather than being clamped to a misleading visible
-        floor. Default ``False`` keeps the existing linear scale.
+    Examples::
 
-    Returns
-    -------
-    Path to the generated ``comparison.png`` (or ``comparison-log.png``
-    when ``log_throughput=True``, so the log-scale variant does not
-    overwrite the linear-scale output in the same ``--output`` dir).
+        _qos_filename("comparison", 1, log_throughput=False) -> "comparison-qos1.png"
+        _qos_filename("comparison", 1, log_throughput=True)  -> "comparison-qos1-log.png"
+        _qos_filename("latency-cdf", 4, log_throughput=False) -> "latency-cdf-qos4.png"
+        _qos_filename("comparison", None, log_throughput=False) -> "comparison-qosNA.png"
     """
-    # Filename suffix differs by throughput scale so both flavours can
-    # coexist in the same output directory.
-    out_filename = "comparison-log.png" if log_throughput else "comparison.png"
+    qos_part = f"qos{qos}" if qos is not None else "qosNA"
+    suffix = "-log" if log_throughput else ""
+    return f"{prefix}-{qos_part}{suffix}.png"
 
-    if not results:
-        return _empty_plot(output_dir, filename=out_filename)
 
-    # Parse variant names and group results by (transport, workload, qos).
-    # Keep only the first entry per key (typical input has one
-    # PerformanceResult per (variant, run); the comparison plot collapses
-    # runs by taking the first one encountered).
-    parsed: dict[tuple[str, str, int | None], PerformanceResult] = {}
+def _index_parsed_results(
+    results: list[PerformanceResult],
+) -> dict[tuple[str, str, int | None, str | None], PerformanceResult]:
+    """Index results by ``(transport, workload, qos, threading_mode)``.
+
+    The first entry per key wins -- matches the pre-T16.13 collapse
+    rule. The four-component key keeps a single-threaded and a multi-
+    threaded spawn of the same (transport, workload, qos) as distinct
+    rows so the paired-bar layout can find both.
+    """
+    parsed: dict[tuple[str, str, int | None, str | None], PerformanceResult] = {}
     for r in results:
-        transport, workload, qos, _threading = _split_variant_name(r.variant)
-        key = (transport, workload, qos)
+        transport, workload, qos, threading_mode = _split_variant_name(r.variant)
+        key = (transport, workload, qos, threading_mode)
         parsed.setdefault(key, r)
+    return parsed
 
-    if not parsed:
-        return _empty_plot(output_dir, filename=out_filename)
 
-    # Collect distinct transports and workloads in deterministic order.
-    transports_seen = {t for t, _, _ in parsed.keys()}
+def _qos_sort_key(q: int | None) -> tuple[int, int]:
+    """Sort key that puts numeric QoS first ascending, ``None`` last."""
+    if q is None:
+        return (1, 0)
+    return (0, q)
+
+
+def _collect_layout_orders(
+    parsed_keys: list[tuple[str, str, int | None, str | None]],
+) -> tuple[list[str], list[str], list[int | None]]:
+    """Return ordered transports, workloads, and QoS levels.
+
+    Mirrors the pre-T16.13 ordering: ``TRANSPORT_FAMILIES`` order for
+    transports (with ``other`` appended if present), load-intensity
+    order for workloads, and ascending order for QoS (``None`` last).
+    """
+    transports_seen = {t for t, _, _, _ in parsed_keys}
     transport_order: list[str] = [t for t in TRANSPORT_FAMILIES if t in transports_seen]
     if "other" in transports_seen:
         transport_order.append("other")
 
-    workload_set: set[str] = {w for _, w, _ in parsed.keys()}
+    workload_set: set[str] = {w for _, w, _, _ in parsed_keys}
     workload_order: list[str] = sorted(workload_set, key=_workload_load_rank)
 
-    # QoS x-axis: every distinct QoS observed, ascending. ``None`` (no
-    # qos suffix) is plotted as a single "n/a" group so legacy single-qos
-    # runs still draw.
-    qos_values_seen: set[int | None] = {q for _, _, q in parsed.keys()}
-    qos_order: list[int | None] = sorted(
-        qos_values_seen, key=lambda q: (q is None, q if q is not None else -1)
-    )
+    qos_values_seen: set[int | None] = {q for _, _, q, _ in parsed_keys}
+    qos_order: list[int | None] = sorted(qos_values_seen, key=_qos_sort_key)
 
-    # Compute the set of unique aggregate write-rate targets present in
-    # the input. A workload named ``<vpt>x<hz>hz`` has an intended write
-    # rate of ``vpt * hz``; the ``max`` workload has no fixed target and
-    # is excluded. Drawing one horizontal reference line per unique
-    # target lets the reader see at a glance whether each bar reached
-    # its intended rate. Targets are independent of QoS, so the same
-    # set of lines is drawn on every throughput subplot.
+    return transport_order, workload_order, qos_order
+
+
+def _slot_threading_modes(
+    transport: str,
+    workload: str,
+    qos: int | None,
+    parsed: dict[tuple[str, str, int | None, str | None], PerformanceResult],
+) -> list[str | None]:
+    """Decide which threading-mode bars fill a (transport, workload, qos) slot.
+
+    Returns one mode per bar to render in the slot, ordered left to
+    right. The convention:
+
+    * Natively-multi-only transports (``quic``, ``webrtc``, ``zenoh``)
+      render a single full-width ``multi`` bar -- they have no
+      single-threaded mode per E14 and the slot is intentionally not
+      a paired half-and-half layout. If a legacy ``-single`` row
+      somehow exists for such a transport, it still gets a paired
+      slot so the data is not silently hidden.
+    * Other transports render the modes actually observed for this
+      slot. If only one of ``single``/``multi`` exists the slot stays
+      half-width with one empty half (so the bar's x-position still
+      lines up with the matching mode in sibling slots) -- this is
+      the "missing data is a gap, not a zero" convention applied to
+      the threading axis.
+    * Legacy spawns (``threading_mode=None``) get a one-bar slot
+      rendered at the ``multi`` tone (documented fallback).
+    """
+    observed = {
+        mode
+        for (t, w, q, mode) in parsed.keys()
+        if t == transport and w == workload and q == qos
+    }
+    if not observed:
+        return []
+
+    if transport in _MULTI_ONLY_TRANSPORTS:
+        # Multi-only families: render only the multi bar if it is
+        # present; otherwise fall back to whatever modes were
+        # observed (covers the pathological legacy-single case).
+        if "multi" in observed:
+            return ["multi"]
+        return sorted(observed, key=lambda m: (m != "single", m != "multi", str(m)))
+
+    # General case: order single, then multi, then None (legacy).
+    ordered: list[str | None] = []
+    for mode in ("single", "multi"):
+        if mode in observed:
+            ordered.append(mode)
+    if None in observed:
+        ordered.append(None)
+    return ordered
+
+
+def _slot_layout(
+    transport: str,
+    workload: str,
+    qos: int | None,
+    parsed: dict[tuple[str, str, int | None, str | None], PerformanceResult],
+) -> tuple[list[str | None], list[float]]:
+    """Return per-bar threading modes and their x-offsets within a slot.
+
+    The slot occupies ``[-0.5, +0.5]`` around its centre. For one-bar
+    slots the offset is ``0.0`` and the bar takes full slot width.
+    For two-bar slots single sits at ``-0.22`` and multi at ``+0.22``
+    so the two bars are visually grouped. A pathological 3-bar slot
+    (single + multi + legacy) spreads evenly across the slot.
+    """
+    modes = _slot_threading_modes(transport, workload, qos, parsed)
+    if not modes:
+        return [], []
+    if len(modes) == 1:
+        return modes, [0.0]
+    if len(modes) == 2:
+        return modes, [-0.22, 0.22]
+    # Fall back to evenly-spaced positions for 3+ bars.
+    n = len(modes)
+    step = 0.7 / n
+    start = -0.35 + 0.5 * step
+    return modes, [start + i * step for i in range(n)]
+
+
+def _bar_width_for_slot(n_bars_in_slot: int) -> float:
+    """Bar width matching the offsets produced by ``_slot_layout``."""
+    if n_bars_in_slot <= 1:
+        return 0.78
+    if n_bars_in_slot == 2:
+        return 0.40
+    return 0.55 / n_bars_in_slot
+
+
+def _collect_target_rates(
+    parsed_keys: list[tuple[str, str, int | None, str | None]],
+) -> list[int]:
+    """Compute the sorted unique ``vpt * hz`` target rates across workloads.
+
+    ``max`` and unparseable workloads contribute nothing.
+    """
     target_rates: set[int] = set()
-    for _, workload, _ in parsed.keys():
+    for _, workload, _, _ in parsed_keys:
         if workload == "max":
             continue
         m = _WORKLOAD_VPS_HZ_RE.match(workload)
         if m is None:
             continue
         target_rates.add(int(m.group(1)) * int(m.group(2)))
-    target_rate_order: list[int] = sorted(target_rates)
+    return sorted(target_rates)
 
-    # Build per-family palettes keyed by (transport, workload).
-    palettes: dict[str, dict[str, tuple[float, float, float, float]]] = {}
+
+def _bar_tier_marker(workload: str) -> str | None:
+    """Return the tier marker for a workload's intended write rate."""
+    if workload == "max":
+        return None
+    m = _WORKLOAD_VPS_HZ_RE.match(workload)
+    if m is None:
+        return None
+    target = int(m.group(1)) * int(m.group(2))
+    return _tier_marker_for_target(target)
+
+
+def _generate_comparison_plot_for_qos(
+    *,
+    qos: int | None,
+    parsed: dict[tuple[str, str, int | None, str | None], PerformanceResult],
+    transport_order: list[str],
+    workload_order: list[str],
+    target_rate_order: list[int],
+    output_dir: Path,
+    log_throughput: bool,
+) -> Path:
+    """Render the comparison chart for a single QoS level.
+
+    Slots are (transport, workload) pairs in family-block x
+    load-intensity order. Each slot holds 1-2 bars: single (lighter
+    tone) and/or multi (darker tone). Returns the path of the PNG
+    written.
+
+    Figure-width formula: ``max(14.0, 0.55 * n_slots + 4.0)``. The
+    coefficient is tuned for the post-E14 6-family x 8-workload (~48
+    slots) matrix so each slot gets roughly 30 px of x-axis space at
+    150 dpi -- wide enough to read the tick label without zooming.
+    Slots with two bars therefore get ~15 px per bar, still visibly
+    distinct.
+    """
+    out_filename = _qos_filename("comparison", qos, log_throughput=log_throughput)
+    qos_label = f"qos{qos}" if qos is not None else "n/a"
+
+    # Slots in family-block x load-intensity order. Drop slots that
+    # have no observation for this QoS at all (saves x-axis width on
+    # sparse QoS levels).
+    slots: list[tuple[str, str]] = []
+    slot_layouts: list[tuple[list[str | None], list[float]]] = []
     for t in transport_order:
-        palettes[t] = _family_palette(t, workload_order)
+        for w in workload_order:
+            modes, offsets = _slot_layout(t, w, qos, parsed)
+            if modes:
+                slots.append((t, w))
+                slot_layouts.append((modes, offsets))
 
-    # Order the (transport, workload) pairs that will become bars within
-    # each QoS group: family blocks (preserving ``transport_order``) of
-    # workloads (preserving ``workload_order``).
-    bar_keys: list[tuple[str, str]] = [
-        (t, w) for t in transport_order for w in workload_order
-    ]
-    n_bars = len(bar_keys)
-    n_qos_groups = len(qos_order)
-
-    if n_bars == 0 or n_qos_groups == 0:
+    if not slots:
         return _empty_plot(output_dir, filename=out_filename)
 
-    # Bar width / x-positions. Each row plots the same set of
-    # (transport, workload) bars for a single QoS, so the x-axis carries
-    # the bar keys themselves rather than QoS groups. Bars are evenly
-    # spaced at integer x positions.
-    x = np.arange(n_bars)
-    bar_width = 0.85
+    n_slots = len(slots)
+    x_centres = np.arange(n_slots, dtype=float)
 
-    # Figure sizing: width tracks the per-row bar count; height grows
-    # with the number of QoS rows so dense charts do not squish.
-    fig_width = max(14.0, 0.45 * n_bars + 4.0)
-    per_row_height = 3.5
-    legend_band_height = 1.5
-    fig_height = per_row_height * n_qos_groups + legend_band_height
-    fig, axes = plt.subplots(
-        n_qos_groups,
-        2,
-        figsize=(fig_width, fig_height),
-        squeeze=False,
+    # Figure size: width grows with slot count (see docstring); height
+    # is a single row plus a legend band.
+    fig_width = max(14.0, 0.55 * n_slots + 4.0)
+    row_height = 4.0
+    legend_band_height = 1.4
+    fig_height = row_height + legend_band_height
+    fig, axes = plt.subplots(1, 2, figsize=(fig_width, fig_height), squeeze=False)
+    ax_tp = axes[0][0]
+    ax_lat = axes[0][1]
+
+    # Per-bar data. Build flat lists of (x_pos, color, value, marker)
+    # so we can pass everything to ax.bar in one shot per axis.
+    tp_x: list[float] = []
+    tp_y: list[float] = []
+    tp_colors: list[tuple[float, float, float, float]] = []
+    tp_markers: list[tuple[float, float, str]] = []
+    lat_x: list[float] = []
+    lat_y: list[float] = []
+    lat_colors: list[tuple[float, float, float, float]] = []
+    lat_yerr_lower: list[float] = []
+    lat_yerr_upper: list[float] = []
+    bar_widths_tp: list[float] = []
+    bar_widths_lat: list[float] = []
+
+    for (transport, workload), (modes, offsets) in zip(slots, slot_layouts):
+        bar_w = _bar_width_for_slot(len(modes))
+        slot_idx = slots.index((transport, workload))
+        slot_centre = x_centres[slot_idx]
+        marker = _bar_tier_marker(workload)
+        for mode, off in zip(modes, offsets):
+            bar_x = slot_centre + off
+            color = _threading_color(transport, mode)
+            r = parsed.get((transport, workload, qos, mode))
+            # Throughput
+            if r is None:
+                tp_val = float("nan")
+            else:
+                tp_val = float(r.writes_per_sec)
+            if log_throughput and (np.isnan(tp_val) or tp_val <= 0.0):
+                tp_val = float("nan")
+            tp_x.append(bar_x)
+            tp_y.append(tp_val)
+            tp_colors.append(color)
+            bar_widths_tp.append(bar_w)
+            if marker is not None:
+                tp_markers.append((bar_x, tp_val, marker))
+            # Latency
+            if r is None:
+                p50 = p95 = p99 = float("nan")
+            else:
+                p50 = float(r.latency_p50_ms)
+                p95 = float(r.latency_p95_ms)
+                p99 = float(r.latency_p99_ms)
+            if np.isnan(p95) or p95 <= 0.0:
+                lat_val = float("nan")
+                lower = upper = 0.0
+            else:
+                safe_p95 = max(p95, _LATENCY_EPSILON_MS)
+                safe_p50 = max(p50, _LATENCY_EPSILON_MS)
+                lat_val = safe_p95
+                lower = max(safe_p95 - safe_p50, 0.0)
+                upper = max(p99 - safe_p95, 0.0)
+            lat_x.append(bar_x)
+            lat_y.append(lat_val)
+            lat_colors.append(color)
+            lat_yerr_lower.append(lower)
+            lat_yerr_upper.append(upper)
+            bar_widths_lat.append(bar_w)
+
+    ax_tp.bar(
+        tp_x,
+        tp_y,
+        bar_widths_tp,
+        color=tp_colors,
+        edgecolor="black",
+        linewidth=0.3,
+    )
+    ax_lat.bar(
+        lat_x,
+        lat_y,
+        bar_widths_lat,
+        color=lat_colors,
+        edgecolor="black",
+        linewidth=0.3,
+        yerr=[lat_yerr_lower, lat_yerr_upper],
+        capsize=2,
+        ecolor="black",
+        error_kw={"linewidth": 0.6},
     )
 
-    # Track legend handles in (transport, workload) order so the shared
-    # legend reads in the same family/load-intensity order as the bars.
-    # Build the handles once -- they do not depend on the QoS row.
+    # x-axis: slot centres carry the tick labels.
+    slot_tick_labels = [w if w else t for t, w in slots]
+    for ax in (ax_tp, ax_lat):
+        ax.set_xticks(x_centres)
+        ax.set_xticklabels(slot_tick_labels, rotation=45, ha="right", fontsize=7)
+
+    # Throughput axis cosmetics.
+    ax_tp.set_ylabel(f"{qos_label} - writes/s")
+    ax_tp.set_title(f"{qos_label} - Throughput (writes/s)")
+    if log_throughput:
+        ax_tp.set_yscale("log")
+        ax_tp.yaxis.grid(True, which="both", linestyle="--", alpha=0.5)
+    else:
+        ax_tp.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax_tp.set_axisbelow(True)
+
+    # Horizontal target-rate reference lines on the throughput panel.
+    right_x = ax_tp.get_xlim()[1]
+    for target in target_rate_order:
+        ax_tp.axhline(
+            y=target,
+            color="grey",
+            linestyle="--",
+            linewidth=0.8,
+            alpha=0.6,
+            zorder=1,
+        )
+        ax_tp.text(
+            x=right_x,
+            y=target,
+            s=_format_target_rate_label(target),
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            color="grey",
+            alpha=0.8,
+        )
+
+    # Per-bar tier markers on the throughput axis. Placement convention
+    # matches the legacy multi-row layout: multiplicative offset on log
+    # axes, fractional linear offset otherwise. NaN log-axis bars are
+    # skipped (no valid y position); NaN linear bars anchor the marker
+    # just above the x-axis so the target tier stays legible.
+    is_log_tp = ax_tp.get_yscale() == "log"
+    if not is_log_tp:
+        linear_offset = 0.02 * ax_tp.get_ylim()[1]
+    else:
+        linear_offset = 0.0
+    for bar_x, bar_height, marker in tp_markers:
+        if is_log_tp:
+            if np.isnan(bar_height) or bar_height <= 0.0:
+                continue
+            y_pos = bar_height * 1.15
+        else:
+            if np.isnan(bar_height):
+                y_pos = linear_offset
+            else:
+                y_pos = bar_height + linear_offset
+        ax_tp.text(
+            bar_x,
+            y_pos,
+            marker,
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            color="dimgrey",
+            alpha=0.85,
+        )
+
+    # Latency axis cosmetics. Log scale exposes both reliable sub-ms
+    # and lossy tens-of-ms regimes simultaneously.
+    ax_lat.set_ylabel(f"{qos_label} - latency (ms, log scale)")
+    ax_lat.set_title(f"{qos_label} - Latency p95 with p50/p99 whiskers")
+    ax_lat.set_yscale("log")
+    ax_lat.yaxis.grid(True, which="both", linestyle="--", alpha=0.5)
+    ax_lat.set_axisbelow(True)
+
+    # Legend: one entry per (transport, threading_mode) actually used
+    # on this QoS. Reads in family order, single before multi.
     legend_handles: list[matplotlib.patches.Patch] = []
-    bar_colors: list[tuple[float, float, float, float]] = []
-    for transport, workload in bar_keys:
-        color = palettes[transport][workload]
-        bar_colors.append(color)
-        legend_handles.append(
-            matplotlib.patches.Patch(
-                facecolor=color,
-                edgecolor="black",
-                linewidth=0.3,
-                label=f"{transport} / {workload}" if workload else transport,
-            )
-        )
-
-    # Short tick labels per bar -- workload (or transport name when the
-    # workload string is empty). The colour-coded legend carries the
-    # transport family, so the per-bar tick label can stay compact.
-    bar_tick_labels: list[str] = [w if w else t for t, w in bar_keys]
-
-    # Per-bar tier marker (``*`` / ``**`` / ``***`` / ...). The marker
-    # depends only on the workload's intended write rate (``vpt * hz``),
-    # which is identical across QoS rows, so compute it once here and
-    # reuse for every row. ``max`` workloads and unparseable workloads
-    # yield ``None`` -> no annotation is drawn for that bar.
-    bar_tier_markers: list[str | None] = []
-    for _, workload in bar_keys:
-        if workload == "max":
-            bar_tier_markers.append(None)
-            continue
-        m = _WORKLOAD_VPS_HZ_RE.match(workload)
-        if m is None:
-            bar_tier_markers.append(None)
-            continue
-        target = int(m.group(1)) * int(m.group(2))
-        bar_tier_markers.append(_tier_marker_for_target(target))
-
-    for row_idx, q in enumerate(qos_order):
-        ax_tp = axes[row_idx][0]
-        ax_lat = axes[row_idx][1]
-        qos_label = f"qos{q}" if q is not None else "n/a"
-
-        throughputs: list[float] = []
-        p50_vals: list[float] = []
-        p95_vals: list[float] = []
-        p99_vals: list[float] = []
-        for transport, workload in bar_keys:
-            r = parsed.get((transport, workload, q))
-            if r is None:
-                throughputs.append(float("nan"))
-                p50_vals.append(float("nan"))
-                p95_vals.append(float("nan"))
-                p99_vals.append(float("nan"))
-            else:
-                throughputs.append(float(r.writes_per_sec))
-                p50_vals.append(float(r.latency_p50_ms))
-                p95_vals.append(float(r.latency_p95_ms))
-                p99_vals.append(float(r.latency_p99_ms))
-
-        # Under log scale a non-positive throughput cannot render; drop
-        # those bars to NaN so the bar disappears rather than being
-        # clamped to a visible "1" floor. This mirrors the latency-panel
-        # treatment of non-positive percentiles below.
-        if log_throughput:
-            throughputs = [
-                t if (not np.isnan(t) and t > 0.0) else float("nan")
-                for t in throughputs
-            ]
-
-        ax_tp.bar(
-            x,
-            throughputs,
-            bar_width,
-            color=bar_colors,
-            edgecolor="black",
-            linewidth=0.3,
-        )
-
-        # Latency bars use p95 with whiskers from p50 (lower) to p99
-        # (upper). Under log scale the lower whisker must be strictly
-        # positive, so the epsilon floor only protects against
-        # log-axis warnings -- a percentile <= 0 (clock-noise artifact)
-        # is dropped to NaN so the bar disappears rather than visually
-        # implying a measurement near the floor.
-        bar_p95: list[float] = []
-        yerr_lower: list[float] = []
-        yerr_upper: list[float] = []
-        for p50, p95, p99 in zip(p50_vals, p95_vals, p99_vals):
-            if np.isnan(p95) or p95 <= 0.0:
-                bar_p95.append(float("nan"))
-                yerr_lower.append(0.0)
-                yerr_upper.append(0.0)
+    seen_legend_keys: set[tuple[str, str | None]] = set()
+    for transport in transport_order:
+        for mode in ("single", "multi", None):
+            key = (transport, mode)
+            if key in seen_legend_keys:
                 continue
-            # p95 is strictly positive -- clamp only protects log-scale
-            # rendering against any tiny float underflow on the lower
-            # whisker arithmetic.
-            safe_p95 = max(p95, _LATENCY_EPSILON_MS)
-            bar_p95.append(safe_p95)
-            # ``p50`` may legitimately be <= 0 even when p95 > 0 (e.g.
-            # half the rows have clock-skew artifacts). Floor the
-            # subtraction at the epsilon so the lower whisker stays in
-            # log-positive space without hiding the bar.
-            safe_p50 = max(p50, _LATENCY_EPSILON_MS)
-            lower = max(safe_p95 - safe_p50, 0.0)
-            upper = max(p99 - safe_p95, 0.0)
-            yerr_lower.append(lower)
-            yerr_upper.append(upper)
-
-        ax_lat.bar(
-            x,
-            bar_p95,
-            bar_width,
-            color=bar_colors,
-            edgecolor="black",
-            linewidth=0.3,
-            yerr=[yerr_lower, yerr_upper],
-            capsize=2,
-            ecolor="black",
-            error_kw={"linewidth": 0.6},
-        )
-
-        # Throughput axis cosmetics. Optional log scale (opt-in via
-        # ``log_throughput``) brings high-rate transports (~400k
-        # writes/s) onto the same panel as low-rate transports (~10k
-        # writes/s) without the slow bars collapsing to near-zero.
-        ax_tp.set_ylabel(f"{qos_label} - writes/s")
-        ax_tp.set_title(f"{qos_label} - Throughput (writes/s)")
-        ax_tp.set_xticks(x)
-        ax_tp.set_xticklabels(bar_tick_labels, rotation=45, ha="right", fontsize=7)
-        if log_throughput:
-            ax_tp.set_yscale("log")
-            ax_tp.yaxis.grid(True, which="both", linestyle="--", alpha=0.5)
-        else:
-            ax_tp.yaxis.grid(True, linestyle="--", alpha=0.5)
-        ax_tp.set_axisbelow(True)
-
-        # Draw horizontal target-rate reference lines. One line per
-        # unique ``vpt * hz`` target observed across all workloads in
-        # the input (``max`` excluded). The bars use the default
-        # ``zorder=2``; lines at ``zorder=1`` therefore sit behind
-        # them. A short SI label at the right edge of the plot, just
-        # above the line, identifies each target. On the log-scale
-        # chart the standard 1 K / 10 K / 100 K / 1 M targets land on
-        # clean log decades so the labels sit at natural gridlines.
-        right_x = ax_tp.get_xlim()[1]
-        for target in target_rate_order:
-            ax_tp.axhline(
-                y=target,
-                color="grey",
-                linestyle="--",
-                linewidth=0.8,
-                alpha=0.6,
-                zorder=1,
+            # Only add if any slot of this transport actually rendered
+            # this mode for this QoS.
+            present = any(
+                t == transport and mode in modes
+                for (t, _w), (modes, _off) in zip(slots, slot_layouts)
             )
-            ax_tp.text(
-                x=right_x,
-                y=target,
-                s=_format_target_rate_label(target),
-                ha="right",
-                va="bottom",
-                fontsize=8,
-                color="grey",
-                alpha=0.8,
-            )
-
-        # Per-bar tier markers. Each bar gets a ``*`` / ``**`` / ``***``
-        # annotation just above its top, identifying which target line
-        # the bar's workload was aiming at. ``max`` workloads (and any
-        # workload with no parseable target) get no marker. Placement
-        # depends on the scale: a multiplicative offset for log-scale
-        # axes keeps the visible gap above the bar roughly constant,
-        # while a small fraction of the linear panel height does the
-        # same on linear-scale axes. NaN bars on log scale have no
-        # valid y position and are skipped entirely; NaN bars on
-        # linear scale still get a marker just above the x-axis so the
-        # reader can see which target the column was meant to hit.
-        is_log_tp = ax_tp.get_yscale() == "log"
-        if not is_log_tp:
-            linear_offset = 0.02 * ax_tp.get_ylim()[1]
-        else:
-            linear_offset = 0.0  # unused on log scale
-        for bar_x, bar_height, marker in zip(x, throughputs, bar_tier_markers):
-            if marker is None:
+            if not present:
                 continue
-            if is_log_tp:
-                if np.isnan(bar_height) or bar_height <= 0.0:
-                    # No valid y position on a log axis -- skip rather
-                    # than render at an arbitrary floor.
-                    continue
-                y_pos = bar_height * 1.15
-            else:
-                if np.isnan(bar_height):
-                    # NaN bar on linear scale: anchor the marker just
-                    # above the x-axis so the target tier is still
-                    # legible for columns like a zero-write spawn.
-                    y_pos = linear_offset
-                else:
-                    y_pos = bar_height + linear_offset
-            ax_tp.text(
-                bar_x,
-                y_pos,
-                marker,
-                ha="center",
-                va="bottom",
-                fontsize=7,
-                color="dimgrey",
-                alpha=0.85,
+            color = _threading_color(transport, mode)
+            label_mode = mode if mode is not None else "legacy"
+            legend_handles.append(
+                matplotlib.patches.Patch(
+                    facecolor=color,
+                    edgecolor="black",
+                    linewidth=0.3,
+                    label=f"{transport} / {label_mode}",
+                )
             )
+            seen_legend_keys.add(key)
 
-        # Latency axis cosmetics. Log scale exposes both reliable sub-ms
-        # and lossy tens-of-ms regimes simultaneously.
-        ax_lat.set_ylabel(f"{qos_label} - latency (ms, log scale)")
-        ax_lat.set_title(f"{qos_label} - Latency p95 with p50/p99 whiskers")
-        ax_lat.set_xticks(x)
-        ax_lat.set_xticklabels(bar_tick_labels, rotation=45, ha="right", fontsize=7)
-        ax_lat.set_yscale("log")
-        ax_lat.yaxis.grid(True, which="both", linestyle="--", alpha=0.5)
-        ax_lat.set_axisbelow(True)
-
-    # Single shared legend below all rows. ``ncol`` is chosen so the
-    # legend has a roughly square footprint relative to the bar count.
-    legend_ncol = max(4, min(8, (n_bars + 3) // 4))
+    legend_ncol = max(3, min(6, (len(legend_handles) + 2) // 3))
     legend_rows = (len(legend_handles) + legend_ncol - 1) // legend_ncol
-    # Reserve a band along the bottom of the figure for the legend. The
-    # band's relative height shrinks as the figure grows taller (more
-    # QoS rows) but is bounded so it never collapses to nothing.
     row_height_in = 0.22
     legend_band_in = max(0.6, 0.4 + row_height_in * legend_rows)
     bottom_reserve = min(0.4, legend_band_in / fig_height)
@@ -707,184 +842,188 @@ def generate_comparison_plot(
         ncol=legend_ncol,
         frameon=True,
         fontsize=8,
-        title="Transport / workload",
+        title="Transport / threading",
         title_fontsize=9,
     )
 
-    # Top reserve is a constant slice of the figure -- enough for the
-    # first row's title -- and ``hspace`` keeps the inter-row titles
-    # from overlapping the row above.
     top_reserve = max(0.6, fig_height - 0.4) / fig_height
     fig.subplots_adjust(
         bottom=bottom_reserve,
         top=top_reserve,
         left=0.07,
         right=0.98,
-        hspace=0.6,
         wspace=0.18,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / out_filename
-    # ``bbox_inches="tight"`` would clip the carefully reserved bottom
-    # band, so save at the figure size we computed.
     fig.savefig(str(out_path), dpi=150)
     plt.close(fig)
-
     return out_path
 
 
-def generate_latency_cdf_plot(
-    results: list[PerformanceResult], output_dir: Path
-) -> Path:
-    """Generate a per-QoS latency CDF chart PNG.
+def generate_comparison_plot(
+    results: list[PerformanceResult],
+    output_dir: Path,
+    *,
+    log_throughput: bool = False,
+) -> list[Path]:
+    """Generate one comparison bar chart PNG per observed QoS level.
 
-    One subplot per observed QoS row, one CDF line per
-    ``(transport, workload)`` combo. ``x`` axis is latency in ms on a
-    log scale; ``y`` axis is the empirical CDF in ``[0, 1]``. The
-    family colormap / tone scheme matches ``generate_comparison_plot``
-    so a viewer can correlate distribution shape with the percentile
-    bars in the comparison chart.
-
-    Source: ``PerformanceResult.latency_samples_ms`` -- a downsampled
-    per-message latency vector (cap ``LATENCY_SAMPLE_CAP`` per result;
-    see ``performance.py``). Results with no samples for a given QoS
-    contribute no line; empty rows are skipped entirely.
+    Replaces the pre-T16.13 monolithic single-PNG output. Each PNG
+    covers exactly one QoS level and pairs ``single``/``multi`` bars
+    per (transport, workload) slot. See the module docstring for the
+    full layout description.
 
     Parameters
     ----------
     results:
         Performance results to visualise.
     output_dir:
-        Directory where the PNG will be saved (created if needed).
+        Directory where the PNGs will be saved (created if needed).
+    log_throughput:
+        When True, render the throughput panels on a log y-axis. Bars
+        with non-positive ``writes_per_sec`` are dropped to NaN
+        (matching the latency-panel convention) so the bar disappears
+        rather than being clamped to a misleading visible floor. The
+        per-QoS filenames carry an extra ``-log`` suffix so the
+        log-scale outputs do not overwrite the linear-scale outputs
+        in the same ``--output`` dir.
 
     Returns
     -------
-    Path to the generated ``latency_cdf.png``.
+    List of paths to the generated PNGs, one per observed QoS, in
+    ascending QoS order (``None`` last for legacy spawns). When
+    ``results`` is empty a single placeholder PNG is generated and
+    returned in a one-element list so callers (and the CLI status
+    print) keep working.
     """
     if not results:
-        return _empty_plot(output_dir, filename="latency_cdf.png")
+        out_filename = _qos_filename("comparison", None, log_throughput=log_throughput)
+        return [_empty_plot(output_dir, filename=out_filename)]
 
-    # Index results by (transport, workload, qos), keeping the first
-    # entry per key (matches the comparison plot's collapse rule).
-    parsed: dict[tuple[str, str, int | None], PerformanceResult] = {}
-    for r in results:
-        transport, workload, qos, _threading = _split_variant_name(r.variant)
-        key = (transport, workload, qos)
-        parsed.setdefault(key, r)
-
+    parsed = _index_parsed_results(results)
     if not parsed:
-        return _empty_plot(output_dir, filename="latency_cdf.png")
+        out_filename = _qos_filename("comparison", None, log_throughput=log_throughput)
+        return [_empty_plot(output_dir, filename=out_filename)]
 
-    # Distinct transports, workloads, qos values (deterministic order
-    # mirroring the bar chart so the colour key is consistent).
-    transports_seen = {t for t, _, _ in parsed.keys()}
-    transport_order: list[str] = [t for t in TRANSPORT_FAMILIES if t in transports_seen]
-    if "other" in transports_seen:
-        transport_order.append("other")
+    parsed_keys = list(parsed.keys())
+    transport_order, workload_order, qos_order = _collect_layout_orders(parsed_keys)
+    target_rate_order = _collect_target_rates(parsed_keys)
 
-    workload_set: set[str] = {w for _, w, _ in parsed.keys()}
-    workload_order: list[str] = sorted(workload_set, key=_workload_load_rank)
+    if not transport_order or not workload_order or not qos_order:
+        out_filename = _qos_filename("comparison", None, log_throughput=log_throughput)
+        return [_empty_plot(output_dir, filename=out_filename)]
 
-    qos_values_seen: set[int | None] = {q for _, _, q in parsed.keys()}
-    qos_order: list[int | None] = sorted(
-        qos_values_seen, key=lambda q: (q is None, q if q is not None else -1)
-    )
+    paths: list[Path] = []
+    for q in qos_order:
+        out_path = _generate_comparison_plot_for_qos(
+            qos=q,
+            parsed=parsed,
+            transport_order=transport_order,
+            workload_order=workload_order,
+            target_rate_order=target_rate_order,
+            output_dir=output_dir,
+            log_throughput=log_throughput,
+        )
+        paths.append(out_path)
+    return paths
 
-    palettes: dict[str, dict[str, tuple[float, float, float, float]]] = {}
-    for t in transport_order:
-        palettes[t] = _family_palette(t, workload_order)
 
-    line_keys: list[tuple[str, str]] = [
-        (t, w) for t in transport_order for w in workload_order
-    ]
-    n_qos_groups = len(qos_order)
-    if not line_keys or n_qos_groups == 0:
-        return _empty_plot(output_dir, filename="latency_cdf.png")
+def _generate_latency_cdf_plot_for_qos(
+    *,
+    qos: int | None,
+    parsed: dict[tuple[str, str, int | None, str | None], PerformanceResult],
+    transport_order: list[str],
+    workload_order: list[str],
+    output_dir: Path,
+) -> Path:
+    """Render the latency-CDF chart for a single QoS level.
 
-    # Figure layout: one row per QoS, single column. Width comfortably
-    # fits the legend on the right; height grows with QoS rows.
+    One line per (transport, workload, threading_mode) observed for
+    this QoS. Line colour uses the same transport-family-tone scheme
+    as the comparison plot; line *style* additionally encodes the
+    threading mode (solid for ``multi``/legacy, dashed for ``single``)
+    so single and multi curves for the same (transport, workload) are
+    distinguishable without doubling the palette.
+    """
+    out_filename = _qos_filename("latency-cdf", qos, log_throughput=False)
+    qos_label = f"qos{qos}" if qos is not None else "n/a"
+
     fig_width = 14.0
-    per_row_height = 3.5
+    plot_height = 5.5
     legend_band_height = 1.5
-    fig_height = per_row_height * n_qos_groups + legend_band_height
-    fig, axes = plt.subplots(
-        n_qos_groups,
-        1,
-        figsize=(fig_width, fig_height),
-        squeeze=False,
-    )
+    fig_height = plot_height + legend_band_height
+    fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
 
-    # Build legend handles in the same order as the bars in the
-    # comparison chart so the two figures share a colour key.
     legend_handles: list[matplotlib.lines.Line2D] = []
-    for transport, workload in line_keys:
-        color = palettes[transport][workload]
-        legend_handles.append(
-            matplotlib.lines.Line2D(
-                [],
-                [],
-                color=color,
-                linewidth=1.4,
-                label=f"{transport} / {workload}" if workload else transport,
-            )
+    plotted_any = False
+    for transport in transport_order:
+        for workload in workload_order:
+            for mode in ("single", "multi", None):
+                r = parsed.get((transport, workload, qos, mode))
+                if r is None:
+                    continue
+                samples = r.latency_samples_ms
+                if not samples:
+                    continue
+                x, y = empirical_cdf(samples)
+                if x.size == 0:
+                    continue
+                color = _threading_color(transport, mode)
+                linestyle = "--" if mode == "single" else "-"
+                ax.plot(x, y, color=color, linewidth=1.4, linestyle=linestyle)
+                plotted_any = True
+                label_mode = mode if mode is not None else "legacy"
+                wl = workload if workload else "-"
+                legend_handles.append(
+                    matplotlib.lines.Line2D(
+                        [],
+                        [],
+                        color=color,
+                        linewidth=1.4,
+                        linestyle=linestyle,
+                        label=f"{transport} / {wl} / {label_mode}",
+                    )
+                )
+
+    ax.set_xscale("log")
+    ax.set_xlabel("latency (ms, log scale)")
+    ax.set_ylabel(f"{qos_label} - empirical CDF")
+    ax.set_title(f"{qos_label} - Latency CDF")
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(True, which="both", linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
+    if not plotted_any:
+        ax.text(
+            0.5,
+            0.5,
+            f"no positive latency samples for {qos_label}",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=10,
+            alpha=0.6,
         )
 
-    for row_idx, q in enumerate(qos_order):
-        ax = axes[row_idx][0]
-        qos_label = f"qos{q}" if q is not None else "n/a"
-
-        plotted_any = False
-        for transport, workload in line_keys:
-            r = parsed.get((transport, workload, q))
-            if r is None:
-                continue
-            samples = r.latency_samples_ms
-            if not samples:
-                continue
-            x, y = empirical_cdf(samples)
-            if x.size == 0:
-                continue
-            color = palettes[transport][workload]
-            ax.plot(x, y, color=color, linewidth=1.4)
-            plotted_any = True
-
-        ax.set_xscale("log")
-        ax.set_xlabel("latency (ms, log scale)")
-        ax.set_ylabel(f"{qos_label} - empirical CDF")
-        ax.set_title(f"{qos_label} - Latency CDF")
-        ax.set_ylim(0.0, 1.0)
-        ax.grid(True, which="both", linestyle="--", alpha=0.5)
-        ax.set_axisbelow(True)
-        if not plotted_any:
-            # Annotate empty rows so the viewer knows the QoS is
-            # absent rather than the data being clipped off-axis.
-            ax.text(
-                0.5,
-                0.5,
-                f"no positive latency samples for {qos_label}",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-                fontsize=10,
-                alpha=0.6,
-            )
-
-    legend_ncol = max(4, min(8, (len(legend_handles) + 3) // 4))
-    legend_rows = (len(legend_handles) + legend_ncol - 1) // legend_ncol
-    row_height_in = 0.22
-    legend_band_in = max(0.6, 0.4 + row_height_in * legend_rows)
-    bottom_reserve = min(0.4, legend_band_in / fig_height)
-    fig.legend(
-        handles=legend_handles,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.005),
-        ncol=legend_ncol,
-        frameon=True,
-        fontsize=8,
-        title="Transport / workload",
-        title_fontsize=9,
-    )
+    if legend_handles:
+        legend_ncol = max(3, min(6, (len(legend_handles) + 2) // 3))
+        legend_rows = (len(legend_handles) + legend_ncol - 1) // legend_ncol
+        row_height_in = 0.22
+        legend_band_in = max(0.6, 0.4 + row_height_in * legend_rows)
+        bottom_reserve = min(0.4, legend_band_in / fig_height)
+        fig.legend(
+            handles=legend_handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.005),
+            ncol=legend_ncol,
+            frameon=True,
+            fontsize=8,
+            title="Transport / workload / threading",
+            title_fontsize=9,
+        )
+    else:
+        bottom_reserve = 0.1
 
     top_reserve = max(0.6, fig_height - 0.4) / fig_height
     fig.subplots_adjust(
@@ -892,12 +1031,62 @@ def generate_latency_cdf_plot(
         top=top_reserve,
         left=0.07,
         right=0.98,
-        hspace=0.6,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / "latency_cdf.png"
+    out_path = output_dir / out_filename
     fig.savefig(str(out_path), dpi=150)
     plt.close(fig)
-
     return out_path
+
+
+def generate_latency_cdf_plot(
+    results: list[PerformanceResult], output_dir: Path
+) -> list[Path]:
+    """Generate one latency-CDF PNG per observed QoS level.
+
+    Mirror of ``generate_comparison_plot`` for the CDF chart family.
+    Each PNG covers exactly one QoS level and carries one CDF line
+    per (transport, workload, threading_mode) actually observed for
+    that QoS. Threading mode is encoded in line style (solid =
+    multi/legacy, dashed = single); the family colormap / tone scheme
+    matches the comparison plot so a viewer can correlate distribution
+    shape with the percentile bars across the eight files.
+
+    Source: ``PerformanceResult.latency_samples_ms`` -- a downsampled
+    per-message latency vector (cap ``LATENCY_SAMPLE_CAP`` per result;
+    see ``performance.py``). Spawns with no samples for a given QoS
+    contribute no line; an entire empty QoS produces a placeholder
+    annotation rather than crashing.
+
+    Returns
+    -------
+    List of paths to the generated PNGs, one per observed QoS, in
+    ascending QoS order (``None`` last for legacy spawns).
+    """
+    if not results:
+        out_filename = _qos_filename("latency-cdf", None, log_throughput=False)
+        return [_empty_plot(output_dir, filename=out_filename)]
+
+    parsed = _index_parsed_results(results)
+    if not parsed:
+        out_filename = _qos_filename("latency-cdf", None, log_throughput=False)
+        return [_empty_plot(output_dir, filename=out_filename)]
+
+    parsed_keys = list(parsed.keys())
+    transport_order, workload_order, qos_order = _collect_layout_orders(parsed_keys)
+    if not transport_order or not workload_order or not qos_order:
+        out_filename = _qos_filename("latency-cdf", None, log_throughput=False)
+        return [_empty_plot(output_dir, filename=out_filename)]
+
+    paths: list[Path] = []
+    for q in qos_order:
+        out_path = _generate_latency_cdf_plot_for_qos(
+            qos=q,
+            parsed=parsed,
+            transport_order=transport_order,
+            workload_order=workload_order,
+            output_dir=output_dir,
+        )
+        paths.append(out_path)
+    return paths
