@@ -164,14 +164,84 @@ class TestDumpFlag:
         body = (clean_out / "summary_warnings.md").read_text(encoding="utf-8")
         assert "No incomplete samples." in body
 
-    def test_no_dump_flag_writes_no_dump_files(
+    def test_summary_diagrams_embeds_per_qos_images(
         self, tmp_logs: Path, tmp_path: Path
     ) -> None:
-        """Without ``--dump`` the dump files must not be created."""
+        """T16.13: ``--summary --diagrams`` embeds per-QoS PNG links.
+
+        ``summary_performance.md`` must reference each generated
+        ``comparison-qos<N>.png`` and ``latency-cdf-qos<N>.png`` under
+        per-QoS markdown headers so the operator gets a one-file
+        walkthrough.
+        """
+        out_dir = tmp_path / "out"
+        rc = main(
+            [
+                str(tmp_logs),
+                "--summary",
+                "--diagrams",
+                "--output",
+                str(out_dir),
+            ]
+        )
+        assert rc == 0
+        summary = (out_dir / "summary_performance.md").read_text(encoding="utf-8")
+        # The conftest fixture exercises a single QoS level (qos1
+        # via the default test-variant); confirm both image kinds
+        # show up under a per-QoS header.
+        comparison_pngs = sorted((out_dir).glob("comparison-qos*.png"))
+        cdf_pngs = sorted((out_dir).glob("latency-cdf-qos*.png"))
+        assert comparison_pngs, "no comparison PNGs generated"
+        assert cdf_pngs, "no latency-cdf PNGs generated"
+        for p in comparison_pngs:
+            assert f"![]({p.name})" in summary, (
+                f"summary_performance.md missing embed for {p.name}"
+            )
+        for p in cdf_pngs:
+            assert f"![]({p.name})" in summary, (
+                f"summary_performance.md missing embed for {p.name}"
+            )
+        # Per-QoS markdown header convention.
+        assert "## QoS" in summary or "## Legacy spawns" in summary, (
+            "summary_performance.md missing per-QoS markdown header"
+        )
+        # Comparison + CDF for the same QoS must group under a single
+        # header (one ``## QoS <N>`` per observed QoS, not one per
+        # image-kind per QoS).
+        qos_ranks_in_files: set[str] = set()
+        for p in (*comparison_pngs, *cdf_pngs):
+            import re as _re
+
+            m = _re.search(r"-qos(\d+)", p.name)
+            if m:
+                qos_ranks_in_files.add(m.group(1))
+        for rank in qos_ranks_in_files:
+            header = f"## QoS {rank} - throughput, latency, CDF"
+            assert summary.count(header) == 1, (
+                f"expected one header '{header}' grouping comparison+CDF, "
+                f"saw {summary.count(header)}"
+            )
+
+    def test_no_dump_flag_writes_only_performance_md(
+        self, tmp_logs: Path, tmp_path: Path
+    ) -> None:
+        """Without ``--dump`` only the performance md is created.
+
+        T16.13: ``summary_performance.md`` is always emitted when the
+        summary computation runs (regardless of ``--dump``) so the
+        per-QoS image embeds requested by ``--summary --diagrams``
+        have a host file. The rest of the dump files still require
+        ``--dump`` explicitly.
+        """
         out_dir = tmp_path / "out"
         rc = main([str(tmp_logs), "--summary", "--output", str(out_dir)])
         assert rc == 0
         for name in _EXPECTED_FILES:
+            if name == "summary_performance.md":
+                assert (out_dir / name).is_file(), (
+                    "summary_performance.md must exist whenever --summary runs"
+                )
+                continue
             assert not (out_dir / name).exists(), (
                 f"{name} should not exist without --dump"
             )
