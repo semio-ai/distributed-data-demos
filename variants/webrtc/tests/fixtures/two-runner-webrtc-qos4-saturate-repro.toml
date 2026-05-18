@@ -1,0 +1,68 @@
+# T17.7 QoS 3/4 DataChannel back-pressure reproducer.
+#
+# Pre-fix: webrtc-multi at `1000x100hz qos3/4` saturated at ~55%
+# delivery -- the unbounded mpsc between the sync `try_publish` and the
+# per-peer DataChannel send loop filled under load. `try_publish`
+# returned `Ok(true)` faster than the SCTP wire could absorb writes, so
+# the variant logged `write` rows for frames that were still queued in
+# the runtime mpsc when the spawn ended and never made it onto the
+# wire.
+#
+# Post-fix (T17.7: per-(peer, qos) bounded mpsc with `blocking_send`
+# from the sync side) the channel back-pressures `publish` /
+# `try_publish`, which back-pressures the driver, and delivery reaches
+# 100% in both directions at the cost of throughput. The bounded
+# capacity (64 messages per channel) absorbs short tick bursts; SCTP
+# per-stream flow control inside `dc.send().await` is the effective
+# rate limit on the wire.
+#
+# Per T3g.2: the WebRTC variant supports exactly one peer per spawn
+# (webrtc-rs ties one PeerConnection to one UDP socket via
+# SettingEngine). The two-runner case fits the envelope.
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/webrtc/tests/fixtures/two-runner-webrtc-qos4-saturate-repro.toml
+#   target/release/runner --name bob   --config variants/webrtc/tests/fixtures/two-runner-webrtc-qos4-saturate-repro.toml
+
+run = "webrtc-t177-qos34-saturate-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 90
+
+[[variant]]
+name = "webrtc-1000x100hz-qos3"
+binary = "target/release/variant-webrtc.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 3
+  # T14.6 / CUSTOM.md: webrtc-rs is async-only, declare Multi.
+  threading_modes = ["multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  signaling_base_port = 19990
+  media_base_port = 20100
+
+[[variant]]
+name = "webrtc-1000x100hz-qos4"
+binary = "target/release/variant-webrtc.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 4
+  threading_modes = ["multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  signaling_base_port = 19990
+  media_base_port = 20110
