@@ -458,52 +458,87 @@ already has an equivalent retry loop (it pre-dates T14.22 because
 T14.18 was wired up with the retry in place). T14.22 only restores
 the same property to the qos=4 data-path connect.
 
-### Single-mode TCP wedge safety net (T14.19)
+### TCP write retry under saturation (T17.3, supersedes T14.19)
 
-At catastrophic symmetric load on QoS 4 (the 2026-05-12 stress run
-at 1000 vpt x 100 Hz = 100K msg/s symmetric on localhost), Single
-mode can mutually deadlock: both runners spend the publish phase
-inside `write_all` on their outbound TCP stream while neither calls
-`poll_receive` to drain the peer's recv buffer, the kernel TCP send
-buffers fill on both sides, and both writes wedge in the kernel.
-The T14.18 control channel cannot help because the variant thread
-is stuck in the data-path syscall before reaching the EOT phase.
+Per `metak-shared/DESIGN.md` § 6.5 (Strict No-Skip Contract for
+QoS 3 / QoS 4), the QoS 4 path MUST deliver 100% of accepted writes
+under sustained overload; the acceptable failure mode is throughput
+collapse, not delivery shortfall. Pre-T17.3 the variant dropped
+peers on ANY `write_all` error, which lost ~55% (multi) / ~68%
+(single) of writes on `custom-udp-1000x100hz-qos4` because a full
+kernel send buffer surfaces as a transient `TimedOut` (Windows) /
+`WouldBlock` (Unix) once `SO_SNDTIMEO` fires -- the variant treated
+that as a peer-death signal and silently disconnected the peer.
 
-The fix is a 5 s `SO_SNDTIMEO` (`set_write_timeout(Some(...))`)
-installed on every **outbound** TCP stream in Single mode -- and
-ONLY in Single mode. Multi mode runs a dedicated reader thread per
-peer that drains the recv buffer in parallel with the publisher, so
-the wedge does not occur; installing `SO_SNDTIMEO` in Multi mode
-would only introduce spurious peer-drops under transient back-
-pressure. The Single-mode branch is gated on
-`self.threading_mode == ThreadingMode::Single` in `setup_tcp`.
+**Post-T17.3 behaviour** (see `publish_encoded` in `src/udp.rs`,
+`Qos::ReliableTcp` branch):
 
-When the timeout fires:
+1. For each connected outbound TCP peer, loop on `write_all`:
+   - on `Ok`: success, advance to next peer.
+   - on transient error (`WouldBlock`, `TimedOut`, `Interrupted` --
+     see `is_fatal_tcp_write_error`): retry. First retry yields,
+     subsequent retries `sleep(100us)` to match the variant-base
+     driver's QoS 3/4 strict-no-skip back-off.
+   - on fatal error (`ConnectionReset`, `BrokenPipe`,
+     `ConnectionAborted`, `NotConnected`, or anything else): drop
+     the peer from `tcp_out_streams` with a
+     `[custom-udp] T17.3: dropping outbound TCP peer ... after FATAL
+     write error` log line. The classifier's everything-else default
+     is conservative: unknown error kinds are treated as fatal
+     rather than retried forever.
+2. `SO_SNDTIMEO = TCP_WRITE_TIMEOUT = 500 ms` is installed on every
+   outbound TCP stream in **both single AND multi modes** (pre-T17.3
+   it was Single-only). The timeout is now used as a wake-from-retry
+   mechanism rather than a peer-drop trigger; spurious Multi-mode
+   peer-drops under transient back-pressure (the T14.19 concern that
+   gated the option Single-only) are no longer a risk because
+   `TimedOut` is now retry, not drop.
 
-- the write returns `TimedOut` (Windows) / `WouldBlock` (Unix),
-- the existing per-write error branch in `publish_encoded` drops the
-  peer from `tcp_out_streams` with a `[custom-udp] T14.19: dropping
-  outbound TCP peer ... after write error` log line,
-- subsequent writes have nothing to broadcast to (no peers) but
-  `try_publish` still returns `Ok(true)` per the QoS 4 contract,
-- the operate phase's time-bounded outer loop exits naturally,
-- the T14.18 control side-channel (a SEPARATE socket from the data
-  path) routes EOT cleanly, both sides observe `eot_received` on
-  the other side, both exit `status=success`.
+**Why a timeout at all?** A pure blocking `write_all` would deadlock
+forever if the peer is genuinely dead (vs merely backpressured);
+the retry loop needs a way to wake periodically and re-check.
+`SO_SNDTIMEO` is the OS-level mechanism for that.
 
-Delivery in this scenario is near-zero (matching hybrid's empirical
-0.12 % at the same workload). The T14.17 classifier marks the
-spawn `completed`. This is honest "log everything with bad latency"
-behaviour, not a hidden failure: operators see the peer-drop log
-in stderr and the catastrophic delivery in the analysis table.
+**Wedge resolution**: at catastrophic symmetric load (1000 vpt x
+100 Hz Single mode) both publisher threads still spin inside their
+retry loops while neither calls `poll_receive`. The kernel TCP send
+buffers fill on both sides. The retry loop keeps re-attempting the
+write; eventually one side's kernel drains a byte (a TCP keepalive,
+an ACK), the retry succeeds, both sides continue. Delivery stays at
+100%; throughput collapses to whatever the kernel permits under the
+saturated condition (typically a few thousand msg/s instead of the
+requested 100K). This is the "log everything with bad latency"
+intent in its current form: operators see slow progress and lower
+writes/s in the analysis table, not silent loss.
 
-5 s is far longer than any realistic transient on a healthy LAN
-(TCP_NODELAY + 4 MiB recv buffers); a timeout firing means the peer
-is genuinely stuck. The constant is `TCP_SINGLE_WRITE_TIMEOUT` in
-`src/udp.rs`. The integration regression
-`tests/two_runner_t14_19_tcp_single_no_deadlock.rs` exercises the
-deadlock workload and asserts both runners exit `status=success`
-(delivery threshold deliberately NOT asserted).
+**Integration tests**:
+
+- `tests/two_runner_t17_3_qos4_backpressure.rs` exercises the
+  saturation workload via the reproducer
+  `tests/fixtures/two-runner-custom-udp-qos4-saturate-repro.toml`
+  (`100x100hz` qos4 in both threading modes). Asserts:
+    - both spawns exit `status=success`,
+    - cross-peer delivery is 100% in both directions (raw counts,
+      matching `analysis/integrity.py::_check_per_pair`),
+    - zero `backpressure_skipped` events with `qos == 4`.
+- `tests/two_runner_t14_19_tcp_single_no_deadlock.rs` still passes:
+  the spawn reaches `eot_sent` cleanly on both sides. Its
+  delivery-near-zero comment in the source is historical -- under
+  T17.3 the same workload now delivers 100% (no peer-drop), but
+  the test deliberately does not assert delivery threshold so it
+  continues to validate the "no deadlock + clean exit" property.
+
+**Unit tests** in `src/udp.rs::tests`:
+
+- `is_fatal_tcp_write_error_classifier` -- direct policy check on
+  every error kind the classifier sees in production.
+- `publish_qos4_happy_path_keeps_peer_alive` -- regression safety
+  for the no-pressure path.
+- `publish_qos4_drops_peer_on_fatal_write_error` -- a closed-peer
+  write surfaces a fatal error and the peer is dropped.
+
+The constant is `TCP_WRITE_TIMEOUT` in `src/udp.rs`; the classifier
+is `is_fatal_tcp_write_error` next to the QoS-4 retry loop.
 
 ### UDP buffer tuning (T-impl.2)
 
@@ -550,14 +585,20 @@ for others:
   retransmit would fail and stall the spawn. The kernel send buffer is
   the natural pacing mechanism; `publish_encoded`'s spin-on-WouldBlock
   is the same loop pre-T-impl.7 used in `publish`.
-- **QoS 4 (ReliableTcp)** — blocking `write_all`. ALWAYS `Ok(true)`.
-  TCP receivers expect strictly contiguous framed messages; a gap would
-  corrupt the per-peer reader state. Outbound TCP streams are kept in
+- **QoS 4 (ReliableTcp)** — blocking `write_all` **with retry on
+  transient errors** (T17.3). ALWAYS `Ok(true)`. TCP receivers
+  expect strictly contiguous framed messages; a gap would corrupt
+  the per-peer reader state. Outbound TCP streams are kept in
   **blocking mode** (`set_nonblocking(false)` in `setup_tcp`) — only
   the inbound `tcp_in_streams` are non-blocking for polled reads, so
   there is no `FIONBIO`-is-socket-wide aliasing between the read and
   write paths. The kernel send-buffer fill makes `write_all` block,
-  which is exactly the back-pressure signal we want to measure.
+  which is exactly the back-pressure signal we want to measure. On
+  transient errors (`TimedOut` from `SO_SNDTIMEO`, `WouldBlock`,
+  `Interrupted`) the variant retries the write; only fatal errors
+  (`ConnectionReset`, `BrokenPipe`, `ConnectionAborted`,
+  `NotConnected`) drop the peer. See "TCP write retry under
+  saturation (T17.3)" below for the contract and reasoning.
 
 Where it lives:
 
