@@ -339,10 +339,81 @@ behaves differently per QoS:
   `Ok(false)`. The override delegates to `publish`, which enqueues
   onto the per-peer send loop where the actual `dc.send().await` is
   awaited. Backpressure for reliable QoS shows up as wall-clock
-  blocking inside the runtime's send loop, **not** as a skip --
-  returning `Ok(false)` would create a receiver-visible seq gap and
-  break the ordering / completeness guarantees the receiver relies
-  on for QoS 3/4.
+  blocking inside `publish` itself via `blocking_send` on a bounded
+  mpsc (T17.7), **not** as a skip -- returning `Ok(false)` would
+  create a receiver-visible seq gap and break the ordering /
+  completeness guarantees the receiver relies on for QoS 3/4.
+
+## Strict no-skip back-pressure chain (T17.7)
+
+DESIGN.md \xc2\xa7 6.5 introduced the strict no-skip contract for
+QoS 3/4 -- variants must block at publish rather than silently drop.
+The pre-T17.7 webrtc variant routed every write through a single
+`mpsc::UnboundedSender<OutboundMessage>` into one shared
+`send_loop`. The unbounded mpsc let `try_publish` succeed faster
+than the wire could absorb writes, and the shared send loop meant
+a stalled reliable channel head-of-line blocked the unreliable
+loops. The `1000x100hz qos3/4` saturation cell measured ~55%
+delivery in that state.
+
+T17.7 splits the send path into a four-layer back-pressure chain:
+
+1. **Per-(peer, qos) bounded mpsc.** One `mpsc::Sender` per channel,
+   capacity `RELIABLE_CHANNEL_CAPACITY = 64` (QoS 3/4) or
+   `UNRELIABLE_CHANNEL_CAPACITY = 64` (QoS 1/2). Reliable spawn a
+   dedicated `send_loop_for_channel` task per entry that calls
+   `dc.send().await` sequentially on its own DataChannel.
+2. **`blocking_send` on the sync side.** `publish` at QoS 3/4 uses
+   `Sender::blocking_send`: when the bounded channel is full because
+   `dc.send().await` is stalled inside SCTP per-stream flow control,
+   the sync caller blocks until a slot frees. `try_publish` at QoS
+   3/4 delegates to `publish`, so the strict no-skip contract holds.
+3. **SCTP per-stream flow control inside `dc.send().await`.**
+   webrtc-rs awaits the SCTP write internally, so the await only
+   resolves once the bytes have been accepted into SCTP's outbound
+   buffer. The bounded mpsc capacity (64) keeps the in-flight
+   window small enough that SCTP's flow control is what gates the
+   send rate; the mpsc is a thin shim that exposes that back-
+   pressure to the sync trait surface.
+4. **Drain on `disconnect`.** `dc.send().await` returns once the
+   bytes are in SCTP's outbound buffer, not when they hit the wire.
+   `disconnect` runs a three-stage protocol: drop the senders, await
+   every `send_loop` JoinHandle (so the bounded mpsc has fully
+   drained into `dc.send()`), then poll `dc.buffered_amount()` until
+   it reaches zero on each reliable DataChannel (or
+   `DRAIN_DEADLINE = 5 s` expires). Without this drain the
+   SCTP-pending bytes are lost when the PeerConnection closes.
+
+QoS 1/2 publishes continue to use `try_send` on the bounded
+channel; a full channel surfaces as a contractual
+`backpressure_skipped` event via the inflight-byte threshold path
+(see "Backpressure semantics (T-impl.7)" above) before the bounded
+channel itself fills. The bounded capacity for unreliable QoS is a
+safety cap, not the primary throttle.
+
+### Why 64 messages of capacity
+
+Empirical sizing. Smaller depths (1-8) gave `dc.send().await` sub-
+millisecond windows that the tokio scheduler could not fill cheaply
+on Windows, dropping throughput further with no delivery
+improvement. Larger depths (256+) defer back-pressure past the
+point where the sync caller can meaningfully react -- the bounded
+channel must be small enough that the per-tick burst of writes
+fills it before the spawn finishes its first tick.
+
+### Why `silent_secs` matters for the saturation reproducer
+
+The T17.7 fixture at `variants/webrtc/tests/fixtures/two-runner-
+webrtc-qos4-saturate-repro.toml` uses `silent_secs = 30` rather
+than the matrix default of 2. The silent phase keeps `poll_receive`
+running while the writer side is idle, draining webrtc-rs's
+per-DataChannel inbound queue before `disconnect`. At saturation
+the writer typically gets ~33% ahead of the receiver inside
+webrtc-rs's stack; allowing 30 s of silent-phase drain brings
+end-of-spawn delivery to 100% without losing in-flight bytes. The
+shorter `silent_secs = 2` used by the non-saturation matrix cells
+is fine because those workloads keep up with the receiver in
+real-time and the queue is empty at the end of `operate`.
 
 ### Why a self-maintained counter instead of `RTCDataChannel::buffered_amount()`
 
