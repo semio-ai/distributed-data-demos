@@ -12424,3 +12424,170 @@ past usefulness.
 **Pending Wave 3** (T17.10 full-matrix re-run, analysis
 acceptance).
 
+## T17.4 -- variants/hybrid: QoS 3/4 TCP back-pressure (2026-05-18, worker variants/hybrid/)
+
+**Status**: implementation done; reproducer passes 100 % delivery on
+both single and multi modes across the full workload matrix. Pending
+Wave 3 (full-matrix re-run + acceptance heatmap, T17.10).
+
+### Implementation
+
+Refactor of the hybrid TCP path to satisfy DESIGN.md § 6.5 (strict
+no-skip at QoS 3/4) end-to-end. Replaces the pre-T17.4 design which
+relied on blocking writes + `SO_SNDTIMEO` + peer-drop-on-error
+(single mode) and bounded mpsc drop-on-full (multi mode) -- both
+mechanisms losing messages at QoS 3/4 under symmetric saturation.
+
+Changes scoped to `variants/hybrid/`:
+
+1. `src/tcp.rs::TcpPeer::from_stream` now flips the socket to
+   non-blocking (`set_nonblocking(true)`), unconditionally on both
+   threading modes. Retired the T16.3 `SO_SNDTIMEO` single-mode-only
+   install.
+2. `src/tcp.rs::TcpTransport::broadcast` switched from
+   blocking-write-with-retry-on-WouldBlock to a non-blocking
+   write loop that retries on `WouldBlock` indefinitely. Single
+   mode invokes an inline read-drain pass between attempts
+   (`inline_drain_into_pending`), so frames the peer sends while
+   our writer is blocked are stashed on `pending_drained` and
+   surfaced by the next `try_recv`. Multi mode skips the inline
+   drain (the per-peer reader thread drains in parallel). A peer
+   is dropped ONLY on truly fatal I/O errors (`ConnectionReset`,
+   `BrokenPipe`, 0-byte write); transient `WouldBlock` never
+   drops a peer.
+3. `src/reader.rs`: TCP reader thread switched from
+   `push_data_or_drop` (`try_send` + drop-on-full) to
+   `push_data_or_block` (loop with `try_send` + shutdown-flag-
+   aware sleep). UDP reader unchanged -- QoS 1/2 keep drop-on-full
+   semantics. Blocking on full propagates kernel TCP recv-buffer
+   pressure to the peer's `write_all`, which surfaces as the
+   application-level back-pressure signal the contract demands.
+4. `src/hybrid.rs::try_publish` doc updated; behaviour unchanged
+   (calls `tcp.broadcast` which now blocks-via-retry instead of
+   blocks-via-syscall).
+5. Stall-diagnostic stderr warning at 30 s of continuous
+   `WouldBlock` retries -- the loop keeps retrying afterwards
+   (the strict-delivery contract has no give-up budget); the
+   warning is operator diagnostic only.
+
+### Tests
+
+`cargo test --release -p variant-hybrid`: 56 bin tests + 7
+integration tests pass. New / updated tests in `src/tcp.rs::tests`:
+
+- `write_nonblocking_strict_recovers_after_one_wouldblock` --
+  drain callback fires on each `WouldBlock`.
+- `write_nonblocking_strict_retries_indefinitely_on_wouldblock` --
+  loop never gives up on `WouldBlock` (counted via test cap, not
+  budget).
+- `write_nonblocking_strict_handles_partial_writes` -- partial
+  writes resume at the offset.
+- `write_nonblocking_strict_surfaces_real_io_errors` --
+  `ConnectionReset` propagates immediately.
+- `from_stream_puts_socket_in_nonblocking_mode_{single,multi}` --
+  both modes now use non-blocking sockets.
+- `broadcast_with_drain_delivers_all_bytes` -- 4 MiB payload
+  fully delivered through a real loopback pair without peer drop.
+
+Retired tests (obsolete with T17.4): `write_with_retry_*`
+(budget-exhausted, TimedOut, partial),
+`from_stream_{installs,skips}_write_timeout_in_*_mode` --
+`SO_SNDTIMEO` is no longer installed.
+
+`cargo clippy --release -p variant-hybrid --all-targets -- -D warnings`:
+clean. `cargo fmt -p variant-hybrid -- --check`: clean.
+
+### Reproducer
+
+`variants/hybrid/tests/fixtures/two-runner-hybrid-qos4-saturate-repro.toml`
+and the split companion `-pt2.toml` exercise
+`hybrid-{1000x100hz,100x1000hz,100x100hz}-qos{3,4}-{single,multi}`
+on localhost with two runners. `silent_secs = 10` so in-flight
+TCP bytes drain before disconnect (a shorter silent phase
+truncates delivery at the wire level even when the broadcast
+loop has succeeded -- the strict-delivery contract is about not
+dropping at the application/transport boundary; bytes still
+need wall-clock time to reach the peer over TCP).
+
+#### Before (pre-T17.4)
+
+From the post-T16.16 heatmap: hybrid TCP qos3/4 dropped 14-86 %
+at 1000x100hz in BOTH single and multi modes. T16.3 had
+previously addressed single mode at 100x100hz (10 K msg/s) but
+the fix was peer-drop-based, losing every undelivered message
+to the dropped peer under harder workloads.
+
+Quick before-after on the 1000x100hz-qos4 cell (run from
+`logs/hybrid-t17-4-qos4-smoke-20260518_173856/`):
+
+| Mode   | Pre-T17.4 delivery | Post-T17.4 (silent=1)   | Post-T17.4 (silent=10)   |
+| ------ | ------------------ | ----------------------- | ------------------------ |
+| single | 0-25 %             | 53.7 % / 82.0 %         | 100.00 % / 100.00 %      |
+| multi  | 14-86 %            | 63.5 % / 79.3 %         | 100.00 % / 100.00 %      |
+
+The silent=1 mid-column shows the strict-retry contract is met at
+the application boundary (zero `backpressure_skipped`, broadcast
+loop succeeded for every message); the residual shortfall is
+purely TCP bytes still in flight when `disconnect` closed the
+socket. silent=10 lets those bytes land.
+
+#### After (post-T17.4, reproducer fixture)
+
+All 12 spawns (6 workloads * 2 modes) reach **100.00 % delivery**:
+
+| Workload          | QoS | Mode    | Delivery | Throttled writes/s |
+| ----------------- | --- | ------- | -------- | ------------------ |
+| 1000x100hz        |  3  | single  | 100.00 % |  33 K              |
+| 1000x100hz        |  3  | multi   | 100.00 % | 100 K              |
+| 1000x100hz        |  4  | single  | 100.00 % |  12 K              |
+| 1000x100hz        |  4  | multi   | 100.00 % |  80 K              |
+| 100x1000hz        |  3  | single  | 100.00 % |  37 K              |
+| 100x1000hz        |  3  | multi   | 100.00 % |  57 K              |
+| 100x1000hz        |  4  | single  | 100.00 % |  62 K              |
+| 100x1000hz        |  4  | multi   | 100.00 % |  13 K              |
+| 100x100hz         |  3  | single  | 100.00 % |  20 K              |
+| 100x100hz         |  3  | multi   | 100.00 % |  15 K              |
+| 100x100hz         |  4  | single  | 100.00 % |  18 K              |
+| 100x100hz         |  4  | multi   | 100.00 % |  20 K              |
+
+Zero `backpressure_skipped` events at QoS 3/4 across every
+spawn, confirmed via `grep -l "backpressure_skipped"` over the
+log directories.
+
+Log dirs:
+- `logs/hybrid-t17-4-qos4-saturate-repro-20260518_174327/`
+  (1000x100hz qos3+qos4, 100x1000hz qos3)
+- `logs/hybrid-t17-4-qos4-saturate-repro-pt2-20260518_174811/`
+  (100x1000hz qos4, 100x100hz qos3+qos4)
+
+### Deviations from spec
+
+- **`silent_secs` sizing**: the task asked for 100 % delivery
+  but did not specify `silent_secs`. The reproducer uses 10 s;
+  under sustained QoS 3/4 saturation the variant's `disconnect`
+  truncates in-flight TCP bytes unless silent is long enough for
+  them to drain. This is a config-level consideration, not a
+  code-level deviation -- the strict-delivery contract concerns
+  the application/transport boundary, not wire-level wall-clock
+  drain time. CUSTOM.md
+  "Strict-delivery delivery + throughput characterization (T17.4)"
+  documents the rule of thumb.
+- **Throughput floor**: per spec, throughput may fall to any
+  value. 1000x100hz-qos4-single reached only 12 K writes/s
+  (12 % of the requested 100 K) -- the single-thread driver
+  spends most of its time inside the broadcast loop's inline
+  drain pass. Multi mode at the same cell reaches 80 K.
+- **T16.3 stress fixture left in place**: the historical
+  `two-runner-hybrid-t16-3-stress.toml` is retained for
+  archival but its acceptance numbers are superseded by the
+  T17.4 100 % across all cells. The CUSTOM.md
+  "Single-mode TCP achievable ceiling (T16.3)" section was
+  rewritten to the T17.4 numbers.
+- **Pre-T17.4 numbers not directly re-measured**: the "before"
+  column above pulls from the T16.16 heatmap rather than
+  reverting the code and re-running. The pivot is the
+  post-fix matrix being 100 % everywhere, which is the
+  acceptance criterion.
+
+**Pending Wave 3** (T17.10 full-matrix re-run + acceptance heatmap).
+
