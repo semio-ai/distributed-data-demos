@@ -45,33 +45,76 @@ analyzer's format detector reads whichever is present.
 
 ## Tables
 
-The Parquet file contains multiple **row groups** (or separate
-Parquet "tables" — implementation choice; the writer picks whichever
-the chosen Rust crate supports cleanly). Each row group has a
-`kind` discriminator in its key-value metadata:
+The Parquet file contains **one columnar tagged-union event table**
+plus **Parquet key-value file metadata** carrying the spawn identity
+and intern dictionaries. The single-table design (chosen 2026-05-18
+after T18.2 implementation review) is simpler than the earlier
+multi-row-group design — one `pl.scan_parquet` + filter selects all
+event types at once, and the analyzer's downstream polars pipeline
+already discriminates by `event` column.
 
-| `kind` | Contents |
-|---|---|
-| `metainfo` | One-row table: spawn identity + workload params + phase timestamps + peer list. See § Metainfo below. |
-| `writes` | Columnar `(ts: i64 ns, path_idx: u32)`. One row per `write` event. |
-| `receives` | Columnar `(ts: i64 ns, path_idx: u32, writer_idx: u8)`. One row per `receive` event. |
-| `paths` | Path-intern table: `(path_idx: u32, path: utf8)`. |
-| `peers` | Peer-intern table: `(writer_idx: u8, runner_name: utf8)`. |
-| `aux_events` | Low-cardinality events: `(ts: i64 ns, event: utf8, qos: i8, seq: i64, writer: utf8, missing_seq: i64, recovered_seq: i64, eot_id: u64, ...)`. Covers `gap_detected`, `gap_filled`, `backpressure_skipped`, `eot_sent`, `eot_received`, `eot_timeout`, `clock_sync`. Most columns null for any given row. |
-| `resource` | Columnar `(ts: i64 ns, cpu_percent: f32, memory_mb: f32)`. |
-| `connected` | One-row-per-peer table: `(ts: i64 ns, peer: utf8, elapsed_ms: f64, threading_mode: utf8, recv_buffer_kb: u32)`. |
-| `phase` | Columnar `(ts: i64 ns, phase: utf8)`. One row per `phase=<state>` transition. |
+### Event table (`compact_events`)
+
+Columnar schema, one row per logical event:
+
+| Column | Type | Description |
+|---|---|---|
+| `ts` | i64 ns | Wall-clock timestamp in the **writer's clock** for `write` / phase / lifecycle, **receiver's clock** for `receive`. Cross-clock semantics handled by E8. |
+| `kind` | i32 (enum) | Event discriminator. See § Event kinds below. |
+| `seq` | i64 nullable | Per-writer monotonic sequence (when applicable; null for lifecycle events). Retained for forward compatibility with seq-based analysis; the **default correlation rule** is ordering-based (see § Correlation) so `seq` is not load-bearing for the post-T17.10 pipeline. |
+| `path_idx` | i32 nullable | Path-intern index. Null for lifecycle events that have no path. |
+| `peer_idx` | i32 nullable | Peer-intern index — writer for receive events, peer for connected/eot events, null for self-only events. |
+| `qos` | i8 nullable | QoS level (1-4) for write/receive/skip/gap events; null for lifecycle. |
+| `bytes` | i32 nullable | Serialized payload size for write/receive; null otherwise. |
+| `extra_f32` | f32 nullable | Polymorphic numeric slot: `cpu_percent` on `resource` events; `elapsed_ms` on `connected`; null otherwise. |
+| `extra_f32_b` | f32 nullable | Polymorphic numeric slot: `memory_mb` on `resource`; null otherwise. |
+| `extra_i64` | i64 nullable | Polymorphic int slot: `missing_seq` on `gap_detected`, `recovered_seq` on `gap_filled`, `eot_id` on `eot_*`, `wait_ms` on `eot_timeout`; null otherwise. |
+| `extra_utf8` | utf8 nullable | Polymorphic string slot: `phase` name on `phase` events; `threading_mode` on `connected`; `eot_missing_json` on `eot_timeout`; null otherwise. |
+
+### Event kinds
+
+| `kind` (int) | Symbolic | Required columns | Notes |
+|---|---|---|---|
+| 0 | `write` | `ts`, `seq`, `path_idx`, `qos`, `bytes` | One row per published value. |
+| 1 | `receive` | `ts`, `seq`, `path_idx`, `peer_idx`, `qos`, `bytes` | `peer_idx` = writer. |
+| 2 | `backpressure_skipped` | `ts`, `path_idx`, `qos` | Only valid at qos 1/2 (DESIGN.md § 6.5). |
+| 3 | `gap_detected` | `ts`, `path_idx`, `peer_idx`, `extra_i64=missing_seq` | QoS 3 only. |
+| 4 | `gap_filled` | `ts`, `path_idx`, `peer_idx`, `extra_i64=recovered_seq` | QoS 3 only. |
+| 5 | `phase` | `ts`, `extra_utf8=phase_name` | One row per phase transition (`connect`, `stabilize`, `operate`, `eot`, `silent`, `digest`, `done`). |
+| 6 | `connected` | `ts`, `peer_idx`, `extra_f32=elapsed_ms`, `extra_utf8=threading_mode` | One row per peer connection establishment. |
+| 7 | `eot_sent` | `ts`, `extra_i64=eot_id` | One row per spawn. |
+| 8 | `eot_received` | `ts`, `peer_idx`, `extra_i64=eot_id` | One per (writer, eot_id) observed by receiver. |
+| 9 | `eot_timeout` | `ts`, `extra_i64=wait_ms`, `extra_utf8=eot_missing_json` | Diagnostic only. |
+| 10 | `resource` | `ts`, `extra_f32=cpu_percent`, `extra_f32_b=memory_mb` | Periodic sampling. |
+| 11 | `clock_sync` | `ts`, `peer_idx`, `extra_i64` (offset_ns), `extra_f32` (rtt_ms) | Reserved for E8; field mapping confirmed when E8 lands. |
+
+Adding a new event kind = adding a new `kind` value and (optionally)
+documenting which `extra_*` slot carries new payload. Schema-version
+bump is NOT required for additive event kinds.
+
+### Intern dictionaries
+
+Stored in Parquet **key-value file metadata** (not as separate row
+groups). Keys / values:
+
+- `path_intern` — JSON-encoded `Vec<String>`; index = `path_idx`.
+- `peer_intern` — JSON-encoded `Vec<String>`; index = `peer_idx`.
+
+JSON encoding chosen over a separate row group for simplicity; the
+intern tables are small (≤ a few hundred entries on realistic
+workloads) and the size win from columnar storage is negligible at
+that cardinality.
 
 The writer SHOULD use Parquet's `snappy` compression by default. The
 writer MAY pick `zstd` if its benchmark on a `1000x100hz × 30 s` spawn
 shows a meaningful size win at acceptable CPU cost; the choice is
 documented in `variant-base/CUSTOM.md`.
 
-## Metainfo
+## Metainfo (Parquet KV file metadata)
 
-The `metainfo` row group has one row with these columns (or
-equivalent representation in Parquet key-value file metadata; writer
-picks the cleaner shape, both are spec-conformant):
+Stored in Parquet **key-value file metadata** (not a row group). Keys
+mirror the table below; values are utf8 (JSON-encoded for non-scalar
+values):
 
 | Column | Type | Description |
 |---|---|---|

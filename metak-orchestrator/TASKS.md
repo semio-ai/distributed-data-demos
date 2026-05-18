@@ -7551,6 +7551,82 @@ integration test; (3) CUSTOM.md docs.
 - Analysis-side compact loader — covered by T18.4.
 - Runner changes — covered by T18.5 + T18.6.
 
+### T18.2b — variant-base: extend compact writer to cover lifecycle events [medium]
+
+**Repo**: `variant-base/`
+**Owner**: orchestrator → spawn worker.
+**Status**: filed 2026-05-18 after T18.2 merge review surfaced a gap.
+
+**Background**: T18.2 (commits `ac25cdb`, `cebdd0d`, `cde4744`,
+`c02ed37` merged via `b992699`) shipped the compact buffer + Parquet
+writer covering `write`, `receive`, `backpressure_skipped`,
+`gap_detected`, `gap_filled` events. Lifecycle events (`phase`,
+`connected`, `eot_*`, `resource`, `clock_sync`) currently stay on the
+legacy JSONL stream only — they're NOT in the compact Parquet file.
+
+This defeats E18's goal: the analyzer's existing pipeline depends on
+`phase` events to find operate/silent/EOT boundaries (the T16.16
+cross-clock fix uses them), on `connected` for connect-time metrics,
+on `eot_sent` to bound the operate window, and on `resource` for
+CPU/memory rollups. Without these in the parquet, compact-only mode
+requires the operator to keep the JSONL files anyway, defeating the
+30-50× size-reduction goal.
+
+The post-T18.2 contract update (commit pending in this batch) defines
+a single tagged-union `compact_events` table covering ALL event types
+with a `kind` discriminator + polymorphic `extra_*` columns. T18.2's
+implementation already uses the single-table shape; this task extends
+the writer to ALSO log lifecycle events into it.
+
+**Goal**: Every JSONL event type produced by `variant-base` is also
+emitted as a row in the compact `compact_events` table, with the
+column mapping from `compact-log-schema.md` § Event kinds.
+
+**Files**:
+- `variant-base/src/compact.rs` — `EventKind` enum gains the
+  lifecycle variants (`Phase=5`, `Connected=6`, `EotSent=7`,
+  `EotReceived=8`, `EotTimeout=9`, `Resource=10`, `ClockSync=11`).
+- `variant-base/src/compact_writer.rs` — schema gets the
+  `extra_f32`, `extra_f32_b`, `extra_i64`, `extra_utf8` columns per
+  the contract. Writer null-handles the polymorphic columns.
+- `variant-base/src/driver.rs` — every JSONL `log_*` call site that
+  currently writes a lifecycle event ALSO routes through
+  `sink.record_*` so the compact buffer captures it.
+- `variant-base/tests/integration.rs` — extend the existing
+  roundtrip test to assert that all lifecycle event kinds appear in
+  the parquet file. Add explicit per-kind unit tests in
+  `compact.rs::tests`.
+
+**Tests**:
+- Roundtrip via VariantDummy: spawn produces a parquet whose
+  `compact_events` table contains rows for every lifecycle event the
+  legacy JSONL stream emits.
+- Per-kind unit tests: each `EventKind` round-trips through the
+  buffer + writer + parquet reader with the right column slot
+  populated.
+
+**Acceptance**:
+- VariantDummy spawn with `--legacy-jsonl-events` OFF produces a
+  parquet whose `compact_events` table has rows for `phase` (one per
+  transition), `connected` (one per peer), `eot_sent` / `eot_received`
+  (one each when applicable), `resource` (periodic), plus the
+  existing write/receive/skip/gap kinds.
+- Reading the parquet via polars + filtering by `kind` gives the
+  same `phase` / `connected` / etc rows the analyzer's existing
+  pipeline expects on the JSONL stream.
+- All previous tests still pass.
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  clean. `cargo fmt --check` clean.
+
+**Commits**: workers commit as they go. Suggested: (1) `EventKind` +
+schema extension + unit tests, (2) driver wiring + integration test.
+
+**Dependencies**:
+- T18.2 (landed).
+- T18.4 (analyzer compact loader) waits on T18.2b — without lifecycle
+  events in the parquet, the analyzer can't operate on compact-only
+  data.
+
 ### T18.3 — Variant audit: any variant bypassing variant-base logger [low]
 
 **Repo**: every `variants/*/`.
