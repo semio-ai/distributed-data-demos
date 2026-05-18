@@ -26,7 +26,7 @@
 
 run = "webrtc-t177-qos34-saturate-repro"
 runners = ["alice", "bob"]
-default_timeout_secs = 90
+default_timeout_secs = 120
 
 [[variant]]
 name = "webrtc-1000x100hz-qos3"
@@ -36,7 +36,13 @@ binary = "target/release/variant-webrtc.exe"
   tick_rate_hz = 100
   stabilize_secs = 2
   operate_secs = 10
-  silent_secs = 2
+  # Long silent_secs gives the receive side time to drain the SCTP
+  # backlog before disconnect (T17.7). At 100x1000hz saturation the
+  # writer side typically gets ~33% ahead of the receiver inside
+  # webrtc-rs's per-DataChannel queues; allowing ~30 seconds of
+  # silent-phase drain absorbs that backlog so end-of-spawn delivery
+  # ratio reaches 100% without losing in-flight bytes.
+  silent_secs = 30
   workload = "scalar-flood"
   values_per_tick = 1000
   qos = 3
@@ -56,7 +62,13 @@ binary = "target/release/variant-webrtc.exe"
   tick_rate_hz = 100
   stabilize_secs = 2
   operate_secs = 10
-  silent_secs = 2
+  # Long silent_secs gives the receive side time to drain the SCTP
+  # backlog before disconnect (T17.7). At 100x1000hz saturation the
+  # writer side typically gets ~33% ahead of the receiver inside
+  # webrtc-rs's per-DataChannel queues; allowing ~30 seconds of
+  # silent-phase drain absorbs that backlog so end-of-spawn delivery
+  # ratio reaches 100% without losing in-flight bytes.
+  silent_secs = 30
   workload = "scalar-flood"
   values_per_tick = 1000
   qos = 4

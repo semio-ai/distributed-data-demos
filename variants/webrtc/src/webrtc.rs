@@ -175,6 +175,21 @@ const RELIABLE_CHANNEL_CAPACITY: usize = 64;
 /// that the previous `mpsc::unbounded_channel` permitted.
 const UNRELIABLE_CHANNEL_CAPACITY: usize = 64;
 
+/// Per-channel poll interval used by `disconnect` while waiting for
+/// `RTCDataChannel::buffered_amount()` to reach zero on each reliable
+/// channel. Short enough not to add noticeable latency at the tail
+/// of a spawn, long enough not to peg a worker thread on the async
+/// mutex inside `buffered_amount()`.
+const BUFFERED_AMOUNT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Maximum wall-clock time `disconnect` is willing to wait for the
+/// SCTP buffer on each reliable DataChannel to drain to zero before
+/// closing the peer connection. Spawns running at the 1000x100hz
+/// reproducer rate spend most of their tail draining 1-2 MiB of
+/// in-flight SCTP frames; 5 seconds is comfortable for that workload
+/// and well below the runner's `default_timeout_secs`.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Inbound observation drained by the variant's poll methods.
 #[derive(Debug)]
 enum Inbound {
@@ -238,6 +253,20 @@ pub struct WebRtcVariant {
     /// channel-full as a soft skip (Ok(false)) via the existing
     /// inflight-byte threshold path.
     send_channels: SendChannelMap,
+    /// Per-(peer, qos) DataChannel handles held alongside the
+    /// `send_channels` map so `disconnect` can poll
+    /// `buffered_amount()` on the reliable channels to drain SCTP's
+    /// outbound buffer before closing the peer connection. Without
+    /// this drain step the in-flight SCTP frames are lost on close
+    /// even though `dc.send().await` already accepted them.
+    peer_dcs: HashMap<(String, u8), Arc<RTCDataChannel>>,
+    /// JoinHandles for the per-(peer, qos) send_loop tasks spawned in
+    /// `connect`. `disconnect` awaits these (after dropping the
+    /// matching sender so the receiver returns `None`) to know the
+    /// mpsc is fully drained into `dc.send().await`. Only then can
+    /// the SCTP `buffered_amount()` drain check meaningfully gate on
+    /// "zero pending outbound bytes".
+    send_loop_handles: Vec<tokio::task::JoinHandle<()>>,
     recv_rx: Option<mpsc::UnboundedReceiver<Inbound>>,
     shutdown_tx: Option<ShutdownTx>,
     /// Held alive for the lifetime of the variant so receive-side
@@ -271,6 +300,8 @@ impl WebRtcVariant {
             peers,
             runtime: None,
             send_channels: HashMap::new(),
+            peer_dcs: HashMap::new(),
+            send_loop_handles: Vec::new(),
             recv_rx: None,
             shutdown_tx: None,
             peer_connections: Vec::new(),
@@ -796,24 +827,31 @@ async fn send_loop_for_channel(
     mut shutdown_rx: ShutdownRx,
 ) {
     loop {
-        tokio::select! {
-            msg = rx.recv() => {
-                match msg {
-                    Some(m) => {
-                        let bytes: bytes::Bytes = m.data.clone();
-                        if let Err(e) = dc.send(&bytes).await {
-                            eprintln!(
-                                "[webrtc] send to peer={peer_name} qos={qos} failed: {e}"
-                            );
-                        }
-                        if let Some(c) = m.inflight_counter.as_ref() {
-                            c.fetch_sub(m.inflight_bytes, Ordering::Relaxed);
-                        }
-                    }
-                    None => break,
-                }
-            }
+        // Pull the next message and dispatch it onto the wire. The
+        // bounded mpsc + `blocking_send` chain on the sync side
+        // already back-pressures the publish caller; `dc.send().await`
+        // participates in SCTP per-stream flow control internally,
+        // so SCTP's reassembly window is the effective second-stage
+        // limit. The drain-on-disconnect step (`disconnect` stage 3)
+        // ensures any frames still in SCTP's outbound buffer at
+        // end-of-spawn make it to the wire before the peer
+        // connection closes -- which was the 70% delivery cliff that
+        // remained when the bounded mpsc alone was the only
+        // back-pressure layer.
+        let m = tokio::select! {
+            msg = rx.recv() => msg,
             _ = shutdown_rx.changed() => break,
+        };
+        let Some(m) = m else {
+            break;
+        };
+
+        let bytes: bytes::Bytes = m.data.clone();
+        if let Err(e) = dc.send(&bytes).await {
+            eprintln!("[webrtc] send to peer={peer_name} qos={qos} failed: {e}");
+        }
+        if let Some(c) = m.inflight_counter.as_ref() {
+            c.fetch_sub(m.inflight_bytes, Ordering::Relaxed);
         }
     }
 }
@@ -944,6 +982,8 @@ impl Variant for WebRtcVariant {
         // to a stalled `dc.send().await` cannot stall the unreliable
         // QoS loops for the same peer.
         let mut send_channels: SendChannelMap = HashMap::new();
+        let mut peer_dcs: HashMap<(String, u8), Arc<RTCDataChannel>> = HashMap::new();
+        let mut send_loop_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         for (peer_name, channels) in &peer_channels {
             for (qos_int, dc) in channels {
                 let capacity = match Qos::from_int(*qos_int) {
@@ -952,12 +992,13 @@ impl Variant for WebRtcVariant {
                 };
                 let (tx, rx) = mpsc::channel::<OutboundMessage>(capacity);
                 send_channels.insert((peer_name.clone(), *qos_int), tx);
+                peer_dcs.insert((peer_name.clone(), *qos_int), dc.clone());
 
                 let dc_clone = dc.clone();
                 let peer_name_owned = peer_name.clone();
                 let qos_owned = *qos_int;
                 let shutdown_for_loop = shutdown_rx.clone();
-                runtime.spawn(async move {
+                let handle = runtime.spawn(async move {
                     send_loop_for_channel(
                         rx,
                         dc_clone,
@@ -967,10 +1008,13 @@ impl Variant for WebRtcVariant {
                     )
                     .await;
                 });
+                send_loop_handles.push(handle);
             }
         }
 
         self.send_channels = send_channels;
+        self.peer_dcs = peer_dcs;
+        self.send_loop_handles = send_loop_handles;
         self.recv_rx = Some(recv_rx);
         self.shutdown_tx = Some(shutdown_tx);
         self.peer_connections = pcs;
@@ -1113,16 +1157,90 @@ impl Variant for WebRtcVariant {
     }
 
     fn disconnect(&mut self) -> Result<()> {
+        // T17.7 strict-delivery drain protocol. Order matters:
+        //
+        //   1. Drop every send-channel sender so the bounded mpsc
+        //      receivers in the send loops will return `None` once
+        //      they have drained the queued messages into
+        //      `dc.send().await`.
+        //   2. Await every send-loop JoinHandle so we KNOW each loop
+        //      has finished and the mpsc is empty.
+        //   3. Poll `dc.buffered_amount()` on each reliable
+        //      DataChannel until it reaches zero (or DRAIN_DEADLINE
+        //      expires). At this point the only writes still in
+        //      flight are SCTP-level bytes that have been accepted by
+        //      the kernel and must drain to the wire.
+        //   4. Signal shutdown, close peer connections, tear down
+        //      the runtime.
+        //
+        // Stages 1+2 together guarantee that we are NOT racing the
+        // send loops to the buffered_amount check: any time we see
+        // `buffered_amount == 0` after stage 2 it means the whole
+        // pipeline (mpsc -> dc.send -> SCTP) is drained.
+        self.send_channels.clear();
+        let handles = std::mem::take(&mut self.send_loop_handles);
+        let reliable_dcs: Vec<Arc<RTCDataChannel>> = self
+            .peer_dcs
+            .iter()
+            .filter(|((_, qos), _)| {
+                matches!(
+                    Qos::from_int(*qos),
+                    Some(Qos::ReliableUdp) | Some(Qos::ReliableTcp)
+                )
+            })
+            .map(|(_, dc)| dc.clone())
+            .collect();
+        if let Some(rt) = self.runtime.as_ref() {
+            rt.block_on(async {
+                // Stage 2: wait for every send loop to finish, up to
+                // DRAIN_DEADLINE. With the senders dropped above,
+                // each `rx.recv()` returns `None` after the queue
+                // empties and the loop exits. If SCTP is wedged
+                // (peer disconnected mid-spawn, etc.) the in-flight
+                // `dc.send().await` may never complete; the timeout
+                // lets us continue to stage 3 + close the peer
+                // connection rather than hang the whole `disconnect`
+                // call.
+                let stage2_deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+                for h in handles {
+                    let now = tokio::time::Instant::now();
+                    if now >= stage2_deadline {
+                        h.abort();
+                        continue;
+                    }
+                    let remaining = stage2_deadline.saturating_duration_since(now);
+                    if tokio::time::timeout(remaining, h).await.is_err() {
+                        // Send loop never finished within the
+                        // window; we move on. Aborting here is
+                        // unnecessary because `runtime.shutdown_timeout`
+                        // below will tear it down.
+                    }
+                }
+                // Stage 3: drain SCTP. With the send loops finished
+                // (or aborted) we cannot add any more bytes to
+                // `buffered_amount`, so once it hits zero it stays
+                // zero.
+                let stage3_deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+                for dc in &reliable_dcs {
+                    while tokio::time::Instant::now() < stage3_deadline {
+                        if dc.buffered_amount().await == 0 {
+                            break;
+                        }
+                        tokio::time::sleep(BUFFERED_AMOUNT_POLL_INTERVAL).await;
+                    }
+                }
+            });
+        }
+        self.peer_dcs.clear();
+
+        // Stage 4: signal shutdown so any remaining background
+        // tasks exit, then close the peer connections.
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
-        // Drop all send-channel senders so the per-(peer, qos) send
-        // loops observe `None` on their receivers and exit cleanly.
-        self.send_channels.clear();
         self.recv_rx.take();
         self.inflight.clear();
 
-        // Close all peer connections gracefully.
         if let Some(rt) = self.runtime.as_ref() {
             let pcs: Vec<Arc<RTCPeerConnection>> = std::mem::take(&mut self.peer_connections);
             rt.block_on(async {
