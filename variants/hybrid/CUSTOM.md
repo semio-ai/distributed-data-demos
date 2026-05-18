@@ -167,47 +167,47 @@ Same compact binary header as custom-udp:
 
 - One TCP connection per peer (bidirectional).
 - For each peer's `TcpStream`:
-  - The socket stays in **blocking mode** (we never call
-    `set_nonblocking(true)` on it). `publish` writes are truly blocking:
-    when the kernel send buffer fills, the writer thread pauses until
-    the receiver drains it. This is the back-pressure signal we want to
-    measure for the benchmark; bypassing it (e.g. with non-blocking
-    writes plus app-side retry-and-drop) would distort the comparison
-    against `custom-udp`'s NACK approach.
-  - **Single mode only (T16.3)**: in addition to the blocking-write
-    semantics above, the write handle gets a `SO_SNDTIMEO` of
-    `SINGLE_WRITE_TIMEOUT` (5 s, see `tcp.rs`). This caps the
-    worst-case write block under symmetric saturation so the spawn
-    cannot deadlock when both peers spend the publish phase inside
-    `write_all` while neither drains the recv buffer (the exact
-    websocket-variant T14.19 wedge, applied to hybrid). A wedged
-    write surfaces as `TimedOut` (Windows) / `WouldBlock` (Unix);
-    `TcpTransport::broadcast` already drops the offending peer on
-    any write error (per "TCP read loop — per-peer fault tolerance"
-    below). The 5 s figure is far longer than any realistic
-    transient on a healthy LAN; a timeout firing means the peer is
-    genuinely stuck. Multi mode does NOT install the write timeout
-    (the per-peer reader thread drains in parallel and the wedge
-    does not occur; a stale `SO_SNDTIMEO` there would only invite
-    spurious peer drops under transient back-pressure).
-  - To make reads pollable without flipping the socket-wide `FIONBIO`
-    flag, the read handle (obtained via `try_clone`) gets a short
-    `SO_RCVTIMEO` via `TcpStream::set_read_timeout` (~1 ms). Reads then
-    return `WouldBlock` (Unix) or `TimedOut` (Windows) when no data is
-    in flight, allowing `poll_receive` to interleave UDP and other
-    peers' reads without stalling the protocol loop. Writes are
-    unaffected by `SO_RCVTIMEO` and remain blocking.
-- **Why not just `set_nonblocking(true)` on the read clone?** Because
-  `set_nonblocking` calls `ioctlsocket(FIONBIO,...)` which is
-  socket-wide; the cloned read handle's `FIONBIO` flag is shared with
-  the write handle and would silently un-block the write side too,
-  defeating the back-pressure goal.
-- The variant also keeps a defence-in-depth `write_with_retry` wrapper
-  with a generous wall-clock budget (10 s) that catches any
-  `WouldBlock` it might somehow see — under normal operation the socket
-  is blocking and `write` never returns `WouldBlock`, but the wrapper
-  protects against accidental future regressions of the blocking flag.
-- Set `TCP_NODELAY` on every connection to disable Nagle — critical for
+  - Since **T17.4**, the socket is in **non-blocking** mode
+    (`set_nonblocking(true)`). Both clones of the stream share the
+    `FIONBIO` flag (it is socket-wide on Windows), so reads AND writes
+    return `WouldBlock` / `TimedOut` immediately when the kernel
+    would otherwise stall. The strict-delivery write loop in
+    `TcpTransport::broadcast` retries indefinitely on `WouldBlock`
+    -- a transient back-pressure is the application-level signal the
+    benchmark exists to measure (DESIGN.md § 6.5). Only true I/O
+    errors (`ConnectionReset`, `BrokenPipe`, etc.) drop the peer.
+  - In **single mode** the broadcast loop runs an inline
+    read-drain pass between write retries (`inline_drain_into_pending`).
+    This breaks the symmetric-saturation wedge that previously
+    forced the T16.3 SO_SNDTIMEO + peer-drop workaround: both
+    peers can spend the publish phase inside the loop, but each
+    drains its own incoming frames while waiting for its own
+    writes to flush. Drained frames are stashed on
+    `TcpTransport::pending_drained` and surfaced by the next
+    `try_recv` call (the variant's `poll_receive` sees them in
+    arrival order).
+  - In **multi mode** the per-peer reader thread drains in
+    parallel; the broadcast loop only retries on `WouldBlock`
+    without running an inline drain. The reader thread now uses
+    `push_data_or_block` (blocking-on-full) on the data channel
+    instead of the pre-T17.4 drop-on-full -- a full bounded
+    channel back-pressures the kernel TCP recv buffer, which
+    back-pressures the peer's writes, which surfaces as the same
+    application-level signal as in single mode.
+  - The read handle (obtained via `try_clone`) keeps a short
+    `SO_RCVTIMEO` for the rare path that re-enables blocking
+    mode during teardown. With the socket non-blocking, the
+    timeout is effectively advisory: reads return `WouldBlock`
+    immediately.
+- **Why non-blocking writes?** Without them, both peers can stall
+  inside `write_all` while neither calls `poll_receive` to drain
+  the kernel recv buffer. The pre-T17.4 fix dropped the offending
+  peer after a `SO_SNDTIMEO` fired, but dropping a peer at QoS 3/4
+  loses every undelivered message to it -- a violation of DESIGN.md
+  § 6.5. Non-blocking writes + inline drain (single) / blocking
+  channel send (multi) instead absorb the back-pressure with zero
+  message loss.
+- Set `TCP_NODELAY` on every connection to disable Nagle -- critical for
   latency.
 
 ### TCP read — buffered-frame fast path (T16.3)
@@ -268,7 +268,7 @@ at Windows-default ~64 KB buffers during 100 K pkt/s same-host runs.
 The TCP path is untouched: TCP back-pressure is the protocol-level
 signal we deliberately measure.
 
-### Backpressure semantics (T-impl.7)
+### Backpressure semantics (T-impl.7 / T17.4)
 
 Hybrid overrides `Variant::try_publish` (see `src/hybrid.rs`,
 `impl Variant for HybridVariant::try_publish`) so the driver gets
@@ -288,13 +288,14 @@ catastrophic for others:
 - **QoS 2 (LatestValue)** — same as QoS 1. Gap-tolerant by design;
   the receiver's stale-discard logic only cares about the highest
   seen seq.
-- **QoS 3 (ReliableUdp / TCP path)** — blocking `TcpTransport::
-  broadcast`. ALWAYS `Ok(true)`. TCP receivers expect strictly
-  contiguous framed messages; a gap would corrupt the per-peer
-  reader state. The outbound TCP socket is in blocking mode (see
-  "TCP connection management" above), so `write_all` blocks under
-  kernel back-pressure — exactly the signal we want to measure for
-  the QoS-3 NACK-vs-TCP comparison.
+- **QoS 3 (ReliableUdp / TCP path)** — `TcpTransport::broadcast`,
+  which under T17.4 is non-blocking-with-internal-strict-retry.
+  ALWAYS `Ok(true)`. Per DESIGN.md § 6.5, QoS 3/4 forbids
+  skipping; the broadcast loop retries on `WouldBlock`
+  indefinitely (while either running the inline drain pass in
+  single mode or relying on the per-peer reader thread + blocking
+  channel send in multi mode to drain on the receiver side),
+  yielding 100 % delivery at the cost of throttled throughput.
 - **QoS 4 (ReliableTcp / TCP path)** — identical to QoS 3 in this
   variant. Always `Ok(true)`.
 
@@ -303,8 +304,12 @@ Where it lives:
 - `src/udp.rs::UdpTransport::try_send_nonblocking` — single attempt,
   `WouldBlock` surfaces as `Ok(false)`.
 - `src/hybrid.rs::Variant::try_publish` — dispatches by QoS.
-- `src/hybrid.rs::Variant::publish` — unchanged; keeps the
-  spin-on-WouldBlock UDP send and the blocking TCP broadcast.
+- `src/tcp.rs::TcpTransport::broadcast` — non-blocking writes,
+  strict retry on `WouldBlock`, inline drain pass in single mode.
+- `src/reader.rs::push_data_or_block` — TCP reader thread (multi
+  mode) blocks on a full data channel instead of dropping.
+- `src/hybrid.rs::Variant::publish` — unchanged; same path as
+  `try_publish` for QoS 3/4.
 
 ### Control side-channel (T14.18)
 
@@ -443,15 +448,20 @@ decoded item onto one of two channels per the T14.16 split:
 
 - `HubDataMessage::Data` -> bounded `data_tx` (an
   `mpsc::sync_channel` of capacity
-  `reader::READER_CHANNEL_CAPACITY = 4096`). `try_send` (no blocking)
-  drops on full-channel rather than blocking the reader. Drop-on-full
-  is acceptable: QoS 1/2 tolerate loss by definition; QoS 3/4 (TCP)
-  receivers depend on kernel TCP, which applies its own back-pressure
-  before the recv buffer can fill pathologically. The warning line
-  for an overrun is
-  `[variant-hybrid] data channel full (... slots) -- dropping Data frame (receiver saturated)`
-  -- disambiguated from the pre-T14.16 wording so operators can be
-  sure lifecycle items (EOT) were NOT lost when this line appears.
+  `reader::READER_CHANNEL_CAPACITY = 4096`).
+  - **UDP reader (QoS 1/2)**: uses `push_data_or_drop` (`try_send`
+    with drop-on-full). QoS 1/2 tolerate loss by definition; a
+    full channel is treated as best-effort drop. Warning:
+    `[variant-hybrid] data channel full (... slots) -- dropping Data frame (receiver saturated)`.
+  - **TCP reader (QoS 3/4, T17.4)**: uses `push_data_or_block`
+    (blocking-on-full with shutdown-flag polling). Dropping
+    here would silently violate the strict no-skip contract
+    (DESIGN.md § 6.5). Blocking the reader propagates back-
+    pressure through the kernel TCP recv buffer to the peer's
+    `write_all`, which surfaces as the same application-level
+    signal as in Single mode. The bounded capacity bounds
+    in-memory growth on a slow driver; the kernel recv buffer
+    plus the peer's send buffer absorb the rest.
 - `HubLifecycleMessage::Eot` -> unbounded `lifecycle_tx` (a
   `std::sync::mpsc::channel`). Lifecycle items must NEVER drop: losing
   an EOT forces the peer's driver to wait the full `eot_timeout`,
@@ -507,37 +517,51 @@ on `ConnectionRefused` / `TimedOut` / `WouldBlock` for a bounded
 Without this retry, the qos4-multi spawn flakes ~50% of the time
 on Windows even on localhost.
 
-### Single-mode TCP achievable ceiling (T16.3)
+### Strict-delivery delivery + throughput characterization (T17.4)
 
-After the T16.3 fixes (SO_SNDTIMEO on Single-mode writes plus the
-buffered-frame fast path in `try_recv_framed`), Single mode at QoS
-3 / QoS 4 on localhost-symmetric two-runner workloads achieves
-the following on Windows (numbers from
-`variants/hybrid/tests/fixtures/two-runner-hybrid-t16-3-stress.toml`):
+After the T17.4 strict-delivery fix (non-blocking writes with
+inline drain in Single mode, blocking channel send in Multi mode,
+no peer-drop on transient back-pressure), both threading modes
+achieve **100 % delivery** at QoS 3/4 across the saturate-repro
+matrix. Throughput falls under saturation -- the trade per
+DESIGN.md § 6.5.
 
-| Workload          | Symmetric rate | Delivery (single)   | Notes                                                      |
-| ----------------- | -------------- | ------------------- | ---------------------------------------------------------- |
-| `10x100hz`-qos3   | 1 K msg/s      | 100 %               | p50 ~0.2 ms; spawn idle-exits quickly.                     |
-| `100x100hz`-qos3  | 10 K msg/s     | 100 %               | p50 ~3-4 ms; runs the full operate window.                 |
-| `1000x100hz`-qos3 | 100 K msg/s    | 80-95 % of *sent*   | Throughput throttles to ~1-2 K msg/s; below the requested  |
-|                   |                |                     | rate because the single-thread driver cannot interleave    |
-|                   |                |                     | 1 000 blocking TCP writes per tick with poll_receive. Of   |
-|                   |                |                     | what was actually published, delivery is 80-95 %. The      |
-|                   |                |                     | acceptable-ceiling case — Multi mode is the recommended    |
-|                   |                |                     | configuration for high-rate symmetric workloads.           |
+Numbers from
+`variants/hybrid/tests/fixtures/two-runner-hybrid-qos4-saturate-repro.toml`
+and `-pt2.toml` on Windows localhost (alice + bob in the same
+machine; `silent_secs = 10` so in-flight TCP bytes can drain
+before disconnect):
 
-Pre-T16.3 the same workloads catastrophically wedged: 0.12-24 %
-delivery with multi-second tail latencies, requiring the runner
-to forcibly terminate the spawn.
+| Workload            | Target rate  | Mode    | Delivery | Actual writes/s (req'd, throttled) |
+| ------------------- | ------------ | ------- | -------- | ---------------------------------- |
+| `100x100hz`-qos3    |  10 K msg/s  | single  | 100.00 % | 20 K msg/s (no throttle needed)    |
+| `100x100hz`-qos3    |  10 K msg/s  | multi   | 100.00 % | 15 K msg/s                         |
+| `100x100hz`-qos4    |  10 K msg/s  | single  | 100.00 % | 18 K msg/s                         |
+| `100x100hz`-qos4    |  10 K msg/s  | multi   | 100.00 % | 20 K msg/s                         |
+| `1000x100hz`-qos3   | 100 K msg/s  | single  | 100.00 % | 33 K msg/s (throttled)             |
+| `1000x100hz`-qos3   | 100 K msg/s  | multi   | 100.00 % | 100 K msg/s                        |
+| `1000x100hz`-qos4   | 100 K msg/s  | single  | 100.00 % | 12 K msg/s (heavily throttled)     |
+| `1000x100hz`-qos4   | 100 K msg/s  | multi   | 100.00 % |  80 K msg/s                        |
+| `100x1000hz`-qos3   | 100 K msg/s  | single  | 100.00 % | 37 K msg/s                         |
+| `100x1000hz`-qos3   | 100 K msg/s  | multi   | 100.00 % | 57 K msg/s                         |
+| `100x1000hz`-qos4   | 100 K msg/s  | single  | 100.00 % | 62 K msg/s                         |
+| `100x1000hz`-qos4   | 100 K msg/s  | multi   | 100.00 % | 13 K msg/s                         |
 
-The 1000x100hz throughput shortfall is not a deadlock — the
-SO_SNDTIMEO never fires at 5 s — but a true single-thread
-saturation: each blocking TCP write at this rate blocks ~ms while
-the peer drains, and with the single driver thread also serving
-poll_receive, the effective tick rate falls to 1-2 Hz. Multi mode
-(per-peer reader thread) handles the full 100 K msg/s with ~30 %
-delivery (kernel buffer pressure, not driver-scheduling) and
-100 % at 10 K msg/s.
+Zero `backpressure_skipped` events at QoS 3/4 across the matrix.
+
+Pre-T17.4 the same workloads dropped 14-86 % at QoS 3/4 even in
+Multi mode (kernel-recv buffer overflow into the bounded mpsc's
+drop-on-full path), and Single mode either dropped peers via the
+T16.3 SO_SNDTIMEO mechanism (losing every undelivered message to
+the dropped peer) or fully deadlocked.
+
+**Operational note**: under sustained saturation at QoS 3/4 the
+spawn's `silent_secs` must be long enough for in-flight TCP
+bytes to drain before `disconnect` runs. The reproducer fixture
+uses `silent_secs = 10`; production configs targeting QoS 3/4
+saturation should size `silent_secs` accordingly (rule of thumb:
+~`kernel_send_buffer_size / actual_throughput * 2` -- a few
+seconds for typical workloads).
 
 ### Testing
 
