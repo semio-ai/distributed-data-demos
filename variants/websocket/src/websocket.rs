@@ -84,36 +84,55 @@ use crate::protocol::{self, Frame};
 /// flight.
 const READ_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 
-/// T14.19: write-side timeout for Single-mode outbound WebSocket
-/// streams. At catastrophic symmetric load (100K msg/s) Single mode
-/// can wedge: both peers spend the publish phase inside tungstenite's
-/// blocking `write` while neither calls `poll_receive` to drain the
-/// kernel recv buffer, and the kernel TCP send buffers fill on both
-/// sides. Without a write timeout the variant deadlocks until the
-/// runner kills it.
+/// T17.5: write-side timeout for Single-mode outbound WebSocket
+/// streams.
 ///
-/// Installing `SO_SNDTIMEO` here turns the wedge into a typed
-/// `TimedOut` (Windows) / `WouldBlock` (Unix) error wrapped in
-/// `tungstenite::Error::Io`. `broadcast_binary` already drops the
-/// offending peer on any write error (mirrors hybrid's per-peer
-/// fault-tolerance rule). With the peer gone, the operate phase
-/// exits its publish loop naturally, and the spawn completes with
-/// `status=success`. Delivery is near zero -- the user's "log
-/// everything with bad latency" intent accepts this; T14.17's
-/// classifier marks the spawn 'completed'.
+/// At symmetric saturation on QoS 3/4 (e.g. 1000 vpt x 100 Hz =
+/// 100K msg/s on localhost) Single mode shares one thread between
+/// `publish` and `poll_receive`. Without intervention, both peers
+/// spend the publish phase inside tungstenite's blocking `write`,
+/// neither side calls `poll_receive` to drain the kernel recv
+/// buffer, and the kernel TCP send buffers fill on both sides --
+/// the variant wedges until the runner kills it.
+///
+/// **Pre-T17.5 (T14.19 era)**: `SO_SNDTIMEO = 5 s` plus drop-the-peer
+/// on the resulting `TimedOut` error. That unwedged the deadlock at
+/// the cost of dropping the peer mid-operate -- delivery collapsed
+/// to ~2.4% on the QoS-4 `1000x100hz` cell of the post-T16.16
+/// heatmap, violating the new E17 contract (DESIGN.md § 6.5:
+/// variants MUST deliver 100% of accepted writes at QoS 3/4,
+/// blocking the publisher rather than dropping bytes).
+///
+/// **Post-T17.5**: the timeout is a **drain-interleave trigger**, not
+/// a kill switch. On `TimedOut` / `WouldBlock` from tungstenite,
+/// `send_to_peer_with_retry` drains the wedged peer's read side
+/// (logging every frame via `LoggerHandle` and incrementing the
+/// variant-base receive counter so the T15.11 internal-stall
+/// watchdog stays calm), drains every OTHER active peer too, then
+/// retries the send via `WebSocket::flush`. tungstenite has
+/// already buffered the partial frame bytes in its internal
+/// `out_buffer`, so `flush` resumes the write from wherever the
+/// kernel stopped accepting -- no duplicate frame, no message
+/// loss. The loop continues until the write lands or the peer
+/// surfaces a non-transient fatal error.
+///
+/// The shorter timeout (100 ms vs. 5 s) keeps the interleave tight:
+/// at 100K msg/s symmetric the drain step needs to happen
+/// frequently enough that neither side's kernel buffer stays full
+/// for long. 100 ms is well above `READ_POLL_TIMEOUT = 1 ms` so
+/// transient bursts on a healthy LAN don't hit it, and well below
+/// the 30 s watchdog threshold so even when both peers are
+/// thoroughly back-pressured the receive counter has many
+/// opportunities to advance per watchdog tick.
 ///
 /// Applied to Single mode only. Multi mode runs a per-peer reader
 /// thread that drains in parallel with the publisher; the wedge
 /// does not occur and `SO_SNDTIMEO` would only invite spurious
-/// peer-drops under transient back-pressure. The `start_reader_threads`
-/// path explicitly clears the timeout on the write clone (see
-/// `set_write_timeout(None)` in `start_reader_threads`) to keep Multi
-/// mode's contract unchanged.
-///
-/// 5 s is far longer than any realistic transient on a healthy LAN
-/// (TCP_NODELAY + 4 MiB recv buffers); a timeout firing means the
-/// peer is genuinely stuck.
-const SINGLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// drain churn. The `start_reader_threads` path explicitly clears
+/// the timeout on the write clone (see `set_write_timeout(None)`
+/// in `start_reader_threads`) to keep Multi mode's contract
+/// unchanged.
+const SINGLE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Discovery / handshake timeout. If a peer never appears after this
 /// duration, `connect` fails loudly rather than deadlocking the whole spawn.
@@ -442,84 +461,258 @@ impl WebSocketVariant {
         }
     }
 
-    /// Send a binary frame to every active peer. Drops a peer on a fatal
-    /// write error; mirrors Hybrid TCP's broadcast behaviour. Routes to
-    /// the mode-appropriate write path.
+    /// Send a binary frame to every active peer. Drops a peer on a
+    /// fatal write error; mirrors Hybrid TCP's broadcast behaviour.
+    /// Routes to the mode-appropriate write path.
     ///
-    /// **T14.19**: a write error -- including a `SO_SNDTIMEO`-driven
-    /// `TimedOut` / `WouldBlock` from the Single-mode write-timeout
-    /// installed by `apply_single_mode_write_timeout` -- drops the
-    /// offending peer with a single warning. After all peers have
-    /// been dropped (the "self.peers is empty" steady-state),
-    /// `broadcast_binary` returns `Ok(())` as a no-op: subsequent
-    /// `publish` / `signal_end_of_test` calls log a `write` /
-    /// attempt to send an EOT frame but emit no bytes. This is the
-    /// pattern that lets a wedged Single-mode spawn exit cleanly
-    /// (the driver's EOT phase will time out waiting for the peer's
-    /// EOT, log `eot_timeout`, and proceed to the silent phase).
-    /// Returning `Err` here would propagate up through `try_publish`
-    /// /// `signal_end_of_test` and fail the spawn even though both
-    /// runners had progressed past the wedge.
+    /// **T17.5 (Single mode, QoS 3/4)**: tungstenite write surfaces
+    /// a `Io(TimedOut)` / `Io(WouldBlock)` when the kernel TCP send
+    /// buffer stays full for `SINGLE_WRITE_TIMEOUT`. Per the E17 /
+    /// DESIGN.md § 6.5 strict-no-skip contract, this is **transient
+    /// back-pressure** -- the publisher MUST block until the message
+    /// is accepted. The retry path is: drain THIS peer's read side
+    /// (logging every received frame via `LoggerHandle` and counting
+    /// it into the variant-base receive counter so the T15.11
+    /// internal-stall watchdog stays calm), drain any other active
+    /// peers, then retry the send via `WebSocket::flush`.
+    /// tungstenite has already buffered the partial frame bytes in
+    /// its internal `out_buffer`; `flush` resumes the partial write
+    /// from wherever the kernel stopped accepting, so no duplicate
+    /// frame and no message loss. The loop continues until the send
+    /// lands or the peer surfaces a genuine fatal error.
+    ///
+    /// **Pre-T17.5 (T14.19 era)**: the function dropped the peer on
+    /// the first `TimedOut`, which left the spawn exiting cleanly
+    /// but with near-zero delivery -- accepted before E17, violates
+    /// the contract now. The retry-with-drain pattern restores 100%
+    /// delivery at QoS 3/4 by paying for it with throughput
+    /// collapse (the explicitly-acceptable failure mode per § 6.5).
+    ///
+    /// Genuine fatal errors (`ConnectionClosed`, `ConnectionReset`,
+    /// `ConnectionAborted`, `AlreadyClosed`, decode error, etc.)
+    /// still drop the peer with a warning. The decision is made via
+    /// `is_transient_io_error` for IO errors; everything else falls
+    /// through to the drop path.
+    ///
+    /// **Multi mode is unchanged**: writes have no timeout, so the
+    /// per-peer reader thread is the back-pressure relief valve.
     fn broadcast_binary(&mut self, payload: Vec<u8>) -> Result<()> {
-        let mut keep: Vec<bool> = Vec::with_capacity(self.peers.len());
+        // Process peers one at a time, popping each off `self.peers`
+        // into a local scratch slot so the per-peer retry loop can
+        // run `poll_peers_once_single` (which iterates over
+        // `self.peers`) without borrow conflict. Survivors are
+        // pushed back onto a holding vec and reassigned at the end.
+        let mut survivors: Vec<WsPeer> = Vec::with_capacity(self.peers.len());
+        while let Some(mut peer) = self.peers.pop() {
+            match self.send_to_peer_with_retry(&mut peer, &payload) {
+                Ok(()) => survivors.push(peer),
+                Err(PeerSendError::Drop(reason)) => {
+                    eprintln!(
+                        "warning: dropping WS peer {} ({}) after write error: {reason:#}",
+                        peer.name, peer.addr
+                    );
+                    // Peer dropped: do not push back.
+                }
+            }
+        }
+        // Restore the active set. Order is observable only to logs
+        // and per-peer drains, both of which are order-insensitive.
+        self.peers = survivors;
+        self.peers.reverse();
+        Ok(())
+    }
 
-        for peer in self.peers.iter_mut() {
+    /// Send `payload` to a single peer, retrying on transient I/O
+    /// back-pressure with an interleaved drain.
+    ///
+    /// In Single mode at QoS 3/4 a `TimedOut` / `WouldBlock` from
+    /// tungstenite's underlying `write` means the kernel TCP send
+    /// buffer is full. To unwedge the symmetric-saturation deadlock
+    /// we drain the receive side of:
+    ///
+    /// 1. **The peer being written to** (via the locally-held
+    ///    `WebSocket`). This is the critical step: every frame we
+    ///    drain off this peer's read socket frees a byte of our
+    ///    kernel recv buffer, which lets the peer's blocked write
+    ///    make progress, which unwedges its publish loop so it can
+    ///    drain ITS recv buffer, which finally lets OUR send
+    ///    progress.
+    /// 2. **Every other active peer in `self.peers`**, via
+    ///    `poll_peers_once_single`. In the canonical 2-runner case
+    ///    this is a no-op; larger fixtures rely on it to avoid
+    ///    starving the unrelated connections while this peer is
+    ///    back-pressured.
+    ///
+    /// Every drained data frame is logged directly via the
+    /// `LoggerHandle` (same pattern as Multi mode's reader thread)
+    /// so the strict "every received message is logged" contract
+    /// from `metak-shared/overview.md` is preserved end-to-end.
+    ///
+    /// We retry the send via `WebSocket::flush`, not `send`:
+    /// tungstenite already buffered the frame bytes in its internal
+    /// `out_buffer` before the IO error, and `flush` resumes the
+    /// partial write from wherever the kernel stopped accepting.
+    /// Calling `send` again would queue a duplicate frame.
+    ///
+    /// In Multi mode the function attempts the send exactly once.
+    /// No write timeout is installed, so back-pressure manifests as
+    /// a truly blocking `write` that the per-peer reader thread
+    /// takes care of via parallel drain. Non-transient errors still
+    /// drop the peer.
+    fn send_to_peer_with_retry(
+        &mut self,
+        peer: &mut WsPeer,
+        payload: &[u8],
+    ) -> std::result::Result<(), PeerSendError> {
+        // First attempt is a `send` (write + flush). On retry after
+        // a transient error, use `flush` only -- the payload is
+        // already buffered in tungstenite and re-issuing `write`
+        // would queue a duplicate frame.
+        let mut first_attempt = true;
+        loop {
             let result = match &mut peer.io {
-                PeerIo::Single(ws) => ws.send(Message::Binary(payload.clone())).map_err(|e| {
-                    anyhow::anyhow!(
+                PeerIo::Single(ws) => {
+                    if first_attempt {
+                        ws.send(Message::Binary(payload.to_vec()))
+                    } else {
+                        ws.flush()
+                    }
+                }
+                PeerIo::Multi { writer } => {
+                    let mut guard = match writer.lock() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            return Err(PeerSendError::Drop(anyhow::anyhow!(
+                                "WS Multi writer mutex poisoned for peer {} ({})",
+                                peer.name,
+                                peer.addr
+                            )));
+                        }
+                    };
+                    let MultiWriter { ctx, stream } = &mut *guard;
+                    // Suppress clippy::result_large_err here:
+                    // tungstenite::Error is intentionally large; we
+                    // immediately convert into PeerSendError.
+                    #[allow(clippy::result_large_err)]
+                    let r = if first_attempt {
+                        ctx.write(stream, Message::Binary(payload.to_vec()))
+                            .and_then(|()| ctx.flush(stream))
+                    } else {
+                        ctx.flush(stream)
+                    };
+                    r
+                }
+            };
+            first_attempt = false;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(tungstenite::Error::Io(io_err)) if is_transient_io_error(&io_err) => {
+                    // T17.5 transient back-pressure. Step 1: drain
+                    // the wedged peer's read side. Every byte we
+                    // pull off this socket unblocks a corresponding
+                    // byte of the peer's blocked write -- this is
+                    // the critical step that breaks the symmetric-
+                    // saturation deadlock in single mode.
+                    drain_current_peer_into_logger(peer, self.logger.as_ref());
+                    // Step 2: drain any other active peers so a
+                    // many-peer fixture doesn't starve unrelated
+                    // connections while this peer is back-pressured.
+                    // The returned Option is dropped: if a peer's
+                    // frame surfaced it was already routed by
+                    // `poll_peers_once_single`'s normal flow. In
+                    // the 2-runner case `self.peers` is empty here
+                    // (the current peer was popped before this
+                    // function was called) and this is a no-op.
+                    let _ = self.poll_peers_once_single();
+                    // Loop again. Next iteration uses `flush()` so
+                    // tungstenite resumes its buffered frame from
+                    // the partial-write position rather than
+                    // appending a duplicate.
+                    continue;
+                }
+                Err(e) => {
+                    return Err(PeerSendError::Drop(anyhow::anyhow!(
                         "WS write error to peer {} ({}): {}",
                         peer.name,
                         peer.addr,
                         e
-                    )
-                }),
-                PeerIo::Multi { writer } => {
-                    let mut guard = writer
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("WS Multi writer mutex poisoned"))?;
-                    let MultiWriter { ctx, stream } = &mut *guard;
-                    // Suppress clippy::result_large_err here:
-                    // tungstenite::Error is intentionally large; we
-                    // immediately convert into anyhow::Error.
-                    #[allow(clippy::result_large_err)]
-                    let write_result = ctx
-                        .write(stream, Message::Binary(payload.clone()))
-                        .and_then(|()| ctx.flush(stream));
-                    write_result.map_err(|e| {
-                        anyhow::anyhow!(
-                            "WS write error to peer {} ({}): {}",
-                            peer.name,
-                            peer.addr,
-                            e
-                        )
-                    })
-                }
-            };
-            match result {
-                Ok(()) => keep.push(true),
-                Err(e) => {
-                    eprintln!(
-                        "warning: dropping WS peer {} ({}) after write error: {:#}",
-                        peer.name, peer.addr, e
-                    );
-                    keep.push(false);
+                    )));
                 }
             }
         }
+    }
+}
 
-        if !keep.iter().all(|&k| k) {
-            let mut idx = 0;
-            self.peers.retain(|_| {
-                let k = keep[idx];
-                idx += 1;
-                k
-            });
+/// Outcome of `send_to_peer_with_retry`. Successful sends return
+/// `Ok(())`. The only failure mode surfaced to the broadcast loop
+/// is "drop this peer", carrying the contextualised error for the
+/// warning log line.
+enum PeerSendError {
+    Drop(anyhow::Error),
+}
+
+/// T17.5 helper: drain whatever frames are immediately available on
+/// `peer`'s read side, logging each `Data` frame via the supplied
+/// `LoggerHandle` (mirroring Multi mode's reader-thread logging
+/// pattern). EOT frames on the data stream are silently discarded
+/// (the on-wire EOT exchange was removed in T15.8; stale peers
+/// might still emit them).
+///
+/// Returns as soon as the read socket signals `WouldBlock` /
+/// `TimedOut` (the short `READ_POLL_TIMEOUT = 1 ms` set on the
+/// underlying TCP recv timeout means this happens within ~1 ms of
+/// the kernel recv buffer running dry). For Multi-mode peers this
+/// is a no-op: the dedicated reader thread owns the read side.
+///
+/// When `logger` is `None` (e.g. unit tests that never call
+/// `attach_logger`), drained frames are silently discarded -- the
+/// retry loop still benefits from the kernel-buffer drain side
+/// effect, which is the back-pressure-relief point of this helper.
+fn drain_current_peer_into_logger(peer: &mut WsPeer, logger: Option<&LoggerHandle>) {
+    let ws = match &mut peer.io {
+        PeerIo::Single(ws) => ws,
+        PeerIo::Multi { .. } => return,
+    };
+    loop {
+        match ws.read() {
+            Ok(Message::Binary(bytes)) => match protocol::decode_frame(&bytes) {
+                Ok(Frame::Data(update)) => {
+                    if let Some(logger) = logger {
+                        if let Err(e) = logger.log_receive(
+                            &update.writer,
+                            update.seq,
+                            &update.path,
+                            update.qos,
+                            update.payload.len(),
+                        ) {
+                            eprintln!(
+                                "warning: WS drain for peer {} ({}) failed to log receive \
+                                 event: {e:#}; continuing",
+                                peer.name, peer.addr
+                            );
+                        }
+                    }
+                }
+                Ok(Frame::Eot { .. }) => {
+                    // T15.8: EOT no longer carried on the data
+                    // stream. Discard.
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: WS drain for peer {} ({}) saw decode error: {e:#}; \
+                         stopping drain",
+                        peer.name, peer.addr
+                    );
+                    return;
+                }
+            },
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+            Ok(Message::Close(_)) => return,
+            Ok(_other) => {}
+            Err(tungstenite::Error::Io(e)) if is_transient_io_error(&e) => return,
+            Err(_) => return,
         }
-
-        // T14.19: no longer fail when self.peers is empty -- see
-        // function docs. A wedged Single-mode spawn relies on this
-        // to exit cleanly via the EOT-timeout / silent-phase path.
-        Ok(())
     }
 }
 
@@ -562,13 +755,25 @@ fn apply_recv_buffer_kb(stream: &TcpStream, recv_buffer_kb: u32, peer_addr: Sock
     }
 }
 
-/// T14.19: install `SO_SNDTIMEO = SINGLE_WRITE_TIMEOUT` on a
+/// T17.5: install `SO_SNDTIMEO = SINGLE_WRITE_TIMEOUT` on a
 /// post-handshake WebSocket TCP stream when running in Single mode.
+///
+/// Originally added in T14.19 as a 5 s "kill switch" to break a
+/// hard deadlock at high symmetric rates by dropping the peer on
+/// timeout. Under E17 the semantics changed: the timeout is now a
+/// **drain-interleave trigger** consumed by
+/// `send_to_peer_with_retry` -- a 100 ms `TimedOut` / `WouldBlock`
+/// signals "the kernel send buffer is full, go drain the recv
+/// side", not "this peer is dead". See `SINGLE_WRITE_TIMEOUT` for
+/// the full rationale.
+///
 /// Multi mode leaves the write timeout unset (the reader thread
 /// drains in parallel and the wedge does not occur). Failure is
-/// logged but never fatal: a missing timeout reverts to the
-/// pre-T14.19 behaviour (potentially deadlock under extreme load)
-/// but does not break the spawn.
+/// logged but never fatal: without the timeout the publisher
+/// would block forever on the first symmetric-saturation wedge,
+/// but the spawn does not break -- the runner-coordinated
+/// termination state machine will eventually time it out at the
+/// `default_timeout_secs` budget.
 fn apply_single_mode_write_timeout(
     stream: &TcpStream,
     threading_mode: ThreadingMode,
@@ -579,8 +784,9 @@ fn apply_single_mode_write_timeout(
     }
     if let Err(e) = stream.set_write_timeout(Some(SINGLE_WRITE_TIMEOUT)) {
         eprintln!(
-            "[variant-websocket] T14.19: set_write_timeout({:?}) failed for {peer_addr}: {e}; \
-             continuing without write-side timeout (Single mode may deadlock under extreme load)",
+            "[variant-websocket] T17.5: set_write_timeout({:?}) failed for {peer_addr}: {e}; \
+             continuing without write-side timeout (Single mode may block forever under \
+             symmetric saturation; default_timeout_secs will catch it)",
             SINGLE_WRITE_TIMEOUT
         );
     }
@@ -1370,13 +1576,37 @@ mod tests {
         let _ = server_thread.join();
     }
 
-    /// T14.19: a Single-mode peer whose write hits the installed
-    /// `SO_SNDTIMEO` is dropped from the active set, and subsequent
-    /// `broadcast_binary` calls return `Ok(())` as a no-op (rather
-    /// than the pre-T14.19 "all peers dropped after write errors"
-    /// `Err` that would have cascaded into a failed spawn).
+    /// T17.5: a Single-mode peer whose write hits the installed
+    /// `SO_SNDTIMEO` MUST NOT be dropped from the active set. Per the
+    /// E17 / DESIGN.md § 6.5 strict-no-skip contract, transient
+    /// back-pressure at QoS 3/4 must block the writer rather than
+    /// drop bytes.
+    ///
+    /// Pre-T17.5 (T14.19 era) this test verified the opposite:
+    /// after `SO_SNDTIMEO` fired the peer was dropped, the active
+    /// set went empty, and `broadcast_binary` returned `Ok(())` so
+    /// the spawn could exit cleanly. That accepted near-zero
+    /// delivery as the cost of unwedging the deadlock; E17
+    /// rescinded the acceptance.
+    ///
+    /// Setup is identical: a server that accepts but never reads
+    /// (so the variant's kernel send buffer fills). Post-T17.5 the
+    /// variant blocks inside `send_to_peer_with_retry`'s drain-then-
+    /// flush loop forever (the peer is genuinely stuck because the
+    /// server never reads). To bound the test we spawn the
+    /// broadcast on a worker thread, observe that:
+    ///
+    /// 1. The worker's iteration counter advances briefly (we get
+    ///    SOME data into the kernel send buffer) then FREEZES while
+    ///    the worker is inside the retry loop -- proof that the
+    ///    publisher is blocked, not returning Ok with the peer
+    ///    dropped or skipping the message.
+    /// 2. After we tear the server down (forcing a non-transient
+    ///    error on the socket), the worker exits and reports the
+    ///    final peer count == 0 -- proof that the genuine-fatal-
+    ///    error path still drops correctly.
     #[test]
-    fn t14_19_broadcast_drops_peer_on_write_timeout_and_returns_ok() {
+    fn t17_5_broadcast_blocks_and_keeps_peer_under_back_pressure() {
         use socket2::SockRef;
         use std::net::TcpListener;
         use std::sync::atomic::AtomicU16;
@@ -1387,20 +1617,17 @@ mod tests {
         let listener = TcpListener::bind(listen_addr).expect("bind ok");
         listener.set_nonblocking(false).unwrap();
 
-        // Server thread: accept and upgrade, then go idle (never read
-        // anything off the socket). The variant under test fills the
-        // peer's recv buffer / its own send buffer and trips the
-        // SO_SNDTIMEO on subsequent writes.
+        // Server: accept + upgrade, then go idle until the test
+        // signals shutdown. Never reads, so the variant's kernel
+        // send buffer fills and trips SO_SNDTIMEO.
+        let (server_shutdown_tx, server_shutdown_rx) = std::sync::mpsc::channel::<()>();
         let server_thread = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
             let ws = tungstenite::accept(stream).expect("server upgrade");
-            std::thread::sleep(Duration::from_secs(3));
+            let _ = server_shutdown_rx.recv();
             drop(ws);
         });
 
-        // Client: connect, upgrade, then shrink SO_SNDBUF and install
-        // a very short write timeout (100 ms — production uses 5 s;
-        // the test uses a short value for fast feedback).
         let stream =
             TcpStream::connect(listen_addr).expect("client connect to localhost test port");
         stream.set_nodelay(true).unwrap();
@@ -1412,11 +1639,10 @@ mod tests {
             tungstenite::client::client(url.as_str(), stream).expect("client upgrade");
         let s = ws.get_ref();
         s.set_read_timeout(Some(READ_POLL_TIMEOUT)).unwrap();
-        s.set_write_timeout(Some(Duration::from_millis(100)))
+        // Short test write timeout for fast feedback. Production
+        // uses 100 ms (T17.5); the test uses 50 ms.
+        s.set_write_timeout(Some(Duration::from_millis(50)))
             .unwrap();
-        // Shrink the kernel send buffer so the wedge is reached
-        // quickly. The default ~64 KiB would need a lot of writes
-        // to fill.
         let sock = SockRef::from(s);
         sock.set_send_buffer_size(1024).unwrap();
 
@@ -1433,28 +1659,65 @@ mod tests {
         });
         v.threading_mode = ThreadingMode::Single;
 
-        // Hammer broadcast_binary with large payloads until the peer
-        // is dropped from the active set OR we exhaust a generous
-        // bound. Each call must return `Ok(())` regardless of whether
-        // the underlying tungstenite write timed out or succeeded.
         let payload = vec![0xAAu8; 8192];
-        let mut iters = 0;
-        while !v.peers.is_empty() && iters < 2000 {
-            v.broadcast_binary(payload.clone())
-                .expect("T14.19: broadcast_binary must return Ok even when the peer is dropped");
-            iters += 1;
+        let (iter_tx, iter_rx) = std::sync::mpsc::channel::<u32>();
+        let (peer_count_tx, peer_count_rx) = std::sync::mpsc::channel::<usize>();
+        let worker = std::thread::spawn(move || {
+            let max_iters: u32 = 10_000;
+            for i in 0..max_iters {
+                if iter_tx.send(i).is_err() {
+                    break;
+                }
+                if v.broadcast_binary(payload.clone()).is_err() {
+                    break;
+                }
+            }
+            drop(iter_tx);
+            let _ = peer_count_tx.send(v.peers.len());
+        });
+
+        // Phase 1: wait briefly for the counter to start advancing.
+        let mut last_seen: u32 = 0;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            match iter_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(i) => last_seen = i,
+                Err(_) => break,
+            }
         }
-        assert!(
-            v.peers.is_empty(),
-            "T14.19: peer should be dropped after SO_SNDTIMEO fires; iters={iters}"
+        // Phase 2: confirm the counter has frozen.
+        let before_freeze = last_seen;
+        let freeze_start = Instant::now();
+        while freeze_start.elapsed() < Duration::from_millis(500) {
+            if let Ok(i) = iter_rx.recv_timeout(Duration::from_millis(50)) {
+                last_seen = i;
+            }
+        }
+        assert_eq!(
+            last_seen, before_freeze,
+            "T17.5 contract violation: broadcast_binary iteration count \
+             advanced from {before_freeze} to {last_seen} during a 500ms \
+             freeze window under sustained back-pressure. Per DESIGN.md \
+             § 6.5, QoS 3/4 must block the publisher rather than dropping \
+             bytes or returning skips."
         );
 
-        // Subsequent broadcasts on an empty peer set must still be Ok.
-        v.broadcast_binary(payload.clone())
-            .expect("T14.19: broadcast_binary with empty peer set must return Ok");
-
-        // Tear the test server thread down.
+        // Tear the server down. The worker's blocked retry loop
+        // will observe a non-transient error and exit cleanly.
+        let _ = server_shutdown_tx.send(());
         let _ = server_thread.join();
+        let _ = worker.join();
+
+        // Confirm the genuine-fatal-error path still drops the
+        // peer correctly. Final count should be zero.
+        let final_count = peer_count_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker must signal final peer count");
+        assert_eq!(
+            final_count, 0,
+            "after teardown the wedged peer must be dropped via the \
+             genuine-error path (ConnectionReset/Closed); got {final_count}"
+        );
     }
 
     // T15.8: removed test `t14_10_poll_multi_drains_lifecycle_items_only`.

@@ -1,0 +1,34 @@
+# T17.5 saturation fixture: high-rate symmetric WebSocket QoS 4 in
+# Single mode at the workload that previously deadlocked / dropped
+# the peer mid-operate (1000 vpt x 100 Hz = 100K msg/s symmetric on
+# localhost). Used to verify the T17.5 drain-and-retry back-pressure
+# pattern preserves 100% delivery at QoS 3/4 per DESIGN.md § 6.5.
+#
+# The operate window is intentionally LONG (30s) so the end-of-window
+# in-flight tail is small relative to total writes -- the same
+# duration the canonical `configs/two-runner-websocket-qos4.toml`
+# uses for the websocket heatmap cells.
+
+run = "websocket-t17-5-saturate"
+runners = ["alice", "bob"]
+# operate (30s) + stabilize (3s) + silent (3s) + EOT + teardown.
+default_timeout_secs = 90
+
+[[variant]]
+name = "websocket-t17-5-1000x100hz"
+supported_modes = ["single"]
+binary = "target/release/variant-websocket.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 4
+  log_dir = "./logs"
+  threading_modes = ["single"]
+
+  [variant.specific]
+  ws_base_port = 19980

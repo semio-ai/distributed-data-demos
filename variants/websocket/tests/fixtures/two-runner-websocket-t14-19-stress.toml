@@ -1,20 +1,30 @@
-﻿# T14.19 regression fixture: high-rate symmetric WebSocket qos4 in
-# Single mode at the workload that previously deadlocked websocket
-# Single (1000 vpt x 100 Hz = 100K msg/s symmetric).
+﻿# T14.19 / T17.5 regression fixture: high-rate symmetric WebSocket
+# qos4 in Single mode at the workload that previously deadlocked
+# websocket Single (1000 vpt x 100 Hz = 100K msg/s symmetric).
 #
 # Pre-T14.19: both runners wedged inside tungstenite's blocking
 # `write` on the qos4 stream because neither could call `poll_receive`
 # between writes to drain the peer's recv buffer; runner killed by
 # `default_timeout_secs`.
 #
-# Post-T14.19: `SO_SNDTIMEO = 5 s` on outbound TCP in Single mode
-# turns the wedge into a typed `TimedOut` error -> peer dropped ->
-# publish loop continues -> operate phase exits naturally -> EOT
-# phase logs `eot_timeout` (websocket has no separate control
-# channel; once the data peer is dropped the EOT cannot route) ->
-# silent phase passes -> spawn exits with status=success.
+# T14.19 (superseded): `SO_SNDTIMEO = 5 s` plus drop-the-peer on the
+# resulting `TimedOut` error. Unwedged the deadlock at the cost of
+# near-zero delivery (peer dropped mid-operate). Accepted before
+# E17 under the "log everything with bad latency" intent.
 #
-# Delivery is expected to be near zero; we ONLY assert `success`.
+# T17.5 (current): `SO_SNDTIMEO = 100 ms` plus DRAIN-AND-RETRY on
+# the resulting `TimedOut`. The drain step empties the recv side
+# (logging every receive), which frees the peer's kernel send
+# buffer so the peer's blocked write can drain; that in turn lets
+# the peer's publish loop continue and eventually call its own
+# `poll_receive`, draining our send buffer. The wedged send is
+# resumed via `WebSocket::flush` (tungstenite keeps the partially-
+# written frame buffered) and the loop blocks the publisher until
+# the message lands -- per DESIGN.md § 6.5. Delivery now reaches
+# 100% on this cell at the cost of throughput collapse (the
+# explicitly-acceptable failure mode per § 6.5).
+#
+# Acceptance: both runners exit `status=success`.
 
 run = "websocket-t14-19"
 runners = ["alice", "bob"]

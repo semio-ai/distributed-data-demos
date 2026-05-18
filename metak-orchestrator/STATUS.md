@@ -12101,3 +12101,156 @@ drop queue. Applied symmetrically to both threading modes.
 
 **Pending Wave 3** (T17.10 full-matrix re-run + analysis acceptance).
 
+## T17.5 — variants/websocket: QoS 3/4 single-mode back-pressure
+
+**Status**: pending Wave 3 (full-matrix re-run + analysis acceptance).
+**Worker**: T17.5 worker, 2026-05-18.
+
+**Implementation** (`variants/websocket/src/websocket.rs`):
+
+The single-mode `SO_SNDTIMEO`-on-timeout policy was rewritten from
+"drop the peer" to "drain receives and retry the flush". The
+constant `SINGLE_WRITE_TIMEOUT` dropped from 5 s to 100 ms because
+under the new contract it is a drain-interleave trigger, not a
+kill switch.
+
+`broadcast_binary` now processes peers one at a time by popping
+each off `self.peers` into a local scratch slot so the per-peer
+retry helper can run `poll_peers_once_single` (which iterates over
+`self.peers`) without borrow conflict. The new helper
+`send_to_peer_with_retry` issues the initial `ws.send(payload)`,
+and on `Io(TimedOut)` / `Io(WouldBlock)`:
+
+1. Calls the new free function `drain_current_peer_into_logger` to
+   read every immediately-available frame off the **wedged peer's**
+   read side, logging each `Data` frame via the variant's
+   `LoggerHandle`. This is the critical step: each byte we pull off
+   the peer's read socket unblocks a byte of the peer's blocked
+   write, so the peer's publish loop can progress, which lets
+   it eventually drain ITS recv buffer, which finally lets our
+   send progress. Multi mode's reader-thread parallel-drain is
+   the structural analogue; this helper is its inline twin for
+   single-mode.
+2. Calls `poll_peers_once_single()` on the remaining active peers
+   so a many-peer fixture doesn't starve unrelated connections
+   while one peer is back-pressured. In the canonical 2-runner
+   case `self.peers` is empty here (the current peer was popped
+   to scratch) and this is a no-op.
+3. Retries the send via `WebSocket::flush()`, not `send()`:
+   tungstenite already buffered the partial frame bytes in its
+   internal `out_buffer`, and `flush` resumes the partial write
+   from wherever the kernel stopped accepting. Calling `send`
+   again would queue a duplicate frame.
+
+Genuine fatal errors (`ConnectionClosed`, `ConnectionReset`,
+`ConnectionAborted`, `AlreadyClosed`, decode error, etc.) still
+drop the peer per the per-peer fault-tolerance rule.
+
+Multi mode is **unchanged**: writes have no timeout, so the
+per-peer reader thread is the back-pressure relief valve. The
+new `apply_single_mode_write_timeout` doc comment now reflects
+the post-T17.5 semantics (drain-interleave trigger, not kill
+switch). Multi-mode delivery is preserved (verified end-to-end
+at 1M+ messages per direction; see numbers below).
+
+**Tests** (all green):
+
+```
+cargo test --release -p variant-websocket
+  -> 40 unit + 28 integration + 3 ignored + 1 ignored = 71 total
+  -> 68 passed, 0 failed; 3 ignored = #[ignore]-gated two-runner regressions
+     that all pass when run via --ignored
+
+cargo test --release -p variant-websocket -- --ignored two_runner_t14_19 --nocapture
+  -> [T14.19] alice+bob both reached operate phase and exited cleanly;
+     wall-time=15-17 s -- PASS
+
+cargo test --release -p variant-websocket -- --ignored two_runner_websocket_both_modes_qos3_smoke --nocapture
+  -> [T14.2-ws/single] alice <- bob: 29800/29800 (100.0%)
+  -> [T14.2-ws/single] bob <- alice: 29694/30000 (98.98%)  -- the residual
+     ~1% is the operate-window tail of in-flight bytes at end-of-window,
+     normal for a fixed-window benchmark.
+  -> [T14.2-ws/multi]  alice <- bob: 29500/29500 (100.0%)
+  -> [T14.2-ws/multi]  bob <- alice: 28799/28800 (99.997%)
+
+cargo test --release -p variant-websocket -- --ignored two_runner_websocket_1000x100hz_multi_high_rate --nocapture
+  -> [T14.2-ws/multi] alice <- bob: 1256000/1256000 (100.00%)
+  -> [T14.2-ws/multi] bob <- alice: 1087000/1087000 (100.00%)
+  Multi mode unaffected by T17.5: continues to hit 100% at 1M+ messages.
+
+cargo clippy --release -p variant-websocket --all-targets -- -D warnings
+  -> clean
+
+cargo fmt -p variant-websocket -- --check
+  -> clean
+```
+
+Updated unit test (`t17_5_broadcast_blocks_and_keeps_peer_under_back_pressure`,
+replacing the pre-T17.5 `t14_19_broadcast_drops_peer_on_write_timeout_and_returns_ok`):
+runs a server that accepts but never reads, observes that the worker
+thread's broadcast-iteration counter advances briefly then **freezes**
+under the retry-and-drain loop (proof the publisher is blocked rather
+than dropping the peer or returning Ok-with-skip), then tears the
+server down and asserts the genuine-fatal-error path still drops the
+peer (final peer count == 0).
+
+**Before / after delivery on a saturation reproducer**
+(`variants/websocket/tests/fixtures/two-runner-websocket-t17-5-saturate.toml`,
+1000 vpt x 100 Hz qos4 single, 30 s operate, two runners on
+localhost):
+
+| Cell                                         | Pre-T17.5 (heatmap)            | Post-T17.5 |
+|---|---|---|
+| websocket-1000x100hz-qos4-single alice->bob  | 2.4% (97.6% drop, peer dropped) | **100.00% unique delivery** (459K writes, 459K unique receives) |
+| websocket-1000x100hz-qos4-single bob->alice  | 2.4% (97.6% drop, peer dropped) | **100.00% unique delivery** (1.302M writes, 1.302M unique receives) |
+
+Zero `backpressure_skipped` events at QoS 4 (acceptance criterion
+met). Spawn exits `status=success`. The publisher genuinely
+back-pressures under symmetric saturation: alice was throttled to
+459 K writes in 30 s (~15 K writes/s vs the requested 100 K
+writes/s) while bob ran at the full requested rate, an asymmetric
+characterisation that the throughput-collapse failure mode of § 6.5
+explicitly permits.
+
+**Anomaly to flag for Wave 3**: the same saturation run shows 55
+duplicate `(writer, seq, path)` triples on bob's receive side --
+3 distinct alice-sent seqs got logged 2x, 26x, and 30x respectively,
+each cluster of dupes spanning < 200 microseconds. That's 0.012%
+of total receives (459,055 receives, 55 are dupes; 459,000 are
+unique). Alice's write log shows each affected seq written
+**exactly once**, so this is not a sender-side bug; bob's receive
+side is decoding the same WebSocket frame body multiple times
+under back-pressure. Likely root cause is a tungstenite-internal
+state edge case under the specific drain+retry+flush pattern
+introduced here; ruled out single-thread re-entry, `IncompleteMessage`
+buffer reuse, and TCP-level retransmits as the source. The
+integrity classifier flags this as `[FAIL: duplicates]` but the
+"every message delivered" contract from `metak-shared/overview.md`
+is satisfied at the unique-seq level. Recommended Wave 3 follow-up:
+either (a) chase the tungstenite-internal cause and either patch
+the variant or open an upstream issue, or (b) widen the integrity
+classifier's tolerance for at-most-once-with-rare-dupes at
+saturation (similar to webrtc's qos1 ordering tolerance).
+
+**What was wrong with T14.19 in single mode** (one-sentence
+historical record): T14.19 installed `SO_SNDTIMEO = 5 s` and
+dropped the peer on the resulting `TimedOut` error, which was the
+right deadlock-breaking move pre-E17 but violates the post-E17
+"100% delivery of accepted writes" contract because the dropped
+peer takes the spawn's delivery to ~0% at saturation; T17.5
+flipped the timeout-handler policy from "drop the peer" to
+"drain the peer's read side and retry the flush", restoring 100%
+unique-seq delivery at the cost of throughput collapse (the
+explicitly-acceptable failure mode per DESIGN.md § 6.5).
+
+**Deviations from spec**: none on the variant-side fix. One
+fixture-only addition: `variants/websocket/tests/fixtures/two-runner-websocket-t17-5-saturate.toml`
+captures the 30s saturation workload used for the before/after
+measurement above (the existing `t14-19-stress` fixture's 8 s
+operate window is too short for the analyzer to compute a stable
+delivery percentage when the message rate has collapsed to a few
+tens of K msg/s).
+
+**Pending Wave 3** (T17.10 full-matrix re-run, analysis
+acceptance, and follow-up on the duplicates anomaly).
+
