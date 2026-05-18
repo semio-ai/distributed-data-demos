@@ -11,6 +11,38 @@ use tokio::sync::mpsc;
 use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::variant_trait::Variant;
 
+/// Bounded capacity of the inbound channel used by the per-connection
+/// stream readers to push decoded frames to the variant's
+/// `poll_receive` queue (T17.6).
+///
+/// The READ side back-pressure mechanism for QoS 3/4 100% delivery:
+/// quinn's per-stream flow-control window opens only as fast as the
+/// stream reader task drains bytes off the stream. The stream reader
+/// here decodes one frame then `.await`s on `mpsc::Sender::send`. If
+/// the inbound channel is full (i.e. `poll_receive` has not been
+/// called recently enough by the driver), `send().await` parks the
+/// reader task, the stream stops draining, and the per-stream flow
+/// control window collapses -- which propagates back to the peer's
+/// `write_all` and blocks the peer's send_loop. The peer's bounded
+/// send channel then back-pressures the peer's `try_publish`, and the
+/// peer's driver slows down to match this variant's drain rate.
+///
+/// Pre-T17.6 the inbound channel was unbounded, so quinn could ACK
+/// gigabytes of frames into RAM without the application ever calling
+/// `poll_receive`. The peer's writes raced ahead, the spawn's
+/// `silent_secs` (~3 s) drained only the tip, and the runtime tore
+/// everything else down. End-to-end delivery on `1000x100hz qos4`
+/// asymptoted at ~50%.
+///
+/// The 4096 bound is tuned so a tick's worth of receives fits
+/// comfortably (a 1000 vpt × 100 Hz workload produces 100K msg/s, so
+/// 4K is ~40 ms of slack) and `poll_receive`'s steady-state drain
+/// keeps the channel below capacity without engaging back-pressure
+/// on the happy path. Under sustained saturation the channel
+/// saturates within a few ticks and the back-pressure chain takes
+/// over.
+const INBOUND_CHANNEL_BOUND: usize = 4096;
+
 /// Bounded capacity of the sync-to-async send channel used by the
 /// reliable (QoS 3/4) publish path (T17.6).
 ///
@@ -314,7 +346,9 @@ pub struct QuicVariant {
     /// asymptote at "what fit through the stream window in
     /// `silent_secs`", never 100%.
     send_join: Option<tokio::task::JoinHandle<()>>,
-    recv_rx: Option<mpsc::UnboundedReceiver<Inbound>>,
+    /// Bounded inbound channel (T17.6). See `INBOUND_CHANNEL_BOUND`
+    /// for the read-side back-pressure rationale.
+    recv_rx: Option<mpsc::Receiver<Inbound>>,
     shutdown_tx: Option<ShutdownTx>,
     /// Pending peer EOTs, drained by `poll_peer_eots`. Populated by
     /// either method as it pumps the inbound channel (the driver
@@ -359,6 +393,52 @@ impl QuicVariant {
     }
 }
 
+/// Tight per-connection transport limits (T17.6) that engage
+/// quinn's flow control at wire-rate rather than the multi-MB
+/// defaults that buffer 4-6 seconds of writes at 100K msg/s.
+///
+/// Defaults (per quinn-proto's `TransportConfig::default`):
+///   stream_receive_window = 1.25 MB
+///   receive_window        = VarInt::MAX
+///   send_window           = 10 MB
+///
+/// Those defaults let alice's `write_all` accept ~25 K queued
+/// messages on loopback before back-pressure kicks in. By the time
+/// the writer's `operate` phase ends, 4-6 seconds of writes live
+/// in quinn's internal buffer; the spawn's `silent_secs` (~2 s)
+/// drain budget cannot catch up, and the runtime tears down
+/// before the buffer flushes.
+///
+/// Shrinking the per-stream + per-connection windows here forces
+/// quinn's flow control to engage closer to wire-rate: the local
+/// send buffer caps at ~128 KB per stream (a few thousand
+/// messages), so `write_all` blocks promptly once the peer's
+/// ack rate is below the writer's offered rate. The bounded mpsc
+/// then back-pressures `try_publish`, and the driver throttles to
+/// the receiver's drain rate. End-to-end this preserves the
+/// DESIGN.md § 6.5 delivery-over-throughput contract at QoS 3/4.
+///
+/// The exact byte values trade throughput for latency: smaller
+/// windows mean tighter back-pressure but more CPU on
+/// flow-control updates. 128 KiB per stream + 1 MiB per
+/// connection was selected empirically as the smallest setting
+/// that did not regress the two-runner-only smoke fixtures.
+const STREAM_RECEIVE_WINDOW_BYTES: u32 = 128 * 1024;
+const CONNECTION_RECEIVE_WINDOW_BYTES: u32 = 1024 * 1024;
+const CONNECTION_SEND_WINDOW_BYTES: u64 = 1024 * 1024;
+
+/// Build a per-spawn `TransportConfig` with the tight T17.6 flow
+/// control windows. Both server and client sides install this so
+/// the back-pressure flows in both directions on bidirectional
+/// spawn topologies.
+fn build_transport_config() -> Arc<quinn::TransportConfig> {
+    let mut cfg = quinn::TransportConfig::default();
+    cfg.stream_receive_window(STREAM_RECEIVE_WINDOW_BYTES.into());
+    cfg.receive_window(CONNECTION_RECEIVE_WINDOW_BYTES.into());
+    cfg.send_window(CONNECTION_SEND_WINDOW_BYTES);
+    Arc::new(cfg)
+}
+
 /// Build a quinn server config from the given certificate.
 fn build_server_config(
     cert_der: rustls::pki_types::CertificateDer<'static>,
@@ -368,9 +448,10 @@ fn build_server_config(
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)?;
 
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
+    server_config.transport_config(build_transport_config());
     Ok(server_config)
 }
 
@@ -381,8 +462,9 @@ fn build_client_config() -> Result<quinn::ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
-    let client_config =
+    let mut client_config =
         quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
+    client_config.transport_config(build_transport_config());
     Ok(client_config)
 }
 
@@ -477,7 +559,7 @@ const RELIABLE_FRAME_MAX_BYTES: u32 = 64 * 1024 * 1024;
 /// ~42 K messages/spawn under the E14 smoke (T14.13 audit).
 async fn handle_connection(
     connection: quinn::Connection,
-    recv_tx: mpsc::UnboundedSender<Inbound>,
+    recv_tx: mpsc::Sender<Inbound>,
     eot_dedup: Arc<EotDedup>,
     mut shutdown_rx: ShutdownRx,
 ) {
@@ -546,7 +628,7 @@ async fn handle_connection(
 /// same stream as the final length-delimited frame before `finish`.
 async fn read_reliable_stream(
     mut recv_stream: quinn::RecvStream,
-    tx: mpsc::UnboundedSender<Inbound>,
+    tx: mpsc::Sender<Inbound>,
     dedup: Arc<EotDedup>,
 ) {
     loop {
@@ -586,14 +668,22 @@ async fn read_reliable_stream(
 /// Decode a single inbound buffer (datagram or finished uni-stream) and
 /// forward the result to the variant's inbound channel. EOT frames are
 /// deduped by `(writer, eot_id)` before being surfaced.
-async fn dispatch_decoded(data: &[u8], tx: &mpsc::UnboundedSender<Inbound>, dedup: &EotDedup) {
+async fn dispatch_decoded(data: &[u8], tx: &mpsc::Sender<Inbound>, dedup: &EotDedup) {
     match decode_frame(data) {
         Ok(DecodedFrame::Data(update)) => {
-            let _ = tx.send(Inbound::Data(update));
+            // T17.6: bounded inbound channel + async `.send().await`
+            // is the read-side back-pressure mechanism. When the
+            // variant's `poll_receive` falls behind, the channel
+            // fills, this `.await` parks the stream reader task,
+            // quinn's per-stream window collapses, and the peer's
+            // `write_all` blocks. End-to-end this throttles the
+            // peer's `try_publish` to match this variant's drain
+            // rate (DESIGN.md § 6.5).
+            let _ = tx.send(Inbound::Data(update)).await;
         }
         Ok(DecodedFrame::Eot(eot)) => {
             if dedup.first_sight(&eot.writer, eot.eot_id).await {
-                let _ = tx.send(Inbound::Eot(eot));
+                let _ = tx.send(Inbound::Eot(eot)).await;
             }
         }
         Err(_) => {
@@ -635,7 +725,11 @@ impl Variant for QuicVariant {
         // driver and produced delivery shortfalls at QoS 3/4
         // saturation. See `RELIABLE_SEND_CHANNEL_BOUND`.
         let (send_tx, send_rx) = mpsc::channel::<OutboundMessage>(RELIABLE_SEND_CHANNEL_BOUND);
-        let (recv_tx, recv_rx) = mpsc::unbounded_channel::<Inbound>();
+        // T17.6: bounded inbound channel. Stream readers `.await` on
+        // `send()`, which stalls when the channel is full and lets
+        // quinn's per-stream flow control collapse -- back-pressuring
+        // the peer's writes to wire-rate. See `INBOUND_CHANNEL_BOUND`.
+        let (recv_tx, recv_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_BOUND);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let eot_dedup = EotDedup::new();
 
@@ -1013,20 +1107,46 @@ impl Variant for QuicVariant {
     // termination (T15.4) plus variant-side idle detection (T15.5).
 }
 
+/// Cap on the local `pending_data` deque used as the staging area
+/// between the bounded mpsc and `poll_receive` (T17.6).
+///
+/// The deque is unbounded by Rust's `VecDeque`, but if we let it
+/// grow without limit the bounded inbound mpsc never engages
+/// back-pressure: `pump_inbound` drains everything on each call,
+/// the local deque absorbs the entire flow, and the per-stream
+/// flow-control window in quinn stays open indefinitely. The cap
+/// stops `pump_inbound` from pulling more from `recv_rx` once the
+/// local deque already has more than this many items pending --
+/// which propagates the bounded `recv_rx` back-pressure all the
+/// way up to the peer's `write_all`.
+///
+/// The exact value trades latency vs. throughput. Smaller caps
+/// surface back-pressure faster (tight delivery, lower throughput).
+/// Larger caps absorb micro-bursts but allow the queue depth
+/// (and therefore end-to-end latency) to grow. 1024 was selected
+/// empirically as the smallest value that did not throttle the
+/// happy-path two-runner-only smoke fixture.
+const PENDING_DATA_CAP: usize = 1024;
+
 impl QuicVariant {
-    /// Drain the inbound channel into the per-kind side buffers.
-    /// Idempotent and non-blocking: returns when the channel reports
-    /// empty or disconnected.
+    /// Drain at most `PENDING_DATA_CAP - pending_data.len()`
+    /// messages from the inbound channel into the per-kind side
+    /// buffers. Bounded so the local deque cannot grow to mask the
+    /// bounded mpsc's back-pressure signal (T17.6).
     fn pump_inbound(&mut self) {
         let Some(recv_rx) = self.recv_rx.as_mut() else {
             return;
         };
-        loop {
+        // The bound on how many messages we are willing to stage
+        // locally before forcing back-pressure onto the bounded
+        // recv_rx (and thence onto the peer's writes).
+        let headroom = PENDING_DATA_CAP.saturating_sub(self.pending_data.len());
+        for _ in 0..headroom {
             match recv_rx.try_recv() {
                 Ok(Inbound::Data(update)) => self.pending_data.push_back(update),
                 Ok(Inbound::Eot(eot)) => self.pending_eots.push(eot),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => return,
+                Err(mpsc::error::TryRecvError::Disconnected) => return,
             }
         }
     }
@@ -1327,7 +1447,8 @@ mod tests {
     /// holds when the sender duplicates aggressively.
     #[tokio::test]
     async fn test_datagram_retry_dedup() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Inbound>();
+        // Bounded inbound channel matches the post-T17.6 wire surface.
+        let (tx, mut rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_BOUND);
         let dedup = EotDedup::new();
 
         let payload = encode_eot("alice", 7);
@@ -1377,7 +1498,7 @@ mod tests {
 
         // Server side: accept a connection, open the receive
         // pipeline, and collect inbound observations.
-        let (tx, mut rx) = mpsc::unbounded_channel::<Inbound>();
+        let (tx, mut rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_BOUND);
         let dedup = EotDedup::new();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 

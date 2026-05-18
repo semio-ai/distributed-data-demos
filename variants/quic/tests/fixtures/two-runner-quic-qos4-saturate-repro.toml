@@ -19,7 +19,7 @@
 
 run = "quic-t176-qos34-saturate-repro"
 runners = ["alice", "bob"]
-default_timeout_secs = 60
+default_timeout_secs = 120
 
 [[variant]]
 name = "quic-1000x100hz-qos3"
@@ -28,9 +28,9 @@ supported_modes = ["multi"]
 
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 2
-  operate_secs = 10
-  silent_secs = 2
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
   qos = 3
@@ -47,9 +47,9 @@ supported_modes = ["multi"]
 
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 2
-  operate_secs = 10
-  silent_secs = 2
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
   workload = "scalar-flood"
   values_per_tick = 1000
   qos = 4
