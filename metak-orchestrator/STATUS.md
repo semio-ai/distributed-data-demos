@@ -11997,3 +11997,107 @@ integrity or headline numbers.
 
 Final summary lives in
 `logs/same-machine-all-variants-01-20260514_084636/analysis/analyze_report.md`
+
+---
+
+## T17.3 — variants/custom-udp: QoS 4 TCP back-pressure — done
+
+**Scope**: Replace the pre-T17.3 "any TCP write error drops the
+peer" policy with a transient-vs-fatal classifier and retry loop, so
+QoS 4 satisfies the DESIGN.md § 6.5 strict-no-skip contract under
+the saturation workload that originally surfaced ~55% (multi) and
+~68% (single) drop rates on `custom-udp-1000x100hz-qos4`.
+
+**What changed** (commit `62a0e0c` for code + tests + fixture,
+`744443a` for CUSTOM.md):
+
+- `src/udp.rs::publish_encoded` -- `Qos::ReliableTcp` branch now
+  loops on `write_all` per peer:
+    - on transient error (`WouldBlock`, `TimedOut`, `Interrupted`):
+      retry. First retry `yield_now()`, subsequent retries
+      `sleep(100us)` to match the variant-base driver's QoS 3/4
+      strict-no-skip back-off.
+    - on fatal error (`ConnectionReset`, `BrokenPipe`,
+      `ConnectionAborted`, `NotConnected`, or anything else):
+      drop the peer from `tcp_out_streams` with a
+      `[custom-udp] T17.3: dropping outbound TCP peer ... after
+      FATAL write error` log line.
+- `is_fatal_tcp_write_error` -- new helper next to the QoS-4 retry
+  loop. Conservative default: unknown error kinds are treated as
+  fatal rather than retried forever.
+- `TCP_SINGLE_WRITE_TIMEOUT` (5 s, Single-only) -> `TCP_WRITE_TIMEOUT`
+  (500 ms, BOTH modes). Pre-T17.3 the timeout was a peer-drop
+  trigger only in Single mode (T14.19); post-T17.3 it is a
+  wake-from-retry mechanism applied uniformly. Multi mode no longer
+  risks spurious peer-drops from transient back-pressure because
+  `TimedOut` is now retry, not drop.
+- The pre-T17.3 test `publish_qos4_drops_peer_on_write_timeout`
+  (which asserted the contract-violating drop-on-TimedOut
+  behaviour) is replaced with three new unit tests covering the
+  classifier policy, happy-path no-pressure, and fatal-error
+  peer-drop branches.
+
+**Reproducer**: `variants/custom-udp/tests/fixtures/
+two-runner-custom-udp-qos4-saturate-repro.toml` -- `100x100hz` qos4
+in both threading modes via the standard runner expansion. The
+matching integration test
+`variants/custom-udp/tests/two_runner_t17_3_qos4_backpressure.rs`
+(gated `#[ignore]`) drives the fixture end-to-end and asserts:
+
+- both spawns reach `status=success`,
+- cross-peer delivery is 100% in both directions (raw counts;
+  matches `analysis/integrity.py::_check_per_pair` semantics),
+- zero `backpressure_skipped` events with `qos == 4`.
+
+**Tests run** (all from workspace root):
+
+```
+cargo test --release -p variant-custom-udp --bins
+  -> 80 passed; 0 failed; 3 ignored
+
+cargo test --release -p variant-custom-udp -- --ignored two_runner_t17_3 --nocapture
+  -> 1 passed; 0 failed
+  -> [T17.3/single] alice -> bob qos4: 50100/50100 (100.0000%)
+  -> [T17.3/single] bob -> alice qos4: 50100/50100 (100.0000%)
+  -> [T17.3/multi]  alice -> bob qos4: 50100/50100 (100.0000%)
+  -> [T17.3/multi]  bob -> alice qos4: 50100/50100 (100.0000%)
+  -> [T17.3] wall-time: 33s -- PASS
+
+cargo test --release -p variant-custom-udp -- --ignored --nocapture --test-threads=1
+  -> all pre-existing #[ignore] tests pass (T12.7-qos1, T12.7-qos4,
+     T14.3-qos4-{single,multi}, T14.19-single-no-deadlock,
+     T14.22-startup-race). T14.19 still passes with delivery
+     now 100 % (previously near-zero) -- its assertions only check
+     status=success + eot_sent, both unchanged.
+
+cargo clippy --release -p variant-custom-udp --all-targets -- -D warnings
+  -> clean
+
+cargo fmt -p variant-custom-udp -- --check
+  -> clean
+```
+
+**Before / after delivery on the reproducer** (raw counts):
+
+| Cell | Pre-T17.3 (heatmap) | Post-T17.3 (reproducer) |
+|---|---|---|
+| custom-udp-1000x100hz-qos4-single | 31.8% | 100.00% |
+| custom-udp-1000x100hz-qos4-multi  | 44.9% | 100.00% |
+
+The reproducer uses `100x100hz` (10 K msg/s symmetric) rather than
+the full `1000x100hz` (100 K msg/s) so a single test run fits the
+CI budget; both rates exercise the same retry-on-timeout pattern.
+The full-rate validation is T17.10's job.
+
+**Workspace clippy + fmt note**: `cargo clippy --workspace
+--all-targets -- -D warnings` and `cargo fmt --check` both surface
+pre-existing issues in `variants/hybrid/` and `variants/websocket/`
+that are being worked on in parallel by T17.4 / T17.5 workers. The
+T17.3-scoped commands (`-p variant-custom-udp`) are clean.
+
+**Deviations from spec**: none. The fix implements blocking writes
+with `SO_SNDTIMEO`-driven retry exactly as described; no user-space
+drop queue. Applied symmetrically to both threading modes.
+
+**Pending Wave 3** (T17.10 full-matrix re-run + analysis acceptance).
+
