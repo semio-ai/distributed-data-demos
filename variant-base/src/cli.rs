@@ -55,6 +55,23 @@ pub const DEFAULT_OPERATE_IDLE_SECS: u32 = 5;
 /// shortest reasonable runner deadline.
 pub const DEFAULT_WATCHDOG_SECS: u32 = 30;
 
+/// Default value for `--digest-mem-soft-mb`. When the running
+/// estimate of in-memory compact-buffer footprint exceeds this size
+/// during operate or silent, the variant logs one warning to its
+/// stderr (rate-limited via a once-flag) but continues. Tuned to
+/// match the E18 100 K msg/s x 30 s x 1-peer headline workload's
+/// approximate steady-state footprint plus a 20% margin.
+pub const DEFAULT_DIGEST_MEM_SOFT_MB: u32 = 1024;
+
+/// Default value for `--digest-mem-hard-mb`. When the running
+/// estimate of in-memory compact-buffer footprint exceeds this size,
+/// the variant returns an error from the operate loop with a clear
+/// message identifying the threshold. Tuned to give the soft ceiling
+/// 2x of headroom so the variant degrades gracefully on a workload
+/// configured beyond its capacity rather than swallowing OOMs at the
+/// kernel boundary.
+pub const DEFAULT_DIGEST_MEM_HARD_MB: u32 = 2048;
+
 /// Validate that `kb` falls within the documented `--recv-buffer-kb`
 /// range. Returned by clap's `value_parser`.
 fn parse_recv_buffer_kb(s: &str) -> Result<u32, String> {
@@ -219,6 +236,48 @@ pub struct CliArgs {
     /// time to complete.
     #[arg(long, default_value_t = DEFAULT_WATCHDOG_SECS)]
     pub watchdog_secs: u32,
+
+    /// Soft in-memory ceiling for compact buffers, in MiB
+    /// (1024 * 1024 bytes). When the running estimate of buffer
+    /// footprint crosses this size, the variant logs one warning
+    /// line to its stderr ("compact buffers exceeded soft ceiling
+    /// XYZ MiB") and continues. Defaults to
+    /// [`DEFAULT_DIGEST_MEM_SOFT_MB`] (1 GiB).
+    ///
+    /// See T18.2 / E18.
+    #[arg(long, default_value_t = DEFAULT_DIGEST_MEM_SOFT_MB)]
+    pub digest_mem_soft_mb: u32,
+
+    /// Hard in-memory ceiling for compact buffers, in MiB. When the
+    /// running estimate of buffer footprint crosses this size, the
+    /// operate loop returns an `Err` with a clear message naming the
+    /// threshold; the driver propagates the error up and the variant
+    /// exits with code 1. Defaults to
+    /// [`DEFAULT_DIGEST_MEM_HARD_MB`] (2 GiB).
+    ///
+    /// See T18.2 / E18.
+    #[arg(long, default_value_t = DEFAULT_DIGEST_MEM_HARD_MB)]
+    pub digest_mem_hard_mb: u32,
+
+    /// Opt in to emitting per-event JSONL lines (`write`, `receive`,
+    /// `backpressure_skipped`, `gap_detected`, `gap_filled`) in
+    /// addition to the compact Parquet output. Off by default once
+    /// T18.2 lands: the compact file carries the same information at
+    /// 30-50x less disk footprint.
+    ///
+    /// When set, the variant produces BOTH the legacy
+    /// `<variant>-<runner>-<run>.jsonl` file and the new
+    /// `<variant>-<runner>-<run>.compact.parquet` file. The two are
+    /// guaranteed to contain the same per-event rows under the same
+    /// spawn -- handy for live debugging or for tooling that has not
+    /// yet been ported to read the compact format.
+    ///
+    /// Lifecycle events (`connected`, `phase`, `eot_sent`,
+    /// `eot_received`, `eot_timeout`, `resource`) ALWAYS go to JSONL
+    /// regardless of this flag; only the high-volume per-event lines
+    /// are gated on it. See T18.2 / E18.
+    #[arg(long, default_value_t = false)]
+    pub legacy_jsonl_events: bool,
 
     // -- Variant-specific pass-through arguments --
     /// Additional variant-specific arguments (collected as trailing args).

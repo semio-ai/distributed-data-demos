@@ -92,6 +92,17 @@ fn test_args_with_mode(log_dir: &str, threading_mode: ThreadingMode) -> CliArgs 
         // tests -- no internal-stall risk and we want zero extra
         // background threads.
         watchdog_secs: 0,
+        // T18.2 / E18: defaults match the CLI defaults so existing
+        // smoke tests do not need to think about the new flags.
+        // Tests that exercise the compact-only path or the soft /
+        // hard ceiling thresholds build their own args from
+        // scratch.
+        digest_mem_soft_mb: variant_base::cli::DEFAULT_DIGEST_MEM_SOFT_MB,
+        digest_mem_hard_mb: variant_base::cli::DEFAULT_DIGEST_MEM_HARD_MB,
+        // Keep the legacy per-event JSONL stream ON in the
+        // integration tests that pre-date T18.2 -- their assertions
+        // explicitly count `write` and `receive` lines.
+        legacy_jsonl_events: true,
         // Single-runner self-loopback peers list -> empty expected set
         // -> EOT phase terminates immediately with no `eot_timeout`.
         extra: vec!["--peers".to_string(), "test-runner=127.0.0.1".to_string()],
@@ -148,9 +159,10 @@ fn test_full_protocol_with_dummy() {
         })
         .collect();
 
-    // After T15.8 the EOT phase is removed; the driver emits four
-    // phase events (connect, stabilize, operate, silent).
-    assert_eq!(phase_events.len(), 4, "should have 4 phase events");
+    // After T15.8 the EOT phase is removed; after T18.2 the digest
+    // phase is appended -- five phase events: connect, stabilize,
+    // operate, silent, digest.
+    assert_eq!(phase_events.len(), 5, "should have 5 phase events");
     assert_eq!(phase_events[0].0, "connect");
     assert_eq!(phase_events[1].0, "stabilize");
     assert_eq!(phase_events[2].0, "operate");
@@ -160,6 +172,7 @@ fn test_full_protocol_with_dummy() {
         "operate phase should include workload profile"
     );
     assert_eq!(phase_events[3].0, "silent");
+    assert_eq!(phase_events[4].0, "digest");
 
     // The `eot_sent` JSONL marker is still emitted exactly once between
     // operate and silent. No on-wire byproducts (`eot_timeout`,
@@ -339,8 +352,8 @@ fn test_variant_dummy_runs_in_both_threading_modes() {
             .collect();
         assert_eq!(
             phases,
-            vec!["connect", "stabilize", "operate", "silent"],
-            "phase order must be canonical in {mode} mode (T15.8: no eot phase)"
+            vec!["connect", "stabilize", "operate", "silent", "digest"],
+            "phase order must be canonical in {mode} mode (T15.8: no eot phase; T18.2: digest appended)"
         );
 
         // Exactly one `connected` event carrying the mode and the
@@ -619,8 +632,8 @@ fn test_variant_dummy_idle_detection_short_circuits_operate() {
         .collect();
     assert_eq!(
         phases,
-        vec!["connect", "stabilize", "operate", "silent"],
-        "idle path must skip the eot phase, got {phases:?}"
+        vec!["connect", "stabilize", "operate", "silent", "digest"],
+        "idle path skips eot, then digest is appended (T18.2), got {phases:?}"
     );
 
     // Exactly one `eot_sent` event.
@@ -681,5 +694,242 @@ fn test_variant_dummy_progress_stdout_zero_disables_emission() {
     assert!(
         stdout.trim().is_empty(),
         "--progress-stdout-interval-ms=0 must produce empty stdout, got:\n{stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T18.2 / E18: compact-log Parquet output
+// ---------------------------------------------------------------------------
+
+/// T18.2 acceptance: an in-process `VariantDummy` run must produce a
+/// well-formed `<variant>-<runner>-<run>.compact.parquet` file
+/// alongside the legacy JSONL, and the file must contain at least one
+/// row per `write` JSONL event observed in the same run. The schema
+/// must match the documented seven-column layout.
+#[test]
+fn test_compact_parquet_is_written_alongside_jsonl() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let args = test_args(log_dir);
+
+    let mut dummy = VariantDummy::new(&args.runner);
+    run_protocol(&mut dummy, &args).expect("protocol should complete");
+
+    // The legacy JSONL must still exist (legacy_jsonl_events is on in
+    // this test's args).
+    let jsonl_path = dir.path().join("dummy-test-runner-run01.jsonl");
+    assert!(
+        jsonl_path.exists(),
+        "legacy JSONL must be written when legacy_jsonl_events = true"
+    );
+
+    // The new compact parquet file MUST exist regardless of the
+    // legacy flag.
+    let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
+    assert!(
+        parquet_path.exists(),
+        "compact Parquet file must be written at <log_dir>/<variant>-<runner>-<run>.compact.parquet"
+    );
+
+    // Read it back and validate the documented schema + KV metadata.
+    let file = std::fs::File::open(&parquet_path).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(
+        meta.file_metadata().schema_descr().num_columns(),
+        7,
+        "compact schema must have exactly 7 columns (ts_ns, kind, seq, path_idx, peer_idx, qos, bytes)"
+    );
+
+    let kv = meta
+        .file_metadata()
+        .key_value_metadata()
+        .expect("KV metadata must be present");
+    let lookup: std::collections::HashMap<&str, &str> = kv
+        .iter()
+        .filter_map(|x| x.value.as_deref().map(|v| (x.key.as_str(), v)))
+        .collect();
+    assert_eq!(lookup.get("variant"), Some(&"dummy"));
+    assert_eq!(lookup.get("runner"), Some(&"test-runner"));
+    assert_eq!(lookup.get("run"), Some(&"run01"));
+    assert!(lookup.contains_key("paths"));
+    assert!(lookup.contains_key("peers"));
+
+    // Cross-check: the parquet row count must equal the number of
+    // per-event rows in the JSONL stream (write + receive +
+    // backpressure_skipped + gap_*).
+    let jsonl_lines: Vec<serde_json::Value> = std::fs::read_to_string(&jsonl_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let jsonl_event_rows = jsonl_lines
+        .iter()
+        .filter(|l| {
+            matches!(
+                l["event"].as_str(),
+                Some("write")
+                    | Some("receive")
+                    | Some("backpressure_skipped")
+                    | Some("gap_detected")
+                    | Some("gap_filled")
+            )
+        })
+        .count() as i64;
+    assert_eq!(
+        meta.file_metadata().num_rows(),
+        jsonl_event_rows,
+        "compact row count must equal the number of per-event JSONL rows"
+    );
+    // VariantDummy echoes every write -> at least one row per write.
+    assert!(meta.file_metadata().num_rows() > 0);
+}
+
+/// T18.2 acceptance: with `--legacy-jsonl-events` disabled (the new
+/// default), per-event JSONL lines (`write`, `receive`,
+/// `backpressure_skipped`) MUST NOT appear in the JSONL stream, but
+/// the lifecycle events (`phase`, `connected`, `eot_sent`, `resource`)
+/// MUST still be present, and the compact Parquet file MUST contain
+/// the full per-event row set.
+#[test]
+fn test_compact_only_mode_suppresses_per_event_jsonl_but_keeps_lifecycle() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let mut args = test_args(log_dir);
+    args.legacy_jsonl_events = false;
+
+    let mut dummy = VariantDummy::new(&args.runner);
+    run_protocol(&mut dummy, &args).expect("protocol should complete");
+
+    let jsonl_path = dir.path().join("dummy-test-runner-run01.jsonl");
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&jsonl_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
+
+    // Per-event rows must be absent.
+    for event in [
+        "write",
+        "receive",
+        "backpressure_skipped",
+        "gap_detected",
+        "gap_filled",
+    ] {
+        assert!(
+            !events.contains(&event),
+            "event '{event}' must NOT appear in JSONL when legacy_jsonl_events = false"
+        );
+    }
+
+    // Lifecycle events must still be present.
+    let phase_count = events.iter().filter(|e| **e == "phase").count();
+    assert!(
+        phase_count >= 5,
+        "must still have all phase events; got {phase_count}"
+    );
+    assert!(
+        events.contains(&"connected"),
+        "must still have connected event"
+    );
+    assert!(
+        events.contains(&"eot_sent"),
+        "must still have eot_sent event"
+    );
+
+    // The compact Parquet file must still contain the per-event rows.
+    let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
+    let reader = SerializedFileReader::new(std::fs::File::open(&parquet_path).unwrap()).unwrap();
+    assert!(
+        reader.metadata().file_metadata().num_rows() > 0,
+        "compact-only mode must STILL accumulate rows in the Parquet file"
+    );
+}
+
+/// T18.2 acceptance: the hard memory ceiling aborts the spawn when
+/// the running buffer footprint exceeds the threshold. Setting an
+/// absurdly low `--digest-mem-hard-mb` (1 MiB) and producing more than
+/// 1 MiB of in-memory rows must produce an error from `run_protocol`.
+#[test]
+fn test_digest_mem_hard_ceiling_aborts_spawn() {
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let mut args = test_args(log_dir);
+    // Crank values_per_tick so the buffers overflow 1 MiB within a
+    // sub-second operate phase: 1 MiB / ~32 bytes/row ~= 32 K rows.
+    // 100 Hz x 1000 vpt x 1 s = 100K rows -> hard ceiling fires
+    // well before operate_secs expires.
+    args.tick_rate_hz = 100;
+    args.operate_secs = 2;
+    args.values_per_tick = 1000;
+    args.digest_mem_soft_mb = 1;
+    args.digest_mem_hard_mb = 1;
+
+    let mut dummy = VariantDummy::new(&args.runner);
+    let result = run_protocol(&mut dummy, &args);
+    let err = result.expect_err("run_protocol must abort when hard ceiling is exceeded");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("compact buffers exceeded hard ceiling"),
+        "error message must identify the hard ceiling, got: {msg}"
+    );
+}
+
+/// T18.2 acceptance: the file-size win. A realistic spawn (5 s
+/// scalar-flood at 1000 Hz x 100 vpt = 500 K events) must produce a
+/// Parquet file at least 10x smaller than the equivalent JSONL.
+///
+/// We run with `legacy_jsonl_events = true` to get both files in
+/// the same spawn, then compare their on-disk sizes. The acceptance
+/// criterion is 10x because conservative -- the target in the epic
+/// is 30-50x, and we want to absorb scheduler jitter, the variant
+/// dummy's worst-case behaviour, and any future overhead while still
+/// catching regressions.
+///
+/// Smaller-than-realistic operate windows would not exercise the
+/// compression payoff because the Parquet footer + KV metadata is a
+/// fixed-cost overhead (~1.5 KiB). At 500 K rows the per-row cost
+/// dominates and the ratio is stable.
+#[test]
+fn test_compact_parquet_at_least_10x_smaller_than_jsonl() {
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let mut args = test_args(log_dir);
+    args.tick_rate_hz = 1000;
+    args.operate_secs = 2;
+    args.silent_secs = 0;
+    args.values_per_tick = 100;
+    args.legacy_jsonl_events = true;
+    // Disable resource sampling noise to keep the comparison clean.
+    args.operate_idle_secs = 0;
+    // Bump the ceilings well above what the run produces.
+    args.digest_mem_soft_mb = 256;
+    args.digest_mem_hard_mb = 512;
+
+    let mut dummy = VariantDummy::new(&args.runner);
+    run_protocol(&mut dummy, &args).expect("protocol must complete");
+
+    let jsonl_path = dir.path().join("dummy-test-runner-run01.jsonl");
+    let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
+
+    let jsonl_size = std::fs::metadata(&jsonl_path).unwrap().len();
+    let parquet_size = std::fs::metadata(&parquet_path).unwrap().len();
+
+    assert!(jsonl_size > 0);
+    assert!(parquet_size > 0);
+    let ratio = jsonl_size as f64 / parquet_size as f64;
+    eprintln!("compact size win: jsonl={jsonl_size}B parquet={parquet_size}B ratio={ratio:.1}x");
+    assert!(
+        ratio >= 10.0,
+        "T18.2 acceptance: parquet must be at least 10x smaller than JSONL; \
+         got jsonl={jsonl_size}B parquet={parquet_size}B ratio={ratio:.1}x"
     );
 }

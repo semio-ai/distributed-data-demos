@@ -1,9 +1,14 @@
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::cli::CliArgs;
+use crate::compact::CompactBuffers;
+use crate::compact_writer::{
+    compact_parquet_path, write_compact_parquet, CompactParquetMeta, CompactWriterOptions,
+};
 use crate::logger::{Logger, LoggerHandle};
 use crate::progress_emitter::ProgressEmitter;
 use crate::resource::ResourceMonitor;
@@ -12,6 +17,17 @@ use crate::types::{Phase, Qos, ThreadingMode};
 use crate::variant_trait::Variant;
 use crate::watchdog::Watchdog;
 use crate::workload::create_workload;
+
+/// Convert a `chrono::DateTime<Utc>` to whole nanoseconds since the
+/// UNIX epoch. Uses `timestamp_nanos_opt` and falls back to `0` on
+/// the (unreachable in practice) overflow path so the buffer push
+/// never has to surface an error -- the resulting row is still
+/// recoverable and the JSONL stream (when enabled) carries the
+/// authoritative timestamp.
+#[inline]
+fn ts_nanos(ts: DateTime<Utc>) -> i64 {
+    ts.timestamp_nanos_opt().unwrap_or(0)
+}
 
 /// Thin proxy that exposes the `Logger` event API on top of a
 /// [`LoggerHandle`]. Used by the driver so existing call sites can keep
@@ -85,6 +101,150 @@ impl<'a> LoggerProxy<'a> {
 
     fn flush(&mut self) -> Result<()> {
         self.lock()?.flush()
+    }
+}
+
+/// Outcome of a memory-ceiling check (T18.2).
+///
+/// Returned by [`EventSink::check_mem_ceilings`] so the driver can
+/// react to soft / hard threshold crossings without spreading the
+/// thresholds through the operate loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemCheckOutcome {
+    /// Buffer footprint is below the soft ceiling.
+    Ok,
+    /// Footprint just crossed the soft ceiling for the first time
+    /// this run -- the driver should log a warning to stderr and
+    /// continue. Subsequent crossings of the soft ceiling return
+    /// `Ok` (the once-flag stays sticky inside the sink).
+    SoftCrossed { current_mb: u64, threshold_mb: u32 },
+    /// Footprint crossed the hard ceiling -- the driver should
+    /// surface this as an error and abort the spawn.
+    HardCrossed { current_mb: u64, threshold_mb: u32 },
+}
+
+/// Dual-emission sink for high-volume per-event rows.
+///
+/// During operate + silent, every event the driver would historically
+/// have logged as a JSONL line is also pushed into the compact
+/// columnar buffers ([`CompactBuffers`]). At digest time the buffers
+/// are serialised to a single Parquet file.
+///
+/// JSONL emission of the same rows is **opt-in** via
+/// `legacy_jsonl_events`. When off (the T18.2 default), each
+/// `record_*` call writes to the compact buffers only -- saving the
+/// ~200 byte JSONL line that the analysis pipeline does not need
+/// once T18.3-T18.6 land. Lifecycle events (`phase`, `connected`,
+/// `eot_sent`, `resource`, etc.) are NOT routed through this sink;
+/// they always go to JSONL because they are low-volume and the
+/// runner reads them out-of-band.
+struct EventSink<'a> {
+    buffers: CompactBuffers,
+    /// Underlying JSONL logger. The proxy is borrowed mutably so the
+    /// sink can emit on the legacy path when enabled.
+    logger: LoggerProxy<'a>,
+    /// True iff per-event JSONL emission is enabled. Set from
+    /// `CliArgs::legacy_jsonl_events`.
+    legacy_jsonl: bool,
+    /// Soft memory ceiling in bytes (`digest_mem_soft_mb * 1 MiB`).
+    soft_ceiling_bytes: u64,
+    /// Hard memory ceiling in bytes (`digest_mem_hard_mb * 1 MiB`).
+    hard_ceiling_bytes: u64,
+    /// Sticky flag so the soft-ceiling warning is only emitted once
+    /// per spawn even if the buffer footprint oscillates around the
+    /// threshold.
+    soft_warning_emitted: bool,
+}
+
+impl<'a> EventSink<'a> {
+    fn new(logger: LoggerProxy<'a>, legacy_jsonl: bool, soft_mb: u32, hard_mb: u32) -> Self {
+        Self {
+            buffers: CompactBuffers::new(),
+            logger,
+            legacy_jsonl,
+            soft_ceiling_bytes: u64::from(soft_mb) * 1024 * 1024,
+            hard_ceiling_bytes: u64::from(hard_mb) * 1024 * 1024,
+            soft_warning_emitted: false,
+        }
+    }
+
+    /// Record a `write` event. The pre-publish `write_ts` is supplied
+    /// by the caller per the T16.2 contract.
+    fn record_write(
+        &mut self,
+        ts: DateTime<Utc>,
+        seq: u64,
+        path: &str,
+        qos: Qos,
+        bytes: usize,
+    ) -> Result<()> {
+        self.buffers
+            .push_write(ts_nanos(ts), path, qos.as_int(), seq, bytes as u32)?;
+        if self.legacy_jsonl {
+            self.logger.log_write_at(ts, seq, path, qos, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Record a `backpressure_skipped` event.
+    fn record_backpressure_skipped(&mut self, path: &str, qos: Qos) -> Result<()> {
+        self.buffers
+            .push_backpressure_skipped(ts_nanos(Utc::now()), path, qos.as_int())?;
+        if self.legacy_jsonl {
+            self.logger.log_backpressure_skipped(path, qos)?;
+        }
+        Ok(())
+    }
+
+    /// Record a `receive` event.
+    fn record_receive(
+        &mut self,
+        writer: &str,
+        seq: u64,
+        path: &str,
+        qos: Qos,
+        bytes: usize,
+    ) -> Result<()> {
+        self.buffers.push_receive(
+            ts_nanos(Utc::now()),
+            writer,
+            seq,
+            path,
+            qos.as_int(),
+            bytes as u32,
+        )?;
+        if self.legacy_jsonl {
+            self.logger.log_receive(writer, seq, path, qos, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Check the in-memory footprint against the soft and hard
+    /// thresholds. The soft threshold uses a sticky once-flag so the
+    /// driver only logs a single warning per spawn; the hard
+    /// threshold surfaces every time it is crossed (the driver is
+    /// expected to abort on the first occurrence).
+    fn check_mem_ceilings(&mut self) -> MemCheckOutcome {
+        let current = self.buffers.approx_bytes() as u64;
+        if current >= self.hard_ceiling_bytes {
+            return MemCheckOutcome::HardCrossed {
+                current_mb: current / (1024 * 1024),
+                threshold_mb: (self.hard_ceiling_bytes / (1024 * 1024)) as u32,
+            };
+        }
+        if current >= self.soft_ceiling_bytes && !self.soft_warning_emitted {
+            self.soft_warning_emitted = true;
+            return MemCheckOutcome::SoftCrossed {
+                current_mb: current / (1024 * 1024),
+                threshold_mb: (self.soft_ceiling_bytes / (1024 * 1024)) as u32,
+            };
+        }
+        MemCheckOutcome::Ok
+    }
+
+    /// Borrow the compact buffers immutably, for the digest writer.
+    fn buffers(&self) -> &CompactBuffers {
+        &self.buffers
     }
 }
 
@@ -162,7 +322,19 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // a `LoggerProxy` that locks the mutex per event -- the proxy keeps
     // the historical `logger.log_*` call shape unchanged at all sites.
     let logger_handle = LoggerHandle::new(owned_logger);
+    // The legacy `logger` variable continues to be used for
+    // lifecycle events (`phase`, `connected`, `eot_sent`,
+    // `resource`). High-volume per-event rows go through `sink`
+    // (which itself owns its own `LoggerProxy` for the gated
+    // legacy-JSONL emission path).
     let mut logger = LoggerProxy::new(&logger_handle);
+    let sink_logger = LoggerProxy::new(&logger_handle);
+    let mut sink = EventSink::new(
+        sink_logger,
+        config.legacy_jsonl_events,
+        config.digest_mem_soft_mb,
+        config.digest_mem_hard_mb,
+    );
     let mut seq_gen = SeqGenerator::new();
     let mut resource_monitor = ResourceMonitor::new();
     let mut workload = create_workload(&config.workload)?;
@@ -360,7 +532,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
             // `variant-base/CUSTOM.md` "Write timestamp capture".
             let write_ts = Utc::now();
             if variant.try_publish(&op.path, &op.payload, qos, seq)? {
-                logger.log_write_at(write_ts, seq, &op.path, qos, op.payload.len())?;
+                sink.record_write(write_ts, seq, &op.path, qos, op.payload.len())?;
                 progress.inc_sent();
                 if max_throughput {
                     consecutive_skipped = 0;
@@ -370,7 +542,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
                 // at-event-time (not at-attempt-time) -- it records
                 // the moment the driver gave up on this op, not the
                 // moment it tried. Do NOT reuse `write_ts` here.
-                logger.log_backpressure_skipped(&op.path, qos)?;
+                sink.record_backpressure_skipped(&op.path, qos)?;
                 if max_throughput {
                     consecutive_skipped = consecutive_skipped.saturating_add(1);
                     if consecutive_skipped == 1 {
@@ -408,7 +580,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         while drained < drain_msg_budget {
             match variant.poll_receive()? {
                 Some(update) => {
-                    logger.log_receive(
+                    sink.record_receive(
                         &update.writer,
                         update.seq,
                         &update.path,
@@ -422,6 +594,37 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
                     }
                 }
                 None => break,
+            }
+        }
+
+        // Compact-buffer memory ceiling checks (T18.2 / E18). The
+        // soft check fires once per spawn (sticky flag inside the
+        // sink); the hard check aborts the operate loop with a
+        // descriptive error. We do this once per outer iteration
+        // (not per drained message) so it never sits in the hot
+        // path of a high-rate receive burst.
+        match sink.check_mem_ceilings() {
+            MemCheckOutcome::Ok => {}
+            MemCheckOutcome::SoftCrossed {
+                current_mb,
+                threshold_mb,
+            } => {
+                eprintln!(
+                    "[variant] compact buffers exceeded soft ceiling \
+                     {threshold_mb} MiB (now {current_mb} MiB) -- \
+                     continuing; raise --digest-mem-soft-mb to silence"
+                );
+            }
+            MemCheckOutcome::HardCrossed {
+                current_mb,
+                threshold_mb,
+            } => {
+                return Err(anyhow::anyhow!(
+                    "compact buffers exceeded hard ceiling {threshold_mb} MiB \
+                     (now {current_mb} MiB); aborting spawn -- \
+                     raise --digest-mem-hard-mb if this workload genuinely \
+                     produces this much per-event data"
+                ));
             }
         }
 
@@ -483,7 +686,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     while silent_start.elapsed() < silent_duration {
         match variant.poll_receive()? {
             Some(update) => {
-                logger.log_receive(
+                sink.record_receive(
                     &update.writer,
                     update.seq,
                     &update.path,
@@ -505,6 +708,60 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // See E14 / T14.1.
     variant.stop_reader_threads()?;
     variant.disconnect()?;
+
+    // -- Phase 6: Digest (T18.2 / E18) --
+    //
+    // Serialise the accumulated columnar buffers to a single
+    // `<variant>-<runner>-<run>.compact.parquet` file alongside the
+    // legacy JSONL. The digest phase runs AFTER `disconnect` so
+    // transport teardown does not race with file-system I/O on
+    // resource-constrained hosts. It runs BEFORE the final logger
+    // flush so the `phase=digest` JSONL marker and any future
+    // digest-time error lines hit disk before the process exits.
+    //
+    // We log `phase=digest` to the legacy JSONL stream unconditionally
+    // (it is a low-volume lifecycle event); the runner uses this to
+    // distinguish a clean run-with-compact-output from one that died
+    // before it could finalise.
+    logger.log_phase(Phase::Digest, None)?;
+    progress.set_phase(Phase::Digest);
+
+    let parquet_path = compact_parquet_path(
+        Path::new(&config.log_dir),
+        &config.variant,
+        &config.runner,
+        &config.run,
+    );
+    let parquet_meta = CompactParquetMeta {
+        variant: config.variant.clone(),
+        runner: config.runner.clone(),
+        run: config.run.clone(),
+        launch_ts: config.launch_ts.clone(),
+        threading_mode: config.threading_mode.as_str().to_string(),
+        recv_buffer_kb: config.recv_buffer_kb,
+    };
+    let parquet_options = CompactWriterOptions::default();
+    let parquet_bytes = write_compact_parquet(
+        &parquet_path,
+        sink.buffers(),
+        &parquet_meta,
+        &parquet_options,
+    )
+    .map_err(|e| anyhow::anyhow!("digest phase: failed to write compact Parquet file: {e}"))?;
+
+    // Emit a one-line summary of the digest phase result to stderr
+    // (not stdout -- the progress emitter owns stdout). This is the
+    // operator-visible confirmation that the compact file was
+    // written; the size + row count let the operator spot a 0-byte
+    // or 0-row file at a glance without reaching for the Parquet
+    // reader.
+    eprintln!(
+        "[variant] digest: wrote {} ({} rows, {} bytes)",
+        parquet_path.display(),
+        sink.buffers().len(),
+        parquet_bytes,
+    );
+
     logger.flush()?;
 
     // Final progress transition: `done`. The emitter thread may emit
@@ -592,6 +849,18 @@ mod tests {
             // unit tests by default. Tests that exercise the new
             // watchdog path override this explicitly.
             watchdog_secs: 0,
+            // T18.2 / E18: keep the default 1 GiB / 2 GiB compact
+            // mem ceilings -- driver unit tests never push enough
+            // rows to approach them. Tests that exercise the soft
+            // / hard ceiling paths override these explicitly.
+            digest_mem_soft_mb: crate::cli::DEFAULT_DIGEST_MEM_SOFT_MB,
+            digest_mem_hard_mb: crate::cli::DEFAULT_DIGEST_MEM_HARD_MB,
+            // Legacy per-event JSONL stream stays ON in driver unit
+            // tests so existing assertions about `write`/`receive`
+            // lines keep working unchanged. Tests that need to
+            // exercise the compact-only path flip this off
+            // explicitly.
+            legacy_jsonl_events: true,
             extra: vec!["--peers".to_string(), peers.to_string()],
         }
     }
@@ -629,8 +898,8 @@ mod tests {
             .collect();
         assert_eq!(
             phase_seq,
-            vec!["connect", "stabilize", "operate", "silent"],
-            "T15.8: eot phase is removed; only operate-silent transition remains"
+            vec!["connect", "stabilize", "operate", "silent", "digest"],
+            "T15.8: no eot phase; T18.2: appended digest phase between silent and process exit"
         );
 
         // Exactly one `eot_sent` event is still emitted as the analysis
@@ -1578,17 +1847,19 @@ mod tests {
         eprintln!("scalar_flood_drain_does_not_overrun_tick: elapsed={elapsed:?}");
 
         // The driver entered the protocol BEFORE the operate phase
-        // (connect, stabilize) and exits AFTER (eot, silent). With
+        // (connect, stabilize) and exits AFTER (silent + digest). With
         // stabilize=0, silent=0, and a single-runner empty expected-peer
-        // EOT, those overheads are minimal. The dominant wall-clock is
-        // the operate phase itself plus per-iteration drain overhead.
-        // 1 s operate + 50 ms slack absorbs scheduler jitter, log I/O,
-        // and the floor-at-1ms fallback when the publish phase overran
-        // the tick. Anything beyond that means the drain compounded the
-        // lateness, which is exactly what the formula must prevent.
+        // EOT, those overheads are minimal -- except the T18.2 digest
+        // phase which serialises every accumulated row to Parquet at
+        // the end. A 1 Hz x 1000 vpt x 1 s run produces ~1M write +
+        // ~1M receive rows; the digest writer churns through them in
+        // 200..500 ms depending on host CPU. 1 s operate + 1 s slack
+        // absorbs that plus scheduler jitter; anything beyond that
+        // means the drain (not the digest) compounded the lateness,
+        // which is what this test still polices.
         assert!(
-            elapsed < Duration::from_millis(1000 + 50),
-            "operate phase should not slip more than 50 ms beyond operate_secs; got {elapsed:?}",
+            elapsed < Duration::from_millis(1000 + 1000),
+            "operate phase + digest should not exceed operate_secs by more than 1 s; got {elapsed:?}",
         );
     }
 
@@ -1994,8 +2265,8 @@ mod tests {
         let phases = phase_sequence(&lines);
         assert_eq!(
             phases,
-            vec!["connect", "stabilize", "operate", "silent"],
-            "idle path must skip the eot phase, got {phases:?}"
+            vec!["connect", "stabilize", "operate", "silent", "digest"],
+            "idle path must skip the eot phase and finish with digest, got {phases:?}"
         );
 
         // Exactly one `eot_sent` JSONL event must be emitted (the
@@ -2055,11 +2326,11 @@ mod tests {
 
         let lines = read_log(dir.path(), "alice");
         let phases = phase_sequence(&lines);
-        // T15.8: phase sequence is always connect/stabilize/operate/silent.
+        // T15.8: no on-wire EOT phase. T18.2: digest phase appended.
         assert_eq!(
             phases,
-            vec!["connect", "stabilize", "operate", "silent"],
-            "phase sequence post-T15.8 has no eot phase, got {phases:?}"
+            vec!["connect", "stabilize", "operate", "silent", "digest"],
+            "phase sequence post-T18.2 ends with digest, got {phases:?}"
         );
     }
 
@@ -2092,8 +2363,8 @@ mod tests {
         let phases = phase_sequence(&lines);
         assert_eq!(
             phases,
-            vec!["connect", "stabilize", "operate", "silent"],
-            "phase sequence post-T15.8 has no eot phase, got {phases:?}"
+            vec!["connect", "stabilize", "operate", "silent", "digest"],
+            "phase sequence post-T18.2 ends with digest, got {phases:?}"
         );
     }
 
@@ -2126,8 +2397,8 @@ mod tests {
         let phases = phase_sequence(&lines);
         assert_eq!(
             phases,
-            vec!["connect", "stabilize", "operate", "silent"],
-            "phase sequence post-T15.8 has no eot phase, got {phases:?}"
+            vec!["connect", "stabilize", "operate", "silent", "digest"],
+            "phase sequence post-T18.2 ends with digest, got {phases:?}"
         );
     }
 }

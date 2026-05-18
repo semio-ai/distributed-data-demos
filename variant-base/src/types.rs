@@ -114,6 +114,14 @@ impl fmt::Display for Qos {
 }
 
 /// Test protocol phases.
+///
+/// The `Digest` phase is the compact-log finalisation step introduced
+/// by T18.2 (E18). It runs after `Silent`; during it the variant
+/// serialises the in-memory columnar buffers populated during
+/// operate and silent to a single
+/// `<variant>-<runner>-<run>.compact.parquet` file. No transport
+/// activity happens during `Digest`. The phase emits one
+/// `phase=digest` JSONL marker so the runner sees the transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -122,6 +130,7 @@ pub enum Phase {
     Operate,
     Eot,
     Silent,
+    Digest,
 }
 
 impl Phase {
@@ -133,6 +142,7 @@ impl Phase {
             Phase::Operate => "operate",
             Phase::Eot => "eot",
             Phase::Silent => "silent",
+            Phase::Digest => "digest",
         }
     }
 }
