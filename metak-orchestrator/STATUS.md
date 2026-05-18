@@ -12912,3 +12912,123 @@ not flap on future dummy / workload changes.
    tests updated for the new phase.
 3. `docs(variant-base): CUSTOM.md + STRUCT.md for T18.2 compact log`
    -- design notes for downstream workers and the orchestrator.
+
+---
+
+## T18.2 merge
+
+**Scope**: merge worktree branch `worktree-agent-ac5cc63f3372fa849`
+(four commits ending at `c02ed37`) onto `main`. The worktree forked
+from `bd7ab5e`, before T17.x (QoS 3/4 strict-no-skip) landed on
+`main`. Single merge commit, `--no-ff`, parent ordering preserved
+(`ade976f` first parent / `c02ed37` second parent).
+
+**Conflicts and resolution**:
+
+1. `metak-orchestrator/STATUS.md` — both sides appended sections.
+   Kept both (T17.x sections first, then the T18.2 status section).
+
+2. `variant-base/src/driver.rs` — purely textual conflict in two
+   blocks; the two changes are orthogonal:
+   - `use` block (line 1): kept `use std::path::Path;` (T18.2) +
+     `use std::sync::atomic::{AtomicBool, Ordering};` (T17.2).
+   - publish call path inside the operate loop: kept main's
+     QoS-3/4 strict-no-skip `if strict_qos { loop { ... } }`
+     verbatim, but routed every `log_write_at` /
+     `log_backpressure_skipped` call through the worktree's
+     `sink.record_write` / `sink.record_backpressure_skipped`
+     methods, so the same row hits both the (gated) legacy JSONL
+     stream and the compact Parquet buffers.
+
+No semantic changes to either feature: the strict-QoS loop and the
+back-off behaviour are byte-identical to `main`; the digest phase,
+`EventSink`, `Phase::Digest`, and Parquet output are byte-identical
+to the worktree.
+
+**Contract vs implementation review**
+(`metak-shared/api-contracts/compact-log-schema.md` § Tables vs
+`variant-base/src/compact_writer.rs`):
+
+The T18.2 worker did not have the T18.1 contract file in their
+worktree (it was added to `main` after the worktree forked), so
+they implemented from the task-prompt description. The resulting
+**file shape diverges from the contract**:
+
+- **Contract**: multiple distinct row-groups / Parquet tables —
+  `metainfo`, `writes (ts, path_idx)`,
+  `receives (ts, path_idx, writer_idx)`, `paths`, `peers`,
+  `aux_events`, `resource`, `connected`, `phase`.
+- **Implementation**: a single one-row-group Parquet table
+  `compact_events` with seven primitive columns —
+  `(ts_ns: i64, kind: i32, seq: i64, path_idx: i32, peer_idx: i32,
+  qos: i32, bytes: i32)`. The `kind` column discriminates rows
+  among `Write=0, Receive=1, BackpressureSkipped=2,
+  GapDetected=3, GapFilled=4`. Intern dictionaries (`paths`,
+  `peers`) and spawn identifiers
+  (`variant`, `runner`, `run`, `launch_ts`, `threading_mode`,
+  `recv_buffer_kb`, `schema_version=1`) live in the Parquet KV
+  metadata block, not in dedicated row groups.
+
+Additional divergences from the contract:
+
+- Lifecycle events (`phase`, `connected`, `eot_*`, `resource`,
+  `clock_sync`) are **not** in the Parquet file at all; they
+  remain in the legacy JSONL stream. The contract assumes they
+  belong inside the compact file (in the `phase`, `connected`,
+  `aux_events`, `resource` row groups).
+- The `metainfo` row group's phase-timestamp fields
+  (`operate_start_ts`, `eot_sent_ts`, `silent_start_ts`,
+  `digest_start_ts`, `digest_end_ts`, `path_count`, `peer_count`,
+  `events_total`) are not present in KV metadata.
+- The `writes` table carries `seq` and `bytes` in the
+  implementation; the contract specifies `(ts, path_idx)` only.
+
+**Reconciliation choice**: defer to the orchestrator via a
+follow-up task. Rationale:
+
+- **Do not change the implementation in this merge**. The merge
+  worker's mandate is "preserve worker authorship". A
+  speculative rewrite of `compact.rs` / `compact_writer.rs` to
+  match the contract is outside the merge scope.
+- **Do not silently update the contract** either. The contract
+  is the right authoritative shape for downstream
+  `analysis/parse_compact.py` (T18.4), and several aspects of
+  the contract — separate `writes` / `receives` tables, no `seq`
+  on writes, lifecycle events inside the file, full metainfo —
+  exist for explicit downstream-correlation and 
+  cross-machine-analysis reasons (per the contract's
+  § Correlation and § Cross-file correlation sections).
+- The right move is for the orchestrator to either (a) revise the
+  contract to match the implementation if the simpler tagged-union
+  shape is preferred (it does cleanly support the analyzer's
+  needs at the cost of a less-tidy schema), or (b) open a
+  follow-up task to align the implementation with the contract
+  before T18.4 work begins. Picking between (a) and (b) requires
+  product judgment the merge worker is not equipped to make.
+
+This merge LEAVES the implementation as-is so T18.3-T18.6 workers
+encounter the implemented shape, not a half-converted state. The
+orchestrator can sequence the reconciliation as needed.
+
+**Tests run** (release, post-merge, on the merge commit):
+
+- `cargo test --release -p variant-base` -- 118 unit + 11
+  integration + 0 doc, all passed.
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  -- clean across the whole workspace.
+- `cargo fmt --check` -- clean.
+- VariantDummy smoke at qos1, qos3, qos4 (50 Hz x 10 vpt x 1 s
+  scalar-flood, `--legacy-jsonl-events` ON):
+  - All three spawns emitted both a `.jsonl` (~173 KB each) and
+    a `.compact.parquet` (~10 KB each) -- about a 17x reduction
+    on this small fixture.
+  - Each `.compact.parquet` decoded cleanly via `polars.read_parquet`:
+    1020 rows = 510 `kind=0` (write) + 510 `kind=1` (receive),
+    seven columns with the expected dtypes.
+  - The `[variant] digest: wrote <path> (1020 rows, ~10 KB)`
+    stderr line fired for each spawn, confirming the digest
+    phase ran to completion.
+
+**Worktree cleanup**: after the merge landed (commit `b992699`),
+the branch `worktree-agent-ac5cc63f3372fa849` and the worktree
+directory `.claude/worktrees/agent-ac5cc63f3372fa849` were removed.
