@@ -12713,3 +12713,75 @@ worktree isolation per worker (`isolation: worktree`), (b) orchestrator
 commits of all docs/contracts BEFORE spawning code workers, or both.
 The "leave dirty for orchestrator convention" we used here doesn't
 survive parallel-commit chaos.
+
+
+## T17.9 — analysis: flag `backpressure_skipped` at QoS 3/4 as contract violation [done]
+
+**Worker**: spawned 2026-05-18 (Wave 3).
+**Commit**: `eb4cef3` -- `feat(analysis): flag backpressure_skipped at QoS 3/4 as contract violation`.
+
+**Implementation**:
+
+- `analysis/integrity.py`:
+  - New helper `_count_skip_at_reliable_per_writer_qos` groups
+    `backpressure_skipped` events by `(variant, run, writer, qos)`
+    where `qos >= 3`.
+  - `IntegrityResult` gains two fields: `skip_at_reliable_count`
+    (int, default 0) and `skip_at_reliable_error` (bool, default
+    False). Defaults keep every existing IntegrityResult call site
+    source-compatible.
+  - The new counter is left-joined onto the per-(writer, receiver,
+    qos) pair stats, so the count lands only on rows whose QoS
+    actually produced the violation -- a writer publishing on both
+    QoS 1 and QoS 3 only flags the QoS 3 row.
+- `analysis/tables.py`: new `[FAIL: skip-at-reliable]` annotation
+  alongside `[FAIL: completeness, ordering, duplicates, gaps]` on the
+  integrity-table row.
+- `analysis/incomplete_warnings.py`: new rule 4 in the
+  incomplete-samples warning emitter. Emits one
+  `WARN: [<variant> / <run>] <writer> <N> backpressure_skipped
+  events at qos<X> -- contract violation per DESIGN.md § 6.5` per
+  `(variant, run, writer, qos)`. Aggregate line carries a new
+  `skip-at-reliable` count. Deduplication: the same writer's count
+  appears on every (writer -> receiver) integrity row, but the
+  WARN line is keyed on `(variant, run, writer, qos)` so multiple
+  receivers collapse to one warning.
+
+**Tests added** (all passing, total suite 330 passed / 6 skipped):
+
+- `tests/test_integrity.py::TestIntegritySkipAtReliable`:
+  qos3 / qos4 skip flags violation, qos1 / qos2 skip does NOT flag
+  violation, healthy stream yields zero, mixed-QoS-per-writer test
+  proving the count only attaches to the matching-QoS row.
+- `tests/test_tables.py::TestIntegrityTableSkipAtReliableAnnotation`:
+  violation row carries `[FAIL: skip-at-reliable]`; clean row and
+  qos1-with-skips row do not.
+- `tests/test_incomplete_warnings.py::TestSkipAtReliable`:
+  qos3/4 violation emits WARN with the DESIGN.md § 6.5 citation;
+  qos1/2 emits nothing; multiple receivers dedupe to one WARN per
+  writer/qos; warning is grouped under the same `[variant / run]`
+  block as other warnings for the same run; aggregate counts the
+  new bucket.
+
+**Pre-E17 dataset run** (informational, per acceptance):
+
+- Dataset: `logs/two-machines-all-variants-01-20260515_143007/`.
+- `python analyze.py <dataset> --summary` exits 0 with the
+  aggregate line:
+  `WARN: 207 job-run case(s) with incomplete samples (1
+  not-completed, 180 delivery shortfall, 26 late tail, **0
+  skip-at-reliable**)`.
+- Zero violations: the only `backpressure_skipped` events in this
+  dataset come from `webrtc-{1000x100hz,100x1000hz,max}-qos{1,2}-multi`
+  -- all contract-compliant. Confirmed by a direct
+  `grep "backpressure_skipped"` over the source JSONL: every match
+  carries `"qos":1` or `"qos":2`.
+
+**Deviations**: none. The lint + test acceptance pipeline (`ruff
+format --check`, `ruff check`, `pytest`) is clean.
+
+**E17 status**: complete pending T17.10 (user-owned full-matrix
+re-run on real hardware). The analyzer regression guard now
+asserts that the post-E17 variants emit zero skips at QoS 3/4 --
+if T17.10 produces any `WARN: ... skip-at-reliable` lines, the
+fix in T17.2-T17.8 is incomplete on that variant.
