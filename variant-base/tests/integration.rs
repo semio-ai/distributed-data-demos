@@ -654,6 +654,60 @@ fn test_variant_dummy_idle_detection_short_circuits_operate() {
     );
 }
 
+/// T17.2 smoke: VariantDummy must complete the full protocol cleanly at
+/// every QoS level (1..=4) under the post-T17.2 driver. The dummy's
+/// default `try_publish` always returns `Ok(true)`, so no `backpressure_skipped`
+/// rows should ever appear -- regardless of QoS -- and the strict-
+/// delivery branch (QoS 3/4) must produce the same write/receive pair
+/// shape as QoS 1/2.
+#[test]
+fn test_variant_dummy_smoke_every_qos_level() {
+    for qos in 1u8..=4u8 {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().to_str().unwrap();
+        let mut args = test_args(log_dir);
+        args.qos = qos;
+
+        let mut dummy = VariantDummy::new(&args.runner);
+        run_protocol(&mut dummy, &args)
+            .unwrap_or_else(|e| panic!("protocol completes at QoS {qos}: {e}"));
+
+        let path = std::path::Path::new(log_dir).join("dummy-test-runner-run01.jsonl");
+        let file = std::fs::File::open(&path).expect("log file should exist");
+        let reader = std::io::BufReader::new(file);
+        let lines: Vec<serde_json::Value> = reader
+            .lines()
+            .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+            .collect();
+
+        let writes = lines.iter().filter(|l| l["event"] == "write").count();
+        let receives = lines.iter().filter(|l| l["event"] == "receive").count();
+        let skipped = lines
+            .iter()
+            .filter(|l| l["event"] == "backpressure_skipped")
+            .count();
+
+        assert!(writes > 0, "QoS {qos}: expected at least one write");
+        assert_eq!(
+            writes, receives,
+            "QoS {qos}: writes should match receives (dummy echoes)"
+        );
+        assert_eq!(
+            skipped, 0,
+            "QoS {qos}: VariantDummy never reports backpressure"
+        );
+
+        // QoS field must round-trip on every write event.
+        for w in lines.iter().filter(|l| l["event"] == "write") {
+            assert_eq!(
+                w["qos"].as_u64().unwrap(),
+                u64::from(qos),
+                "QoS {qos}: write.qos must match requested level"
+            );
+        }
+    }
+}
+
 /// T15.1: with `--progress-stdout-interval-ms 0`, the variant must
 /// emit ZERO stdout lines (back-compat path).
 #[test]

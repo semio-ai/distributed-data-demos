@@ -1,6 +1,7 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 
 use crate::cli::CliArgs;
@@ -142,13 +143,92 @@ pub fn compute_operate_drain_time_budget(
     }
 }
 
+/// Return `true` if the QoS level demands strict no-skip delivery.
+///
+/// Per `metak-shared/DESIGN.md` § 6.5 (and the § 6.6 summary table),
+/// QoS 3 (`ReliableUdp`) and QoS 4 (`ReliableTcp`) prioritise delivery
+/// over throughput: variants MUST block at publish until the message is
+/// accepted, and the driver MUST loop on `try_publish` rather than
+/// emit `backpressure_skipped` if a variant momentarily returns
+/// `Ok(false)`.
+#[inline]
+pub fn is_strict_delivery_qos(qos: Qos) -> bool {
+    matches!(qos, Qos::ReliableUdp | Qos::ReliableTcp)
+}
+
+/// One-shot stderr warning guard for the strict-delivery QoS path
+/// (T17.2). Set to `true` by the driver the first time `try_publish`
+/// returns `Ok(false)` at QoS 3/4 in this process. Subsequent
+/// violations within the same spawn do NOT spam stderr.
+///
+/// Stored as a `static AtomicBool` (not a per-spawn local) for two
+/// reasons: (a) the warning is process-scoped diagnostic, not part of
+/// the JSONL contract, so a process is the right granularity; (b)
+/// per-spawn tests reset the flag explicitly via
+/// [`reset_strict_qos_violation_warning`] before invoking the driver.
+static STRICT_QOS_VIOLATION_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Reset the one-shot strict-QoS violation warning guard. Tests call
+/// this before each driver invocation so the assertion that the
+/// warning fires "exactly once per spawn" remains deterministic
+/// regardless of test execution order.
+#[doc(hidden)]
+pub fn reset_strict_qos_violation_warning() {
+    STRICT_QOS_VIOLATION_WARNED.store(false, Ordering::SeqCst);
+}
+
+/// Stderr text emitted (once per process) on the first QoS 3/4
+/// `Ok(false)` observed by the driver. Exposed as a constant so tests
+/// can substring-match without duplicating the wording.
+pub const STRICT_QOS_VIOLATION_MSG: &str =
+    "QoS 3/4 contract violation: try_publish returned Ok(false); see DESIGN.md § 6.5";
+
+/// Emit the strict-QoS contract-violation warning at most once per
+/// process. Returns whether this call actually emitted (useful for
+/// targeted tests that need to verify the driver tripped the guard).
+#[doc(hidden)]
+pub fn warn_strict_qos_violation_once() -> bool {
+    // `compare_exchange` is the canonical race-free "do exactly one
+    // thing the first time" guard. SeqCst is overkill but free here
+    // (this path is cold) and the strongest documentation signal.
+    if STRICT_QOS_VIOLATION_WARNED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        eprintln!("{STRICT_QOS_VIOLATION_MSG}");
+        true
+    } else {
+        false
+    }
+}
+
 /// Run the full test protocol: connect, stabilize, operate, silent.
 ///
 /// The driver owns the logger and all support modules. The variant only
 /// performs transport-specific operations through the `Variant` trait.
 pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> {
-    let qos = Qos::from_int(config.qos)
-        .ok_or_else(|| anyhow::anyhow!("invalid QoS level: {}", config.qos))?;
+    let qos =
+        Qos::from_int(config.qos).ok_or_else(|| anyhow!("invalid QoS level: {}", config.qos))?;
+
+    // T17.2: `max-throughput` workload is incompatible with strict
+    // delivery QoS (3/4). `max-throughput` removes the inter-tick sleep
+    // and relies on `Ok(false)` skips to self-pace; QoS 3/4 forbids
+    // skips by contract (DESIGN.md § 6.5). Combining them produces an
+    // unbounded busy loop with no throttle. Reject at startup, before
+    // any connect / logger emission, with a clear actionable error.
+    if config.workload == "max-throughput" && is_strict_delivery_qos(qos) {
+        return Err(anyhow!(
+            "max-throughput workload is incompatible with QoS {} (strict no-skip delivery; \
+             see DESIGN.md § 6.5). Use scalar-flood with QoS 3/4, or QoS 1/2 with max-throughput.",
+            qos.as_int()
+        ));
+    }
+
+    // T17.2: Reset the one-shot QoS-3/4 violation warning guard so a
+    // misbehaving variant in THIS spawn produces exactly one stderr
+    // line, regardless of whether some earlier spawn in the same
+    // process already tripped the guard.
+    reset_strict_qos_violation_warning();
 
     let owned_logger = Logger::new(
         &config.log_dir,
@@ -340,6 +420,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         // `variant-base/CUSTOM.md`. Under scalar-flood the inter-tick
         // sleep already paces the writer, so no extra back-off here.
         let ops = workload.generate(config.values_per_tick);
+        let strict_qos = is_strict_delivery_qos(qos);
         for op in &ops {
             let seq = seq_gen.next_seq();
             // T16.2: capture `write_ts` BEFORE `try_publish`.
@@ -359,13 +440,58 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
             // `metak-shared/api-contracts/jsonl-log-schema.md` and
             // `variant-base/CUSTOM.md` "Write timestamp capture".
             let write_ts = Utc::now();
-            if variant.try_publish(&op.path, &op.payload, qos, seq)? {
+
+            if strict_qos {
+                // T17.2: strict-delivery QoS (3/4) path -- loop on
+                // `try_publish` until `Ok(true)` (or `Err`). A
+                // well-behaved variant blocks internally and returns
+                // `Ok(true)` on the first call; the loop below is
+                // defensive against a variant that briefly returns
+                // `Ok(false)`. We emit a one-shot stderr warning the
+                // first time that happens per spawn, then yield/sleep
+                // and retry -- we never emit a `backpressure_skipped`
+                // event at QoS 3/4 (DESIGN.md § 6.5; jsonl-log-schema
+                // `backpressure_skipped` is restricted to QoS 1/2).
+                //
+                // Back-off: yield_now() on the first consecutive false,
+                // sleep(100us) on later attempts. The yield is cheap
+                // (<100us on Windows) and gives a misbehaving variant a
+                // chance to drain; the short sleep prevents 100% CPU
+                // spin without adding meaningful latency under real
+                // saturation (where the variant should be blocking
+                // anyway and the loop body runs at most once).
+                let mut strict_attempts: u32 = 0;
+                loop {
+                    if variant.try_publish(&op.path, &op.payload, qos, seq)? {
+                        logger.log_write_at(write_ts, seq, &op.path, qos, op.payload.len())?;
+                        progress.inc_sent();
+                        break;
+                    }
+                    // Contract violation: the variant returned
+                    // `Ok(false)` at QoS 3/4. Warn once per spawn so
+                    // the operator notices; the analyzer (T17.9) will
+                    // also flag this via the absence of `write` rows
+                    // relative to expected.
+                    warn_strict_qos_violation_once();
+                    strict_attempts = strict_attempts.saturating_add(1);
+                    if strict_attempts == 1 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(Duration::from_micros(100));
+                    }
+                }
+            } else if variant.try_publish(&op.path, &op.payload, qos, seq)? {
                 logger.log_write_at(write_ts, seq, &op.path, qos, op.payload.len())?;
                 progress.inc_sent();
                 if max_throughput {
                     consecutive_skipped = 0;
                 }
             } else {
+                // QoS 1/2 path: `Ok(false)` is the contractual back-
+                // pressure signal. Log `backpressure_skipped` and move
+                // on; under `max-throughput` also apply the two-tier
+                // self-pacing back-off (T-impl.8).
+                //
                 // Note: backpressure_skipped is correctly timestamped
                 // at-event-time (not at-attempt-time) -- it records
                 // the moment the driver gave up on this op, not the
@@ -528,7 +654,9 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::cli::{CliArgs, DEFAULT_RECV_BUFFER_KB};
-    use crate::driver::run_protocol;
+    use crate::driver::{
+        reset_strict_qos_violation_warning, run_protocol, warn_strict_qos_violation_once,
+    };
     use crate::types::{Qos, ReceivedUpdate, ThreadingMode};
     use crate::variant_trait::Variant;
 
@@ -2095,6 +2223,288 @@ mod tests {
             vec!["connect", "stabilize", "operate", "silent"],
             "phase sequence post-T15.8 has no eot phase, got {phases:?}"
         );
+    }
+
+    // ----- T17.2: strict no-skip QoS 3/4 enforcement -----
+
+    /// Tests in this section share the process-wide
+    /// `STRICT_QOS_VIOLATION_WARNED` `AtomicBool` guard. Cargo runs
+    /// tests in parallel by default, so without serialisation a probe
+    /// of the guard at the end of one test would race with another
+    /// test's driver invocation. This mutex serialises only the
+    /// strict-QoS tests; everything else still runs in parallel.
+    fn strict_qos_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // PoisonError still gives us the guard; we don't care about
+        // the previous test's panic state -- we only need exclusion.
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// A variant whose `try_publish` returns `Ok(false)` exactly N times
+    /// per `(path, seq)` before returning `Ok(true)`. Used to exercise
+    /// the QoS 3/4 retry loop in the driver: even if the variant
+    /// momentarily reports back-pressure, the driver must loop until
+    /// `Ok(true)` and never emit a `backpressure_skipped` event.
+    struct StrictRetryVariant {
+        /// Pending false-returns per seq. We model "first call false,
+        /// then true forever" by tracking the last-seen seq and a flag.
+        first_call_per_seq_returns_false: bool,
+        last_seq: Option<u64>,
+        try_publish_calls: u64,
+        seen_false_for_seq: std::collections::HashSet<u64>,
+    }
+
+    impl StrictRetryVariant {
+        fn new(first_call_per_seq_returns_false: bool) -> Self {
+            Self {
+                first_call_per_seq_returns_false,
+                last_seq: None,
+                try_publish_calls: 0,
+                seen_false_for_seq: std::collections::HashSet::new(),
+            }
+        }
+    }
+
+    impl Variant for StrictRetryVariant {
+        fn name(&self) -> &str {
+            "strict-retry"
+        }
+        fn connect(&mut self, _threading_mode: ThreadingMode) -> Result<()> {
+            Ok(())
+        }
+        fn publish(&mut self, _path: &str, _payload: &[u8], _qos: Qos, _seq: u64) -> Result<()> {
+            Ok(())
+        }
+        fn try_publish(
+            &mut self,
+            _path: &str,
+            _payload: &[u8],
+            _qos: Qos,
+            seq: u64,
+        ) -> Result<bool> {
+            self.try_publish_calls += 1;
+            self.last_seq = Some(seq);
+            if self.first_call_per_seq_returns_false && !self.seen_false_for_seq.contains(&seq) {
+                self.seen_false_for_seq.insert(seq);
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        }
+        fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
+            Ok(None)
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// QoS 1 (best-effort) + `try_publish` returns `Ok(false)` always:
+    /// the driver MUST keep emitting `backpressure_skipped` (existing
+    /// behaviour preserved) and the one-shot QoS 3/4 warning guard
+    /// MUST NOT trip. Coverage for T17.2 acceptance "QoS 1/2 path
+    /// unchanged".
+    #[test]
+    fn qos1_backpressure_emits_skipped_no_strict_warning() {
+        let _serial = strict_qos_test_lock();
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.tick_rate_hz = 10;
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 5;
+        args.qos = 1;
+
+        // Reset the static guard so we can later assert this run did
+        // NOT trip it.
+        reset_strict_qos_violation_warning();
+
+        let mut variant = AlwaysBackpressuredVariant::new();
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        let lines = read_log(dir.path(), "alice");
+        let write_events: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["event"] == "write").collect();
+        let skip_events: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backpressure_skipped")
+            .collect();
+
+        assert!(
+            write_events.is_empty(),
+            "QoS 1 always-false: no `write` events expected; got {}",
+            write_events.len()
+        );
+        assert!(
+            !skip_events.is_empty(),
+            "QoS 1 always-false: expected at least one `backpressure_skipped`"
+        );
+        // The strict-QoS one-shot warning must NOT have fired in this
+        // spawn. We probe by calling the helper after run_protocol; if
+        // the guard was tripped by the driver during the run, this call
+        // returns false (no double-fire). If the driver respected the
+        // QoS 1 branch, the guard is still clear and this call returns
+        // true (we are the first to trip it, post-run).
+        let post_run_first_trip = warn_strict_qos_violation_once();
+        assert!(
+            post_run_first_trip,
+            "QoS 1/2 path must not trip the QoS 3/4 contract-violation warning"
+        );
+        // Cleanup so subsequent tests start clean.
+        reset_strict_qos_violation_warning();
+    }
+
+    /// QoS 3 + variant returns `Ok(false)` once per `(path, seq)` then
+    /// `Ok(true)`: the driver MUST loop, emit exactly one `write`
+    /// event per seq (no `backpressure_skipped` rows), and the one-shot
+    /// stderr warning MUST have fired exactly once for the spawn.
+    #[test]
+    fn qos3_blocks_on_backpressure_and_warns_once() {
+        let _serial = strict_qos_test_lock();
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.tick_rate_hz = 10;
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+        args.qos = 3;
+
+        reset_strict_qos_violation_warning();
+
+        let mut variant = StrictRetryVariant::new(true);
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        let lines = read_log(dir.path(), "alice");
+        let write_events: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["event"] == "write").collect();
+        let skip_events: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backpressure_skipped")
+            .collect();
+
+        assert!(
+            !write_events.is_empty(),
+            "QoS 3 retry: expected at least one `write` event after retry"
+        );
+        assert_eq!(
+            skip_events.len(),
+            0,
+            "QoS 3/4 MUST NOT emit `backpressure_skipped` events (DESIGN.md § 6.5); got {}",
+            skip_events.len()
+        );
+        // Every published seq should yield exactly one `write` row.
+        // The variant returned `Ok(false)` exactly once per seq, so
+        // try_publish_calls == 2 * write_events.len().
+        assert_eq!(
+            variant.try_publish_calls as usize,
+            2 * write_events.len(),
+            "expected exactly 2 try_publish calls per write under once-false-then-true: \
+             calls={}, writes={}",
+            variant.try_publish_calls,
+            write_events.len()
+        );
+        // The one-shot warning must have fired during the spawn. A
+        // post-run call to the helper returns `false` if the guard was
+        // already tripped.
+        let post_run_first_trip = warn_strict_qos_violation_once();
+        assert!(
+            !post_run_first_trip,
+            "QoS 3/4 spawn with at least one Ok(false) must trip the strict-QoS warning exactly once"
+        );
+        reset_strict_qos_violation_warning();
+    }
+
+    /// QoS 4 + variant returns `Ok(false)` once per seq then `Ok(true)`:
+    /// symmetric to the QoS 3 case (the driver classifies QoS 3 and
+    /// QoS 4 identically for this rule).
+    #[test]
+    fn qos4_blocks_on_backpressure_and_warns_once() {
+        let _serial = strict_qos_test_lock();
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.tick_rate_hz = 10;
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+        args.qos = 4;
+
+        reset_strict_qos_violation_warning();
+
+        let mut variant = StrictRetryVariant::new(true);
+        run_protocol(&mut variant, &args).expect("protocol completes");
+
+        let lines = read_log(dir.path(), "alice");
+        let skip_events: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backpressure_skipped")
+            .collect();
+        assert_eq!(
+            skip_events.len(),
+            0,
+            "QoS 4 must not emit backpressure_skipped"
+        );
+
+        let post_run_first_trip = warn_strict_qos_violation_once();
+        assert!(
+            !post_run_first_trip,
+            "QoS 4 spawn with at least one Ok(false) must trip the strict-QoS warning exactly once"
+        );
+        reset_strict_qos_violation_warning();
+    }
+
+    /// QoS 3/4 + `max-throughput` workload: driver MUST reject at
+    /// startup with a clear error, before any phase event lands in the
+    /// JSONL. Coverage for T17.2 acceptance "max-throughput + QoS 3/4
+    /// is rejected loudly".
+    #[test]
+    fn max_throughput_with_qos3_is_rejected_at_startup() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "max-throughput".to_string();
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+        args.qos = 3;
+
+        let mut variant = StubVariant::new("stub");
+        let err = run_protocol(&mut variant, &args)
+            .expect_err("max-throughput + QoS 3 must be rejected before publishing");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max-throughput"),
+            "error must mention the offending workload; got: {msg}"
+        );
+        assert!(msg.contains("QoS"), "error must mention QoS; got: {msg}");
+        // No JSONL log file should have been produced (rejection
+        // happens before logger init).
+        let log_path = dir.path().join("test-alice-run01.jsonl");
+        assert!(
+            !log_path.exists(),
+            "rejection must happen before logger creates the JSONL file"
+        );
+    }
+
+    /// Symmetric check at QoS 4: same rejection, same error shape.
+    #[test]
+    fn max_throughput_with_qos4_is_rejected_at_startup() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "max-throughput".to_string();
+        args.operate_secs = 1;
+        args.silent_secs = 0;
+        args.values_per_tick = 1;
+        args.qos = 4;
+
+        let mut variant = StubVariant::new("stub");
+        let err = run_protocol(&mut variant, &args)
+            .expect_err("max-throughput + QoS 4 must be rejected before publishing");
+        let msg = err.to_string();
+        assert!(msg.contains("max-throughput"), "error: {msg}");
+        assert!(msg.contains("QoS"), "error: {msg}");
     }
 
     #[test]

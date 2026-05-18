@@ -102,17 +102,29 @@ pub trait Variant {
     ///   on to the next value rather than retrying within the same tick).
     /// - `Err(_)` for real errors (propagated to the driver as today).
     ///
-    /// `Ok(false)` is NOT an error -- it just means "not now". The
-    /// driver logs a `backpressure_skipped` event instead of a `write`
-    /// event so the analysis can distinguish "writer held back" from
-    /// "writer sent and downstream dropped it".
+    /// **QoS contract** (see `metak-shared/DESIGN.md` § 6.5):
+    /// - **QoS 1 / QoS 2** (best-effort / latest-value): `Ok(false)` is
+    ///   the contractual back-pressure signal. The driver records a
+    ///   `backpressure_skipped` JSONL event and moves on -- the value
+    ///   is dropped, not retried. Variants that can detect back-pressure
+    ///   cheaply (non-blocking sends returning `WouldBlock`, QUIC
+    ///   `SendDatagramError::Blocked`, WebRTC `bufferedAmount`, etc.)
+    ///   should override this method per T-impl.7.
+    /// - **QoS 3 / QoS 4** (reliable-UDP / reliable-TCP): variants MUST
+    ///   block internally until the message is accepted -- delivery is
+    ///   the contract, throughput collapse is the acceptable failure
+    ///   mode. Returning `Ok(false)` at QoS 3/4 is a **contract
+    ///   violation**: the driver loops on `try_publish` until it gets
+    ///   `Ok(true)` (or `Err`), emits a one-shot stderr warning, and
+    ///   does NOT emit a `backpressure_skipped` event (the analyzer's
+    ///   T17.9 integrity check flags any such event at QoS 3/4 as a
+    ///   variant bug). See also `metak-shared/api-contracts/variant-cli.md`
+    ///   `--qos` and `metak-shared/api-contracts/jsonl-log-schema.md`
+    ///   `backpressure_skipped`.
     ///
     /// Default implementation: call `publish(...)` and return `Ok(true)`,
     /// preserving the existing fire-and-forget semantics for variants
-    /// that do not override this method. Transports that can detect
-    /// backpressure cheaply (non-blocking sends returning `WouldBlock`,
-    /// QUIC `SendDatagramError::Blocked`, WebRTC `bufferedAmount`, etc.)
-    /// should override this method per T-impl.7.
+    /// that do not override this method.
     fn try_publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<bool> {
         self.publish(path, payload, qos, seq)?;
         Ok(true)
