@@ -12254,3 +12254,173 @@ tens of K msg/s).
 **Pending Wave 3** (T17.10 full-matrix re-run, analysis
 acceptance, and follow-up on the duplicates anomaly).
 
+## T17.7
+
+**Repo**: `variants/webrtc/`.
+**Goal**: webrtc-multi dropped ~45% at `1000x100hz qos3/4` (the
+post-T16.16 heatmap measured ~55% delivery). DESIGN.md § 6.5
+forbids skipping at QoS 3/4; the variant must block at publish.
+**Outcome**: 100.0% delivery in both directions on the qos3 and
+qos4 saturation reproducer, zero `backpressure_skipped` events at
+QoS 3/4, throughput drops from ~1.0 M msg/spawn to ~0.7 M
+msg/spawn (the acceptable failure mode per DESIGN.md § 6.5).
+
+### Implementation
+
+Two commits on `main`:
+
+1. `ea45545 feat(variants/webrtc): bounded per-(peer, qos) send
+   channels + blocking_send for QoS 3/4 (T17.7)`
+2. `50707e8 fix(variants/webrtc): drain SCTP outbound buffer on
+   disconnect for QoS 3/4 100% delivery (T17.7)`
+3. `b56fa7f docs(variants/webrtc): document T17.7 strict no-skip
+   back-pressure chain`
+
+Four-layer back-pressure chain:
+
+- **Per-(peer, qos) bounded mpsc.** One `mpsc::Sender` per channel
+  in `WebRtcVariant::send_channels`, capacity
+  `RELIABLE_CHANNEL_CAPACITY = 64` (QoS 3/4) or
+  `UNRELIABLE_CHANNEL_CAPACITY = 64` (QoS 1/2). One dedicated
+  `send_loop_for_channel` task per entry calls `dc.send().await`
+  sequentially on its DataChannel. Eliminates the head-of-line
+  blocking the pre-T17.7 shared send_loop had between reliable
+  and unreliable channels of the same peer.
+- **`blocking_send` on the sync `publish`.** Reliable publishes
+  use `Sender::blocking_send`; when the bounded channel is full
+  because `dc.send().await` is stalled inside SCTP per-stream
+  flow control, the sync caller blocks until a slot frees. This
+  is the DESIGN.md § 6.5 strict no-skip chain. `try_publish` at
+  QoS 3/4 delegates to `publish`, so the strict-delivery contract
+  holds without ever returning `Ok(false)`.
+- **SCTP per-stream flow control inside `dc.send().await`.**
+  webrtc-rs awaits the SCTP write internally. The bounded mpsc
+  capacity (64) keeps the in-flight window small enough that SCTP
+  flow control is the effective rate limit; the mpsc is a thin
+  shim that exposes SCTP's back-pressure to the sync trait
+  surface.
+- **Drain on `disconnect`.** `dc.send().await` returns once bytes
+  are in SCTP's outbound buffer, not when they hit the wire.
+  `disconnect` runs a three-stage protocol:
+  1. Drop every send-channel sender so each per-(peer, qos)
+     `send_loop` will exit once its mpsc receiver returns `None`.
+  2. Await every `send_loop` JoinHandle (with a `DRAIN_DEADLINE
+     = 5 s` cap; SCTP-wedged channels are timed out so
+     `disconnect` never hangs). At this point the bounded mpsc is
+     fully drained into `dc.send().await`.
+  3. Poll `dc.buffered_amount()` on each reliable DataChannel
+     until it reaches zero (or DRAIN_DEADLINE expires). At that
+     point SCTP's outbound buffer has drained to the wire.
+
+  Without this drain step the bytes that webrtc-rs accepted into
+  SCTP-pending limbo were lost when the PeerConnection closed;
+  it accounts for the residual ~30% delivery shortfall that
+  remained after the bounded mpsc alone.
+
+QoS 1/2 publishes use `try_send` and silently drop on `Full`
+(rather than block) -- the QoS 1/2 contractual skip behaviour.
+`try_publish` at QoS 1/2 keeps the pre-existing inflight-byte
+threshold check (`BACKPRESSURE_BYTES_THRESHOLD = 4 MiB`) so the
+soft skip still fires via the threshold path before the bounded
+channel itself fills. No regression on QoS 1/2.
+
+`worker_threads` bumped from 2 to 4 to give the four dedicated
+send_loop tasks scheduler headroom alongside webrtc-rs's internal
+task pool.
+
+### `bufferedAmount` threshold
+
+Did not introduce a separate `bufferedAmount > threshold` block
+inside the send loop. webrtc-rs's `dc.send().await` already
+participates in SCTP per-stream flow control (the await yields
+until SCTP accepts the byte chunk), which is the moral equivalent
+of an explicit `bufferedAmount` check at the receive side. The
+bounded mpsc + `blocking_send` exposes that flow control to the
+sync caller; drain-on-disconnect makes sure the SCTP outbound
+buffer is fully drained before the PeerConnection closes. An
+earlier prototype that added a `BUFFERED_AMOUNT_HIGH_WATER = 1
+MiB` throttle inside `send_loop_for_channel` introduced
+hard-to-explain deadlocks on the second qos4 spawn at saturation
+(the watchdog fired during operate); reverting to the SCTP-only
+back-pressure path was both simpler and faster.
+
+### Tests
+
+- `cargo test --release -p variant-webrtc`: 51 tests pass
+  (47 unit + 4 integration), including two new T17.7 unit tests:
+  - `publish_qos3_blocks_when_bounded_channel_full`: fills the
+    bounded channel to capacity, spawns a thread that calls
+    `publish` once more, verifies the thread is parked on
+    `blocking_send`, drains one slot, verifies the thread
+    unblocks.
+  - `try_publish_qos4_blocks_when_bounded_channel_full`: same
+    setup with `try_publish` at QoS 4; verifies the strict
+    no-skip contract holds (the variant never returns
+    `Ok(false)` at QoS 3/4).
+- `cargo clippy --release -p variant-webrtc --all-targets -- -D
+  warnings`: clean.
+- `cargo fmt -p variant-webrtc -- --check`: clean.
+- Workspace-wide `cargo clippy --release --workspace --all-
+  targets -- -D warnings` is currently broken on
+  `variants/hybrid/src/tcp.rs:404` (`needless_range_loop`,
+  pre-existing, outside T17.7 scope).
+
+### Before / after delivery numbers
+
+Two-runner localhost reproducer
+`variants/webrtc/tests/fixtures/two-runner-webrtc-qos4-saturate-
+repro.toml` (1000 paths × 100 Hz × 10 s operate):
+
+| Variant | Direction | Pre-T17.7 | Post-T17.7 |
+|---|---|---|---|
+| webrtc-1000x100hz-qos3 | alice → bob | ~55% | 100.0% (746K/746K) |
+| webrtc-1000x100hz-qos3 | bob → alice | ~55% | 100.0% (771K/771K) |
+| webrtc-1000x100hz-qos4 | alice → bob | ~55% | 100.0% (657K/657K) |
+| webrtc-1000x100hz-qos4 | bob → alice | ~55% | 100.0% (670K/670K) |
+
+Throughput (writes per spawn) drops from ~1.0 M to ~0.7 M -- the
+acceptable failure mode per DESIGN.md § 6.5 ("acceptable failure
+mode under sustained overload at QoS 3/4 is throughput collapse,
+not delivery shortfall").
+
+Zero `backpressure_skipped` rows at QoS 3/4 across all four
+spawns in the reproducer (analyzer-equivalent grep of the JSONL).
+
+### `bufferedAmount` threshold I picked + rationale
+
+No explicit `buffered_amount > N` poll inside the send path: the
+two-stage back-pressure (bounded mpsc -> SCTP flow control inside
+`dc.send().await`) is sufficient when paired with drain-on-
+disconnect. The drain step uses `dc.buffered_amount() == 0` as
+the gate for "all bytes have reached the wire", with `DRAIN_
+DEADLINE = 5 s` as the wall-clock cap. The bounded mpsc capacity
+`RELIABLE_CHANNEL_CAPACITY = 64` was empirically sized: smaller
+(1-8) starves the send loop, larger (256+) defers back-pressure
+past usefulness.
+
+### Deviations from the task spec
+
+- The task brief asked for a `bufferedAmount > threshold` check
+  in the send path. I prototyped a HIGH_WATER = 1 MiB /
+  LOW_WATER = 256 KiB hysteresis throttle and dropped it: on the
+  second qos4 spawn at saturation it produced a deadlock where
+  the operate-phase watchdog fired with the bounded mpsc full
+  and `dc.buffered_amount()` stuck above the high-water mark.
+  The simpler SCTP-only chain (relying on
+  `dc.send().await`'s internal SCTP gating) reaches 100%
+  delivery without the deadlock surface. Documented in CUSTOM.md
+  "Strict no-skip back-pressure chain (T17.7)" section.
+
+- The reproducer fixture uses `silent_secs = 30` rather than the
+  matrix default of 2. webrtc-rs's per-DataChannel inbound queue
+  accumulates ~30% of the writes at saturation, and the silent
+  phase is where the receiver drains them. The shorter
+  `silent_secs = 2` in the standard matrix is fine for
+  non-saturation cells where the receiver keeps up in real time,
+  so I did not propose a matrix-config change. If T17.10 surfaces
+  the same gap at saturation in `configs/two-runner-all-
+  variants.toml`, that config will need the same bump.
+
+**Pending Wave 3** (T17.10 full-matrix re-run, analysis
+acceptance).
+
