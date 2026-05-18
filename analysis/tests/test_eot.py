@@ -244,10 +244,14 @@ class TestOperateWindowScoping:
 
     def test_late_receives_counted_between_eot_and_silent(self) -> None:
         """Receives that arrive AFTER alice's eot_sent_ts but at or
-        before silent_start are counted as late_receives. They must NOT
-        contribute to the loss% denominator's matched receives -- a
-        write+receive that straddles eot_sent_ts is considered
-        unmatched in the operate window (write within, receive late).
+        before silent_start are counted as late_receives. Under T16.16
+        writer-clock accounting they are NOT treated as losses, because
+        their source writes (alice's seq=4,5 at offsets 1100, 1101) are
+        in the writer's operate window -- the loss formula counts
+        matched deliveries whose ``write_ts`` is in the writer's window,
+        regardless of when the receive landed on the receiver's clock.
+        ``late_receives`` remains as a separate observability metric for
+        the post-EOT/pre-silent in-flight tail.
         """
         # alice writes seq 1..3 at offset 1001..1003 (within window).
         # alice writes seq 4..5 at offset 1100..1101 -- ALSO within
@@ -369,9 +373,11 @@ class TestOperateWindowScoping:
         r = _perf(alice + bob)
         # Two receives landed in (eot_sent_ts, silent_start].
         assert r.late_receives == 2
-        # 5 writes within the operate window, 3 in-window receives ->
-        # loss% = (1 - 3/5) * 100 = 40%.
-        assert abs(r.loss_pct - 40.0) < 1e-6
+        # T16.16: 5 writes within the operate window, all 5 have a
+        # matching delivery whose ``write_ts`` is also in the writer's
+        # window -> loss% = 0%. The late receives are still surfaced
+        # via ``late_receives`` so the in-flight tail is visible.
+        assert r.loss_pct == 0.0
 
     def test_receives_before_eot_not_counted_as_late(self) -> None:
         """Receives strictly before alice's eot_sent_ts are NOT late."""
