@@ -299,3 +299,178 @@ class TestPerformanceForGroup:
         r = _perf(events)
         assert abs(r.connect_mean_ms - 51.25) < 0.01
         assert r.connect_max_ms == 60.0
+
+
+class TestLossCrossClockAccounting:
+    """T16.16: loss% accounting must use writer-clock-only boundaries.
+
+    The pre-T16.16 bug filtered receives by ``receive_ts`` (receiver's
+    local clock) against the writer's ``eot_sent_ts`` (writer's clock).
+    On cross-machine runs with unsynced OS clocks this systematically
+    excluded legitimate receives whose corresponding writes were
+    in-window, manifesting as a spurious ~1% loss baseline on every
+    transport at QoS 4 low rates (see
+    ``logs/two-machines-all-variants-01-20260515_143007``).
+
+    The fix derives ``receive_count`` from correlated deliveries and
+    uses each delivery's ``write_ts`` (writer's clock) as the in-window
+    test. These tests pin the new accounting so the bug cannot regress.
+    """
+
+    @staticmethod
+    def _writer_and_receiver_events(
+        *,
+        write_count: int,
+        clock_drift_ms: int,
+        in_flight_ms: float,
+        skip_receive_seqs: tuple[int, ...] = (),
+        eot_offset_ms: int = 10_000,
+        silent_offset_ms: int = 12_000,
+    ) -> list[dict]:
+        """Build a synthetic two-runner spawn with controllable clock drift.
+
+        Alice writes ``seq=1..write_count`` over ``[1000, 10_000]`` ms in
+        her own clock (one write every ~9 ms). Each write's
+        corresponding receive on bob lands at
+        ``alice_write_ts + in_flight_ms + clock_drift_ms`` in bob's
+        clock -- a fixed receiver-side drift simulates two unsynced
+        OS clocks. Alice's ``eot_sent`` at ``eot_offset_ms`` (her
+        clock) closes the writer window; ``phase=silent`` at
+        ``silent_offset_ms`` closes the group. Receives for sequences
+        in ``skip_receive_seqs`` are omitted so the test can pin the
+        ``loss_pct = 1/N`` arithmetic.
+        """
+        alice: list[dict] = [
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000),
+        ]
+        bob: list[dict] = [
+            make_event("phase", runner="bob", phase="operate", offset_ms=1000),
+        ]
+        # Spread writes evenly across [1000, eot_offset_ms - 1].
+        span = (eot_offset_ms - 1) - 1000
+        step = span / max(write_count - 1, 1)
+        for i in range(1, write_count + 1):
+            write_offset = 1000 + step * (i - 1)
+            alice.append(
+                make_event(
+                    "write",
+                    runner="alice",
+                    seq=i,
+                    path="/k",
+                    qos=4,
+                    bytes=8,
+                    offset_ms=write_offset,
+                )
+            )
+            if i in skip_receive_seqs:
+                continue
+            bob.append(
+                make_event(
+                    "receive",
+                    runner="bob",
+                    writer="alice",
+                    seq=i,
+                    path="/k",
+                    qos=4,
+                    bytes=8,
+                    offset_ms=write_offset + in_flight_ms + clock_drift_ms,
+                )
+            )
+        alice.append(
+            make_event("eot_sent", runner="alice", eot_id=1, offset_ms=eot_offset_ms)
+        )
+        alice.append(
+            make_event(
+                "phase", runner="alice", phase="silent", offset_ms=silent_offset_ms
+            )
+        )
+        bob.append(
+            make_event(
+                "phase", runner="bob", phase="silent", offset_ms=silent_offset_ms
+            )
+        )
+        return alice + bob
+
+    def test_cross_clock_drift_yields_zero_loss(self) -> None:
+        """Every write has a matching receive; receiver's clock runs
+        ahead by 500 ms so half the receives have ``receive_ts >
+        alice's eot_sent_ts``. Pre-T16.16 this would report ~50% loss
+        (and would have reported ~1% on the validation dataset where
+        drift was small relative to the run length). Post-T16.16 the
+        loss must be 0% because every write_ts is in-window and every
+        write has a matched delivery.
+        """
+        events = self._writer_and_receiver_events(
+            write_count=100,
+            clock_drift_ms=500,
+            in_flight_ms=1.0,
+        )
+        r = _perf(events)
+        assert r.loss_pct == 0.0
+
+    def test_cross_clock_drift_with_one_missing(self) -> None:
+        """Same setup as above but drop a single receive on the wire.
+        The reported loss% must be exactly ``1/N * 100`` -- the cross-
+        clock drift does NOT add phantom losses on top of the real one.
+        """
+        events = self._writer_and_receiver_events(
+            write_count=100,
+            clock_drift_ms=500,
+            in_flight_ms=1.0,
+            skip_receive_seqs=(50,),
+        )
+        r = _perf(events)
+        # 99/100 delivered -> 1% loss.
+        assert abs(r.loss_pct - 1.0) < 1e-6
+
+    def test_legacy_no_eot_falls_back_to_silent_start(self) -> None:
+        """Legacy logs without any ``eot_sent`` event must still produce
+        sensible loss% by falling back to ``silent_start`` as the writer
+        window end. The writer-clock accounting still applies: a
+        delivery is "in-window" if its ``write_ts <= silent_start``.
+
+        Expected behaviour for legacy logs:
+        - ``late_receives`` is ``None`` (no EOT to define the late
+          boundary -- documented in ``_late_receives_count``).
+        - ``loss_pct`` is computed exactly as for the EOT path, just
+          with ``silent_start`` substituted for ``eot_sent_ts``.
+        """
+        events = self._writer_and_receiver_events(
+            write_count=50,
+            clock_drift_ms=200,
+            in_flight_ms=1.0,
+            eot_offset_ms=10_000,
+            silent_offset_ms=11_000,
+        )
+        # Strip the eot_sent event injected by the helper so this run
+        # exercises the legacy fallback path.
+        events = [e for e in events if e.get("event") != "eot_sent"]
+        r = _perf(events)
+        assert r.late_receives is None
+        assert r.loss_pct == 0.0
+
+    def test_late_receives_metric_independent_of_loss_fix(self) -> None:
+        """The late_receives observability metric is unchanged by the
+        T16.16 fix: it still counts receives in
+        ``(eot_sent_ts, silent_start]`` on the receiver's clock. Even
+        when loss_pct = 0 (every write is matched), late_receives can
+        be non-zero -- the two metrics surface different things.
+        """
+        # Drift = 600 ms; writes evenly spaced; in-flight 1 ms; the
+        # last few receives will land after alice's eot_sent_ts in
+        # bob's clock and so will count as late_receives.
+        events = self._writer_and_receiver_events(
+            write_count=20,
+            clock_drift_ms=600,
+            in_flight_ms=1.0,
+            eot_offset_ms=10_000,
+            silent_offset_ms=12_000,
+        )
+        r = _perf(events)
+        # Loss% is 0 because every write_ts is in-window and every
+        # write has a matched delivery (writer-clock accounting).
+        assert r.loss_pct == 0.0
+        # Late_receives is > 0 because some receives crossed
+        # alice's eot_sent_ts in bob's clock (drift > in-flight).
+        assert r.late_receives is not None
+        assert r.late_receives > 0

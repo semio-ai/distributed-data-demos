@@ -546,38 +546,56 @@ def _resource_metrics(
 
 
 def _write_receive_counts(
-    group: pl.LazyFrame, windows: _OperateWindows
+    group: pl.LazyFrame,
+    deliveries: pl.DataFrame,
+    windows: _OperateWindows,
 ) -> tuple[int, int]:
     """(write_count, receive_count) scoped to per-writer operate windows.
 
     For each writer the window is ``[operate_start, eot_sent_ts]``
     when ``eot_sent_ts`` is available, else ``[operate_start,
-    silent_start]`` (legacy fallback). Receives are scoped to the
-    *writer's* window via the receive event's ``writer`` field --
-    cross-peer receives in the writer's window.
+    silent_start]`` (legacy fallback).
 
-    The per-writer scoping replaces the Phase 1 "count all writes,
-    count all receives" approach so that loss% and throughput are
-    not contaminated by post-EOT in-flight receives. Late receives
-    (post-EOT, pre-silent) are reported separately via
-    ``_late_receives``.
+    **Writer-clock-only accounting (T16.16)**: both halves use the
+    *writer's* ``write_ts`` as the boundary input -- never the
+    receiver's ``receive_ts``. The write count is the number of
+    ``write`` events whose ``ts`` (writer clock) falls in the writer's
+    window. The receive count is the number of correlated deliveries
+    (rows in ``deliveries``) whose source ``write_ts`` (writer clock)
+    falls in the writer's window.
+
+    Before T16.16 the receive count was the number of ``receive``
+    events whose receiver-clock ``ts`` fell in the writer's window.
+    That cross-clock comparison broke on two-machine runs with
+    unsynchronised OS clocks: legitimate receives whose corresponding
+    writes were in-window got systematically excluded when the
+    receiver's clock drift pushed ``receive_ts`` past the writer's
+    ``eot_sent_ts``, which manifested as a spurious ~1% loss baseline
+    across every transport at QoS 4 low rates. Counting by message
+    identity (matched delivery) instead of by raw timestamp removes
+    the dependency on cross-clock comparability for the delivery
+    accounting. Latency reporting still needs E8 clock-sync for
+    cross-machine correctness; delivery accounting no longer does.
+
+    Late receives (post-EOT, pre-silent in the receiver's local clock)
+    are reported separately via ``_late_receives_count`` as an
+    observability metric and are not part of the loss formula.
     """
     if windows.operate_start is None:
         # No operate phase at all -- fall through to the legacy
-        # all-rows count so empty/degenerate groups still return 0/0.
+        # all-rows count so empty/degenerate groups still return
+        # ``write_count`` from raw event counts and ``receive_count``
+        # from the delivery row count. This matches the pre-T16.16
+        # fallback for empty/degenerate groups; the asymmetry vs the
+        # main branch is benign because no operate window means no
+        # meaningful loss% anyway.
         df = (
-            group.filter(pl.col("event").is_in(["write", "receive"]))
-            .group_by("event")
-            .agg(pl.len().alias("n"))
+            group.filter(pl.col("event") == "write")
+            .select(pl.len().alias("n"))
             .collect()
         )
-        write_count = 0
-        receive_count = 0
-        for row in df.iter_rows(named=True):
-            if row["event"] == "write":
-                write_count = int(row["n"])
-            elif row["event"] == "receive":
-                receive_count = int(row["n"])
+        write_count = int(df.item(0, "n")) if not df.is_empty() else 0
+        receive_count = int(deliveries.height)
         return write_count, receive_count
 
     operate_start = windows.operate_start
@@ -585,9 +603,9 @@ def _write_receive_counts(
     # Build the per-writer end-boundary table once.
     fallback_end = windows.silent_start
     end_rows: list[dict] = []
-    # Discover the candidate writer set from both the EOT events and
-    # the writes themselves so legacy logs without EOT still get a
-    # row for every writer (with the silent_start fallback).
+    # Discover the candidate writer set from the EOT events, the
+    # writes themselves, AND the deliveries DataFrame so we cover
+    # every writer that contributes to either half of the count.
     candidate_writers: set[str] = set(windows.per_writer_eot_ts.keys())
     writer_df = (
         group.filter(pl.col("event") == "write")
@@ -599,6 +617,10 @@ def _write_receive_counts(
         r = row.get("runner")
         if r is not None:
             candidate_writers.add(str(r))
+    if not deliveries.is_empty() and "writer" in deliveries.columns:
+        for w in deliveries.get_column("writer").unique().to_list():
+            if w is not None:
+                candidate_writers.add(str(w))
 
     for writer in candidate_writers:
         end = windows.per_writer_eot_ts.get(writer, fallback_end)
@@ -615,7 +637,8 @@ def _write_receive_counts(
         orient="row",
     )
 
-    # Writes: per-writer scoping on (runner, ts).
+    # Writes: per-writer scoping on (runner, ts). The boundary is the
+    # writer's own clock on both sides -- no cross-clock issue.
     writes_in_window = (
         group.filter(pl.col("event") == "write")
         .filter(pl.col("ts") >= operate_start)
@@ -626,19 +649,25 @@ def _write_receive_counts(
         .height
     )
 
-    # Receives: scoped on the receive event's ``writer`` field, NOT
-    # the receiver's runner. Cross-peer receives in the writer's
-    # window.
-    receives_in_window = (
-        group.filter(pl.col("event") == "receive")
-        .filter(pl.col("writer").is_not_null())
-        .filter(pl.col("ts") >= operate_start)
-        .select(pl.col("writer").cast(pl.Utf8), pl.col("ts"))
-        .collect()
-        .join(end_df, on="writer", how="inner")
-        .filter(pl.col("ts") <= pl.col("end_ts"))
-        .height
-    )
+    # Receives: count deliveries whose source write happened in the
+    # writer's window. ``write_ts`` is in the writer's clock so the
+    # comparison is intra-clock by construction. This is the T16.16
+    # fix -- pre-fix code filtered ``receive_ts`` (receiver clock)
+    # against the writer's ``end_ts`` (writer clock), which mis-counted
+    # on unsynced two-machine runs.
+    if deliveries.is_empty() or "write_ts" not in deliveries.columns:
+        receives_in_window = 0
+    else:
+        receives_in_window = (
+            deliveries.select(
+                pl.col("writer").cast(pl.Utf8),
+                pl.col("write_ts"),
+            )
+            .join(end_df, on="writer", how="inner")
+            .filter(pl.col("write_ts") >= operate_start)
+            .filter(pl.col("write_ts") <= pl.col("end_ts"))
+            .height
+        )
 
     return int(writes_in_window), int(receives_in_window)
 
@@ -711,15 +740,23 @@ def performance_for_group(
 
     Operate-window boundaries follow E12: per-writer
     ``[operate_start, eot_sent_ts]`` when ``eot_sent`` is present,
-    otherwise ``[operate_start, silent_start]``. ``late_receives``
-    counts receives in ``(eot_sent_ts, silent_start]`` for each
-    writer; ``None`` for legacy logs without any ``eot_sent`` event.
+    otherwise ``[operate_start, silent_start]``. **Both halves of the
+    loss formula are evaluated in the writer's clock** (T16.16):
+    ``write_count`` counts ``write`` events whose ``ts`` is in the
+    writer's window, ``receive_count`` counts correlated deliveries
+    whose source ``write_ts`` is in the writer's window. The receive
+    side no longer depends on the receiver's local clock, which fixes
+    a spurious ~1% loss baseline on cross-machine runs with unsynced
+    OS clocks. ``late_receives`` continues to count receives in
+    ``(eot_sent_ts, silent_start]`` (receiver's clock) for each writer
+    as a separate observability metric; it is ``None`` for legacy
+    logs without any ``eot_sent`` event.
     """
     connect_mean, connect_max = _connection_metrics(group, variant, run)
     p50, p95, p99, mx = _latency_stats(deliveries)
     latency_samples = _latency_samples(deliveries)
     windows = _operate_windows(group)
-    write_count, receive_count = _write_receive_counts(group, windows)
+    write_count, receive_count = _write_receive_counts(group, deliveries, windows)
     duration = _operate_duration_seconds(windows)
     writes_per_sec = write_count / duration if duration > 0 else 0.0
     receives_per_sec = receive_count / duration if duration > 0 else 0.0
