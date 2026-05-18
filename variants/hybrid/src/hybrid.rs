@@ -435,7 +435,7 @@ impl Variant for HybridVariant {
         Ok(())
     }
 
-    /// T-impl.7: honest backpressure for the driver.
+    /// T-impl.7 / T17.4: honest backpressure for the driver.
     ///
     /// QoS 1/2 (UDP multicast) do a single non-blocking `send_to`.
     /// `WouldBlock` -> `Ok(false)`; the driver logs
@@ -443,15 +443,17 @@ impl Variant for HybridVariant {
     /// resulting seq gap (best-effort by definition, latest-value
     /// discards anything older than the newest seq anyway).
     ///
-    /// QoS 3/4 (TCP) use the existing blocking `broadcast` -> always
-    /// `Ok(true)`. TCP receivers expect contiguous sequences and the
-    /// kernel send buffer is the natural pacing mechanism: a full
-    /// send buffer makes `write_all` block, which is the back-pressure
-    /// signal we want to measure for the benchmark. Returning
-    /// `Ok(false)` here would corrupt the per-peer receiver state by
-    /// emitting a seq the receiver will never see.
+    /// QoS 3/4 (TCP) use `broadcast`, which under T17.4 is
+    /// non-blocking-with-internal-strict-retry: the call returns
+    /// `Ok(())` only after every byte landed in the kernel send
+    /// buffer (or all peers errored out fatally). The variant
+    /// therefore always returns `Ok(true)` on the QoS 3/4 path --
+    /// strict no-skip per DESIGN.md § 6.5. The receiver-side
+    /// kernel-recv buffer + the per-peer reader thread (multi
+    /// mode) / inline drain in `broadcast` (single mode) make this
+    /// safe without deadlocking under symmetric saturation.
     ///
-    /// See `variants/hybrid/CUSTOM.md` "Backpressure semantics (T-impl.7)".
+    /// See `variants/hybrid/CUSTOM.md` "Backpressure semantics".
     fn try_publish(&mut self, path: &str, payload: &[u8], qos: Qos, seq: u64) -> Result<bool> {
         match qos {
             Qos::BestEffort | Qos::LatestValue => {

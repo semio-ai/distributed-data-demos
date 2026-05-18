@@ -15,10 +15,18 @@
 //!
 //! - `data_tx` / `rx` — bounded `mpsc::sync_channel` (capacity
 //!   `READER_CHANNEL_CAPACITY = 4096`) carrying decoded
-//!   `HubDataMessage::Data` frames. Drop-on-full is acceptable: QoS
-//!   1/2 tolerate loss by definition; QoS 3/4 (TCP) receivers depend
-//!   on kernel TCP, which applies its own back-pressure before the
-//!   recv buffer can fill pathologically.
+//!   `HubDataMessage::Data` frames.
+//!   - **UDP path (QoS 1/2)**: drop-on-full is acceptable; QoS 1/2
+//!     tolerate loss by definition.
+//!   - **TCP path (QoS 3/4 — T17.4)**: blocking-on-full. Dropping a
+//!     TCP-delivered frame here would violate the strict-no-skip
+//!     contract (DESIGN.md § 6.5). By blocking the TCP reader on a
+//!     full channel, the kernel TCP recv buffer fills, kernel TCP
+//!     back-pressures the peer's `write_all`, and the back-pressure
+//!     signal reaches the application's `try_publish`. The driver
+//!     thread's `poll_receive_multi` is responsible for draining the
+//!     channel; if it stalls, `JOIN_TIMEOUT` on shutdown caps the
+//!     wait.
 //! - `lifecycle_tx` / `lifecycle_rx` — unbounded `mpsc::channel`
 //!   carrying `HubLifecycleMessage::Eot` markers. Must NEVER drop:
 //!   losing an EOT forces the peer's driver to wait the full
@@ -78,10 +86,15 @@ pub const UDP_READER_TIMEOUT: Duration = Duration::from_millis(200);
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Pre-decoded DATA frame pushed by a reader thread onto the bounded
-/// data channel. Drop-on-full is acceptable here -- QoS 1/2 tolerate
-/// loss by definition; QoS 3/4 receivers depend on kernel TCP, which
-/// already applies its own back-pressure before the read buffer can
-/// fill pathologically.
+/// data channel.
+///
+/// - UDP path (QoS 1/2): drop-on-full is acceptable; QoS 1/2 tolerate
+///   loss by definition.
+/// - TCP path (QoS 3/4 — T17.4): block-on-full. The TCP reader thread
+///   uses [`push_data_or_block`] so back-pressure on a saturated
+///   driver propagates through the kernel TCP recv buffer into the
+///   peer's `write_all`, reaching the application via the strict
+///   no-skip contract (DESIGN.md § 6.5).
 #[derive(Debug, Clone)]
 pub enum HubDataMessage {
     /// A `Frame::Data` decoded into a `ReceivedUpdate`.
@@ -307,7 +320,13 @@ fn tcp_reader_loop(
             buf.drain(..total);
             match protocol::decode_frame(&payload) {
                 Ok(Frame::Data(update)) => {
-                    push_data_or_drop(&data_tx, HubDataMessage::Data(update))
+                    // T17.4: TCP path carries QoS 3/4 only. Block the
+                    // reader on a full channel rather than dropping --
+                    // dropping here would silently violate the strict
+                    // no-skip contract (DESIGN.md § 6.5).
+                    if !push_data_or_block(&data_tx, HubDataMessage::Data(update), &shutdown) {
+                        return;
+                    }
                 }
                 Ok(Frame::Eot { writer, eot_id }) => {
                     push_lifecycle(&lifecycle_tx, HubLifecycleMessage::Eot { writer, eot_id })
@@ -326,6 +345,9 @@ fn tcp_reader_loop(
 /// NOT lost when this line appears in stderr -- those ride the separate
 /// unbounded `lifecycle_tx`. Does NOT block the reader -- in a
 /// benchmark a blocking reader is worse than a missed Data frame.
+///
+/// **UDP reader only** (T17.4): QoS 1/2 tolerate loss by definition.
+/// TCP readers use [`push_data_or_block`] instead.
 fn push_data_or_drop(tx: &SyncSender<HubDataMessage>, msg: HubDataMessage) {
     match tx.try_send(msg) {
         Ok(()) => {}
@@ -337,6 +359,41 @@ fn push_data_or_drop(tx: &SyncSender<HubDataMessage>, msg: HubDataMessage) {
         }
         Err(TrySendError::Disconnected(_)) => {
             // Driver dropped the receiver -- spawn is winding down.
+        }
+    }
+}
+
+/// T17.4: TCP reader push that BLOCKS on a full channel instead of
+/// dropping the frame. Periodically wakes to check `shutdown` so the
+/// reader can exit cleanly during teardown even if the driver is no
+/// longer draining. Returns `false` when shutdown is requested or the
+/// receiver has hung up (caller exits its read loop).
+///
+/// Why blocking is required: TCP carries QoS 3/4 frames, which the
+/// strict no-skip contract (DESIGN.md § 6.5) forbids dropping. Letting
+/// the channel block back-pressures the kernel TCP recv buffer, which
+/// in turn back-pressures the peer's `write_all`, which surfaces as
+/// the application-level signal we want to measure.
+const TCP_READER_FULL_BACKOFF: Duration = Duration::from_millis(2);
+
+fn push_data_or_block(
+    tx: &SyncSender<HubDataMessage>,
+    mut msg: HubDataMessage,
+    shutdown: &Arc<AtomicBool>,
+) -> bool {
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(returned)) => {
+                msg = returned;
+                if shutdown.load(Ordering::SeqCst) {
+                    return false;
+                }
+                thread::sleep(TCP_READER_FULL_BACKOFF);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return false;
+            }
         }
     }
 }
