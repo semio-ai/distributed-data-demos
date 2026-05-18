@@ -1,0 +1,70 @@
+# T17.4 reproducer fixture, part 2: workloads not in -repro.toml's
+# first half (the runner cuts off after timeout if the wallclock
+# budget per spawn is exhausted; splitting keeps each runner invocation
+# under the conversational tool timeout).
+#
+# See `two-runner-hybrid-qos4-saturate-repro.toml` for full rationale.
+
+run = "hybrid-t17-4-qos4-saturate-repro-pt2"
+runners = ["alice", "bob"]
+default_timeout_secs = 120
+
+# 100 vpt * 1000 Hz = 100 K msg/s symmetric, QoS 4.
+[[variant]]
+name = "hybrid-t17-4-100x1000hz-qos4"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 10
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 4
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19773"
+  tcp_base_port = 28330
+
+# 100 vpt * 100 Hz = 10 K msg/s symmetric, QoS 3 (sanity-floor).
+[[variant]]
+name = "hybrid-t17-4-100x100hz-qos3"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 10
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 3
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19774"
+  tcp_base_port = 28340
+
+# 100 vpt * 100 Hz = 10 K msg/s symmetric, QoS 4 (sanity-floor).
+[[variant]]
+name = "hybrid-t17-4-100x100hz-qos4"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 10
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 4
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19775"
+  tcp_base_port = 28350

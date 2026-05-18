@@ -1,0 +1,188 @@
+# T17.4 reproducer fixture: high-rate symmetric Hybrid QoS 3/4 in BOTH
+# Single and Multi modes, exercising the strict-delivery contract
+# (DESIGN.md § 6.5 / E17). Three workloads cover the cell space the
+# post-T16.16 heatmap flagged as catastrophic (14-86% drop):
+#
+#   - 1000x100hz = 100 K msg/s symmetric
+#   - 100x1000hz = 100 K msg/s symmetric (high tick rate variant)
+#   - 100x100hz  =  10 K msg/s symmetric (sanity-floor)
+#
+# Pre-T17.4 behaviour:
+#   - Single mode used SO_SNDTIMEO + drop-peer-on-error which lost
+#     all undelivered messages to the dropped peer once the kernel
+#     send buffer saturated.
+#   - Multi mode used a 4096-slot bounded mpsc with drop-on-full
+#     between the reader thread and the driver thread; at high rates
+#     the driver couldn't keep up and frames were silently dropped at
+#     the channel boundary.
+#
+# Post-T17.4 acceptance (DESIGN.md § 6.5):
+#   - 100% delivery for all (workload, qos, mode) cells exercised here.
+#   - Throughput (writes/s) may fall arbitrarily -- that's the trade.
+#   - Zero `backpressure_skipped` events with qos in (3, 4).
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/hybrid/tests/fixtures/two-runner-hybrid-qos4-saturate-repro.toml
+#   target/release/runner --name bob   --config variants/hybrid/tests/fixtures/two-runner-hybrid-qos4-saturate-repro.toml
+
+run = "hybrid-t17-4-qos4-saturate-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 120
+
+# 1000 vpt * 100 Hz = 100 K msg/s symmetric, QoS 3 (TCP path).
+[[variant]]
+name = "hybrid-t17-4-1000x100hz-qos3"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  # T17.4: a longer silent_secs gives strict-delivery TCP time to
+  # drain its kernel send/recv buffers before the spawn tears down.
+  # The variant-side `disconnect` would otherwise close the socket
+  # while bytes remained in flight, surfacing as "sent > received"
+  # despite the broadcast loop having succeeded -- the wire-level
+  # delivery is asynchronous w.r.t. the application's `Ok(true)`.
+  silent_secs = 10
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 3
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19750"
+  tcp_base_port = 28200
+
+# 1000 vpt * 100 Hz = 100 K msg/s symmetric, QoS 4 (TCP path).
+[[variant]]
+name = "hybrid-t17-4-1000x100hz-qos4"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  # T17.4: a longer silent_secs gives strict-delivery TCP time to
+  # drain its kernel send/recv buffers before the spawn tears down.
+  # The variant-side `disconnect` would otherwise close the socket
+  # while bytes remained in flight, surfacing as "sent > received"
+  # despite the broadcast loop having succeeded -- the wire-level
+  # delivery is asynchronous w.r.t. the application's `Ok(true)`.
+  silent_secs = 10
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 4
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19751"
+  tcp_base_port = 28210
+
+# 100 vpt * 1000 Hz = 100 K msg/s symmetric, QoS 3 (high-tick-rate
+# variant of the same total load).
+[[variant]]
+name = "hybrid-t17-4-100x1000hz-qos3"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
+  stabilize_secs = 1
+  operate_secs = 5
+  # T17.4: a longer silent_secs gives strict-delivery TCP time to
+  # drain its kernel send/recv buffers before the spawn tears down.
+  # The variant-side `disconnect` would otherwise close the socket
+  # while bytes remained in flight, surfacing as "sent > received"
+  # despite the broadcast loop having succeeded -- the wire-level
+  # delivery is asynchronous w.r.t. the application's `Ok(true)`.
+  silent_secs = 10
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 3
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19752"
+  tcp_base_port = 28220
+
+# 100 vpt * 1000 Hz = 100 K msg/s symmetric, QoS 4.
+[[variant]]
+name = "hybrid-t17-4-100x1000hz-qos4"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 1000
+  stabilize_secs = 1
+  operate_secs = 5
+  # T17.4: a longer silent_secs gives strict-delivery TCP time to
+  # drain its kernel send/recv buffers before the spawn tears down.
+  # The variant-side `disconnect` would otherwise close the socket
+  # while bytes remained in flight, surfacing as "sent > received"
+  # despite the broadcast loop having succeeded -- the wire-level
+  # delivery is asynchronous w.r.t. the application's `Ok(true)`.
+  silent_secs = 10
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 4
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19753"
+  tcp_base_port = 28230
+
+# 100 vpt * 100 Hz = 10 K msg/s symmetric, QoS 3 (sanity-floor: this
+# rate was passing in T16.3 already; T17.4 must not regress it).
+[[variant]]
+name = "hybrid-t17-4-100x100hz-qos3"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  # T17.4: a longer silent_secs gives strict-delivery TCP time to
+  # drain its kernel send/recv buffers before the spawn tears down.
+  # The variant-side `disconnect` would otherwise close the socket
+  # while bytes remained in flight, surfacing as "sent > received"
+  # despite the broadcast loop having succeeded -- the wire-level
+  # delivery is asynchronous w.r.t. the application's `Ok(true)`.
+  silent_secs = 10
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 3
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19754"
+  tcp_base_port = 28240
+
+# 100 vpt * 100 Hz = 10 K msg/s symmetric, QoS 4 (sanity-floor).
+[[variant]]
+name = "hybrid-t17-4-100x100hz-qos4"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  # T17.4: a longer silent_secs gives strict-delivery TCP time to
+  # drain its kernel send/recv buffers before the spawn tears down.
+  # The variant-side `disconnect` would otherwise close the socket
+  # while bytes remained in flight, surfacing as "sent > received"
+  # despite the broadcast loop having succeeded -- the wire-level
+  # delivery is asynchronous w.r.t. the application's `Ok(true)`.
+  silent_secs = 10
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 4
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19755"
+  tcp_base_port = 28250

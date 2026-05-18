@@ -1,0 +1,27 @@
+# T17.4 smoke fixture: a single high-rate QoS 4 spawn in both
+# threading modes. Used to quickly validate the strict-delivery fix
+# before exercising the full saturate-repro matrix.
+
+run = "hybrid-t17-4-qos4-smoke"
+runners = ["alice", "bob"]
+default_timeout_secs = 120
+
+# 1000 vpt * 100 Hz = 100 K msg/s symmetric, QoS 4.
+[[variant]]
+name = "hybrid-t17-4-1000x100hz-qos4"
+binary = "target/release/variant-hybrid.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 10
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 4
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19761"
+  tcp_base_port = 28310
