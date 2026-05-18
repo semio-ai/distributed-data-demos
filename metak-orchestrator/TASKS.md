@@ -7458,18 +7458,201 @@ cell. QoS 1/2 unchanged (best-effort by design).
 
 ## E18 — Compact Log Format + Runner Log-Path + Auto-Analyze
 
-See `metak-orchestrator/EPICS.md` § E18. **Waits on E17 (T17.10)**
-before any worker spawns. Detailed T18.x entries will be filed when
-E17 acceptance lands. Shape:
+See `metak-orchestrator/EPICS.md` § E18. User-approved 2026-05-18 to
+**proceed in parallel with E17 Wave 3** (T17.9 + T17.10) rather than
+strictly serialising.
 
-- T18.1 — Contract `metak-shared/api-contracts/compact-log-schema.md`
-  (Apache Parquet, columnar `(ts, path_idx)` + `(ts, path_idx,
-  writer_idx)` arrays + metainfo header + path-intern table; no `seq`,
-  ordering-based correlation; orchestrator-only).
-- T18.2 — variant-base: in-memory buffers + digest phase + Parquet
-  writer.
-- T18.3 — variant audit for any bypassing the variant-base logger.
-- T18.4 — analysis: load both compact + legacy formats.
-- T18.5 — runner: `--log-dir <path>` arg + TOML key.
-- T18.6 — runner: `--analyze-full` arg.
-- T18.7 — user-owned: re-run + validation.
+### T18.1 — Contract: compact-log-schema.md — DONE
+
+`metak-shared/api-contracts/compact-log-schema.md` filed 2026-05-18.
+Apache Parquet binary format; per-spawn `.compact.parquet` files;
+columnar `(ts, path_idx)` writes + `(ts, path_idx, writer_idx)`
+receives; metainfo + path-intern + peer-intern + aux + resource +
+connected + phase row groups; ordering-based correlation (no `seq`);
+30-50× target size reduction.
+
+### T18.2 — variant-base: in-memory buffers + digest phase + Parquet writer [high]
+
+**Repo**: `variant-base/`
+**Owner**: orchestrator → spawn worker (Wave 1 — foundation).
+**Status**: ready to spawn.
+
+**Goal**: Add the `digest` phase between `silent` and `done`. During
+operate + silent the variant accumulates writes/receives in columnar
+in-memory buffers. At `digest` it serializes the buffers to a single
+`<variant>-<runner>-<run>.compact.parquet` file per the T18.1 schema
+and exits cleanly.
+
+**Files**:
+- `variant-base/src/logger.rs` (or wherever the JSONL logger lives):
+  add a parallel compact-buffer logger that captures the same events
+  into columnar `Vec<i64> ts`, `Vec<u32> path_idx`, `Vec<u8>
+  writer_idx` (receives only), plus a `HashMap<String, u32>` path
+  intern table and a `Vec<String> writer_names` peer intern. Aux
+  events (`gap_*`, `eot_*`, `clock_sync`, `backpressure_skipped`,
+  `phase`, `resource`, `connected`) go into a tagged-union Vec.
+- `variant-base/src/driver.rs`: new `digest` phase between `silent`
+  and the final exit. Emits a `phase=digest` JSONL event (legacy
+  stream, if enabled) so the runner sees the transition. Flushes the
+  compact buffer to disk via the Parquet writer.
+- Add a Parquet writer dep — recommended: `parquet = "53"` (arrow-rs
+  family) with `arrow = "53"`. Worker picks based on workspace dep
+  compatibility check.
+- New CLI args (per `compact-log-schema.md` § Memory budget):
+  - `--digest-mem-soft-mb <u32>` (default `1024`).
+  - `--digest-mem-hard-mb <u32>` (default `2048`).
+  - `--legacy-jsonl-events` (bool, default OFF) — if set, ALSO writes
+    the legacy per-event JSONL stream alongside the compact file.
+- Path intern: grow `Vec<String> paths` + `HashMap<String, u32>
+  lookup` lazily during `log_write` / `log_receive`. Cap at u32::MAX;
+  return error if exceeded (impossible at realistic workloads).
+- Peer intern: same shape with `Vec<String> peers` +
+  `HashMap<String, u8>` lookup. Cap at `u8::MAX` (255 peers).
+- Soft / hard memory ceilings: log a warning on cross of soft, fail
+  fast on cross of hard.
+- The compact writer SHOULD use snappy compression. Worker MAY use
+  zstd if a benchmark on a `1000x100hz × 30 s` spawn shows a
+  meaningful win — document the choice in `variant-base/CUSTOM.md`.
+
+**Tests** (mandatory):
+- Unit: path intern grows correctly; duplicate path returns existing
+  index.
+- Unit: peer intern grows correctly; overflow at 256 peers returns
+  an error.
+- Unit: soft mem ceiling logs a warning; hard ceiling errors out.
+- Unit: writes/receives buffer captures the right columns.
+- Integration: VariantDummy spawn writes a `.compact.parquet`; reading
+  it back via the `parquet` crate gives the expected row counts +
+  column dtypes per `compact-log-schema.md`.
+- Integration: `--legacy-jsonl-events` ON writes both files.
+- Round-trip with the analysis tool's compact loader (T18.4) — defer
+  to T18.4 if T18.4 hasn't landed yet.
+
+**Build + test**:
+```
+cargo test --release -p variant-base
+cargo clippy --release --workspace --all-targets -- -D warnings
+cargo fmt --check
+```
+
+**Acceptance**:
+- VariantDummy spawn produces a `.compact.parquet` whose `metainfo`
+  row group matches the spawn identity.
+- File size on a `100x100hz × 30 s` VariantDummy spawn is at least
+  10× smaller than the equivalent legacy JSONL on the same workload.
+- All variant-base tests pass.
+
+**Commits**: worker commits as they go. Suggested: (1) buffer + intern
+infrastructure + unit tests; (2) Parquet writer + digest phase +
+integration test; (3) CUSTOM.md docs.
+
+**Out of scope**:
+- Variant changes — covered by T18.3.
+- Analysis-side compact loader — covered by T18.4.
+- Runner changes — covered by T18.5 + T18.6.
+
+### T18.3 — Variant audit: any variant bypassing variant-base logger [low]
+
+**Repo**: every `variants/*/`.
+**Owner**: orchestrator → spawn worker(s) (Wave 2, after T18.2).
+**Goal**: Each concrete variant should already route all `write` /
+`receive` events through `variant-base`'s logger. T18.3 confirms this
+and fixes any that don't.
+
+**Acceptance**: each variant's `connect`/`publish`/`poll_receive`
+paths use the `variant-base` logger; no variant writes JSONL or
+custom files directly. Variants that need to skip the compact write
+path for any structural reason (e.g. zenoh sidecar mode) are
+documented in their CUSTOM.md.
+
+### T18.4 — analysis: load both compact and legacy formats [medium]
+
+**Repo**: `analysis/`.
+**Owner**: orchestrator → spawn worker (Wave 2, after T18.2).
+**Goal**: Add a format detector + compact loader to the analysis
+pipeline. Existing pivot/integrity/plot code stays unchanged
+downstream of the parse layer.
+
+**Files**:
+- `analysis/parse.py` — detect `.compact.parquet` vs `.jsonl` per
+  spawn; pick the right loader.
+- New `analysis/parse_compact.py` — read a compact-parquet file,
+  expand its columnar arrays back to the `SHARD_SCHEMA` projection
+  used by the existing polars pipeline.
+- `analysis/cache.py` — bump `SCHEMA_VERSION` (legacy + compact rows
+  map to a slightly different shape with the new `writer_idx` /
+  `path_idx` mapping resolved).
+- `analysis/tests/` — round-trip test against a small
+  `.compact.parquet` fixture produced by VariantDummy. Compare
+  expanded output to the equivalent legacy JSONL parse output for
+  the same spawn — should be byte-equivalent in the columns that
+  matter.
+
+**Acceptance**: re-running analyze on a directory containing both
+compact + legacy spawn files produces a coherent unified output.
+
+### T18.5 — runner: `--log-dir <path>` arg [medium]
+
+**Repo**: `runner/`.
+**Owner**: orchestrator → spawn worker (Wave 2, parallelisable).
+**Goal**: Add a runner CLI flag + TOML key for output log directory.
+The runner uses it as the working directory for spawned variants
+(so variant `--log-dir` resolves there) and as the destination for
+the runner's own coordination logs.
+
+**Files**:
+- `runner/src/cli.rs` (or wherever) — new `--log-dir <path>` arg.
+- TOML schema: new `[runner] log_dir = "..."` key.
+- Cross-platform path handling — UNC paths on Windows
+  (`\\server\share`), mounted NFS / SMB on Linux. Worker validates
+  the path is writable at runner startup; fails loudly otherwise.
+
+**Acceptance**: a runner pointed at a shared network folder writes
+the spawn logs into that folder without errors. Both flag-driven
+and TOML-driven entry produce identical behaviour.
+
+### T18.6 — runner: `--analyze-full` arg [medium]
+
+**Repo**: `runner/`.
+**Owner**: orchestrator → spawn worker (Wave 2, parallelisable).
+**Goal**: Add a runner CLI flag that, after every spawn in the matrix
+completes, runs the analysis tool on the final log directory.
+
+**Files**:
+- `runner/src/cli.rs` — new `--analyze-full` flag.
+- Runner main loop — after the matrix exits, shell out to
+  `python analysis/analyze.py <log-dir> --summary --dump --diagrams
+  --output <log-dir>/analysis`.
+- Python interpreter resolution: prefer `python3`, fall back to
+  `python`; fail loudly if neither is on PATH.
+- Repo-root detection: walk up from the runner binary location until
+  the `analysis/` folder is found.
+- **Only ONE runner runs the analysis** — the lower-sorted-index
+  runner (alice in the typical `alice` / `bob` pair), matching the
+  pair-convention used by websocket / webrtc / hybrid.
+- Captures Python stderr/stdout, surfaces to runner stderr.
+- Non-zero Python exit → runner-level warning, not hard failure
+  (the benchmark itself succeeded).
+
+**Acceptance**: a matrix run with `--analyze-full` set produces the
+expected `<log-dir>/analysis/` subfolder (`summary_*.md`, pivot
+tables, drop-rate heatmaps).
+
+### T18.7 — User-owned: re-run + validation [medium]
+
+**Repo**: operational (no code).
+**Owner**: **user** (runs on real hardware).
+**Wave**: 3 (after T18.2-T18.6 land).
+
+**Procedure**:
+1. Build + deploy post-T18.6.
+2. Re-run `configs/two-runner-all-variants.toml` with
+   `--log-dir <shared-folder> --analyze-full`.
+3. Confirm:
+   - One `.compact.parquet` per spawn in the shared folder.
+   - File sizes 30-50× smaller than the equivalent legacy run.
+   - `<log-dir>/analysis/` subfolder produced automatically.
+   - Pivot tables / heatmaps numerically match a parallel legacy-
+     JSONL run on the same workloads.
+
+**Acceptance**: user signs off on the new pipeline.

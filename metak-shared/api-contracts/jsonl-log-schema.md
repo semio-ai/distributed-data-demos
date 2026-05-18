@@ -5,6 +5,14 @@ by the analysis tool.
 
 Source: BENCHMARK.md S8, ANALYSIS.md S4-S6.
 
+> **Note (E18, 2026-05-18)**: starting with the E18 rollout, variants
+> default to the **compact post-run digest format** documented in
+> [`compact-log-schema.md`](compact-log-schema.md) and write a single
+> Parquet file per spawn instead of one JSONL line per event. The JSONL
+> schema below remains authoritative for legacy datasets and for the
+> opt-in `--legacy-jsonl-events` debug mode. The analyzer's format
+> detector picks whichever is present per spawn.
+
 ## General Rules
 
 - One JSON object per line (JSON Lines format).
