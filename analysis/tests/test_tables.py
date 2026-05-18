@@ -6,7 +6,8 @@ from helpers import events_to_lazy, make_event
 
 from correlate import correlate_lazy
 from performance import performance_for_group
-from tables import format_performance_table
+from integrity import IntegrityResult
+from tables import format_integrity_table, format_performance_table
 
 
 def _perf(events: list[dict], variant: str = "test-variant", run: str = "run01"):
@@ -327,3 +328,66 @@ class TestPerformanceTableColumnOrder:
             assert col in table, f"Missing column: {col}"
         # Resource Usage sub-table is preserved.
         assert "Resource Usage" in table
+
+
+def _build_integrity(
+    *,
+    qos: int,
+    skip_at_reliable_count: int,
+    skip_at_reliable_error: bool,
+) -> IntegrityResult:
+    """Build an IntegrityResult focused on the skip-at-reliable signal."""
+    return IntegrityResult(
+        variant="custom-udp",
+        run="r1",
+        writer="alice",
+        receiver="bob",
+        qos=qos,
+        write_count=100,
+        receive_count=100,
+        delivery_pct=100.0,
+        out_of_order=0,
+        duplicates=0,
+        unresolved_gaps=None,
+        backpressure_skipped_count=skip_at_reliable_count,
+        completeness_error=False,
+        ordering_error=False,
+        duplicate_error=False,
+        gap_error=False,
+        skip_at_reliable_count=skip_at_reliable_count,
+        skip_at_reliable_error=skip_at_reliable_error,
+        timeout_classification="completed",
+    )
+
+
+class TestIntegrityTableSkipAtReliableAnnotation:
+    """T17.9: ``[FAIL: skip-at-reliable]`` annotation on the integrity row."""
+
+    def test_violation_row_carries_annotation(self) -> None:
+        rows = [
+            _build_integrity(
+                qos=3, skip_at_reliable_count=4, skip_at_reliable_error=True
+            )
+        ]
+        table = format_integrity_table(rows)
+        assert "[FAIL: skip-at-reliable]" in table
+
+    def test_clean_row_has_no_annotation(self) -> None:
+        rows = [
+            _build_integrity(
+                qos=3, skip_at_reliable_count=0, skip_at_reliable_error=False
+            )
+        ]
+        table = format_integrity_table(rows)
+        assert "skip-at-reliable" not in table
+
+    def test_qos1_with_skips_has_no_annotation(self) -> None:
+        """A QoS 1 row with a non-zero backpressure_skipped_count is
+        contract-compliant -- the annotation must not appear."""
+        rows = [
+            _build_integrity(
+                qos=1, skip_at_reliable_count=0, skip_at_reliable_error=False
+            )
+        ]
+        table = format_integrity_table(rows)
+        assert "skip-at-reliable" not in table

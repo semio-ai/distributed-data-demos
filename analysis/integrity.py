@@ -59,6 +59,18 @@ class IntegrityResult:
     ordering_error: bool
     duplicate_error: bool
     gap_error: bool
+    # T17.9: count of ``backpressure_skipped`` events that the writer
+    # emitted at the row's QoS level when ``qos >= 3``. Per
+    # ``DESIGN.md`` § 6.5 (Strict No-Skip Contract for QoS 3/4) the
+    # variant MUST block the publish call at QoS 3/4 rather than skip,
+    # so any non-zero count here is a contract violation. The count is
+    # always ``0`` for QoS 1/2 rows (skips are the contractual
+    # back-pressure mechanism at those levels). Surfaces as
+    # ``skip_at_reliable_error = True`` on this dataclass and as a
+    # ``[FAIL: skip-at-reliable]`` annotation on the integrity table
+    # row.
+    skip_at_reliable_count: int = 0
+    skip_at_reliable_error: bool = False
     timeout_classification: str = "unknown"
     timeout_sub_tags: tuple[str, ...] = field(default_factory=tuple)
 
@@ -98,6 +110,36 @@ def _count_backpressure_skipped_per_writer(group: pl.LazyFrame) -> pl.DataFrame:
             pl.col("variant").cast(pl.Utf8),
             pl.col("run").cast(pl.Utf8),
             pl.col("writer").cast(pl.Utf8),
+        )
+        .collect()
+    )
+
+
+def _count_skip_at_reliable_per_writer_qos(group: pl.LazyFrame) -> pl.DataFrame:
+    """Count ``backpressure_skipped`` events at QoS 3/4 per (writer, qos).
+
+    Per ``DESIGN.md`` § 6.5 (Strict No-Skip Contract for QoS 3/4) and
+    ``api-contracts/jsonl-log-schema.md``, ``backpressure_skipped`` is
+    valid only at QoS 1/2. Any event emitted at ``qos in (3, 4)`` is a
+    contract violation -- the variant should have blocked the publish
+    call rather than reported the skip. Returns one row per
+    ``(variant, run, writer, qos)`` where ``qos >= 3`` and the writer
+    emitted at least one skip event; absence of a row means "no
+    violation at that (writer, qos)". Used by ``integrity_for_group``
+    to attach ``skip_at_reliable_count`` to every integrity row whose
+    QoS matches, and by ``incomplete_warnings`` to emit per-violation
+    WARN lines.
+    """
+    return (
+        group.filter((pl.col("event") == "backpressure_skipped") & (pl.col("qos") >= 3))
+        .group_by(["variant", "run", "runner", "qos"])
+        .agg(pl.len().cast(pl.UInt32).alias("skip_at_reliable_count"))
+        .rename({"runner": "writer"})
+        .with_columns(
+            pl.col("variant").cast(pl.Utf8),
+            pl.col("run").cast(pl.Utf8),
+            pl.col("writer").cast(pl.Utf8),
+            pl.col("qos").cast(pl.Int64),
         )
         .collect()
     )
@@ -302,6 +344,7 @@ def integrity_for_group(
     """
     write_counts = _count_writes_per_writer(group)
     skip_counts = _count_backpressure_skipped_per_writer(group)
+    skip_at_reliable_counts = _count_skip_at_reliable_per_writer_qos(group)
     pair_stats = _check_per_pair(deliveries)
     gaps = _gap_counts(group)
 
@@ -350,6 +393,20 @@ def integrity_for_group(
         joined = joined.with_columns(
             pl.lit(0).cast(pl.UInt32).alias("backpressure_skipped_count")
         )
+    # T17.9: attach the per-(writer, qos) skip-at-reliable count. The
+    # join keys include ``qos`` so the count only lands on rows whose
+    # QoS level actually produced the violation. Rows at QoS 1/2 stay
+    # null and are filled with 0 below.
+    if not skip_at_reliable_counts.is_empty():
+        joined = joined.with_columns(pl.col("qos").cast(pl.Int64)).join(
+            skip_at_reliable_counts,
+            on=["variant", "run", "writer", "qos"],
+            how="left",
+        )
+    else:
+        joined = joined.with_columns(
+            pl.lit(0).cast(pl.UInt32).alias("skip_at_reliable_count")
+        )
     if not gaps.is_empty():
         joined = joined.join(
             gaps,
@@ -366,6 +423,7 @@ def integrity_for_group(
         pl.col("out_of_order").fill_null(0),
         pl.col("duplicates").fill_null(0),
         pl.col("backpressure_skipped_count").fill_null(0),
+        pl.col("skip_at_reliable_count").fill_null(0),
     ).sort(["variant", "run", "writer", "receiver"])
 
     results: list[IntegrityResult] = []
@@ -376,6 +434,7 @@ def integrity_for_group(
         out_of_order = int(row["out_of_order"])
         duplicates = int(row["duplicates"])
         backpressure_skipped_count = int(row["backpressure_skipped_count"])
+        skip_at_reliable_count = int(row["skip_at_reliable_count"])
 
         delivery_pct = (receive_count / write_count * 100.0) if write_count > 0 else 0.0
 
@@ -391,6 +450,12 @@ def integrity_for_group(
         ordering_error = False
         duplicate_error = False
         gap_error = False
+        # T17.9: skip-at-reliable is a contract violation independent
+        # of completeness/ordering/duplicate checks. It fires whenever
+        # the row's QoS is 3 or 4 and the writer emitted at least one
+        # ``backpressure_skipped`` event at that QoS. Per
+        # ``DESIGN.md`` § 6.5 the variant should have blocked instead.
+        skip_at_reliable_error = qos >= 3 and skip_at_reliable_count > 0
 
         # T14.17 follow-up (2026-05-14): the ordering check is QoS-aware.
         # qos1 (best-effort) and qos2 (latest-value) are datagram-style
@@ -440,6 +505,8 @@ def integrity_for_group(
                 ordering_error=ordering_error,
                 duplicate_error=duplicate_error,
                 gap_error=gap_error,
+                skip_at_reliable_count=skip_at_reliable_count,
+                skip_at_reliable_error=skip_at_reliable_error,
                 timeout_classification=t_class,
                 timeout_sub_tags=t_sub,
             )

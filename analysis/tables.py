@@ -116,6 +116,12 @@ def format_integrity_table(
             errors.append("duplicates")
         if r.gap_error:
             errors.append("gaps")
+        # T17.9: ``backpressure_skipped`` at QoS 3/4 violates the
+        # strict no-skip contract (DESIGN.md § 6.5). Surfaced as its
+        # own annotation so the row makes it clear which contract was
+        # broken -- separate from completeness/ordering/duplicates.
+        if r.skip_at_reliable_error:
+            errors.append("skip-at-reliable")
 
         # T14.17: build the timeout-classification cell. The base
         # enum value is left-aligned in the narrow column. Any

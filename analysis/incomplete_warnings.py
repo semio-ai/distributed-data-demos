@@ -1,7 +1,7 @@
 """Job-run "incomplete samples" warnings (T14.21).
 
 After the integrity and performance tables are produced, scan the
-results for any job-run case that hits one of three triggers and emit
+results for any job-run case that hits one of four triggers and emit
 ``WARN:`` lines on stderr so operators don't have to scan the tables
 row-by-row:
 
@@ -20,6 +20,11 @@ row-by-row:
    row.
 3. **Late tail present**: ``PerformanceResult.late_receives_tail_pct
    > 0``. Granularity: per ``(variant, run)``.
+4. **Skip-at-reliable (T17.9)**: any ``backpressure_skipped`` event
+   emitted at QoS 3 or QoS 4. Per ``DESIGN.md`` § 6.5 ("Strict
+   No-Skip Contract for QoS 3/4") the variant MUST block the
+   publish call at QoS 3/4 -- a skipped value is a contract
+   violation. Granularity: per ``(variant, run, writer, qos)``.
 
 The warnings are grouped by ``(variant, run)`` so an operator can see
 the full picture for a given run at a glance. A final aggregate line is
@@ -71,17 +76,41 @@ class _LateTailWarning:
 
 
 @dataclass(frozen=True)
+class _SkipAtReliableWarning:
+    """T17.9: ``backpressure_skipped`` event at QoS 3/4 (contract violation).
+
+    Per ``DESIGN.md`` § 6.5 ("Strict No-Skip Contract for QoS 3/4")
+    and ``api-contracts/jsonl-log-schema.md``, ``backpressure_skipped``
+    is valid only at QoS 1/2. Any non-zero count at QoS 3/4 means a
+    variant skipped a publish where the contract requires it to block.
+    Granularity: per ``(variant, run, writer, qos)`` -- the same
+    writer can have separate violations at QoS 3 and QoS 4 in the
+    same run.
+    """
+
+    variant: str
+    run: str
+    writer: str
+    qos: int
+    count: int
+
+
+@dataclass(frozen=True)
 class IncompleteWarnings:
     """Collected warnings, grouped/ordered for stable rendering."""
 
     not_completed: list[_NotCompletedWarning]
     delivery_shortfall: list[_DeliveryShortfallWarning]
     late_tail: list[_LateTailWarning]
+    skip_at_reliable: list[_SkipAtReliableWarning]
 
     @property
     def total_cases(self) -> int:
         return (
-            len(self.not_completed) + len(self.delivery_shortfall) + len(self.late_tail)
+            len(self.not_completed)
+            + len(self.delivery_shortfall)
+            + len(self.late_tail)
+            + len(self.skip_at_reliable)
         )
 
 
@@ -169,10 +198,30 @@ def collect_incomplete_warnings(
                 )
             )
 
+    # T17.9: collect skip-at-reliable contract violations. Dedupe by
+    # ``(variant, run, writer, qos)`` -- the same writer's count is
+    # replicated onto every (writer -> receiver) integrity row, but
+    # we want to emit one WARN line per writer/qos, not per receiver.
+    skip_at_reliable_index: dict[tuple[str, str, str, int], _SkipAtReliableWarning] = {}
+    for r in integrity_results:
+        if r.skip_at_reliable_error and r.skip_at_reliable_count > 0:
+            key = (r.variant, r.run, r.writer, r.qos)
+            skip_at_reliable_index.setdefault(
+                key,
+                _SkipAtReliableWarning(
+                    variant=r.variant,
+                    run=r.run,
+                    writer=r.writer,
+                    qos=r.qos,
+                    count=r.skip_at_reliable_count,
+                ),
+            )
+
     return IncompleteWarnings(
         not_completed=list(not_completed.values()),
         delivery_shortfall=delivery_shortfall,
         late_tail=late_tail,
+        skip_at_reliable=list(skip_at_reliable_index.values()),
     )
 
 
@@ -204,6 +253,8 @@ def format_incomplete_warnings(warnings: IncompleteWarnings) -> list[str]:
     for w in warnings.delivery_shortfall:
         groups.add(_group_key(w))
     for w in warnings.late_tail:
+        groups.add(_group_key(w))
+    for w in warnings.skip_at_reliable:
         groups.add(_group_key(w))
 
     lines: list[str] = []
@@ -251,12 +302,26 @@ def format_incomplete_warnings(warnings: IncompleteWarnings) -> list[str]:
                 f"WARN: [{w.variant} / {w.run}] late-tail "
                 f"{w.late_tail_pct:.2f}% of receives beyond 10x p99"
             )
+        # T17.9: skip-at-reliable contract violation. Rendered last
+        # within the group so the line stands out and references the
+        # design contract explicitly. ``writer`` is included so the
+        # operator can find the spawn in the integrity table.
+        for w in sorted(
+            (w for w in warnings.skip_at_reliable if _group_key(w) == group),
+            key=lambda x: (x.writer, x.qos),
+        ):
+            lines.append(
+                f"WARN: [{w.variant} / {w.run}] {w.writer} {w.count} "
+                f"backpressure_skipped events at qos{w.qos} -- "
+                f"contract violation per DESIGN.md § 6.5"
+            )
 
     lines.append(
         f"WARN: {warnings.total_cases} job-run case(s) with incomplete samples "
         f"({len(warnings.not_completed)} not-completed, "
         f"{len(warnings.delivery_shortfall)} delivery shortfall, "
-        f"{len(warnings.late_tail)} late tail)."
+        f"{len(warnings.late_tail)} late tail, "
+        f"{len(warnings.skip_at_reliable)} skip-at-reliable)."
     )
     return lines
 

@@ -667,3 +667,176 @@ class TestIntegrityBackpressureSkipped:
         for r in results:
             assert r.writer == "alice"
             assert r.backpressure_skipped_count == 2
+
+
+class TestIntegritySkipAtReliable:
+    """T17.9: ``backpressure_skipped`` at QoS 3/4 is a contract violation.
+
+    Per ``DESIGN.md`` § 6.5 (Strict No-Skip Contract for QoS 3/4) and
+    ``api-contracts/jsonl-log-schema.md``, the variant MUST block the
+    publish call at QoS 3/4 rather than skip. Any
+    ``backpressure_skipped`` row with ``qos >= 3`` is a regression
+    against E17 -- the integrity row must flip ``skip_at_reliable_error``
+    on (-> ``[FAIL: skip-at-reliable]`` annotation in the table).
+    """
+
+    def _events_with_skip(self, qos: int) -> list[dict]:
+        return [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=qos,
+                bytes=8,
+                offset_ms=100,
+            ),
+            make_event(
+                "backpressure_skipped",
+                runner="alice",
+                path="/k",
+                qos=qos,
+                offset_ms=101,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=qos,
+                bytes=8,
+                offset_ms=110,
+            ),
+        ]
+
+    def test_qos3_skip_flags_violation(self) -> None:
+        results = _verify(self._events_with_skip(qos=3))
+        r = results[0]
+        assert r.skip_at_reliable_count == 1
+        assert r.skip_at_reliable_error
+
+    def test_qos4_skip_flags_violation(self) -> None:
+        results = _verify(self._events_with_skip(qos=4))
+        r = results[0]
+        assert r.skip_at_reliable_count == 1
+        assert r.skip_at_reliable_error
+
+    def test_qos1_skip_is_not_a_violation(self) -> None:
+        """``backpressure_skipped`` is contractual at QoS 1."""
+        results = _verify(self._events_with_skip(qos=1))
+        r = results[0]
+        # Aggregate counter still records the skip event for stats...
+        assert r.backpressure_skipped_count == 1
+        # ...but the contract-violation specific counter stays 0 and
+        # the error flag stays False -- QoS 1 is loss-tolerant by
+        # design (DESIGN.md § 6.5).
+        assert r.skip_at_reliable_count == 0
+        assert not r.skip_at_reliable_error
+
+    def test_qos2_skip_is_not_a_violation(self) -> None:
+        """``backpressure_skipped`` is contractual at QoS 2 too."""
+        results = _verify(self._events_with_skip(qos=2))
+        r = results[0]
+        assert r.backpressure_skipped_count == 1
+        assert r.skip_at_reliable_count == 0
+        assert not r.skip_at_reliable_error
+
+    def test_no_skip_events_yields_zero(self) -> None:
+        """Healthy QoS 3 stream produces zero violation count + flag."""
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=100,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110,
+            ),
+        ]
+        results = _verify(events)
+        r = results[0]
+        assert r.skip_at_reliable_count == 0
+        assert not r.skip_at_reliable_error
+
+    def test_skip_count_attaches_only_to_matching_qos_row(self) -> None:
+        """Per-(writer, qos) keying: a qos3 skip count does not bleed
+        onto a qos1 row written by the same writer.
+
+        Synthetic shape: alice writes to bob (qos1) and to carol
+        (qos3), and the driver emits a single ``backpressure_skipped``
+        at qos3. Only the alice->carol qos3 row should carry the
+        violation; the alice->bob qos1 row stays clean.
+        """
+        events = [
+            # qos1 path: one write, one receive (bob).
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k1",
+                qos=1,
+                bytes=8,
+                offset_ms=100,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k1",
+                qos=1,
+                bytes=8,
+                offset_ms=110,
+            ),
+            # qos3 path: one write, one receive (carol), one violation skip.
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k3",
+                qos=3,
+                bytes=8,
+                offset_ms=200,
+            ),
+            make_event(
+                "backpressure_skipped",
+                runner="alice",
+                path="/k3",
+                qos=3,
+                offset_ms=201,
+            ),
+            make_event(
+                "receive",
+                runner="carol",
+                writer="alice",
+                seq=1,
+                path="/k3",
+                qos=3,
+                bytes=8,
+                offset_ms=210,
+            ),
+        ]
+        results = _verify(events)
+        by_receiver = {r.receiver: r for r in results}
+        # alice -> bob (qos1): clean, no contract violation.
+        bob = by_receiver["bob"]
+        assert bob.qos == 1
+        assert bob.skip_at_reliable_count == 0
+        assert not bob.skip_at_reliable_error
+        # alice -> carol (qos3): contract violation flagged.
+        carol = by_receiver["carol"]
+        assert carol.qos == 3
+        assert carol.skip_at_reliable_count == 1
+        assert carol.skip_at_reliable_error

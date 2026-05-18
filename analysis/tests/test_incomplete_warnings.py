@@ -27,6 +27,8 @@ def _ok_integrity(
     qos: int = 4,
     delivery_pct: float = 100.0,
     classification: str = "completed",
+    skip_at_reliable_count: int = 0,
+    skip_at_reliable_error: bool = False,
 ) -> IntegrityResult:
     """Build an IntegrityResult with sensible defaults for a clean row."""
     return IntegrityResult(
@@ -46,6 +48,8 @@ def _ok_integrity(
         ordering_error=False,
         duplicate_error=False,
         gap_error=False,
+        skip_at_reliable_count=skip_at_reliable_count,
+        skip_at_reliable_error=skip_at_reliable_error,
         timeout_classification=classification,
     )
 
@@ -499,3 +503,142 @@ class TestCollectorUnit:
     def test_formatter_empty_on_clean(self) -> None:
         warnings = collect_incomplete_warnings([_ok_integrity()], [_ok_perf()])
         assert format_incomplete_warnings(warnings) == []
+
+
+class TestSkipAtReliable:
+    """T17.9: rule 4 -- ``backpressure_skipped`` at QoS 3/4.
+
+    The integrity row's ``skip_at_reliable_error`` flag drives the
+    warning. The warning's wording must explicitly cite DESIGN.md § 6.5
+    so operators can find the contract.
+    """
+
+    @pytest.mark.parametrize("qos", [3, 4])
+    def test_violation_emits_warning(
+        self, capsys: pytest.CaptureFixture, qos: int
+    ) -> None:
+        ints = [
+            _ok_integrity(
+                qos=qos,
+                skip_at_reliable_count=5,
+                skip_at_reliable_error=True,
+            )
+        ]
+        perfs = [_ok_perf()]
+
+        warnings = emit_incomplete_warnings(ints, perfs)
+        lines = _warn_lines(capsys.readouterr().err)
+
+        assert len(warnings.skip_at_reliable) == 1
+        # Per-violation line + aggregate.
+        assert len(lines) == 2
+        case_line, agg_line = lines
+        assert f"qos{qos}" in case_line
+        assert "5 backpressure_skipped" in case_line
+        assert "contract violation" in case_line
+        assert "DESIGN.md" in case_line
+        assert "6.5" in case_line
+        assert "1 skip-at-reliable" in agg_line
+
+    @pytest.mark.parametrize("qos", [1, 2])
+    def test_qos_one_or_two_skip_emits_no_violation(
+        self, capsys: pytest.CaptureFixture, qos: int
+    ) -> None:
+        """At QoS 1/2 ``backpressure_skipped`` is the contractual signal,
+        not a violation. The warning rule must stay silent.
+
+        We construct an integrity row that *would* fire the warning if
+        the rule had been keyed on raw ``backpressure_skipped_count``;
+        the row's ``skip_at_reliable_*`` fields are the correct gating
+        signal and stay False/0.
+        """
+        ints = [
+            _ok_integrity(
+                qos=qos,
+                skip_at_reliable_count=0,
+                skip_at_reliable_error=False,
+            )
+        ]
+        perfs = [_ok_perf()]
+
+        warnings = emit_incomplete_warnings(ints, perfs)
+        out = capsys.readouterr()
+
+        assert len(warnings.skip_at_reliable) == 0
+        assert warnings.total_cases == 0
+        assert out.err == ""
+
+    def test_multiple_receivers_deduped_to_one_per_writer_qos(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """The same (writer, qos) appearing on two integrity rows
+        (writer publishes to two receivers) emits ONE WARN line, not
+        two -- the violation is a property of the writer's publish
+        path, not the (writer, receiver) pair.
+        """
+        ints = [
+            _ok_integrity(
+                receiver="bob",
+                qos=4,
+                skip_at_reliable_count=3,
+                skip_at_reliable_error=True,
+            ),
+            _ok_integrity(
+                receiver="carol",
+                qos=4,
+                skip_at_reliable_count=3,
+                skip_at_reliable_error=True,
+            ),
+        ]
+        perfs = [_ok_perf()]
+
+        warnings = emit_incomplete_warnings(ints, perfs)
+        lines = _warn_lines(capsys.readouterr().err)
+
+        assert len(warnings.skip_at_reliable) == 1
+        # 1 warning + 1 aggregate.
+        assert len(lines) == 2
+        assert "1 skip-at-reliable" in lines[-1]
+
+    def test_warning_grouped_with_other_warnings_for_same_run(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A skip-at-reliable warning lands inside the same
+        ``[variant / run]`` block as other warnings for that group.
+        """
+        ints = [
+            _ok_integrity(
+                variant="v1",
+                run="r1",
+                qos=3,
+                delivery_pct=80.0,
+                skip_at_reliable_count=7,
+                skip_at_reliable_error=True,
+            )
+        ]
+        perfs = [_ok_perf(variant="v1", run="r1")]
+
+        emit_incomplete_warnings(ints, perfs)
+        lines = _warn_lines(capsys.readouterr().err)
+
+        # 1 delivery shortfall + 1 skip-at-reliable + aggregate.
+        assert len(lines) == 3
+        for ln in lines[:-1]:
+            assert "[v1 / r1]" in ln
+        # Skip-at-reliable is the last per-case line (after delivery).
+        assert "DESIGN.md" in lines[1]
+        agg = lines[-1]
+        assert "1 delivery shortfall" in agg
+        assert "1 skip-at-reliable" in agg
+
+    def test_clean_run_aggregate_still_mentions_skip_at_reliable_count(
+        self,
+    ) -> None:
+        """Sanity: the aggregate string includes the new bucket even
+        when zero -- format_incomplete_warnings returns empty on clean,
+        but collect returns a structured zero result that callers can
+        inspect.
+        """
+        warnings = collect_incomplete_warnings([_ok_integrity()], [_ok_perf()])
+        assert warnings.skip_at_reliable == []
+        assert warnings.total_cases == 0
