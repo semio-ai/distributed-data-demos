@@ -11997,3 +11997,128 @@ integrity or headline numbers.
 
 Final summary lives in
 `logs/same-machine-all-variants-01-20260514_084636/analysis/analyze_report.md`
+
+## T18.2 — variant-base: compact buffers + digest phase + Parquet writer
+
+**Status:** done. Ready for Wave 2 (T18.3-T18.6).
+
+**Implementation summary.** Two new modules in `variant-base/src/`:
+
+- `compact.rs` -- in-memory columnar `CompactBuffers` (seven parallel
+  `Vec`s: ts_ns, kind, seq, path_idx, peer_idx, qos, bytes) with
+  lazy `PathInterner` (`u32` indices, cap `u32::MAX`) and
+  `PeerInterner` (`u8` indices, cap `MAX_PEERS = 254` so
+  `u8::MAX = 255` is the `PEER_SELF` sentinel). `EventKind`
+  discriminants pinned (Write=0, Receive=1, BackpressureSkipped=2,
+  GapDetected=3, GapFilled=4). Coarse `approx_bytes()` for the
+  mem-ceiling check (32 bytes/row + intern heap).
+
+- `compact_writer.rs` -- serialises `CompactBuffers` to
+  `<log_dir>/<variant>-<runner>-<run>.compact.parquet` via the
+  `parquet = "53"` crate. One row group, seven primitive columns,
+  snappy default. Intern dictionaries + spawn identifiers
+  (variant/runner/run/launch_ts/threading_mode/recv_buffer_kb) +
+  `schema_version=1` stored in the file's KV metadata.
+
+**Driver wiring.** New `Phase::Digest` variant appended after
+`Silent`. The protocol emits one `phase=digest` JSONL marker then
+writes the Parquet file via `compact_writer::write_compact_parquet`
+and prints `[variant] digest: wrote <path> (<rows>, <bytes>)` to
+stderr for operator visibility. A new `EventSink` struct in the
+driver owns the buffers and the legacy-JSONL gate: every per-event
+observation always pushes to the buffers; the legacy JSONL line is
+emitted only when `--legacy-jsonl-events` is on. Lifecycle events
+(phase / connected / eot_sent / eot_received / eot_timeout /
+resource) are unconditional JSONL.
+
+**CLI surface added.**
+
+- `--digest-mem-soft-mb` (default 1024): single sticky stderr
+  warning when buffer footprint crosses this.
+- `--digest-mem-hard-mb` (default 2048): operate loop returns an
+  error with the threshold + current footprint when crossed.
+- `--legacy-jsonl-events` (default **false**): re-enables
+  per-event JSONL lines alongside the compact file. Lifecycle
+  events always go to JSONL regardless of this flag.
+
+**Test results** (all run from worktree root):
+
+- `cargo test --release -p variant-base` -- 113 unit + 10
+  integration pass, 0 failures.
+  - 18 new unit tests covering intern semantics (idempotent
+    indices, overflow rejection, sentinel placement) and the
+    Parquet round-trip (empty file, row shape, KV metadata,
+    dictionary recovery).
+  - 4 new integration tests: compact-Parquet alongside JSONL,
+    compact-only mode suppresses per-event JSONL but keeps
+    lifecycle, hard mem-ceiling aborts the spawn with a clear
+    error, ratio >= 10x acceptance.
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  -- clean.
+- `cargo fmt --check` -- clean.
+
+**Parquet crate version chosen.** `parquet = "53"` (resolved as
+`parquet 53.4.1` with `arrow-*` 53.4.1 as transitive). Compatible
+with rustc 1.94.1 and the existing workspace dependency graph.
+Built fresh on Windows without modifications to other crates.
+
+**Compression choice.** Snappy. A 2 s scalar-flood at 1000 Hz x
+100 vpt produces ~400 K events; snappy encode finishes in
+~200-500 ms (release), zstd-3 in ~800-1500 ms for ~5% smaller
+files. Since the digest phase runs inside the per-spawn budget,
+the 3x CPU saving outweighs the 5% file-size delta. The
+`CompactWriterOptions::compression` field lets future workers
+switch codecs without an API break; the analysis reader
+auto-detects.
+
+**Measured size reduction.** Release-mode acceptance test
+(`test_compact_parquet_at_least_10x_smaller_than_jsonl`):
+
+- Workload: 2 s scalar-flood, 1000 Hz, 100 values per tick =
+  ~400 K events, single-runner self-loopback via VariantDummy.
+- Legacy JSONL: 69,176,504 bytes (~66 MiB).
+- Compact Parquet: 3,321,568 bytes (~3.2 MiB), 400,200 rows.
+- **Ratio: 20.8x** (vs. test acceptance floor of 10x and the
+  epic target band of 30-50x).
+
+The 20.8x is below the 30-50x epic target band because the
+worst-case JSONL line for `VariantDummy` is artificially short
+(no `arora_types::Value` payload diversity, single path
+`/bench/0`); real variants will produce longer JSONL lines and
+more distinct paths/peers, pushing the ratio higher. The 10x
+floor in the acceptance test is generous slack so the test does
+not flap on future dummy / workload changes.
+
+**Deviations from spec.**
+
+- **Schema design**: I designed the compact-event row schema myself
+  (7-column primitive Parquet layout with `EventKind` enum codes
+  and string interning) because
+  `metak-shared/api-contracts/compact-log-schema.md` does not
+  exist in the worktree. The schema is locally documented in
+  `variant-base/src/compact_writer.rs` and `CUSTOM.md`. Per the
+  task spec's "see compact-log-schema.md" reference, the orchestrator
+  should write that file using the implementation here as a
+  reference. The `schema_version=1` field in the KV metadata gives
+  the analysis side a hard stop for future incompatible changes.
+- **Empty `metak-orchestrator/EPICS.md § E18` and `TASKS.md § T18.2`**:
+  neither entry exists yet. I followed the task spec embedded in the
+  orchestrator's prompt and added cross-references to "T18.2 / E18"
+  inside the new modules so they tie back once the orchestrator
+  formalises the entries.
+- **`compact_writer::CompactWriterError`** is exported but not
+  currently surfaced through public API (the driver wraps it in
+  `anyhow::anyhow!` for the operator-friendly digest-phase error).
+  Future workers writing tooling around the writer can match on
+  it directly.
+
+**Commits on this worktree branch:**
+
+1. `feat(variant-base): compact columnar buffers + Parquet writer
+   (T18.2)` -- buffers + intern + writer + 18 unit tests.
+2. `feat(variant-base): digest phase + Parquet output wired into
+   driver (T18.2)` -- CLI args, EventSink, Phase::Digest, driver
+   wiring, 4 new integration tests, existing phase-sequence
+   tests updated for the new phase.
+3. `docs(variant-base): CUSTOM.md + STRUCT.md for T18.2 compact log`
+   -- design notes for downstream workers and the orchestrator.
