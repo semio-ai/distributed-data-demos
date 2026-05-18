@@ -25,6 +25,18 @@ serde_json = "1"
 socket2 = "0.5"
 sysinfo = "0.33"
 thiserror = "2"
+# `parquet` (arrow-rs family) is used by the `compact_writer` module
+# to serialise the in-memory columnar buffers into a single
+# `<variant>-<runner>-<run>.compact.parquet` file at the end of each
+# spawn (T18.2 / E18). We use the lower-level `column::writer` API
+# rather than the higher-level `arrow` integration to avoid pulling
+# the full arrow + arrow-buffer + arrow-array dependency graph into
+# the variant base crate. Default features (including `snap` for the
+# Snappy codec which is our chosen compression) are sufficient.
+parquet = "53"
 
 [dev-dependencies]
 tempfile = "3"
+# `parquet` is also a dev-dependency so the integration test can
+# read the produced file back via `SerializedFileReader`.
+parquet = "53"
