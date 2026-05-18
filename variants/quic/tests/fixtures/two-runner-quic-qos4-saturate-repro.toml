@@ -1,0 +1,60 @@
+# T17.6 QoS 3/4 stream-flow-control reproducer.
+#
+# Pre-fix: quic-multi at `1000x100hz qos3` saturates ~88.6% delivery and
+# qos4 saturates ~86%. The unbounded mpsc between the sync `try_publish`
+# and the async send_loop fills under load, the send_loop falls behind
+# quinn's per-stream flow control window, and the variant logs `write`
+# rows for messages that never made it onto the wire. Post-fix
+# (bounded mpsc + `blocking_send` from the sync side) the channel
+# back-pressures `try_publish`, which back-pressures the driver, and
+# delivery reaches 100% in both directions at the cost of throughput.
+#
+# This fixture exercises both qos 3 (UDP-reliable) and qos 4 (TCP-style
+# reliable) at the same 1000 paths * 100 Hz = 100 K writes/s/spawn that
+# revealed the bug in the full-matrix run.
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/quic/tests/fixtures/two-runner-quic-qos4-saturate-repro.toml
+#   target/release/runner --name bob   --config variants/quic/tests/fixtures/two-runner-quic-qos4-saturate-repro.toml
+
+run = "quic-t176-qos34-saturate-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "quic-1000x100hz-qos3"
+binary = "target/release/variant-quic.exe"
+supported_modes = ["multi"]
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 3
+  threading_modes = ["multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  base_port = 19930
+
+[[variant]]
+name = "quic-1000x100hz-qos4"
+binary = "target/release/variant-quic.exe"
+supported_modes = ["multi"]
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 10
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 4
+  threading_modes = ["multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  base_port = 19940

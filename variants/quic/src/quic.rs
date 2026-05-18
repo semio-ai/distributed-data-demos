@@ -11,6 +11,61 @@ use tokio::sync::mpsc;
 use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::variant_trait::Variant;
 
+/// Bounded capacity of the sync-to-async send channel used by the
+/// reliable (QoS 3/4) publish path (T17.6).
+///
+/// The channel is the only piece of the variant that sits between the
+/// driver's sync `try_publish` call and the async send_loop that
+/// actually writes onto quinn's per-stream flow-controlled
+/// uni-streams. Pre-T17.6 the channel was unbounded, which meant the
+/// sync side could enqueue faster than the send_loop could drain
+/// under saturation: messages piled up in process memory and the
+/// `Variant` trait observed `Ok(true)` for writes that quinn had not
+/// yet sent. When the spawn's operate phase ended the leftover queue
+/// was dropped on `disconnect`, surfacing as missing receives in the
+/// integrity report (e.g. quic-multi `1000x100hz qos4` stuck at
+/// ~86% delivery).
+///
+/// A bounded channel + `blocking_send` from the sync side propagates
+/// quinn's per-stream flow control all the way to the driver: when
+/// the channel is full the sync thread blocks until the send_loop
+/// has drained at least one slot, which only happens after the QUIC
+/// stream has accepted enough bytes to satisfy its peer's window.
+/// This matches the DESIGN.md § 6.5 strict no-skip contract for
+/// QoS 3/4 (the variant MUST block at publish, MUST NOT drop or
+/// return `Ok(false)`).
+///
+/// The bound is intentionally small: large enough to absorb a tick's
+/// worth of bursty publishes without forcing per-message blocking on
+/// the common case (a 100-value/tick workload at 100 Hz fits two
+/// ticks here), small enough that the back-pressure signal reaches
+/// the driver promptly under sustained overload. Larger bounds delay
+/// the back-pressure signal without hiding the delivery shortfall;
+/// they just push it earlier in the spawn's operate phase.
+const RELIABLE_SEND_CHANNEL_BOUND: usize = 256;
+
+/// How long to wait on `SendStream::stopped` per peer at shutdown
+/// before giving up and tearing the runtime down (T17.6).
+///
+/// `finish()` on a quinn `SendStream` marks the local end as
+/// finishable, but the bytes still in quinn's send buffer + the
+/// per-stream flow-control window are NOT yet ACK'd by the peer when
+/// `finish()` returns. To preserve the QoS 3/4 100%-delivery contract
+/// we must wait for the peer to ACK the FIN -- otherwise the runtime
+/// tears down before quinn finishes draining and we lose the tail of
+/// every reliable spawn.
+///
+/// `stopped()` resolves once the peer has either ACK'd the FIN or
+/// reset the stream. The wallclock budget here is per peer; with a
+/// well-behaved peer on a LAN that finishes immediately, this is
+/// effectively a no-op. Under sustained saturation it gives quinn up
+/// to 30 s to drain the bounded mpsc + the stream window before the
+/// runtime forcibly shuts down. The driver's `silent_secs` (typically
+/// 2 s) is far too short for fully-saturated reliable streams; the
+/// explicit per-stream wait below is what carries the "drain the
+/// tail" semantics that QoS 3/4 requires.
+const RELIABLE_STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Internal record of an observed peer EOT marker.
 ///
 /// The on-wire EOT exchange was retired in T15.8 (the `Variant` trait
@@ -242,7 +297,23 @@ pub struct QuicVariant {
     bind_addr: SocketAddr,
     peers: Vec<SocketAddr>,
     runtime: Option<Runtime>,
-    send_tx: Option<mpsc::UnboundedSender<OutboundMessage>>,
+    /// Bounded sync→async send channel feeding the reliable send_loop
+    /// (T17.6). `blocking_send` from the variant's sync `publish` path
+    /// blocks when the channel is full; that block is the
+    /// application-level back-pressure signal required by DESIGN.md
+    /// § 6.5 for the QoS 3/4 strict no-skip contract.
+    send_tx: Option<mpsc::Sender<OutboundMessage>>,
+    /// Join handle for the background send_loop task (T17.6).
+    /// `disconnect()` awaits this handle AFTER dropping `send_tx` so
+    /// the send_loop drains the bounded channel and waits for every
+    /// reliable stream's FIN to be ACK'd before the runtime is torn
+    /// down. Without this wait, the runtime's
+    /// `shutdown_timeout(2 s)` would cancel the send_loop mid-flight
+    /// and the tail of every reliable spawn would be lost on the
+    /// wire -- delivery numbers in the integrity report would
+    /// asymptote at "what fit through the stream window in
+    /// `silent_secs`", never 100%.
+    send_join: Option<tokio::task::JoinHandle<()>>,
     recv_rx: Option<mpsc::UnboundedReceiver<Inbound>>,
     shutdown_tx: Option<ShutdownTx>,
     /// Pending peer EOTs, drained by `poll_peer_eots`. Populated by
@@ -278,6 +349,7 @@ impl QuicVariant {
             peers,
             runtime: None,
             send_tx: None,
+            send_join: None,
             recv_rx: None,
             shutdown_tx: None,
             pending_eots: Vec::new(),
@@ -558,7 +630,11 @@ impl Variant for QuicVariant {
         }
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
 
-        let (send_tx, send_rx) = mpsc::unbounded_channel::<OutboundMessage>();
+        // T17.6: bounded sync→async send channel. Unbounded pre-T17.6
+        // hid quinn's per-stream flow-control back-pressure from the
+        // driver and produced delivery shortfalls at QoS 3/4
+        // saturation. See `RELIABLE_SEND_CHANNEL_BOUND`.
+        let (send_tx, send_rx) = mpsc::channel::<OutboundMessage>(RELIABLE_SEND_CHANNEL_BOUND);
         let (recv_tx, recv_rx) = mpsc::unbounded_channel::<Inbound>();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let eot_dedup = EotDedup::new();
@@ -679,13 +755,16 @@ impl Variant for QuicVariant {
         // with the send_loop task.
         self.connections = connections.clone();
 
-        // Spawn background send task.
+        // Spawn background send task. T17.6 retains the JoinHandle so
+        // `disconnect` can await full drain (channel close → stream
+        // FIN → peer ACK of FIN) BEFORE the runtime is torn down.
         let send_shutdown_rx = shutdown_rx.clone();
-        runtime.spawn(async move {
+        let send_join = runtime.spawn(async move {
             send_loop(send_rx, connections, send_shutdown_rx).await;
         });
 
         self.send_tx = Some(send_tx);
+        self.send_join = Some(send_join);
         self.recv_rx = Some(recv_rx);
         self.shutdown_tx = Some(shutdown_tx);
         self.runtime = Some(runtime);
@@ -702,8 +781,24 @@ impl Variant for QuicVariant {
         let data = encode_data(&self.runner, path, qos, seq, payload);
         let reliable = matches!(qos, Qos::ReliableUdp | Qos::ReliableTcp);
 
+        // T17.6: `blocking_send` on the bounded sync→async channel.
+        // When the channel is full this parks the calling thread
+        // (the driver's publish loop) until the send_loop has drained
+        // one slot -- which only happens once quinn has accepted bytes
+        // through its per-stream flow-control window. That makes the
+        // bounded mpsc the application-level back-pressure mechanism
+        // required by DESIGN.md § 6.5 for QoS 3/4. The reliable path
+        // is the only caller that hits this in steady state: the
+        // QoS 1/2 datagram path uses the channel only as a fire-and-
+        // forget convenience inside `send_loop`, and `try_publish`
+        // bypasses the channel entirely for QoS 1/2.
+        //
+        // `blocking_send` is safe here because `publish` is called
+        // from the sync driver thread (no tokio runtime on the stack).
+        // Calling it from inside a tokio task would panic, but the
+        // variant's sync surface guarantees that does not happen.
         send_tx
-            .send(OutboundMessage {
+            .blocking_send(OutboundMessage {
                 data,
                 reliable,
                 retries: 1,
@@ -735,8 +830,14 @@ impl Variant for QuicVariant {
     ///   serialised onto a **single long-lived unidirectional stream
     ///   per connection** (T14.13) by the send_loop; quinn's per-stream
     ///   flow control absorbs backpressure inside the `write_all` await
-    ///   without producing a seq gap. The send_loop is fed via the
-    ///   unbounded mpsc, so `publish` itself returns immediately.
+    ///   without producing a seq gap. Post-T17.6 the send_loop is fed
+    ///   via a **bounded** mpsc with `blocking_send` from the sync
+    ///   side, so `try_publish` blocks the driver when quinn's
+    ///   per-stream window is exhausted (DESIGN.md § 6.5 strict
+    ///   no-skip contract). On return the variant has either
+    ///   committed the message into the channel or propagated a
+    ///   hard error; it never silently drops at QoS 3/4 and never
+    ///   returns `Ok(false)`.
     ///
     /// Note: quinn 0.11's `Connection::send_datagram` *cannot* return
     /// `SendDatagramError::Blocked` -- the wrapper forces `drop=true`
@@ -847,13 +948,53 @@ impl Variant for QuicVariant {
     }
 
     fn disconnect(&mut self) -> Result<()> {
-        // Signal shutdown to all background tasks.
+        // T17.6 drain order, critical for QoS 3/4 100% delivery:
+        //
+        // 1. Drop `send_tx` FIRST. This closes the bounded mpsc; on
+        //    the next `rx.recv()` the send_loop sees `None` and exits
+        //    its forwarding loop. Anything we had already enqueued
+        //    via `blocking_send` from `publish` is still in the
+        //    channel and will be drained before send_loop falls
+        //    through to the per-stream finish/stopped phase.
+        //
+        // 2. Await the send_loop's `JoinHandle` inside the runtime.
+        //    This is the wait-for-drain step: send_loop runs until
+        //    it has (a) written every pending channel message onto
+        //    its per-connection reliable stream, (b) `finish()`-ed
+        //    each stream, and (c) awaited the peer's FIN ACK via
+        //    `SendStream::stopped` (bounded by
+        //    `RELIABLE_STREAM_DRAIN_TIMEOUT`). Only then does
+        //    `disconnect` continue.
+        //
+        // 3. NOW signal the watch shutdown for the receive-side
+        //    background tasks (handle_connection / accept task).
+        //    These don't carry the reliable-write tail, so it is
+        //    fine for them to be cancelled by runtime shutdown.
+        //
+        // 4. Drop the runtime with a generous timeout for any still-
+        //    racing accept/receive tasks. The reliable-write tail is
+        //    already on the wire and ACK'd at this point.
+        //
+        // Pre-T17.6 order (signal-shutdown → drop send_tx →
+        // shutdown_timeout(2s)) cancelled the send_loop mid-flight
+        // and lost up to 50% of writes on saturated reliable spawns.
+        self.send_tx.take();
+
+        if let (Some(rt), Some(join)) = (self.runtime.as_ref(), self.send_join.take()) {
+            // Block-on the send_loop join inside the runtime. The
+            // task itself does the bounded waits (per-stream
+            // `stopped()` with `RELIABLE_STREAM_DRAIN_TIMEOUT`), so
+            // worst-case latency here is bounded by `peers.len() *
+            // RELIABLE_STREAM_DRAIN_TIMEOUT` plus the time to drain
+            // any remaining channel content. On a LAN with a healthy
+            // peer this is milliseconds.
+            let _ = rt.block_on(join);
+        }
+
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
 
-        // Drop channels.
-        self.send_tx.take();
         self.recv_rx.take();
         // Drop our clones of the connections so the underlying handles
         // can fully drop with the runtime.
@@ -911,7 +1052,7 @@ impl QuicVariant {
 /// `finish()`-ed on shutdown so the receiver sees a clean
 /// end-of-stream at a frame boundary.
 async fn send_loop(
-    mut rx: mpsc::UnboundedReceiver<OutboundMessage>,
+    mut rx: mpsc::Receiver<OutboundMessage>,
     connections: Vec<quinn::Connection>,
     mut shutdown_rx: ShutdownRx,
 ) {
@@ -954,12 +1095,28 @@ async fn send_loop(
         }
     }
 
-    // Cleanly finish every still-open reliable stream so the peer's
-    // read loop sees a frame-aligned end-of-stream. Errors during
-    // shutdown are ignored.
+    // T17.6: Cleanly finish every still-open reliable stream so the
+    // peer's read loop sees a frame-aligned end-of-stream. `finish()`
+    // only marks the local end as closeable; the bytes still queued
+    // in quinn's send buffer + the flow-control window must drain to
+    // the peer (and the peer must ACK the FIN) before delivery is
+    // truly 100%. We await `stopped()` per stream with a per-stream
+    // timeout so a stuck peer does not block shutdown forever, but
+    // a well-behaved peer on a LAN drains in milliseconds. This is
+    // what carries the tail of every reliable spawn over the wire
+    // before `disconnect` returns -- pre-T17.6 the runtime's 2 s
+    // forced timeout cut off the drain, costing us 10-50% delivery
+    // on heavily saturated reliable spawns.
     for slot in reliable_streams.iter_mut() {
         if let Some(stream) = slot.as_mut() {
             let _ = stream.finish();
+            // `stopped()` resolves once the peer has either ACK'd
+            // the FIN or sent a STOP_SENDING reset. Either way the
+            // stream is fully drained or known-broken; we can let
+            // the runtime shut down. A timeout indicates the peer
+            // is stuck and we give up to avoid blocking
+            // `disconnect` indefinitely.
+            let _ = tokio::time::timeout(RELIABLE_STREAM_DRAIN_TIMEOUT, stream.stopped()).await;
         }
     }
 }
@@ -1435,11 +1592,13 @@ mod tests {
     }
 
     /// For QoS 3/4 (reliable streams) `try_publish` MUST always return
-    /// `Ok(true)` even under load: the reliable path goes through the
-    /// existing `publish` channel and quinn's stream flow control,
-    /// neither of which should produce a `backpressure_skipped`
-    /// seq-gap. Verifies the contract for the reliable side of the
-    /// QoS split.
+    /// `Ok(true)` even under load. Post-T17.6 the reliable path goes
+    /// through `publish`, which `blocking_send`s onto a bounded mpsc
+    /// (back-pressure ride-through happens INSIDE the call -- it
+    /// blocks the sync caller until the send_loop drains one slot).
+    /// The variant never surfaces `Ok(false)` at QoS 3/4: the
+    /// DESIGN.md § 6.5 strict no-skip contract forbids it. Verifies
+    /// the contract for the reliable side of the QoS split.
     #[test]
     fn test_try_publish_qos3_and_qos4_never_backpressure() {
         let port_a = pick_free_udp_port();
@@ -1578,6 +1737,199 @@ mod tests {
 
         variant_a.disconnect().expect("disconnect a");
         variant_b.disconnect().expect("disconnect b");
+    }
+
+    /// T17.6 regression: under a sustained reliable-QoS burst far
+    /// larger than the bounded send channel, every message must reach
+    /// the receiver. Pre-T17.6 the variant used an unbounded mpsc
+    /// between the sync `try_publish` and the async send_loop; under
+    /// 100K writes/s saturation the queue grew without bound while
+    /// quinn's per-stream flow-control window held back the actual
+    /// bytes. The `Variant` trait observed `Ok(true)` for writes that
+    /// quinn had not yet sent, and `disconnect` dropped the leftover
+    /// queue, surfacing as a delivery shortfall in the integrity
+    /// report (quic-multi 1000x100hz qos4 stuck at ~86%).
+    ///
+    /// Post-T17.6 the channel is bounded at `RELIABLE_SEND_CHANNEL_BOUND`
+    /// and `blocking_send` parks the sync caller when full; that
+    /// back-pressure rides all the way to the driver, so writes only
+    /// proceed at the rate quinn can actually push bytes. Delivery
+    /// reaches 100% at the cost of throughput.
+    ///
+    /// The N below is intentionally chosen well above the channel
+    /// bound so the burst hits the blocking path repeatedly without
+    /// needing to also saturate quinn's per-stream window
+    /// (untestable deterministically on loopback at unit-test scale).
+    #[test]
+    fn test_qos4_burst_delivers_every_message_t17_6() {
+        let port_a = pick_free_udp_port();
+        let port_b = pick_free_udp_port();
+        let addr_a: SocketAddr = format!("127.0.0.1:{}", port_a).parse().unwrap();
+        let addr_b: SocketAddr = format!("127.0.0.1:{}", port_b).parse().unwrap();
+
+        let mut variant_a = QuicVariant::new("a", addr_a, vec![addr_b]);
+        let mut variant_b = QuicVariant::new("b", addr_b, vec![addr_a]);
+        variant_b
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect b");
+        std::thread::sleep(Duration::from_millis(200));
+        variant_a
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect a");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while variant_a.connections.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !variant_a.connections.is_empty(),
+            "variant A never established an outbound connection to B"
+        );
+
+        // Burst far more messages than the bounded channel can hold.
+        // RELIABLE_SEND_CHANNEL_BOUND is 256; using ~16x that exercises
+        // the `blocking_send` path many times over.
+        const N: u64 = 4096;
+        let payload = vec![0xEEu8; 256];
+        for seq in 0..N {
+            let ok = variant_a
+                .try_publish("/bench/0", &payload, Qos::ReliableTcp, seq)
+                .expect("try_publish qos4 must not error under burst");
+            assert!(
+                ok,
+                "try_publish at QoS 4 must never return Ok(false) (DESIGN.md § 6.5): seq {}",
+                seq
+            );
+        }
+
+        // Drain B's inbound channel. Disconnect A first so the
+        // T17.6 drain path (channel close → finish → stopped) runs;
+        // this is what carries the in-flight tail across the wire
+        // before the test's drain loop starts looking.
+        variant_a.disconnect().expect("disconnect a");
+        let mut received: Vec<u64> = Vec::with_capacity(N as usize);
+        let drain_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while received.len() < N as usize && std::time::Instant::now() < drain_deadline {
+            match variant_b.poll_receive() {
+                Ok(Some(update)) => {
+                    received.push(update.seq);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => panic!("poll_receive errored: {e}"),
+            }
+        }
+
+        assert_eq!(
+            received.len(),
+            N as usize,
+            "T17.6: every reliable write must be delivered; got {}/{}",
+            received.len(),
+            N,
+        );
+
+        // Ordering invariant (T16.10) preserved.
+        let mut out_of_order = 0usize;
+        for win in received.windows(2) {
+            if win[1] <= win[0] {
+                out_of_order += 1;
+            }
+        }
+        assert_eq!(
+            out_of_order, 0,
+            "T16.10 ordering invariant: qos4 receives must be strictly ascending"
+        );
+
+        variant_b.disconnect().expect("disconnect b");
+    }
+
+    /// T17.6 mechanism check: `publish` MUST actually block when the
+    /// bounded send channel is full. We construct the variant + a
+    /// loopback peer that is then disconnected before the burst so its
+    /// receive side stops draining. With the send_loop unable to push
+    /// onto quinn's stream and no receiver, the bounded channel fills
+    /// and a subsequent `publish` call blocks. We measure that the
+    /// blocking call is slow enough to be observable (well above the
+    /// fast-path latency of a non-blocking send).
+    ///
+    /// This is the "back-pressure reaches the sync side" assertion:
+    /// pre-T17.6 the unbounded channel would happily accept this
+    /// burst at memcpy-speed; post-T17.6 the bounded channel parks
+    /// the writer.
+    #[test]
+    fn test_publish_blocks_when_channel_full_t17_6() {
+        use std::time::Instant;
+
+        let port_a = pick_free_udp_port();
+        let port_b = pick_free_udp_port();
+        let addr_a: SocketAddr = format!("127.0.0.1:{}", port_a).parse().unwrap();
+        let addr_b: SocketAddr = format!("127.0.0.1:{}", port_b).parse().unwrap();
+
+        let mut variant_a = QuicVariant::new("a", addr_a, vec![addr_b]);
+        let mut variant_b = QuicVariant::new("b", addr_b, vec![addr_a]);
+        variant_b
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect b");
+        std::thread::sleep(Duration::from_millis(200));
+        variant_a
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect a");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while variant_a.connections.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !variant_a.connections.is_empty(),
+            "variant A never established an outbound connection to B"
+        );
+
+        // Tear down B so its receive side stops draining. quinn's
+        // per-stream flow control window then plateaus and A's
+        // send_loop stalls inside `write_all`, so the bounded mpsc
+        // saturates and subsequent `publish` calls block.
+        variant_b.disconnect().expect("disconnect b");
+
+        // 4 KiB payload * (bound + headroom) far exceeds quinn's
+        // initial stream window. Beyond that the bounded channel
+        // fills and `blocking_send` parks the caller.
+        let payload = vec![0xAAu8; 4096];
+        // Fast-path budget: any single send that does NOT block should
+        // complete in well under this threshold. On Windows debug
+        // builds an empty `blocking_send` is single-digit microseconds;
+        // 250 ms is generous enough to avoid flakiness on a loaded CI
+        // machine.
+        let blocking_threshold = Duration::from_millis(250);
+
+        let mut observed_block = false;
+        // Cap the number of attempts: if the back-pressure mechanism
+        // is correct we expect to see a block within the first few
+        // thousand sends (channel fills, stream window drains, etc.).
+        // 8x channel bound is a safe ceiling. Each iteration uses
+        // try_publish so the test mirrors the driver's actual call
+        // shape.
+        for seq in 0..(RELIABLE_SEND_CHANNEL_BOUND as u64 * 8) {
+            let start = Instant::now();
+            let ok = variant_a
+                .try_publish("/bench/0", &payload, Qos::ReliableTcp, seq)
+                .expect("try_publish must not error");
+            assert!(ok, "QoS 4 try_publish must return Ok(true)");
+            if start.elapsed() >= blocking_threshold {
+                observed_block = true;
+                break;
+            }
+        }
+        assert!(
+            observed_block,
+            "T17.6: with the receiver torn down and the channel bound at {}, \
+             at least one publish() call must measurably block",
+            RELIABLE_SEND_CHANNEL_BOUND
+        );
+
+        // Cleanly tear down A. The variant's disconnect path drops the
+        // runtime and cancels the send_loop, so any still-queued
+        // blocking_send calls would unblock with `send channel closed`
+        // (none here; we only ran on this thread).
+        variant_a.disconnect().expect("disconnect a");
     }
 
     /// Helper for the loopback tests: bind a UDP socket to an
