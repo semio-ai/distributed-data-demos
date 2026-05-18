@@ -46,33 +46,55 @@ const EOT_UDP_SPACING: Duration = Duration::from_millis(5);
 /// reads use a real OS-level `SO_RCVTIMEO`; writes are unaffected.
 const READER_RCVTIMEO: Duration = Duration::from_millis(50);
 
-/// T14.19: write-side timeout for Single-mode outbound QoS 4 TCP
-/// streams. At catastrophic symmetric load (100K msg/s) Single mode
-/// can wedge: both peers spend the publish phase inside `write_all`
-/// while neither calls `poll_receive` to drain the kernel recv
-/// buffer, and the kernel TCP send buffers fill on both sides. Without
-/// a write timeout the variant deadlocks until the runner kills it.
+/// T17.3: write-side timeout for outbound QoS 4 TCP streams.
 ///
-/// Installing `SO_SNDTIMEO` here turns the wedge into a typed
-/// `TimedOut` (Windows) / `WouldBlock` (Unix) error. The publish
-/// path drops the offending peer from the broadcast set (same fault-
-/// tolerance branch already used for any TCP write error) and the
-/// operate phase exits its publish loop on the next iteration. The
-/// T14.18 control channel — a SEPARATE socket — still routes EOT
-/// cleanly, so the spawn completes with `status=success` (delivery
-/// near zero, matching hybrid's empirical 0.12 %). Path A in
-/// `metak-orchestrator/STATUS.md` "T14.19 audit".
+/// **Both threading modes**. Installed on every outbound TCP stream
+/// regardless of `ThreadingMode` because the timeout is now used as
+/// a periodic-wake mechanism for the strict-no-skip retry loop in
+/// `publish_encoded`, NOT as a peer-drop trigger. When the timeout
+/// fires the variant simply retries `write_all` until the kernel
+/// accepts the bytes (or the peer is genuinely gone), so the wedge
+/// concern that originally motivated T14.19 (Single mode deadlocking
+/// because no thread drained the recv buffer) is now absorbed by the
+/// retry loop, not by silently dropping the peer.
 ///
-/// Applied to Single mode only. Multi mode runs a reader thread that
-/// drains the recv buffer in parallel with the writer's publish loop;
-/// the wedge does not occur and `SO_SNDTIMEO` would only introduce
-/// unnecessary risk of spurious peer-drops under transient
-/// back-pressure.
+/// Per DESIGN.md § 6.5 (Strict No-Skip Contract for QoS 3 / QoS 4),
+/// QoS 4 MUST deliver 100% of accepted writes -- silently dropping a
+/// peer on `TimedOut` was a contract violation that surfaced as the
+/// ~55% (multi) / ~68% (single) drop rate on `custom-udp-1000x100hz-qos4`
+/// in the post-T16.16 heatmap.
 ///
-/// 5 s is far longer than any realistic transient on a healthy LAN
-/// (TCP_NODELAY + 4 MiB recv buffers); a timeout firing means the
-/// peer is genuinely stuck.
-const TCP_SINGLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// **Why a timeout at all?** A pure blocking `write_all` with no
+/// timeout would deadlock indefinitely if the peer is dead (vs
+/// merely backpressured): we'd never make progress, the operate
+/// phase would never advance, and the runner's `default_timeout_secs`
+/// would eventually kill the spawn. Installing `SO_SNDTIMEO` turns
+/// the kernel-level full-send-buffer wait into a typed
+/// `TimedOut` (Windows) / `WouldBlock` (Unix) result that the retry
+/// loop can observe -- giving the loop a chance to either (a)
+/// detect a genuinely fatal error on subsequent attempts or (b)
+/// keep retrying while the peer drains.
+///
+/// **Why 500 ms?** Short enough that the retry loop reacts to real
+/// progress (kernel buffer draining) on the timescale of a single
+/// tick or so. Long enough that healthy bursts of back-pressure
+/// don't trigger needless wake-up overhead. The driver's
+/// `default_timeout_secs` (60 s in `configs/two-runner-all-variants.toml`)
+/// gives the retry loop ample budget under sustained overload --
+/// throughput may collapse to single-digit percent of the requested
+/// rate, but delivery stays at 100% (the DESIGN.md § 6.5
+/// "throughput collapse, not delivery shortfall" failure mode).
+///
+/// **Single mode caveat**: in single mode the variant is the only
+/// thread touching the socket, so a full kernel send buffer cannot
+/// be drained by us until `poll_receive` runs -- which it can't
+/// while we're spinning in `publish_encoded`. The peer's reader
+/// thread (their side) drains it for us. As long as the peer is
+/// alive and progressing, the kernel buffer drains and our retry
+/// succeeds. If the peer is genuinely wedged BOTH sides spin in
+/// their retry loops; the runner's `default_timeout_secs` is the
+/// ultimate safety net.
+const TCP_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Maximum wall-clock time the variant waits for all expected inbound TCP
 /// peer connections to be accepted before `start_reader_threads` proceeds.
@@ -314,6 +336,36 @@ fn apply_recv_buffer_kb_tcp(stream: &TcpStream, recv_buffer_kb: u32) {
     }
 }
 
+/// T17.3: classify a `write_all` error on a QoS-4 outbound TCP
+/// stream as transient (retry) or fatal (drop the peer).
+///
+/// Per DESIGN.md § 6.5, QoS 4 MUST NOT silently drop a peer on a
+/// transient back-pressure error. The pre-T17.3 code dropped on ANY
+/// write error, which lost ~55% of writes under load because a full
+/// kernel send buffer surfaces as `TimedOut` (Windows) /
+/// `WouldBlock` (Unix) once `SO_SNDTIMEO` fires -- a transient
+/// condition the retry loop must absorb, not a peer-death signal.
+///
+/// Transient (return `false`):
+///   - `WouldBlock` -- send buffer full, kernel asking us to try later.
+///   - `TimedOut` -- `SO_SNDTIMEO` fired before the buffer drained.
+///   - `Interrupted` -- syscall interrupted by a signal; standard
+///     retry pattern from `std::io::Write::write_all`.
+///
+/// Fatal (return `true`):
+///   - `ConnectionReset`, `ConnectionAborted`, `BrokenPipe` -- peer
+///     genuinely closed the connection.
+///   - `NotConnected` -- socket never connected or already torn down.
+///   - Anything else (default-fatal) -- preserve "log and drop"
+///     behaviour for unknown errors rather than retrying forever on
+///     an unrecognised failure.
+fn is_fatal_tcp_write_error(e: &io::Error) -> bool {
+    !matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
 /// T14.22: connect to `addr` with bounded retry ONLY on
 /// `ConnectionRefused`. The two-runner startup is a known race: both
 /// sides hit the ready barrier and call `connect` near simultaneously;
@@ -552,20 +604,20 @@ impl UdpVariant {
                     // it again so the back-pressure contract doesn't
                     // depend on upstream defaults.
                     stream.set_nonblocking(false)?;
-                    // T14.19: install a write-side timeout in Single mode
-                    // so a wedged peer surfaces as a typed error instead
-                    // of deadlocking the publish path forever. See
-                    // TCP_SINGLE_WRITE_TIMEOUT docs.
-                    if self.threading_mode == ThreadingMode::Single {
-                        stream
-                            .set_write_timeout(Some(TCP_SINGLE_WRITE_TIMEOUT))
-                            .with_context(|| {
-                                format!(
-                                    "T14.19: set_write_timeout on outbound TCP to {}",
-                                    peer_addr
-                                )
-                            })?;
-                    }
+                    // T17.3: install a write-side timeout on every
+                    // outbound TCP stream, in BOTH threading modes.
+                    // Pre-T17.3 (T14.19) this was Single-mode only; now
+                    // the timeout is used as a wake-for-retry mechanism
+                    // by the strict-no-skip publish loop rather than as
+                    // a peer-drop trigger, so Multi mode benefits from
+                    // it too (a transient timeout is just a retry
+                    // signal, not a kill signal). See
+                    // TCP_WRITE_TIMEOUT docs and DESIGN.md § 6.5.
+                    stream
+                        .set_write_timeout(Some(TCP_WRITE_TIMEOUT))
+                        .with_context(|| {
+                            format!("T17.3: set_write_timeout on outbound TCP to {}", peer_addr)
+                        })?;
                     // T14.3: apply SO_RCVBUF on the outbound stream too.
                     // The kernel reserves recv-side buffer per socket
                     // regardless of direction-of-use; honouring the
@@ -837,10 +889,17 @@ impl UdpVariant {
     /// `WouldBlock` returns `Ok(false)` so the caller can log a
     /// `backpressure_skipped` event.
     ///
-    /// TCP (QoS 4) is always blocking — see `try_publish` for the
-    /// rationale: gapping a TCP stream would corrupt the per-peer
-    /// receiver state, and TCP's own send buffer already provides
-    /// natural pacing.
+    /// TCP (QoS 4) is always blocking and **always retries on transient
+    /// errors** — never returns `Ok(false)`, never silently drops a
+    /// peer on `TimedOut`/`WouldBlock`. Per DESIGN.md § 6.5
+    /// (Strict No-Skip Contract for QoS 3 / QoS 4), gapping the TCP
+    /// stream would corrupt the per-peer receiver state; the only
+    /// acceptable failure mode under sustained overload is throughput
+    /// collapse (the retry loop spins on every peer until each accepts
+    /// the bytes). Genuinely fatal errors (`ConnectionReset`,
+    /// `BrokenPipe`, `ConnectionAborted`, `NotConnected`) drop the
+    /// peer; transient errors (`TimedOut` from `SO_SNDTIMEO`,
+    /// `WouldBlock`, `Interrupted`) trigger a retry. See `is_fatal_tcp_write_error`.
     fn publish_encoded(
         &mut self,
         encoded: &[u8],
@@ -901,32 +960,67 @@ impl UdpVariant {
                 Ok(true)
             }
             Qos::ReliableTcp => {
-                // QoS 4: blocking TCP write. Strictly contiguous seqs;
-                // never report backpressure (the kernel send buffer
-                // fills and `write_all` blocks until it drains).
+                // QoS 4: strict-no-skip blocking write per DESIGN.md
+                // § 6.5. For each connected peer, loop on `write_all`
+                // until either:
+                //   - the kernel accepts the full frame (success), or
+                //   - the peer surfaces a genuinely fatal error (e.g.
+                //     ConnectionReset, BrokenPipe) — only THEN drop
+                //     that peer.
                 //
-                // T14.19: in Single mode an `SO_SNDTIMEO` is installed
-                // on outbound streams so a wedge surfaces as a typed
-                // error rather than a forever-block. Any write error
-                // — timeout, connection reset, partial-write-aborted,
-                // anything — drops the offending peer and the
-                // operate phase advances naturally. See
-                // `TCP_SINGLE_WRITE_TIMEOUT` docs.
+                // Transient errors (`TimedOut` from `SO_SNDTIMEO`,
+                // `WouldBlock`, `Interrupted`) DO NOT drop the peer:
+                // they trigger a retry. `SO_SNDTIMEO` is the wake-up
+                // mechanism that lets the loop observe shutdown /
+                // genuine peer-death without deadlocking forever in
+                // `write_all`. See TCP_WRITE_TIMEOUT docs.
+                //
+                // Pre-T17.3 behaviour: ANY write error dropped the
+                // peer, which silently lost ~55% (multi) / ~68%
+                // (single) of writes at `1000x100hz-qos4` because a
+                // saturated kernel send buffer produces transient
+                // `TimedOut` errors under load. See post-T16.16
+                // heatmap and EPICS.md § E17 for the motivation.
                 let mut failed_indices = Vec::new();
                 for (i, stream) in self.tcp_out_streams.iter_mut().enumerate() {
-                    if let Err(e) = stream.write_all(encoded) {
-                        let peer_addr = stream
-                            .peer_addr()
-                            .map(|a| a.to_string())
-                            .unwrap_or_else(|_| "<unknown>".to_string());
-                        eprintln!(
-                            "[custom-udp] T14.19: dropping outbound TCP peer #{} ({}) after write error: {} ({:?})",
-                            i,
-                            peer_addr,
-                            e,
-                            e.kind()
-                        );
-                        failed_indices.push(i);
+                    let mut consecutive_transient: u32 = 0;
+                    loop {
+                        match stream.write_all(encoded) {
+                            Ok(()) => break,
+                            Err(e) if !is_fatal_tcp_write_error(&e) => {
+                                // Transient: kernel send buffer full
+                                // and the SO_SNDTIMEO fired, OR the
+                                // syscall was interrupted. Retry.
+                                consecutive_transient = consecutive_transient.saturating_add(1);
+                                if consecutive_transient == 1 {
+                                    std::thread::yield_now();
+                                } else {
+                                    // After the first retry, back off
+                                    // briefly so we don't spin a CPU
+                                    // while the peer drains. 100 us
+                                    // matches the variant-base driver's
+                                    // QoS 3/4 strict-no-skip back-off
+                                    // (see `variant-base/CUSTOM.md`
+                                    // "Strict no-skip contract").
+                                    std::thread::sleep(Duration::from_micros(100));
+                                }
+                            }
+                            Err(e) => {
+                                let peer_addr = stream
+                                    .peer_addr()
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|_| "<unknown>".to_string());
+                                eprintln!(
+                                    "[custom-udp] T17.3: dropping outbound TCP peer #{} ({}) after FATAL write error: {} ({:?})",
+                                    i,
+                                    peer_addr,
+                                    e,
+                                    e.kind()
+                                );
+                                failed_indices.push(i);
+                                break;
+                            }
+                        }
                     }
                 }
                 for &i in failed_indices.iter().rev() {
@@ -2050,60 +2144,158 @@ mod tests {
         }
     }
 
-    /// T14.19: when an outbound TCP write hits the Single-mode
-    /// `SO_SNDTIMEO`, the publish path drops the peer cleanly
-    /// instead of wedging in `write_all`. Simulated with a tiny
-    /// `SO_SNDBUF` + a peer that never reads — the kernel fills the
-    /// send buffer almost immediately and subsequent writes return
-    /// `TimedOut` once the (very short) `SO_SNDTIMEO` we install
-    /// elapses.
+    /// T17.3: classifier sanity. Transient kinds (`WouldBlock`,
+    /// `TimedOut`, `Interrupted`) must NOT be fatal; everything else
+    /// must be fatal. This guards the policy that motivates the
+    /// retry-vs-drop branch in `publish_encoded`.
     #[test]
-    fn publish_qos4_drops_peer_on_write_timeout() {
-        use socket2::SockRef;
+    fn is_fatal_tcp_write_error_classifier() {
+        let transient = [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+        ];
+        for kind in transient {
+            let e = io::Error::new(kind, "test");
+            assert!(
+                !is_fatal_tcp_write_error(&e),
+                "{:?} must be classified TRANSIENT (retry, not drop)",
+                kind
+            );
+        }
+        let fatal = [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::Other,
+        ];
+        for kind in fatal {
+            let e = io::Error::new(kind, "test");
+            assert!(
+                is_fatal_tcp_write_error(&e),
+                "{:?} must be classified FATAL (drop the peer)",
+                kind
+            );
+        }
+    }
+
+    /// T17.3: a healthy peer that drains promptly must see every
+    /// frame land successfully -- the retry loop is invisible to
+    /// happy-path traffic. This is the regression-safety bar: any
+    /// future refactor of the retry loop must not break the simple
+    /// "write, get Ok, peer survives" path.
+    ///
+    /// Note on Windows: small `SO_SNDBUF` values are silently ignored
+    /// by the kernel, so we cannot reliably wedge an outbound TCP
+    /// socket via `set_send_buffer_size` to force `SO_SNDTIMEO`
+    /// firings in a unit test. The transient-retry behaviour is
+    /// validated end-to-end by the
+    /// `two_runner_t17_3_qos4_saturate_100_percent_delivery`
+    /// integration test (under `tests/`) which exercises the saturation
+    /// workload that originally surfaced the ~55% drop regression.
+    /// At the unit level we assert the classifier policy directly
+    /// via `is_fatal_tcp_write_error_classifier` and the happy-path
+    /// success here.
+    #[test]
+    fn publish_qos4_happy_path_keeps_peer_alive() {
         use std::net::TcpListener;
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Synthetic outbound stream that will wedge: connect, then
-        // shrink SO_SNDBUF, then install a 100 ms SO_SNDTIMEO (the
-        // production path uses 5 s; we use 100 ms to keep the test
-        // fast). The accepted peer is intentionally never read from
-        // so the send-buffer fills and stays full.
         let writer = TcpStream::connect(addr).unwrap();
         writer.set_nonblocking(false).unwrap();
-        let _accepted = listener.accept().unwrap(); // hold it open, never read
-        let sock = SockRef::from(&writer);
-        sock.set_send_buffer_size(1024).unwrap();
-        writer
-            .set_write_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
+        let (mut accepted, _peer_addr) = listener.accept().unwrap();
+        // Install the same write timeout the production path uses, so
+        // the test exercises the SO_SNDTIMEO-installed branch.
+        writer.set_write_timeout(Some(TCP_WRITE_TIMEOUT)).unwrap();
 
-        // Build a minimal variant with the wedge-stream pre-installed
-        // and exercise the QoS 4 publish path.
+        // Eager reader so writes never block.
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let reader_done_clone = Arc::clone(&reader_done);
+        let reader_handle = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut total = 0usize;
+            // Read until we've drained roughly the expected payload or
+            // the connection closes.
+            while total < 16 * 4096 {
+                match accepted.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(_) => break,
+                }
+            }
+            reader_done_clone.store(true, Ordering::Relaxed);
+        });
+
         let mut cfg = default_config(Qos::ReliableTcp);
-        cfg.multicast_group = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 19941);
+        cfg.multicast_group = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 19946);
         let mut v = UdpVariant::new(cfg);
         v.tcp_out_streams.push(writer);
 
-        let payload = vec![0xAAu8; 8192];
-        // Hammer publish until either the peer is dropped or we hit
-        // a generous bound. The first write may fill the buffer
-        // happily; subsequent writes time out and drop the peer.
-        let mut iterations = 0;
-        while v.tcp_out_streams.len() == 1 && iterations < 2000 {
-            // Direct write through the publish-encoded path on QoS 4.
-            // Always returns `Ok(true)` per the QoS 4 contract; the
-            // side-effect is the peer-drop on timeout.
-            v.publish_encoded(&payload, Qos::ReliableTcp, iterations as u64, true)
+        // Hammer 16 frames through. With an eager reader every write
+        // succeeds first try; the peer must remain in the broadcast
+        // set throughout.
+        let payload = vec![0xAAu8; 4096];
+        for seq in 0..16u64 {
+            v.publish_encoded(&payload, Qos::ReliableTcp, seq, true)
+                .expect("QoS 4 publish_encoded should succeed on happy path");
+            assert_eq!(
+                v.tcp_out_streams.len(),
+                1,
+                "T17.3: peer must remain in broadcast set on happy path"
+            );
+        }
+
+        // Drop the writer side so the reader sees EOF and exits.
+        v.tcp_out_streams.clear();
+        let _ = reader_handle.join();
+        assert!(
+            reader_done.load(Ordering::Relaxed),
+            "reader exited via EOF after publish loop"
+        );
+    }
+
+    /// T17.3: a peer that closes its read side mid-write (the kernel
+    /// surfaces `BrokenPipe` or `ConnectionReset` on the next write,
+    /// depending on platform) MUST drop the peer immediately rather
+    /// than spin forever in the retry loop. This is the genuine
+    /// peer-death case the classifier is designed to catch.
+    #[test]
+    fn publish_qos4_drops_peer_on_fatal_write_error() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let writer = TcpStream::connect(addr).unwrap();
+        writer.set_nonblocking(false).unwrap();
+        let (accepted, _peer_addr) = listener.accept().unwrap();
+        // Close the peer immediately so the next write surfaces a
+        // fatal error (BrokenPipe / ConnectionReset).
+        drop(accepted);
+
+        let mut cfg = default_config(Qos::ReliableTcp);
+        cfg.multicast_group = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 1), 19947);
+        let mut v = UdpVariant::new(cfg);
+        v.tcp_out_streams.push(writer);
+
+        // Hammer publish until the peer is dropped. The first write
+        // may succeed (kernel hasn't realised the peer closed yet)
+        // but a subsequent write surfaces a fatal error.
+        let payload = vec![0xBBu8; 4096];
+        let mut iterations = 0u64;
+        while v.tcp_out_streams.len() == 1 && iterations < 1000 {
+            v.publish_encoded(&payload, Qos::ReliableTcp, iterations, true)
                 .expect("QoS 4 publish_encoded should not propagate write errors");
             iterations += 1;
         }
         assert_eq!(
             v.tcp_out_streams.len(),
             0,
-            "T14.19: peer should be dropped after the write hits SO_SNDTIMEO; \
-             iterations spent={iterations}"
+            "T17.3: peer should be dropped after fatal-error write; \
+             iterations={iterations}"
         );
     }
 

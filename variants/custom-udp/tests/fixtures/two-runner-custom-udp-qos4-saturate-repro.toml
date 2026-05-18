@@ -1,0 +1,52 @@
+# T17.3 reproducer fixture: QoS 4 saturation workload that ought to
+# achieve 100% delivery post-T17.3 (strict no-skip back-pressure).
+#
+# Pre-T17.3 the post-T16.16 heatmap showed
+#   custom-udp-1000x100hz-qos4-single  31.8% delivery
+#   custom-udp-1000x100hz-qos4-multi   44.9% delivery
+# because outbound TCP writes that hit `SO_SNDTIMEO` (kernel send
+# buffer full) were treated as peer-death signals and the peer was
+# silently dropped from the broadcast set.
+#
+# Post-T17.3 the variant retries on transient timeouts; the peer is
+# only dropped on a genuinely fatal error (BrokenPipe etc.).
+# Throughput may fall but delivery MUST reach 100%.
+#
+# The full `1000x100hz` saturation workload runs cleanly on a healthy
+# dev box; we use a slightly smaller `100x100hz` here so the test
+# completes in reasonable wall-clock time without sacrificing the
+# back-pressure pattern. The two-machine + full-rate validation is
+# T17.10's job.
+#
+# Two-runner cross-product: qos=4, threading_modes=["single", "multi"].
+# The runner expansion yields two spawns:
+#   - custom-udp-1000x100hz-qos4-repro-single
+#   - custom-udp-1000x100hz-qos4-repro-multi
+#
+# Run from the repo root:
+#   target/release/runner --name alice --config variants/custom-udp/tests/fixtures/two-runner-custom-udp-qos4-saturate-repro.toml
+#   target/release/runner --name bob   --config variants/custom-udp/tests/fixtures/two-runner-custom-udp-qos4-saturate-repro.toml
+
+run = "custom-udp-t17-3-qos4-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 90
+
+[[variant]]
+name = "custom-udp-1000x100hz-qos4-repro"
+binary = "target/release/variant-custom-udp.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 100
+  qos = 4
+  threading_modes = ["single", "multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  multicast_group = "239.0.0.1:19548"
+  buffer_size = 65536
+  tcp_base_port = 19860
