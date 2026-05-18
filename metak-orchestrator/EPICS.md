@@ -1183,3 +1183,141 @@ ranking of pre-existing weaknesses:
 - E14 / E15: this epic is downstream of both. The dataset under
   analysis is the first one to exercise both together.
 
+---
+
+## E17: Strict No-Skip Contract for QoS 3 / QoS 4
+
+**Repos**: `metak-shared/` (contracts + DESIGN.md, T17.1), `variant-base/`,
+every concrete variant (`variants/*/`), `analysis/`, `runner/`.
+
+**Status**: filed 2026-05-18. Wave 1 (T17.2 foundation) + Wave 2
+(T17.3-T17.8 per-variant fixes) **complete**. Wave 3 (T17.9 analysis +
+T17.10 user-owned matrix re-run) pending.
+
+### Motivation
+
+The post-T16.16 QoS-4 heatmap revealed that several variants drop
+30-95% of writes at saturation rates (`1000x100hz qos4`):
+- websocket-multi 100.0% ✓ (reference impl), custom-udp-multi qos3 99.8% ✓
+- custom-udp qos4 (TCP) 31.8%/44.9%, hybrid qos3/4 10-86%, websocket-single
+  qos3/4 2.4%, quic-multi 86-89%, webrtc-multi ~55%, zenoh-multi ~44-57%
+
+User decision 2026-05-18: at QoS 3/4 prefer delivery over throughput,
+even Zenoh must coordinate peers. At QoS 1/2 keep throughput priority.
+
+### Contract changes (T17.1 — done)
+
+- `metak-shared/DESIGN.md` § 6.5 new "Strict No-Skip Contract": variant
+  MUST block at QoS 3/4 publish, MUST NOT return `Ok(false)`,
+  application-level back-pressure required if transport doesn't natively
+  provide it.
+- `metak-shared/DESIGN.md` § 6.6 QoS Summary table updated with `Skips
+  allowed` + `Priority` columns.
+- `metak-shared/api-contracts/jsonl-log-schema.md` — `backpressure_skipped`
+  restricted to QoS 1/2.
+- `metak-shared/api-contracts/variant-cli.md` — `--qos` row notes the
+  publish-blocking semantics.
+
+### Sub-tasks (status)
+
+- T17.1 Contract updates — **DONE** (orchestrator)
+- T17.2 variant-base driver loop on Ok(false) at qos3/4 — **DONE**
+  (commits `842fb5e`, `adf39f7`)
+- T17.3 custom-udp TCP qos4 blocking — **DONE**
+  (commits `62a0e0c`, `744443a`, `4946310`)
+- T17.4 hybrid TCP qos3/4 blocking (subsumes T16.3) — **DONE**
+  (commits `9d2f15d`, `1b94bfc`, `fc67f64`, `aa0775b`)
+- T17.5 websocket single-mode drain-and-retry — **DONE**
+  (commit `c8e6629`)
+- T17.6 quic bounded-mpsc + tight stream windows — **DONE**
+  (commits `e8ff2bb`, `b07c5b3`)
+- T17.7 webrtc bounded-mpsc + drain-on-disconnect — **DONE**
+  (commits `ea45545`, `50707e8`, `b56fa7f`, `9a675b6`)
+- T17.8 zenoh credit/window over Zenoh side-channel (reopens T16.12) —
+  **DONE** (commits `4195a2d`, `24dd4ad`)
+- T17.9 analysis: flag `backpressure_skipped` at qos3/4 — **PENDING**
+- T17.10 user-owned full-matrix re-run + acceptance heatmap — **PENDING**
+
+### Acceptance gates
+
+- Post-T17.10 heatmap shows 100.0% delivery on every QoS 3/4 cell across
+  every variant on `configs/two-runner-all-variants.toml`.
+- Throughput ratio cells may drop arbitrarily — that's the trade.
+- T17.9 integrity check catches any `backpressure_skipped` at QoS 3/4.
+
+### Side-effects observed during Wave 2 (worth flagging for T17.10)
+
+- webrtc reproducer needed `silent_secs = 30` for SCTP outbound drain;
+  matrix default is 2. Consider per-variant override or global bump.
+- hybrid reproducer needed `silent_secs = 10` for in-flight TCP drain.
+- websocket-multi saturation test surfaced ~55 duplicate
+  `(writer, seq, path)` triples (0.012%) — uniq delivery is 100% but
+  integrity flags `[FAIL: duplicates]`. Filed for follow-up (T17.11
+  TBD if user wants to chase the tungstenite internal cause).
+- Three workers reported "working tree appears to have been reverted by
+  some external action" mid-task during the parallel-commit wave —
+  cost of 6 concurrent commits to `main`. None lost data but consider
+  worktree isolation for future waves.
+
+---
+
+## E18: Compact Log Format + Runner Log-Path + Auto-Analyze
+
+**Repos**: `variant-base/`, `variants/*/`, `runner/`, `analysis/`,
+`metak-shared/`.
+
+**Status**: filed 2026-05-18 at user request. **Waits on E17 completion**
+(T17.10 acceptance) before any T18.x worker spawns, so the matrix
+re-run produces meaningful baselines on both formats.
+
+### Motivation
+
+Full-matrix two-machine runs produce thousands of GB of per-message
+JSONL. User wants:
+1. **Compact post-run digest format** — variant accumulates writes/
+   receives in memory during operate/silent, then in a new `digest`
+   phase serializes a single compact file per spawn (target: 30-50×
+   smaller than current JSONL).
+2. **Configurable log location** — runner accepts `--log-dir <path>`
+   for shared network folder output.
+3. **Auto-analyze flag** — runner accepts `--analyze-full`; after the
+   matrix completes the lower-sorted-index runner shells out to
+   `python analysis/analyze.py <log-dir> --summary --dump --diagrams
+   --output <log-dir>/analysis`.
+
+### Format decisions (user-approved 2026-05-18)
+
+- **Columnar arrays**: `(ts: i64 ns, path_idx: u32)` for writes;
+  `(ts: i64 ns, path_idx: u32, writer_idx: u8)` for receives. **No
+  `seq`** — prepares for N>2 peers; correlation is ordering-based
+  (Nth write on `(writer, path)` ↔ Nth receive at receiver). Per-message
+  latency exact at QoS 3/4 (strict order, no drops); QoS 1/2 keeps
+  aggregate metrics only.
+- **Binary format: Apache Parquet** (not JSON, not pickle). Reuses the
+  analysis cache pipeline so the variant writes the final storage shape
+  directly, eliminating the JSONL→Parquet cache rebuild step. Dict-
+  encoding + snappy/zstd compression. Expected ~30-50× size reduction.
+- **Path-intern table** in the metainfo header; per-event arrays carry
+  the path_idx (u32). Workloads with repeated path strings (the
+  dominant case) get an additional 10-100× win on path storage alone.
+- **Legacy JSONL** stays as opt-in debug mode under
+  `--legacy-jsonl-events` (default OFF).
+
+### Sub-tasks (planned, none started)
+
+- T18.1 Contract: `metak-shared/api-contracts/compact-log-schema.md`
+  (orchestrator-only).
+- T18.2 variant-base in-memory buffers + digest phase + Parquet writer.
+- T18.3 variant audit for any that bypass the variant-base logger.
+- T18.4 analysis: load both compact and legacy formats.
+- T18.5 runner: `--log-dir <path>` arg + TOML key.
+- T18.6 runner: `--analyze-full` arg, lower-sorted-index runner invokes
+  Python analyzer post-matrix.
+- T18.7 user-owned: re-run + size/correctness validation.
+
+### Dependencies
+
+E17 completion (T17.10 acceptance) is required before T18.7 can produce
+a meaningful baseline. T18.1-T18.6 implementation can start once
+T17.9-T17.10 land.
+

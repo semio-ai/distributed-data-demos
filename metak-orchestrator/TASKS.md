@@ -7396,3 +7396,80 @@ guarantee.
 driver::tests::write_ts_is_captured_before_try_publish` pass without
 flake.
 
+
+---
+
+## E17 — Strict No-Skip Contract for QoS 3 / QoS 4
+
+See `metak-orchestrator/EPICS.md` § E17 for full motivation, contract
+changes, dependencies, and acceptance. Sub-tasks T17.1-T17.8 are
+**done**; T17.9 + T17.10 remain.
+
+### T17.1-T17.8 — DONE
+
+Captured in EPICS.md § E17 sub-tasks list with commit hashes. STATUS.md
+has per-task completion reports.
+
+### T17.9 — analysis: flag `backpressure_skipped` at QoS 3/4 as contract violation [medium]
+
+**Repo**: `analysis/`
+**Owner**: orchestrator → spawn worker (Wave 3).
+**Goal**: Per the updated `metak-shared/api-contracts/jsonl-log-schema.md`,
+`backpressure_skipped` at QoS 3/4 is a contract violation. Add an
+analyzer integrity check that flags any such row.
+
+**Files**:
+- `analysis/integrity.py` — per-`(variant, run, qos)` count of
+  `backpressure_skipped` where `qos >= 3`. Surface as `[FAIL:
+  skip-at-reliable]` annotation on the integrity row.
+- `analysis/incomplete_warnings.py` — emit a contract-violation warning
+  for any non-zero count.
+- `analysis/tests/` — synthetic fixture with a `backpressure_skipped`
+  row at `qos=3` asserts FAIL annotation + warning.
+
+**Acceptance**: synthetic fixture triggers warning; re-running on
+post-E17 logs produces zero such warnings.
+
+### T17.10 — runner: full-matrix re-run + acceptance heatmap [medium]
+
+**Repo**: `runner/`, `configs/`, `logs/`.
+**Owner**: **user** (runs the full matrix on real hardware).
+**Wave**: 3.
+
+**Procedure**:
+1. `cargo build --release --workspace`
+2. Mirror build to second machine.
+3. `<runner> --name <a|b> --config configs/two-runner-all-variants.toml`
+4. Collect into `logs/two-machines-all-variants-e17-<timestamp>/`.
+5. `python analysis/analyze.py <log-dir> --summary --diagrams --output <log-dir>/analysis`
+
+**Acceptance**: QoS 3/4 drop-rate heatmaps solid 0.0% across every
+cell. QoS 1/2 unchanged (best-effort by design).
+
+**Open items**:
+- `silent_secs` per-variant: webrtc 30s, hybrid 10s (otherwise in-flight
+  bytes truncate at disconnect). Bump matrix default to 30s (+~2h) or
+  extend TOML schema for per-variant override.
+- websocket duplicates anomaly (T17.5 follow-up — file as T17.11 if
+  reproducible at matrix scale).
+
+
+---
+
+## E18 — Compact Log Format + Runner Log-Path + Auto-Analyze
+
+See `metak-orchestrator/EPICS.md` § E18. **Waits on E17 (T17.10)**
+before any worker spawns. Detailed T18.x entries will be filed when
+E17 acceptance lands. Shape:
+
+- T18.1 — Contract `metak-shared/api-contracts/compact-log-schema.md`
+  (Apache Parquet, columnar `(ts, path_idx)` + `(ts, path_idx,
+  writer_idx)` arrays + metainfo header + path-intern table; no `seq`,
+  ordering-based correlation; orchestrator-only).
+- T18.2 — variant-base: in-memory buffers + digest phase + Parquet
+  writer.
+- T18.3 — variant audit for any bypassing the variant-base logger.
+- T18.4 — analysis: load both compact + legacy formats.
+- T18.5 — runner: `--log-dir <path>` arg + TOML key.
+- T18.6 — runner: `--analyze-full` arg.
+- T18.7 — user-owned: re-run + validation.

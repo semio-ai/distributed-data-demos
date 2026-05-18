@@ -12591,3 +12591,125 @@ Log dirs:
 
 **Pending Wave 3** (T17.10 full-matrix re-run + acceptance heatmap).
 
+
+## T17.2 — variant-base: driver enforces blocking publish at QoS 3/4 — done (2026-05-18)
+
+Commits `842fb5e` (code + tests) + `adf39f7` (CUSTOM.md).
+
+**Implementation**:
+- `variant-base/src/driver.rs`: QoS-aware publish loop. QoS 1/2 path
+  byte-for-byte unchanged. QoS 3/4 loops on `try_publish` until
+  `Ok(true)`, yielding CPU between attempts (`yield_now()` first,
+  `sleep(100us)` after). One-shot stderr warning (`AtomicBool`-guarded)
+  the first time `Ok(false)` is observed at QoS 3/4 per spawn.
+  No `backpressure_skipped` event emitted at QoS 3/4 even if a variant
+  misbehaves (T17.9 catches it).
+- `max-throughput` workload + QoS 3/4 rejected at startup with clear
+  error.
+- Five new unit tests + integration smoke (QoS sweep on VariantDummy).
+
+**Tests**: 100 unit + 7 integration pass. clippy + fmt clean.
+
+**Ready for Wave 2** (per-variant fixes T17.3-T17.8).
+
+
+## T17.6 — variants/quic: bounded mpsc + tight stream windows — done (2026-05-18)
+
+Commits `e8ff2bb` (bounded send channel + drain-on-disconnect) +
+`b07c5b3` (wire-rate back-pressure via bounded inbound + tight stream
+windows).
+
+**Why two commits**: the first attempt (bounded sync→async send
+channel) was necessary but not sufficient. Quinn's default per-stream
+flow-control window is 1.25 MB (~25K queued messages on loopback) and
+the variant's inbound mpsc was unbounded, so the application's
+back-pressure signal never reached the peer's `write_all`. The
+follow-up adds three back-pressure layers:
+
+1. **Tight `quinn::TransportConfig`**: `stream_receive_window = 128 KiB`,
+   `receive_window = 1 MiB`, `send_window = 1 MiB`. Forces
+   `SendStream::write_all` to stall on flow control rather than the
+   local 10 MB send buffer.
+2. **Bounded inbound mpsc (4096 slots)** with `send().await` from per-
+   connection stream readers. When `poll_receive` falls behind, the
+   reader parks, quinn's per-stream window collapses, peer's
+   `write_all` blocks → end-to-end throttle.
+3. **Capped local `pending_data` deque (1024 slots)** inside
+   `pump_inbound`, otherwise the local deque would absorb the entire
+   incoming flow and defeat layer 2.
+
+Throughput collapses ~100× as DESIGN.md § 6.5 expects. `Out-of-order = 0`
+(T16.10 ordering preserved). `BP-skip = 0` at qos3/4.
+
+**Note**: worker hit context budget before writing this STATUS entry
++ a final cleanup pass. The two commits' messages contain the full
+implementation rationale. Orchestrator wrote this summary on the
+worker's behalf 2026-05-18.
+
+**Pending Wave 3** (T17.10).
+
+
+## T17.8 — variants/zenoh: peer-coordinated credit/window back-pressure — done (2026-05-18)
+
+Commits `4195a2d` (code + tests) + `24dd4ad` (CUSTOM.md docs).
+**Reopens and resolves T16.12** (the "throughput cliff accepted as docs"
+status is rescinded).
+
+**Mechanism** (Option B from prototype menu — watermark-based credit
+window over a Zenoh side-channel):
+
+- **Receiver-side**: `subscriber_task` updates `per_writer_max_seq` on
+  every QoS 3/4 receive. New `ack_emitter_task` snapshots the map every
+  `ACK_EMIT_INTERVAL` (25 ms) and publishes one u64 watermark per
+  remote writer to `bench/__ack__/<self>/<writer>` with `CC=Drop`
+  (idempotent heartbeats; dropped ack recovered on next tick).
+- **Sender-side**: new `ack_subscriber_task` listens on wildcard
+  `bench/__ack__/*/<self>` and feeds `(peer, max_seq)` into a new
+  `WindowGate`. Pre-seeded at connect time from `--peers` with
+  watermark 0 so the window is active from the first publish.
+- **Driver-side**: at QoS 3/4 publish entry, gate blocks on a
+  `std::sync::Condvar` until `seq <= min_peer_ack + 2048`
+  (`QOS_STRICT_WINDOW`). Blocks the driver thread directly — not
+  publisher_task or the bridge mpsc — preserving the tokio runtime so
+  acks keep flowing.
+
+**Why watermarks (Option B) over explicit credit grants (Option A)**:
+watermarks are idempotent; a dropped ack recovers automatically on
+the next 25 ms tick. Explicit-token grants would need durable
+delivery to avoid stalls.
+
+**Tests**: 63 unit pass including new `test_window_gate_*` suite
+(no-peers, within-window, blocks-until-ack, no-regression,
+min-across-peers, shutdown-unblocks), `test_parse_ack_key_rejects_bad_shapes`,
+`test_publish_qos3_no_peers_known_does_not_block`,
+`test_try_publish_qos3_and_qos4_never_return_ok_false`. clippy + fmt
+clean.
+
+**Note**: worker hit context budget mid-task. Orchestrator committed
+the verified state (tests pass, clippy clean) on 2026-05-18.
+
+**Pending Wave 3** (T17.10).
+
+
+## Note on lost orchestrator-only edits
+
+During Wave 2 (six parallel workers committing to `main`) the
+working-tree state became unstable. Three workers (T17.3, T17.4, T17.7)
+explicitly reported "working tree appears to have been reverted by some
+external action mid-task" — they re-applied and committed cleanly.
+However, **uncommitted orchestrator-only edits to contracts and epics
+were lost in the chaos**: DESIGN.md § 6.5, the contract addendums in
+jsonl-log-schema.md and variant-cli.md, EPICS.md E17 + E18 sections,
+TASKS.md T17.x + T18.x entries. Workers' commit messages cite "DESIGN.md
+§ 6.5" but the section was missing from the working tree when checked
+on 2026-05-18 evening.
+
+**Restoration commit**: 2026-05-18 evening, orchestrator re-applied
+the lost contracts + epic entries from conversation history and
+committed them durably so the workers' references are valid again.
+
+**Process lesson**: future parallel waves should use either (a)
+worktree isolation per worker (`isolation: worktree`), (b) orchestrator
+commits of all docs/contracts BEFORE spawning code workers, or both.
+The "leave dirty for orchestrator convention" we used here doesn't
+survive parallel-commit chaos.
