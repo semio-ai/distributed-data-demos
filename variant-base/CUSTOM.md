@@ -175,6 +175,57 @@ the runner's own name. If the wait expires with peers still missing,
 the driver logs a single `eot_timeout` event with the missing names —
 the spawn does NOT abort.
 
+### Strict no-skip contract for QoS 3 / QoS 4 (T17.2)
+
+Per `metak-shared/DESIGN.md` § 6.5 (and the § 6.6 summary table),
+QoS 3 (Reliable-UDP) and QoS 4 (Reliable-TCP) prioritise **delivery
+over throughput**. Variants MUST deliver 100% of accepted writes and
+MUST NOT silently drop messages at the publish path; under sustained
+overload the acceptable failure mode is throughput collapse, not
+delivery shortfall.
+
+The driver enforces this rule by branching the per-tick publish loop
+on the QoS level (`driver::is_strict_delivery_qos`):
+
+- **QoS 1 / QoS 2** -- unchanged. `try_publish` returning `Ok(false)`
+  produces exactly one `backpressure_skipped` JSONL event; under
+  `max-throughput` workload the two-tier self-pacing back-off (T-impl.8)
+  applies.
+- **QoS 3 / QoS 4** -- the driver loops on `try_publish` until it
+  returns `Ok(true)` (or `Err`, which propagates). The first
+  consecutive `Ok(false)` issues a `std::thread::yield_now()`; later
+  consecutive `Ok(false)` results issue
+  `std::thread::sleep(Duration::from_micros(100))`. Critically the
+  driver does NOT emit `backpressure_skipped` at QoS 3/4: that event is
+  restricted to QoS 1/2 by `metak-shared/api-contracts/jsonl-log-schema.md`
+  and the analyzer (T17.9) flags any QoS 3/4 occurrence as a variant
+  bug.
+
+When a variant returns `Ok(false)` at QoS 3/4 (a contract violation
+under DESIGN.md § 6.5), the driver emits the one-shot stderr line
+
+```
+QoS 3/4 contract violation: try_publish returned Ok(false); see DESIGN.md § 6.5
+```
+
+exactly once per spawn (guarded by a process-static `AtomicBool` that
+the driver resets at the top of `run_protocol`). The warning surfaces
+the misbehaviour to the operator without spamming stderr; the
+analyzer's T17.9 check is the load-bearing detector.
+
+**`max-throughput` + QoS 3/4 is rejected at startup.** The
+`max-throughput` workload removes the inter-tick sleep and relies on
+`Ok(false)` skips to self-pace; QoS 3/4 forbids skips by contract.
+The combination produces an unbounded busy loop with no throttle, so
+the driver returns an `Err` from `run_protocol` BEFORE any
+phase/logger emission. Use `scalar-flood` with QoS 3/4, or QoS 1/2
+with `max-throughput`.
+
+Concrete variants enforce no-skip by blocking inside their own
+`try_publish` at QoS 3/4 (kernel TCP back-pressure, bounded
+application-level queues, peer-acknowledged credit windows, etc.) --
+see T17.3..T17.8 for the per-variant implementations.
+
 ### Self-pacing in max-throughput (T-impl.8)
 
 The operate-phase loop runs differently for the two workload profiles:
