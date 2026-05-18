@@ -521,3 +521,97 @@ becomes `variant_self_killed_idle`. Both still land as "not
 completed" warnings, but the operator can read the JSONL cleanness
 and stderr signature to tell which library failure mode produced
 the row.
+
+### Compact-log Parquet output (T18.1 + T18.2 / E18)
+
+E18 attacks the 60+ GB log volumes that a 100 K msg/s x 30 s x 200
+spawn campaign would otherwise produce with per-event JSONL. The
+target is a 30-50x reduction with no loss of the rows the analysis
+pipeline actually consumes.
+
+**Two new modules** in `variant-base/src/`:
+
+- `compact.rs` -- in-memory columnar event buffers
+  (`CompactBuffers`) with lazy interning of paths (`u32` indices,
+  capped at `u32::MAX`) and peer/writer names (`u8` indices, capped
+  at `MAX_PEERS = 254` so `u8::MAX = 255` is the `PEER_SELF`
+  sentinel). One row per per-event observation across seven
+  parallel `Vec`s: `ts_ns: i64`, `kind: u8`, `seq: u64`,
+  `path_idx: u32`, `peer_idx: u8`, `qos: u8`, `bytes: u32`.
+  `EventKind` discriminants are pinned (Write=0, Receive=1,
+  BackpressureSkipped=2, GapDetected=3, GapFilled=4) and form part
+  of the on-disk Parquet wire format -- renumbering would break
+  analysis that has already parsed previous files.
+
+- `compact_writer.rs` -- serialises a `CompactBuffers` instance to
+  `<log_dir>/<variant>-<runner>-<run>.compact.parquet` via the
+  `parquet = "53"` crate. One row group, seven primitive columns
+  (small unsigned fields widened to the smallest signed Parquet
+  type that holds them losslessly), snappy compression by default
+  (zstd-3 buys ~5% file-size at ~3x CPU cost; not worth it for the
+  digest-phase budget). Intern dictionaries + spawn identifiers go
+  into the file's KV metadata block so the analysis tool can
+  decode `path_idx` / `peer_idx` back to strings without a
+  side-car file.
+
+**Digest phase** (the new `Phase::Digest`): runs after `Silent` and
+after `Variant::disconnect`. The driver emits one `phase=digest`
+JSONL marker, writes the Parquet file, prints a single
+`[variant] digest: wrote <path> (<rows>, <bytes>)` line to stderr
+for operator visibility, then flushes and exits. The marker is
+how the runner distinguishes a clean run-with-compact-output from
+one that died before it could finalise.
+
+**Dual-emission gate** (`EventSink`): during operate + silent, every
+per-event observation is unconditionally pushed into the compact
+buffers. JSONL emission of the same row is opt-in via the new
+`--legacy-jsonl-events` flag (default **off**). Lifecycle events
+(`phase`, `connected`, `eot_sent`, `eot_received`, `eot_timeout`,
+`resource`) are NEVER routed through `EventSink` -- they remain
+unconditional JSONL because they are low-volume and the runner
+consumes them out-of-band (E15 progress streaming, T11.5 analysis
+markers). The runner-side defaults are unchanged; only the variant
+side decides whether to also emit per-event JSONL.
+
+**Memory ceilings** (`--digest-mem-soft-mb` / `--digest-mem-hard-mb`,
+defaults 1024 / 2048):
+
+- Soft ceiling: once `CompactBuffers::approx_bytes()` exceeds the
+  threshold, the driver prints one stderr warning per spawn and
+  continues. A sticky once-flag inside the `EventSink` prevents
+  the warning from oscillating if the footprint hovers around the
+  threshold.
+- Hard ceiling: once exceeded, the operate loop returns an error
+  with a descriptive message naming both the current footprint and
+  the threshold. The spawn aborts cleanly; the JSONL has the full
+  phase trail up to the abort point.
+- The check fires **once per outer iteration** of the operate
+  loop, not per drained message -- the `approx_bytes` math is
+  cheap, but keeping it off the hot path is free.
+
+**Why snappy over zstd.** Both codecs are supported by the `parquet`
+crate (the `compression` field on `CompactWriterOptions` is the
+single switch). Snappy was chosen because:
+
+1. The dominant columns are mostly non-redundant numerics: `seq` is
+   strictly increasing, `ts_ns` is approximately so, `path_idx` and
+   `peer_idx` cycle through small dictionaries. Snappy LZ77 picks
+   up the dictionary repetition; zstd's entropy coder adds at most
+   ~5% over that on this column shape.
+2. Digest runs inside the spawn budget -- a 3x CPU saving on the
+   encode path is more valuable than ~5% smaller files. Empirically
+   on a 2 s scalar-flood at 1000 Hz x 100 vpt the digest write
+   finishes in 200..500 ms with snappy versus 800 ms..1.5 s with
+   zstd-3.
+3. The cross-task analysis reader is happy with either codec (the
+   `parquet` crate's reader auto-detects); changing the codec later
+   does not break older files.
+
+**Acceptance evidence.** The new `test_compact_parquet_at_least_10x_smaller_than_jsonl`
+integration test runs a 2 s scalar-flood at 1000 Hz x 100 vpt =
+~400 K events, produces both files, asserts the Parquet file is at
+least 10x smaller than the JSONL (10x is conservative slack on the
+30-50x epic target). Local Windows measurement: jsonl ~15.1 MB vs
+parquet ~930 KB -- 16.3x. Release mode is expected to push this
+toward the upper end of the 10-30x range as the JSONL serialisation
+becomes the bottleneck rather than the Parquet writer.

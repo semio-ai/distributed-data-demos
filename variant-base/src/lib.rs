@@ -1,5 +1,7 @@
 pub mod build_info;
 pub mod cli;
+pub mod compact;
+pub mod compact_writer;
 pub mod driver;
 pub mod dummy;
 pub mod logger;
@@ -14,6 +16,11 @@ pub mod workload;
 
 // Re-export primary types for convenient access.
 pub use cli::CliArgs;
+pub use compact::{
+    CompactBuffers, EventKind, InternError, PathInterner, PeerInterner, MAX_PATHS, MAX_PEERS,
+    PEER_SELF, ROW_BYTES_ESTIMATE,
+};
+pub use compact_writer::{write_compact_parquet, CompactParquetMeta, CompactWriterError};
 pub use dummy::VariantDummy;
 pub use logger::Logger;
 pub use progress_emitter::{build_progress_line, ProgressEmitter, ProgressSnapshot, DONE_PHASE};
