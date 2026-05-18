@@ -76,6 +76,12 @@ after `try_publish` returned) introduced under T16.2 (2026-05-14).
 
 ### `backpressure_skipped`
 
+**Valid only at QoS 1 and QoS 2.** Per `DESIGN.md` § 6.5 (Strict No-Skip
+Contract for QoS 3/4), the variant MUST block the publish call at
+QoS 3/4 rather than skip. The driver enforces this (loops on
+`Ok(false)` at QoS 3/4) and the analyzer flags any
+`backpressure_skipped` row with `qos in (3, 4)` as a contract violation.
+
 Logged by the writer when the driver's per-tick value loop calls
 `Variant::try_publish` and the transport reports `Ok(false)`
 (backpressured -- not delivered, not retried within this tick). No

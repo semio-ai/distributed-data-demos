@@ -151,14 +151,49 @@ branch owner. A descendant owner may override the QoS for its own sub-branch.
 - **Use case**: Configuration state, registration events, and data where
   implementation simplicity is preferred over per-path independence.
 
-### 6.5 QoS Summary
+### 6.5 Strict No-Skip Contract for QoS 3 / QoS 4
 
-| Level | Transport | Ordering | Loss | Complexity | Latency |
-|---|---|---|---|---|---|
-| Best-Effort | UDP | None | Tolerant | Minimal | Lowest |
-| Latest-Value | UDP | Latest-wins | Tolerant | Low | Low |
-| Reliable-UDP | UDP | Strict | Intolerant | High | Variable (lags on loss) |
-| Reliable-TCP | TCP | Strict | Intolerant | Low (kernel) | Low (HOL on loss) |
+QoS 3 and QoS 4 prioritise **delivery over throughput**. Variants MUST
+deliver 100% of accepted writes — at the cost of throughput, latency, or
+both — and MUST NOT silently drop messages at the publish path.
+
+Concretely, for a `publish` call at QoS 3 or QoS 4:
+
+1. If the underlying transport's send path is full (kernel send buffer,
+   application queue, congestion-control window, or peer-coordinated
+   credit window), the variant MUST block the caller until the message
+   is accepted or the spawn terminates.
+2. Variants MUST NOT return a non-error "skipped" outcome at QoS 3/4.
+   The non-blocking `try_publish` may still return `Ok(false)` at QoS 1/2
+   (the driver records `backpressure_skipped` and moves on), but at
+   QoS 3/4 the variant either reaches `Ok(true)` or blocks until it can.
+3. If the native transport does not provide end-to-end back-pressure
+   (e.g. async APIs with unbounded internal queues), the variant MUST
+   implement **application-level back-pressure** — bounded queue with
+   blocking enqueue, peer-acknowledged credit/window protocol, or
+   equivalent — so the back-pressure signal reaches the application's
+   `publish` call.
+4. The acceptable failure mode under sustained overload at QoS 3/4 is
+   **throughput collapse**, not delivery shortfall.
+
+QoS 1 and QoS 2 keep the opposite priority: throughput and low latency
+over delivery. Skipping is the contractual mechanism to relieve
+back-pressure at QoS 1/2 — variants emit `backpressure_skipped` and
+move on without blocking the writer.
+
+This rule was made explicit on 2026-05-18 after the first full QoS-4
+matrix surfaced 50%+ drop rates at saturation on TCP-family variants
+and on async-runtime variants with unbounded internal queues. See
+epic E17.
+
+### 6.6 QoS Summary
+
+| Level | Transport | Ordering | Skips allowed | Priority | Complexity | Latency |
+|---|---|---|---|---|---|---|
+| Best-Effort | UDP | None | Yes (skip + log) | Throughput | Minimal | Lowest |
+| Latest-Value | UDP | Latest-wins | Yes (skip + log) | Throughput | Low | Low |
+| Reliable-UDP | UDP | Strict | **No — block** | Delivery | High | Variable (lags on loss) |
+| Reliable-TCP | TCP | Strict | **No — block** | Delivery | Low (kernel) | Low (HOL on loss) |
 
 ## 7. Topology
 

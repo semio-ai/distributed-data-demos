@@ -27,7 +27,7 @@ design:
 | `--silent-secs` | integer | Duration of the silent/drain phase in seconds |
 | `--workload` | string | Workload profile name (e.g. `scalar-flood`) |
 | `--values-per-tick` | integer | Number of value updates per tick |
-| `--qos` | integer | QoS level (1-4). Always a single integer at the variant CLI level — when the TOML omits `qos` or specifies a list, the runner expands the entry into multiple per-QoS spawn invocations and passes one concrete level per spawn. |
+| `--qos` | integer | QoS level (1-4). Always a single integer at the variant CLI level — when the TOML omits `qos` or specifies a list, the runner expands the entry into multiple per-QoS spawn invocations and passes one concrete level per spawn. Variants MUST honour the publish-blocking contract from `DESIGN.md` § 6.5: at QoS 3/4 `try_publish` either returns `Ok(true)` or blocks (no `Ok(false)`); at QoS 1/2 `Ok(false)` is allowed and the driver records `backpressure_skipped`. |
 | `--log-dir` | path | Directory for JSONL output |
 
 ## Runner-Injected Arguments
