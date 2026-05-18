@@ -7,10 +7,12 @@ variant-base/
   src/
     lib.rs                 -- Public API re-exports for the library crate
     variant_trait.rs       -- Variant trait definition (connect, publish, poll_receive, disconnect, signal_end_of_test, poll_peer_eots) + PeerEot struct
-    types.rs               -- Shared types: Qos enum, Phase enum (connect|stabilize|operate|eot|silent), ReceivedUpdate struct
-    cli.rs                 -- Common CLI argument parsing with clap derive (CliArgs struct, including --eot-timeout-secs); helpers for parsing extra args (--peers names)
+    types.rs               -- Shared types: Qos enum, Phase enum (connect|stabilize|operate|eot|silent|digest), ReceivedUpdate struct
+    cli.rs                 -- Common CLI argument parsing with clap derive (CliArgs struct, including --eot-timeout-secs, --digest-mem-soft-mb, --digest-mem-hard-mb, --legacy-jsonl-events); helpers for parsing extra args (--peers names)
     logger.rs              -- JSONL structured logger with methods for connected, phase, write, receive, gap_detected, gap_filled, resource, eot_sent, eot_received, eot_timeout
-    driver.rs              -- Test protocol driver: runs connect, stabilize, operate, eot, silent phases
+    compact.rs             -- T18.1 / T18.2: in-memory columnar event buffers (CompactBuffers) + lazy PathInterner / PeerInterner with documented caps and PEER_SELF sentinel; EventKind enum with pinned discriminants
+    compact_writer.rs      -- T18.2: serialises CompactBuffers to <variant>-<runner>-<run>.compact.parquet via the `parquet` crate (snappy by default); embeds intern dictionaries + spawn identifiers in Parquet KV metadata
+    driver.rs              -- Test protocol driver: runs connect, stabilize, operate, silent, digest phases. Owns an EventSink wrapping the compact buffers + the legacy-JSONL flag.
     workload.rs            -- Workload trait + ScalarFlood implementation + factory function
     seq.rs                 -- Monotonic sequence number generator (SeqGenerator)
     resource.rs            -- CPU/memory resource monitor using sysinfo (ResourceMonitor)
@@ -18,7 +20,7 @@ variant-base/
     bin/
       variant_dummy.rs     -- Binary entry point for variant-dummy (parses CLI, runs protocol)
   tests/
-    integration.rs         -- Integration tests: full pipeline with VariantDummy, binary subprocess test
+    integration.rs         -- Integration tests: full pipeline with VariantDummy, binary subprocess test, compact-Parquet roundtrip, legacy-jsonl gate, hard mem-ceiling abort, 10x size-win acceptance
   Cargo.toml               -- Crate manifest with lib + variant-dummy binary targets
   AGENTS.md                -- Agent guide for this repo
   CUSTOM.md                -- Repo-specific custom instructions (tech stack, design guidance)
