@@ -7,6 +7,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
+use crate::compact::CompactBuffers;
 use crate::types::{Phase, Qos, ThreadingMode};
 
 /// Structured JSONL log writer.
@@ -292,7 +293,21 @@ impl Logger {
     }
 }
 
-/// Thread-safe shared handle to a [`Logger`].
+/// Shared compact-buffer sink used by [`LoggerHandle::record_receive`]
+/// (T18.3a) so per-event observations emitted from non-driver threads
+/// land in the same `CompactBuffers` instance the driver later
+/// serialises to Parquet during the digest phase.
+///
+/// Wrapped in `Arc<Mutex<...>>` so the driver's `EventSink` and any
+/// number of reader threads can push into the same column buffers
+/// without racing. Reader-thread writes acquire this mutex briefly
+/// (one push per receive event); the driver's digest phase runs after
+/// `stop_reader_threads` has joined every thread so there is no
+/// contention by the time the Parquet writer reads the buffers.
+pub type CompactSink = Arc<Mutex<CompactBuffers>>;
+
+/// Thread-safe shared handle to a [`Logger`] (plus the optional shared
+/// compact buffer introduced by T18.3a).
 ///
 /// Wraps an `Arc<Mutex<Logger>>` so multiple threads can write events
 /// concurrently. Designed for variants whose Multi-mode reader threads
@@ -310,18 +325,55 @@ impl Logger {
 /// be emitted from a non-driver thread are exposed. Driver-only events
 /// (phase, connected, write, eot_sent, ...) stay on the locked path
 /// through the original `Logger` handle.
+///
+/// ## T18.3a: compact-buffer attachment
+///
+/// In the T18.2 compact-default world every per-event row must land in
+/// the per-spawn `CompactBuffers` regardless of which thread emits it.
+/// The driver constructs a shared [`CompactSink`] (`Arc<Mutex<CompactBuffers>>`)
+/// alongside the logger, wires both into the handle via
+/// [`LoggerHandle::attach_compact_sink`], and shares the same `Arc`
+/// with its own `EventSink`. Reader threads then call
+/// [`LoggerHandle::record_receive`] which mirrors what the driver's
+/// `EventSink::record_receive` does on the driver thread -- one push
+/// into the compact buffer and (gated on `legacy_jsonl_events`) one
+/// JSONL line.
+///
+/// The compact-sink attachment is optional so existing unit tests that
+/// construct a `LoggerHandle` directly via [`LoggerHandle::new`] keep
+/// working without modification. When the sink is `None`,
+/// `record_receive` falls back to the legacy `log_receive` behaviour
+/// (JSONL only) -- equivalent to a pre-T18.2 setup.
 #[derive(Clone)]
 pub struct LoggerHandle {
     inner: Arc<Mutex<Logger>>,
+    /// Shared compact-buffer sink, populated by
+    /// [`LoggerHandle::attach_compact_sink`]. `None` for handles built
+    /// by tests or for pre-T18.2 callers that never set up a compact
+    /// sink.
+    compact: Option<CompactSink>,
+    /// Whether the legacy JSONL `receive` line should also be written.
+    /// Mirrors the driver's `--legacy-jsonl-events` flag so reader-
+    /// thread emissions stay consistent with driver-thread emissions
+    /// under both T18.2 defaults (`false`) and the legacy-compatible
+    /// opt-in (`true`).
+    legacy_jsonl: bool,
 }
 
 impl LoggerHandle {
     /// Wrap an owned `Logger` for cross-thread use. The driver retains
     /// its own clone of the `Arc` so the original can keep emitting
     /// driver-side events while reader threads use additional clones.
+    ///
+    /// The compact-sink attachment defaults to `None` and `legacy_jsonl`
+    /// to `true`. Callers that want T18.3a compact-buffer mirroring
+    /// invoke [`Self::attach_compact_sink`] before sharing the handle
+    /// across threads.
     pub fn new(logger: Logger) -> Self {
         Self {
             inner: Arc::new(Mutex::new(logger)),
+            compact: None,
+            legacy_jsonl: true,
         }
     }
 
@@ -332,13 +384,49 @@ impl LoggerHandle {
         &self.inner
     }
 
-    /// Emit a `receive` event from any thread.
+    /// Wire a shared [`CompactSink`] into this handle (T18.3a).
+    ///
+    /// The driver calls this on the handle BEFORE cloning it into
+    /// variants via `Variant::attach_logger`, passing the same
+    /// `Arc<Mutex<CompactBuffers>>` it shares with its own `EventSink`
+    /// and the `legacy_jsonl` flag from `CliArgs::legacy_jsonl_events`.
+    /// Every reader thread that clones this handle therefore writes
+    /// into the same column buffers the digest phase serialises.
+    ///
+    /// Idempotent: calling twice replaces the previously-wired sink.
+    /// Tests typically skip this step and rely on the `None` fallback
+    /// (`record_receive` then writes JSONL only).
+    pub fn attach_compact_sink(&mut self, sink: CompactSink, legacy_jsonl: bool) {
+        self.compact = Some(sink);
+        self.legacy_jsonl = legacy_jsonl;
+    }
+
+    /// Inspect the attached compact sink, if any (test helper).
+    #[doc(hidden)]
+    pub fn compact_sink(&self) -> Option<&CompactSink> {
+        self.compact.as_ref()
+    }
+
+    /// Whether the legacy JSONL `receive` line is enabled for
+    /// [`Self::record_receive`].
+    #[doc(hidden)]
+    pub fn legacy_jsonl_enabled(&self) -> bool {
+        self.legacy_jsonl
+    }
+
+    /// Emit a `receive` event from any thread (legacy JSONL only).
     ///
     /// Acquires the shared mutex and writes one JSONL line; the lock is
     /// released before this returns. Errors are mapped through the
     /// `anyhow::Result` channel; callers in reader-thread paths typically
     /// log-and-continue on Err since dropping the variant during an
     /// in-flight write is the only realistic source of failure.
+    ///
+    /// **Prefer [`Self::record_receive`]** in new code: under the T18.2
+    /// compact-default writer, `log_receive` writes only the legacy
+    /// JSONL line and the receive will be missing from
+    /// `*.compact.parquet`. This method remains for back-compat and
+    /// for tests that explicitly want the legacy-only behaviour.
     pub fn log_receive(
         &self,
         writer: &str,
@@ -352,6 +440,70 @@ impl LoggerHandle {
             .lock()
             .map_err(|_| anyhow::anyhow!("LoggerHandle mutex poisoned"))?;
         guard.log_receive(writer, seq, path, qos, bytes)
+    }
+
+    /// Record a `receive` event into the shared compact buffer and
+    /// (when enabled) the legacy JSONL stream (T18.3a).
+    ///
+    /// This is the cross-thread analogue of the driver's
+    /// `EventSink::record_receive` -- the public method websocket
+    /// reader threads (and the T17.5 Single-mode drain helper) call
+    /// instead of `log_receive` so receives never bypass the compact
+    /// `EventBuffer` that the digest phase serialises.
+    ///
+    /// **Mutex behaviour**: this acquires the compact-sink mutex
+    /// briefly, performs the push, releases it, then acquires the
+    /// logger mutex briefly for the optional JSONL line. The two
+    /// mutexes are distinct, so concurrent reader threads may have one
+    /// holding the compact lock while another holds the logger lock --
+    /// this is intentional, not a contention regression. The T14.10
+    /// design's "one mutex acquisition per receive" property is no
+    /// longer load-bearing: the compact push is microsecond-scale (one
+    /// `Vec::push` per column plus an intern-table lookup) and the
+    /// JSONL line is microsecond-scale too. Empirically the cliff that
+    /// motivated T14.10 (100 K msg/s symmetric on the WS reader) moves
+    /// only slightly with the extra lock; the legacy-JSONL-OFF mode
+    /// (the T18.2 default) drops the logger lock entirely from this
+    /// path, so the effective cost is one lock per receive under the
+    /// default flag.
+    ///
+    /// When no compact sink is attached the row is silently dropped
+    /// and the call degenerates to `log_receive` (gated on
+    /// `legacy_jsonl`). This keeps unit-test callsites that construct
+    /// a bare `LoggerHandle::new(...)` working unmodified.
+    pub fn record_receive(
+        &self,
+        writer: &str,
+        seq: u64,
+        path: &str,
+        qos: Qos,
+        bytes: usize,
+    ) -> Result<()> {
+        // Capture `ts` once so the compact row and the JSONL line
+        // share the same timestamp -- analysis code can then
+        // cross-correlate the two streams on `(ts, seq, writer)`
+        // exactly.
+        let ts = Utc::now();
+        if let Some(sink) = &self.compact {
+            let ts_ns = ts.timestamp_nanos_opt().unwrap_or(0);
+            let mut buf = sink
+                .lock()
+                .map_err(|_| anyhow::anyhow!("LoggerHandle compact-sink mutex poisoned"))?;
+            buf.push_receive(ts_ns, writer, seq, path, qos.as_int(), bytes as u32)?;
+        }
+        if self.legacy_jsonl {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("LoggerHandle mutex poisoned"))?;
+            // Use the JSONL `log_receive` shape so the on-disk
+            // timestamp string format is unchanged. We pay an extra
+            // `Utc::now()` here vs. `ts` above; on the legacy-JSONL
+            // path that small drift is harmless (the analyzer keys on
+            // (seq, writer) for correlation, not on the textual ts).
+            guard.log_receive(writer, seq, path, qos, bytes)?;
+        }
+        Ok(())
     }
 }
 
@@ -690,5 +842,194 @@ mod tests {
         let frac = ts.split('.').nth(1).unwrap();
         let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
         assert_eq!(digits.len(), 9, "ts should have 9 fractional digits");
+    }
+
+    // ------ T18.3a: LoggerHandle::record_receive tests ------
+
+    fn handle_with_logger(dir: &TempDir) -> LoggerHandle {
+        let logger = Logger::new(
+            dir.path().to_str().unwrap(),
+            "test-variant",
+            "runner-a",
+            "run01",
+        )
+        .unwrap();
+        LoggerHandle::new(logger)
+    }
+
+    fn read_jsonl_at(path: &Path) -> Vec<serde_json::Value> {
+        let file = File::open(path).unwrap();
+        let reader = std::io::BufReader::new(file);
+        reader
+            .lines()
+            .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn t18_3a_record_receive_without_compact_sink_writes_jsonl_only() {
+        // Backwards-compat path: a `LoggerHandle` constructed without
+        // `attach_compact_sink` (e.g. legacy unit tests) keeps writing
+        // the JSONL line and silently skips the compact push.
+        let dir = TempDir::new().unwrap();
+        let handle = handle_with_logger(&dir);
+        let log_path = handle.inner().lock().unwrap().path().to_path_buf();
+
+        handle
+            .record_receive("alice", 42, "/bench/0", Qos::ReliableTcp, 64)
+            .unwrap();
+        handle.inner().lock().unwrap().flush().unwrap();
+
+        let lines = read_jsonl_at(&log_path);
+        assert_eq!(lines.len(), 1, "exactly one JSONL line");
+        assert_eq!(lines[0]["event"], "receive");
+        assert_eq!(lines[0]["writer"], "alice");
+        assert_eq!(lines[0]["seq"], 42);
+        assert_eq!(lines[0]["path"], "/bench/0");
+        assert_eq!(lines[0]["qos"], 4);
+        assert_eq!(lines[0]["bytes"], 64);
+        // No compact sink attached -> compact_sink() is None.
+        assert!(handle.compact_sink().is_none());
+    }
+
+    #[test]
+    fn t18_3a_record_receive_pushes_into_compact_buffer() {
+        // Core T18.3a invariant: with a compact sink attached, the
+        // receive row lands in the shared `CompactBuffers` so the
+        // digest phase later serialises it to Parquet.
+        let dir = TempDir::new().unwrap();
+        let mut handle = handle_with_logger(&dir);
+        let sink: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
+        // Default `legacy_jsonl = true` matches the legacy code path
+        // exactly; the T18.2-default `false` is tested below.
+        handle.attach_compact_sink(sink.clone(), true);
+
+        handle
+            .record_receive("bob", 7, "/bench/0", Qos::ReliableTcp, 128)
+            .unwrap();
+
+        let buf = sink.lock().unwrap();
+        assert_eq!(buf.len(), 1, "exactly one compact row");
+        assert_eq!(buf.kind, vec![crate::compact::EventKind::Receive as u8]);
+        assert_eq!(buf.seq, vec![7]);
+        assert_eq!(buf.qos, vec![4]);
+        assert_eq!(buf.bytes, vec![128]);
+        // Peer name interned at index 0; path at index 0.
+        assert_eq!(buf.peer_idx, vec![0]);
+        assert_eq!(buf.path_idx, vec![0]);
+        assert_eq!(buf.peers.dict(), &["bob".to_string()]);
+        assert_eq!(buf.paths.dict(), &["/bench/0".to_string()]);
+    }
+
+    #[test]
+    fn t18_3a_record_receive_emits_jsonl_when_legacy_flag_on() {
+        let dir = TempDir::new().unwrap();
+        let mut handle = handle_with_logger(&dir);
+        let sink: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
+        handle.attach_compact_sink(sink.clone(), true);
+        let log_path = handle.inner().lock().unwrap().path().to_path_buf();
+
+        handle
+            .record_receive("alice", 1, "/bench/0", Qos::ReliableTcp, 16)
+            .unwrap();
+        handle.inner().lock().unwrap().flush().unwrap();
+
+        // Compact row pushed.
+        assert_eq!(sink.lock().unwrap().len(), 1);
+        // JSONL line written.
+        let lines = read_jsonl_at(&log_path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["event"], "receive");
+        assert_eq!(lines[0]["writer"], "alice");
+        assert_eq!(lines[0]["seq"], 1);
+    }
+
+    #[test]
+    fn t18_3a_record_receive_skips_jsonl_when_legacy_flag_off() {
+        // T18.2 default: legacy_jsonl=false. The compact row is
+        // pushed (the digest writer is the analyser's only source)
+        // and NO JSONL line lands.
+        let dir = TempDir::new().unwrap();
+        let mut handle = handle_with_logger(&dir);
+        let sink: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
+        handle.attach_compact_sink(sink.clone(), false);
+        let log_path = handle.inner().lock().unwrap().path().to_path_buf();
+
+        handle
+            .record_receive("alice", 5, "/bench/0", Qos::ReliableTcp, 16)
+            .unwrap();
+        handle.inner().lock().unwrap().flush().unwrap();
+
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            1,
+            "compact row pushed under legacy_jsonl=false"
+        );
+        let lines = read_jsonl_at(&log_path);
+        assert!(
+            lines.is_empty(),
+            "no JSONL line under legacy_jsonl=false, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn t18_3a_record_receive_clone_shares_compact_sink() {
+        // Cloning a `LoggerHandle` (the pattern reader threads use)
+        // shares the SAME `CompactSink` `Arc` -- pushes from any clone
+        // land in the same buffer.
+        let dir = TempDir::new().unwrap();
+        let mut handle = handle_with_logger(&dir);
+        let sink: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
+        handle.attach_compact_sink(sink.clone(), false);
+
+        let clone_a = handle.clone();
+        let clone_b = handle.clone();
+        clone_a
+            .record_receive("alice", 1, "/p", Qos::ReliableTcp, 8)
+            .unwrap();
+        clone_b
+            .record_receive("bob", 2, "/p", Qos::ReliableTcp, 8)
+            .unwrap();
+
+        let buf = sink.lock().unwrap();
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.peers.dict(), &["alice".to_string(), "bob".to_string()]);
+        // Both rows share the single interned path index.
+        assert_eq!(buf.path_idx, vec![0, 0]);
+    }
+
+    #[test]
+    fn t18_3a_record_receive_concurrent_pushes_all_land() {
+        // The promise the audit cares about: under concurrent reader-
+        // thread pushes (the websocket Multi-mode reproducer), every
+        // receive lands in the compact buffer. Smoke-test by spawning
+        // a few threads that each push N rows; assert the final row
+        // count is exactly the sum.
+        use std::thread;
+        let dir = TempDir::new().unwrap();
+        let mut handle = handle_with_logger(&dir);
+        let sink: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
+        handle.attach_compact_sink(sink.clone(), false);
+
+        const THREADS: usize = 4;
+        const PER_THREAD: u64 = 250;
+        let mut joins = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let h = handle.clone();
+            let writer = format!("peer{t}");
+            joins.push(thread::spawn(move || {
+                for seq in 0..PER_THREAD {
+                    h.record_receive(&writer, seq, "/p", Qos::ReliableTcp, 8)
+                        .unwrap();
+                }
+            }));
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+        let buf = sink.lock().unwrap();
+        assert_eq!(buf.len(), THREADS * (PER_THREAD as usize));
+        // All four peers got interned distinct slots.
+        assert_eq!(buf.peers.dict().len(), THREADS);
     }
 }

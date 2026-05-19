@@ -22,7 +22,7 @@ pub use compact::{
 };
 pub use compact_writer::{write_compact_parquet, CompactParquetMeta, CompactWriterError};
 pub use dummy::VariantDummy;
-pub use logger::Logger;
+pub use logger::{CompactSink, Logger, LoggerHandle};
 pub use progress_emitter::{build_progress_line, ProgressEmitter, ProgressSnapshot, DONE_PHASE};
 pub use resource::ResourceMonitor;
 pub use seq::SeqGenerator;

@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -10,7 +11,7 @@ use crate::compact::CompactBuffers;
 use crate::compact_writer::{
     compact_parquet_path, write_compact_parquet, CompactParquetMeta, CompactWriterOptions,
 };
-use crate::logger::{Logger, LoggerHandle};
+use crate::logger::{CompactSink, Logger, LoggerHandle};
 use crate::progress_emitter::ProgressEmitter;
 use crate::resource::ResourceMonitor;
 use crate::seq::SeqGenerator;
@@ -147,7 +148,15 @@ pub enum MemCheckOutcome {
 /// side-car JSONL file to find phase boundaries / connect metrics /
 /// resource samples.
 struct EventSink<'a> {
-    buffers: CompactBuffers,
+    /// Shared compact-buffer sink. T18.3a wraps the buffers in
+    /// `Arc<Mutex<CompactBuffers>>` so cross-thread emitters (the
+    /// `LoggerHandle::record_receive` path used by websocket reader
+    /// threads and the T17.5 Single-mode drain helper) push into the
+    /// same instance the digest phase later serialises. The driver
+    /// thread is the only contender outside reader threads; lock
+    /// contention is microsecond-scale per push and not on the hot
+    /// path of any T18.2 benchmark.
+    buffers: CompactSink,
     /// Underlying JSONL logger. The proxy is borrowed mutably so the
     /// sink can emit on the legacy path when enabled.
     logger: LoggerProxy<'a>,
@@ -165,15 +174,31 @@ struct EventSink<'a> {
 }
 
 impl<'a> EventSink<'a> {
-    fn new(logger: LoggerProxy<'a>, legacy_jsonl: bool, soft_mb: u32, hard_mb: u32) -> Self {
+    fn new(
+        buffers: CompactSink,
+        logger: LoggerProxy<'a>,
+        legacy_jsonl: bool,
+        soft_mb: u32,
+        hard_mb: u32,
+    ) -> Self {
         Self {
-            buffers: CompactBuffers::new(),
+            buffers,
             logger,
             legacy_jsonl,
             soft_ceiling_bytes: u64::from(soft_mb) * 1024 * 1024,
             hard_ceiling_bytes: u64::from(hard_mb) * 1024 * 1024,
             soft_warning_emitted: false,
         }
+    }
+
+    /// Lock the shared compact-buffer mutex. The driver and reader
+    /// threads contend here; contention is minimal because the
+    /// reader-thread fast path holds the lock only for the duration
+    /// of one `push_receive` call.
+    fn lock_buffers(&self) -> Result<std::sync::MutexGuard<'_, CompactBuffers>> {
+        self.buffers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("EventSink compact-buffer mutex poisoned"))
     }
 
     /// Record a `write` event. The pre-publish `write_ts` is supplied
@@ -186,7 +211,7 @@ impl<'a> EventSink<'a> {
         qos: Qos,
         bytes: usize,
     ) -> Result<()> {
-        self.buffers
+        self.lock_buffers()?
             .push_write(ts_nanos(ts), path, qos.as_int(), seq, bytes as u32)?;
         if self.legacy_jsonl {
             self.logger.log_write_at(ts, seq, path, qos, bytes)?;
@@ -196,7 +221,7 @@ impl<'a> EventSink<'a> {
 
     /// Record a `backpressure_skipped` event.
     fn record_backpressure_skipped(&mut self, path: &str, qos: Qos) -> Result<()> {
-        self.buffers
+        self.lock_buffers()?
             .push_backpressure_skipped(ts_nanos(Utc::now()), path, qos.as_int())?;
         if self.legacy_jsonl {
             self.logger.log_backpressure_skipped(path, qos)?;
@@ -213,7 +238,7 @@ impl<'a> EventSink<'a> {
         qos: Qos,
         bytes: usize,
     ) -> Result<()> {
-        self.buffers.push_receive(
+        self.lock_buffers()?.push_receive(
             ts_nanos(Utc::now()),
             writer,
             seq,
@@ -238,7 +263,7 @@ impl<'a> EventSink<'a> {
 
     /// Mirror a `phase` event into the compact buffers (T18.2b).
     fn record_phase(&mut self, phase: Phase) -> Result<()> {
-        self.buffers
+        self.lock_buffers()?
             .push_phase(ts_nanos(Utc::now()), phase.as_str())?;
         Ok(())
     }
@@ -250,7 +275,7 @@ impl<'a> EventSink<'a> {
     /// per-peer connections may call `buffers.push_connected` with a
     /// real peer name from inside their own reader-thread code.
     fn record_connected(&mut self, elapsed_ms: f64, threading_mode: ThreadingMode) -> Result<()> {
-        self.buffers.push_connected(
+        self.lock_buffers()?.push_connected(
             ts_nanos(Utc::now()),
             None,
             elapsed_ms as f32,
@@ -261,14 +286,18 @@ impl<'a> EventSink<'a> {
 
     /// Mirror an `eot_sent` event into the compact buffers (T18.2b).
     fn record_eot_sent(&mut self, eot_id: u64) -> Result<()> {
-        self.buffers.push_eot_sent(ts_nanos(Utc::now()), eot_id)?;
+        self.lock_buffers()?
+            .push_eot_sent(ts_nanos(Utc::now()), eot_id)?;
         Ok(())
     }
 
     /// Mirror a `resource` event into the compact buffers (T18.2b).
     fn record_resource(&mut self, cpu_percent: f64, memory_mb: f64) -> Result<()> {
-        self.buffers
-            .push_resource(ts_nanos(Utc::now()), cpu_percent as f32, memory_mb as f32)?;
+        self.lock_buffers()?.push_resource(
+            ts_nanos(Utc::now()),
+            cpu_percent as f32,
+            memory_mb as f32,
+        )?;
         Ok(())
     }
 
@@ -278,7 +307,13 @@ impl<'a> EventSink<'a> {
     /// threshold surfaces every time it is crossed (the driver is
     /// expected to abort on the first occurrence).
     fn check_mem_ceilings(&mut self) -> MemCheckOutcome {
-        let current = self.buffers.approx_bytes() as u64;
+        // Lock briefly to read approx_bytes. Failure here is an
+        // unrecoverable poisoning of the compact mutex; the operate
+        // loop will surface it via record_* on the next event.
+        let current = match self.buffers.lock() {
+            Ok(buf) => buf.approx_bytes() as u64,
+            Err(_) => return MemCheckOutcome::Ok,
+        };
         if current >= self.hard_ceiling_bytes {
             return MemCheckOutcome::HardCrossed {
                 current_mb: current / (1024 * 1024),
@@ -296,8 +331,12 @@ impl<'a> EventSink<'a> {
     }
 
     /// Borrow the compact buffers immutably, for the digest writer.
-    fn buffers(&self) -> &CompactBuffers {
-        &self.buffers
+    ///
+    /// Returns a locked `MutexGuard`. The digest phase runs after
+    /// `stop_reader_threads` has joined every reader, so the only
+    /// contender at this point is the driver thread itself.
+    fn buffers(&self) -> Result<std::sync::MutexGuard<'_, CompactBuffers>> {
+        self.lock_buffers()
     }
 }
 
@@ -453,7 +492,15 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // into the spawned thread. Driver-side event emission goes through
     // a `LoggerProxy` that locks the mutex per event -- the proxy keeps
     // the historical `logger.log_*` call shape unchanged at all sites.
-    let logger_handle = LoggerHandle::new(owned_logger);
+    let mut logger_handle = LoggerHandle::new(owned_logger);
+    // T18.3a: build the shared compact-buffer sink BEFORE wiring it
+    // into both the driver-side `EventSink` and the cross-thread
+    // `LoggerHandle`. Every receive (driver-thread or reader-thread)
+    // pushes into this one `Arc<Mutex<CompactBuffers>>`, so the
+    // digest-phase Parquet writer sees a complete row set regardless
+    // of which thread observed the event.
+    let shared_buffers: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
+    logger_handle.attach_compact_sink(Arc::clone(&shared_buffers), config.legacy_jsonl_events);
     // The legacy `logger` variable continues to be used for
     // lifecycle events (`phase`, `connected`, `eot_sent`,
     // `resource`). High-volume per-event rows go through `sink`
@@ -462,6 +509,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     let mut logger = LoggerProxy::new(&logger_handle);
     let sink_logger = LoggerProxy::new(&logger_handle);
     let mut sink = EventSink::new(
+        shared_buffers,
         sink_logger,
         config.legacy_jsonl_events,
         config.digest_mem_soft_mb,
@@ -927,13 +975,21 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         recv_buffer_kb: config.recv_buffer_kb,
     };
     let parquet_options = CompactWriterOptions::default();
-    let parquet_bytes = write_compact_parquet(
-        &parquet_path,
-        sink.buffers(),
-        &parquet_meta,
-        &parquet_options,
-    )
-    .map_err(|e| anyhow::anyhow!("digest phase: failed to write compact Parquet file: {e}"))?;
+    let (parquet_bytes, parquet_rows) = {
+        // Hold the compact-buffer lock for the duration of the
+        // digest write so the Parquet writer sees a consistent
+        // snapshot. By this point `stop_reader_threads` has joined
+        // every reader thread so there is no contention.
+        let buffers_guard = sink.buffers()?;
+        let bytes = write_compact_parquet(
+            &parquet_path,
+            &buffers_guard,
+            &parquet_meta,
+            &parquet_options,
+        )
+        .map_err(|e| anyhow::anyhow!("digest phase: failed to write compact Parquet file: {e}"))?;
+        (bytes, buffers_guard.len())
+    };
 
     // Emit a one-line summary of the digest phase result to stderr
     // (not stdout -- the progress emitter owns stdout). This is the
@@ -944,7 +1000,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     eprintln!(
         "[variant] digest: wrote {} ({} rows, {} bytes)",
         parquet_path.display(),
-        sink.buffers().len(),
+        parquet_rows,
         parquet_bytes,
     );
 
