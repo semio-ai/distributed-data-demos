@@ -13,13 +13,17 @@
 //!
 //! ```text
 //! message compact_events {
-//!     required int64  ts_ns;
-//!     required int32  kind;       // values 0..255 (the EventKind enum)
-//!     required int64  seq;        // u64 cast to i64 -- analysis re-casts
-//!     required int32  path_idx;   // u32 cast to i32 -- analysis re-casts
-//!     required int32  peer_idx;   // u8 -> i32; PEER_SELF == 255
-//!     required int32  qos;        // u8 0..=4
-//!     required int32  bytes;      // u32 cast to i32 -- analysis re-casts
+//!     required int64       ts_ns;
+//!     required int32       kind;        // values 0..255 (the EventKind enum)
+//!     required int64       seq;         // u64 cast to i64 -- analysis re-casts
+//!     required int32       path_idx;    // u32 cast to i32 -- analysis re-casts
+//!     required int32       peer_idx;    // u8 -> i32; PEER_SELF == 255
+//!     required int32       qos;         // u8 0..=4
+//!     required int32       bytes;       // u32 cast to i32 -- analysis re-casts
+//!     optional float       extra_f32;   // T18.2b polymorphic numeric slot
+//!     optional float       extra_f32_b; // T18.2b polymorphic numeric slot
+//!     optional int64       extra_i64;   // T18.2b polymorphic int slot
+//!     optional binary      extra_utf8;  // T18.2b polymorphic string slot
 //! }
 //! ```
 //!
@@ -27,6 +31,14 @@
 //! are widened to the smallest signed type that holds them losslessly.
 //! Analysis consumers should reinterpret these as unsigned where the
 //! domain calls for it.
+//!
+//! The four `extra_*` columns (T18.2b) are nullable; their per-kind
+//! population is documented in
+//! `metak-shared/api-contracts/compact-log-schema.md` § Event kinds.
+//! For an event kind that doesn't use a given slot, the column carries
+//! a null value (def-level = 0). The Parquet reader returns `None`
+//! for those rows, which the analyzer treats as "not applicable for
+//! this kind".
 //!
 //! ## Compression
 //!
@@ -66,7 +78,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parquet::basic::{Compression, Encoding, Repetition, Type as PhysicalType};
-use parquet::data_type::{Int32Type, Int64Type};
+use parquet::data_type::{ByteArray, ByteArrayType, FloatType, Int32Type, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::format::KeyValue;
@@ -142,6 +154,8 @@ impl Default for CompactWriterOptions {
 /// multiple writes if a single process produces many spawns
 /// (currently we produce one file per spawn, but cheap to share).
 fn build_schema() -> Arc<Type> {
+    use parquet::basic::{ConvertedType, LogicalType};
+
     let fields: Vec<Arc<Type>> = vec![
         Arc::new(
             Type::primitive_type_builder("ts_ns", PhysicalType::INT64)
@@ -184,6 +198,39 @@ fn build_schema() -> Arc<Type> {
                 .with_repetition(Repetition::REQUIRED)
                 .build()
                 .expect("bytes schema build"),
+        ),
+        // T18.2b polymorphic columns. All four are nullable (OPTIONAL)
+        // -- analyzers receive None for rows whose event kind does
+        // not populate the slot. The per-kind population is defined
+        // in `metak-shared/api-contracts/compact-log-schema.md`.
+        Arc::new(
+            Type::primitive_type_builder("extra_f32", PhysicalType::FLOAT)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()
+                .expect("extra_f32 schema build"),
+        ),
+        Arc::new(
+            Type::primitive_type_builder("extra_f32_b", PhysicalType::FLOAT)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()
+                .expect("extra_f32_b schema build"),
+        ),
+        Arc::new(
+            Type::primitive_type_builder("extra_i64", PhysicalType::INT64)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()
+                .expect("extra_i64 schema build"),
+        ),
+        Arc::new(
+            // UTF8 logical/converted type so analyzers that decode by
+            // logical type (polars, pyarrow) see the column as a
+            // string rather than raw bytes.
+            Type::primitive_type_builder("extra_utf8", PhysicalType::BYTE_ARRAY)
+                .with_repetition(Repetition::OPTIONAL)
+                .with_logical_type(Some(LogicalType::String))
+                .with_converted_type(ConvertedType::UTF8)
+                .build()
+                .expect("extra_utf8 schema build"),
         ),
     ];
     Arc::new(
@@ -360,12 +407,110 @@ pub fn write_compact_parquet(
             col.close()?;
         }
 
+        // ---- T18.2b polymorphic OPTIONAL columns ----
+        //
+        // For each nullable column we compute a def-level slice (1 =
+        // defined, 0 = null) covering EVERY row, but pass ONLY the
+        // defined values to `write_batch`. The parquet crate
+        // interleaves the two: it consumes one value per def-level
+        // entry that is >= max-def-level for the column. See the
+        // `write_batch` docstring in `parquet::column::writer`.
+
+        // extra_f32: Option<f32>
+        let (vals, defs) = collect_optional_f32(&buffers.extra_f32);
+        if let Some(mut col) = row_group.next_column()? {
+            col.typed::<FloatType>()
+                .write_batch(&vals, Some(&defs), None)?;
+            col.close()?;
+        }
+
+        // extra_f32_b: Option<f32>
+        let (vals, defs) = collect_optional_f32(&buffers.extra_f32_b);
+        if let Some(mut col) = row_group.next_column()? {
+            col.typed::<FloatType>()
+                .write_batch(&vals, Some(&defs), None)?;
+            col.close()?;
+        }
+
+        // extra_i64: Option<i64>
+        let (vals_i64, defs) = collect_optional_i64(&buffers.extra_i64);
+        if let Some(mut col) = row_group.next_column()? {
+            col.typed::<Int64Type>()
+                .write_batch(&vals_i64, Some(&defs), None)?;
+            col.close()?;
+        }
+
+        // extra_utf8: Option<String>
+        let (vals_ba, defs) = collect_optional_utf8(&buffers.extra_utf8);
+        if let Some(mut col) = row_group.next_column()? {
+            col.typed::<ByteArrayType>()
+                .write_batch(&vals_ba, Some(&defs), None)?;
+            col.close()?;
+        }
+
         row_group.close()?;
     }
     writer.close()?;
 
     let size = std::fs::metadata(path)?.len();
     Ok(size)
+}
+
+/// Split an `Option<f32>` column into (defined values, def-levels)
+/// suitable for `ColumnWriter::write_batch`.
+///
+/// Output invariants:
+/// - `defs.len() == col.len()` -- one def-level per logical row.
+/// - `defs[i] == 1` iff `col[i].is_some()`; `0` otherwise.
+/// - `vals.len() == defs.iter().filter(|&&d| d == 1).count()` -- one
+///   value per defined row, in row order.
+fn collect_optional_f32(col: &[Option<f32>]) -> (Vec<f32>, Vec<i16>) {
+    let mut vals = Vec::with_capacity(col.len());
+    let mut defs = Vec::with_capacity(col.len());
+    for v in col {
+        match v {
+            Some(x) => {
+                vals.push(*x);
+                defs.push(1);
+            }
+            None => defs.push(0),
+        }
+    }
+    (vals, defs)
+}
+
+/// Split an `Option<i64>` column into (defined values, def-levels).
+/// See [`collect_optional_f32`] for invariants.
+fn collect_optional_i64(col: &[Option<i64>]) -> (Vec<i64>, Vec<i16>) {
+    let mut vals = Vec::with_capacity(col.len());
+    let mut defs = Vec::with_capacity(col.len());
+    for v in col {
+        match v {
+            Some(x) => {
+                vals.push(*x);
+                defs.push(1);
+            }
+            None => defs.push(0),
+        }
+    }
+    (vals, defs)
+}
+
+/// Split an `Option<String>` column into (defined byte-array values,
+/// def-levels). See [`collect_optional_f32`] for invariants.
+fn collect_optional_utf8(col: &[Option<String>]) -> (Vec<ByteArray>, Vec<i16>) {
+    let mut vals = Vec::with_capacity(col.len());
+    let mut defs = Vec::with_capacity(col.len());
+    for v in col {
+        match v {
+            Some(s) => {
+                vals.push(ByteArray::from(s.as_bytes().to_vec()));
+                defs.push(1);
+            }
+            None => defs.push(0),
+        }
+    }
+    (vals, defs)
 }
 
 /// Construct the canonical compact-Parquet file path for a spawn.
@@ -423,12 +568,13 @@ mod tests {
         )
         .unwrap();
         assert!(size > 0, "even empty files have a Parquet footer");
-        // Read it back -- should have zero rows and the expected schema.
+        // Read it back -- should have zero rows and the expected schema
+        // (7 base columns + 4 T18.2b extra columns = 11).
         let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
         let meta = reader.metadata();
         assert_eq!(meta.num_row_groups(), 1);
         assert_eq!(meta.file_metadata().num_rows(), 0);
-        assert_eq!(meta.file_metadata().schema_descr().num_columns(), 7);
+        assert_eq!(meta.file_metadata().schema_descr().num_columns(), 11);
     }
 
     #[test]
@@ -467,6 +613,11 @@ mod tests {
         assert_eq!(row0.get_int(4).unwrap(), 255); // PEER_SELF
         assert_eq!(row0.get_int(5).unwrap(), 1); // qos
         assert_eq!(row0.get_int(6).unwrap(), 128);
+        // All four T18.2b extras should be null on a write row.
+        assert!(row0.get_float(7).is_err());
+        assert!(row0.get_float(8).is_err());
+        assert!(row0.get_long(9).is_err());
+        assert!(row0.get_string(10).is_err());
 
         // Row 2 -- receive from bob, peer_idx=0
         let row2 = &rows[2];
@@ -480,9 +631,92 @@ mod tests {
         assert_eq!(row3.get_long(2).unwrap(), 0);
         assert_eq!(row3.get_int(6).unwrap(), 0);
 
-        // Row 4 / 5 -- gap_detected / gap_filled
+        // Row 4 / 5 -- gap_detected / gap_filled. The T18.2b
+        // contract puts the missing/recovered seq in both `seq` and
+        // `extra_i64`.
         assert_eq!(rows[4].get_int(1).unwrap(), 3);
+        assert_eq!(rows[4].get_long(9).unwrap(), 42);
         assert_eq!(rows[5].get_int(1).unwrap(), 4);
+        assert_eq!(rows[5].get_long(9).unwrap(), 42);
+    }
+
+    /// T18.2b: round-trip every new lifecycle event kind through the
+    /// Parquet writer + reader. Asserts that the right `extra_*`
+    /// slot carries the value the per-kind `push_*` helper supplied.
+    #[test]
+    fn lifecycle_event_kinds_round_trip_through_parquet() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("lifecycle.compact.parquet");
+
+        let mut buf = CompactBuffers::new();
+        buf.push_phase(100, "operate").unwrap();
+        buf.push_connected(200, Some("alice"), 7.5, "single")
+            .unwrap();
+        buf.push_eot_sent(300, 42).unwrap();
+        buf.push_eot_received(400, "alice", 42).unwrap();
+        buf.push_eot_timeout(500, 5000, r#"["bob"]"#).unwrap();
+        buf.push_resource(600, 12.5, 256.0).unwrap();
+        buf.push_clock_sync(700, "alice", -1_234, 0.5).unwrap();
+
+        write_compact_parquet(
+            &path,
+            &buf,
+            &sample_meta(),
+            &CompactWriterOptions::default(),
+        )
+        .unwrap();
+
+        let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        let rows: Vec<_> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 7);
+
+        // phase -- extra_utf8 = "operate"
+        let phase = &rows[0];
+        assert_eq!(phase.get_int(1).unwrap(), 5);
+        assert_eq!(phase.get_string(10).unwrap(), "operate");
+
+        // connected -- peer_idx populated, extra_f32=7.5,
+        // extra_utf8="single"
+        let connected = &rows[1];
+        assert_eq!(connected.get_int(1).unwrap(), 6);
+        assert_eq!(connected.get_int(4).unwrap(), 0); // peer_idx = alice
+        assert!((connected.get_float(7).unwrap() - 7.5).abs() < 1e-6);
+        assert_eq!(connected.get_string(10).unwrap(), "single");
+
+        // eot_sent -- extra_i64 = 42
+        let eot_sent = &rows[2];
+        assert_eq!(eot_sent.get_int(1).unwrap(), 7);
+        assert_eq!(eot_sent.get_long(9).unwrap(), 42);
+
+        // eot_received -- peer_idx populated, extra_i64 = 42
+        let eot_recv = &rows[3];
+        assert_eq!(eot_recv.get_int(1).unwrap(), 8);
+        assert_eq!(eot_recv.get_int(4).unwrap(), 0);
+        assert_eq!(eot_recv.get_long(9).unwrap(), 42);
+
+        // eot_timeout -- extra_i64 = wait_ms, extra_utf8 = JSON
+        let eot_to = &rows[4];
+        assert_eq!(eot_to.get_int(1).unwrap(), 9);
+        assert_eq!(eot_to.get_long(9).unwrap(), 5000);
+        assert_eq!(eot_to.get_string(10).unwrap(), r#"["bob"]"#);
+
+        // resource -- extra_f32 = cpu_percent, extra_f32_b = mem_mb
+        let resource = &rows[5];
+        assert_eq!(resource.get_int(1).unwrap(), 10);
+        assert!((resource.get_float(7).unwrap() - 12.5).abs() < 1e-6);
+        assert!((resource.get_float(8).unwrap() - 256.0).abs() < 1e-6);
+
+        // clock_sync -- peer_idx populated, extra_i64=offset_ns,
+        // extra_f32=rtt_ms
+        let cs = &rows[6];
+        assert_eq!(cs.get_int(1).unwrap(), 11);
+        assert_eq!(cs.get_int(4).unwrap(), 0);
+        assert_eq!(cs.get_long(9).unwrap(), -1_234);
+        assert!((cs.get_float(7).unwrap() - 0.5).abs() < 1e-6);
     }
 
     #[test]

@@ -25,10 +25,14 @@
 //! | `ts_ns` | `i64` | wall-clock nanos since UNIX epoch |
 //! | `kind` | `u8` | event kind enum, see [`EventKind`] |
 //! | `seq` | `u64` | writer sequence number (0 when not applicable) |
-//! | `path_idx` | `u32` | interned path index |
+//! | `path_idx` | `u32` | interned path index (0 when not applicable) |
 //! | `peer_idx` | `u8` | interned writer/peer name; `u8::MAX` = self/none |
 //! | `qos` | `u8` | QoS level 1..=4 (0 when not applicable) |
 //! | `bytes` | `u32` | payload bytes (0 when not applicable) |
+//! | `extra_f32` | `Option<f32>` | polymorphic numeric slot (T18.2b) |
+//! | `extra_f32_b` | `Option<f32>` | second polymorphic numeric slot (T18.2b) |
+//! | `extra_i64` | `Option<i64>` | polymorphic int slot (T18.2b) |
+//! | `extra_utf8` | `Option<String>` | polymorphic string slot (T18.2b) |
 //!
 //! Paths and peers are interned **lazily**: the first time the variant
 //! observes a new path/peer it allocates an index and stores the string
@@ -36,6 +40,13 @@
 //! reuse the same index. The dictionaries are bounded at `u32::MAX`
 //! paths and `u8::MAX` peers; both caps are far above any realistic
 //! benchmark (single-digit peers, single-digit-to-hundreds of paths).
+//!
+//! The four `extra_*` columns carry polymorphic per-event-kind payload
+//! introduced in T18.2b to cover lifecycle events that don't fit the
+//! original (ts, kind, seq, path_idx, peer_idx, qos, bytes) shape. They
+//! are nullable; the column-mapping table in
+//! `metak-shared/api-contracts/compact-log-schema.md` § Event kinds
+//! defines which slot each kind populates.
 //!
 //! ## Memory accounting
 //!
@@ -78,9 +89,20 @@ pub const PEER_SELF: u8 = u8::MAX;
 
 /// Approximate bytes per row in the columnar buffers. Used by the
 /// memory-ceiling check; conservative -- counts the sum of column
-/// widths exactly (8 + 1 + 8 + 4 + 1 + 1 + 4 = 27 bytes), rounded up
-/// to 32 to absorb `Vec` over-allocation slop.
-pub const ROW_BYTES_ESTIMATE: usize = 32;
+/// widths exactly. Pre-T18.2b the seven base columns summed to
+/// 27 bytes (8 + 1 + 8 + 4 + 1 + 1 + 4). T18.2b adds four nullable
+/// `extra_*` columns whose per-row cost dominates on lifecycle events
+/// only (one row each for `phase` / `connected` / `eot_*`,
+/// `~100..1000` rows for `resource`). For the hot-path per-event
+/// kinds (`write` / `receive`) the nullable slots are `None` which
+/// the `Option<T>` representation stores as a discriminant only.
+///
+/// We size the estimate at 64 bytes per row (was 32) to absorb the
+/// `Option<T>` discriminant cost plus the `Vec` over-allocation slop
+/// from four additional column vectors. The figure is intentionally
+/// conservative -- the ceiling check is for catching unbounded
+/// growth, not for predicting exact MiB consumption.
+pub const ROW_BYTES_ESTIMATE: usize = 64;
 
 /// Categorical event kind written into the `kind` column.
 ///
@@ -88,6 +110,13 @@ pub const ROW_BYTES_ESTIMATE: usize = 32;
 /// **do not renumber existing variants**. Adding new kinds is fine
 /// (extend the enum + `From<EventKind> for u8`); analysis consumers
 /// must tolerate unknown kinds gracefully (drop or warn).
+///
+/// The lifecycle kinds (5..=11) were added in T18.2b to round out the
+/// compact format so an analyzer no longer needs the side-car JSONL
+/// stream for phase boundaries, connect-time metrics, EOT markers,
+/// resource samples, or clock-sync events. The per-kind column
+/// mapping is defined in
+/// `metak-shared/api-contracts/compact-log-schema.md` § Event kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EventKind {
@@ -107,6 +136,38 @@ pub enum EventKind {
     /// A `gap_filled` event: a previously-detected gap was recovered
     /// (QoS 3 only). `bytes` is 0.
     GapFilled = 4,
+    /// A `phase` event: one row per phase transition. `extra_utf8`
+    /// carries the phase name (`connect`, `stabilize`, `operate`,
+    /// `eot`, `silent`, `digest`, `done`).
+    Phase = 5,
+    /// A `connected` event: one row per peer connection
+    /// establishment. `peer_idx` identifies the peer (or
+    /// [`PEER_SELF`] when the variant has no peer concept and the
+    /// connect step is self-only). `extra_f32` carries the
+    /// `elapsed_ms` since `launch_ts`; `extra_utf8` carries the
+    /// threading mode string (`single` / `multi`).
+    Connected = 6,
+    /// An `eot_sent` event: one row per spawn. `extra_i64` carries
+    /// the `eot_id`.
+    EotSent = 7,
+    /// An `eot_received` event: one per `(writer, eot_id)` observed
+    /// by the receiver. `peer_idx` is the writer; `extra_i64` is the
+    /// `eot_id`.
+    EotReceived = 8,
+    /// An `eot_timeout` event: diagnostic emission when the EOT
+    /// wait expired with peers still missing. `extra_i64` is the
+    /// `wait_ms`, `extra_utf8` is a JSON array of missing peer
+    /// names.
+    EotTimeout = 9,
+    /// A `resource` event: periodic CPU / memory sample.
+    /// `extra_f32` = `cpu_percent`, `extra_f32_b` = `memory_mb`.
+    Resource = 10,
+    /// A `clock_sync` event: reserved for the E8 clock-sync epic.
+    /// `peer_idx` is the peer, `extra_i64` is the `offset_ns`,
+    /// `extra_f32` is the `rtt_ms`. The column mapping is pinned
+    /// here so analysis tooling can prepare for the E8 rollout; the
+    /// driver does not currently emit this kind.
+    ClockSync = 11,
 }
 
 impl EventKind {
@@ -120,6 +181,13 @@ impl EventKind {
             EventKind::BackpressureSkipped => "backpressure_skipped",
             EventKind::GapDetected => "gap_detected",
             EventKind::GapFilled => "gap_filled",
+            EventKind::Phase => "phase",
+            EventKind::Connected => "connected",
+            EventKind::EotSent => "eot_sent",
+            EventKind::EotReceived => "eot_received",
+            EventKind::EotTimeout => "eot_timeout",
+            EventKind::Resource => "resource",
+            EventKind::ClockSync => "clock_sync",
         }
     }
 }
@@ -285,7 +353,7 @@ pub struct CompactBuffers {
     pub paths: PathInterner,
     pub peers: PeerInterner,
 
-    // Columnar event rows.
+    // Columnar event rows -- base columns (T18.1 / T18.2).
     pub ts_ns: Vec<i64>,
     pub kind: Vec<u8>,
     pub seq: Vec<u64>,
@@ -293,6 +361,14 @@ pub struct CompactBuffers {
     pub peer_idx: Vec<u8>,
     pub qos: Vec<u8>,
     pub bytes: Vec<u32>,
+
+    // Polymorphic `extra_*` columns (T18.2b). Nullable; each entry
+    // carries the per-event-kind payload defined in
+    // `metak-shared/api-contracts/compact-log-schema.md` § Event kinds.
+    pub extra_f32: Vec<Option<f32>>,
+    pub extra_f32_b: Vec<Option<f32>>,
+    pub extra_i64: Vec<Option<i64>>,
+    pub extra_utf8: Vec<Option<String>>,
 }
 
 impl CompactBuffers {
@@ -333,13 +409,8 @@ impl CompactBuffers {
     ) -> Result<(), InternError> {
         let path_idx = self.paths.intern(path)?;
         self.push_row(
-            ts_ns,
-            EventKind::Write,
-            seq,
-            path_idx,
-            PEER_SELF,
-            qos,
-            bytes,
+            RowBuilder::new(ts_ns, EventKind::Write)
+                .with_base(seq, path_idx, PEER_SELF, qos, bytes),
         );
         Ok(())
     }
@@ -357,13 +428,8 @@ impl CompactBuffers {
         let path_idx = self.paths.intern(path)?;
         let peer_idx = self.peers.intern(writer)?;
         self.push_row(
-            ts_ns,
-            EventKind::Receive,
-            seq,
-            path_idx,
-            peer_idx,
-            qos,
-            bytes,
+            RowBuilder::new(ts_ns, EventKind::Receive)
+                .with_base(seq, path_idx, peer_idx, qos, bytes),
         );
         Ok(())
     }
@@ -377,13 +443,8 @@ impl CompactBuffers {
     ) -> Result<(), InternError> {
         let path_idx = self.paths.intern(path)?;
         self.push_row(
-            ts_ns,
-            EventKind::BackpressureSkipped,
-            0,
-            path_idx,
-            PEER_SELF,
-            qos,
-            0,
+            RowBuilder::new(ts_ns, EventKind::BackpressureSkipped)
+                .with_base(0, path_idx, PEER_SELF, qos, 0),
         );
         Ok(())
     }
@@ -398,15 +459,14 @@ impl CompactBuffers {
         let peer_idx = self.peers.intern(writer)?;
         // No path on gap events -- use 0 as a placeholder. Analysis
         // never reads path_idx for gap kinds so the value is
-        // unconstrained.
+        // unconstrained. The T18.2b contract update routes the
+        // missing seq through `extra_i64` as well, in addition to
+        // the legacy `seq` column population, so analyzers reading
+        // either column see a consistent value.
         self.push_row(
-            ts_ns,
-            EventKind::GapDetected,
-            missing_seq,
-            0,
-            peer_idx,
-            0,
-            0,
+            RowBuilder::new(ts_ns, EventKind::GapDetected)
+                .with_base(missing_seq, 0, peer_idx, 0, 0)
+                .with_extra_i64(missing_seq as i64),
         );
         Ok(())
     }
@@ -420,37 +480,207 @@ impl CompactBuffers {
     ) -> Result<(), InternError> {
         let peer_idx = self.peers.intern(writer)?;
         self.push_row(
-            ts_ns,
-            EventKind::GapFilled,
-            recovered_seq,
-            0,
-            peer_idx,
-            0,
-            0,
+            RowBuilder::new(ts_ns, EventKind::GapFilled)
+                .with_base(recovered_seq, 0, peer_idx, 0, 0)
+                .with_extra_i64(recovered_seq as i64),
+        );
+        Ok(())
+    }
+
+    /// Push a `phase` event row (T18.2b). `extra_utf8` carries the
+    /// phase name; no other columns are populated.
+    pub fn push_phase(&mut self, ts_ns: i64, phase: &str) -> Result<(), InternError> {
+        self.push_row(RowBuilder::new(ts_ns, EventKind::Phase).with_extra_utf8(phase.to_string()));
+        Ok(())
+    }
+
+    /// Push a `connected` event row (T18.2b). `peer_idx` identifies
+    /// the peer (or [`PEER_SELF`] when the variant has no peer
+    /// concept); `extra_f32` is the elapsed-ms since `launch_ts`;
+    /// `extra_utf8` is the threading-mode string.
+    pub fn push_connected(
+        &mut self,
+        ts_ns: i64,
+        peer: Option<&str>,
+        elapsed_ms: f32,
+        threading_mode: &str,
+    ) -> Result<(), InternError> {
+        let peer_idx = match peer {
+            Some(name) => self.peers.intern(name)?,
+            None => PEER_SELF,
+        };
+        self.push_row(
+            RowBuilder::new(ts_ns, EventKind::Connected)
+                .with_peer(peer_idx)
+                .with_extra_f32(elapsed_ms)
+                .with_extra_utf8(threading_mode.to_string()),
+        );
+        Ok(())
+    }
+
+    /// Push an `eot_sent` event row (T18.2b). `extra_i64` is the
+    /// `eot_id`.
+    pub fn push_eot_sent(&mut self, ts_ns: i64, eot_id: u64) -> Result<(), InternError> {
+        self.push_row(RowBuilder::new(ts_ns, EventKind::EotSent).with_extra_i64(eot_id as i64));
+        Ok(())
+    }
+
+    /// Push an `eot_received` event row (T18.2b). `peer_idx` is the
+    /// writer; `extra_i64` is the `eot_id`.
+    pub fn push_eot_received(
+        &mut self,
+        ts_ns: i64,
+        writer: &str,
+        eot_id: u64,
+    ) -> Result<(), InternError> {
+        let peer_idx = self.peers.intern(writer)?;
+        self.push_row(
+            RowBuilder::new(ts_ns, EventKind::EotReceived)
+                .with_peer(peer_idx)
+                .with_extra_i64(eot_id as i64),
+        );
+        Ok(())
+    }
+
+    /// Push an `eot_timeout` event row (T18.2b). `extra_i64` is
+    /// `wait_ms`; `extra_utf8` is the JSON-encoded list of missing
+    /// peer names (matches the legacy `eot_timeout` JSONL field
+    /// shape so analyzers can reuse the same parser).
+    pub fn push_eot_timeout(
+        &mut self,
+        ts_ns: i64,
+        wait_ms: u64,
+        missing_json: &str,
+    ) -> Result<(), InternError> {
+        self.push_row(
+            RowBuilder::new(ts_ns, EventKind::EotTimeout)
+                .with_extra_i64(wait_ms as i64)
+                .with_extra_utf8(missing_json.to_string()),
+        );
+        Ok(())
+    }
+
+    /// Push a `resource` event row (T18.2b). `extra_f32` is the CPU
+    /// percent; `extra_f32_b` is the resident memory in MiB.
+    pub fn push_resource(
+        &mut self,
+        ts_ns: i64,
+        cpu_percent: f32,
+        memory_mb: f32,
+    ) -> Result<(), InternError> {
+        self.push_row(
+            RowBuilder::new(ts_ns, EventKind::Resource)
+                .with_extra_f32(cpu_percent)
+                .with_extra_f32_b(memory_mb),
+        );
+        Ok(())
+    }
+
+    /// Push a `clock_sync` event row (T18.2b). Reserved for the E8
+    /// clock-sync epic -- the column mapping is pinned here so the
+    /// analyzer can read this kind once E8 begins emitting it.
+    pub fn push_clock_sync(
+        &mut self,
+        ts_ns: i64,
+        peer: &str,
+        offset_ns: i64,
+        rtt_ms: f32,
+    ) -> Result<(), InternError> {
+        let peer_idx = self.peers.intern(peer)?;
+        self.push_row(
+            RowBuilder::new(ts_ns, EventKind::ClockSync)
+                .with_peer(peer_idx)
+                .with_extra_i64(offset_ns)
+                .with_extra_f32(rtt_ms),
         );
         Ok(())
     }
 
     /// Append one row to every column. Private; all public push
     /// methods go through this so the column lengths stay in lockstep.
-    #[allow(clippy::too_many_arguments)]
-    fn push_row(
-        &mut self,
-        ts_ns: i64,
-        kind: EventKind,
-        seq: u64,
-        path_idx: u32,
-        peer_idx: u8,
-        qos: u8,
-        bytes: u32,
-    ) {
-        self.ts_ns.push(ts_ns);
-        self.kind.push(kind.into());
-        self.seq.push(seq);
-        self.path_idx.push(path_idx);
-        self.peer_idx.push(peer_idx);
-        self.qos.push(qos);
-        self.bytes.push(bytes);
+    fn push_row(&mut self, row: RowBuilder) {
+        self.ts_ns.push(row.ts_ns);
+        self.kind.push(row.kind.into());
+        self.seq.push(row.seq);
+        self.path_idx.push(row.path_idx);
+        self.peer_idx.push(row.peer_idx);
+        self.qos.push(row.qos);
+        self.bytes.push(row.bytes);
+        self.extra_f32.push(row.extra_f32);
+        self.extra_f32_b.push(row.extra_f32_b);
+        self.extra_i64.push(row.extra_i64);
+        self.extra_utf8.push(row.extra_utf8);
+    }
+}
+
+/// Internal builder used by [`CompactBuffers::push_row`] so the
+/// per-kind `push_*` helpers can compose a row without a long
+/// positional argument list. All fields default to "not applicable"
+/// (`0` / `PEER_SELF` / `None`) and the helpers override only the
+/// slots the kind actually populates.
+struct RowBuilder {
+    ts_ns: i64,
+    kind: EventKind,
+    seq: u64,
+    path_idx: u32,
+    peer_idx: u8,
+    qos: u8,
+    bytes: u32,
+    extra_f32: Option<f32>,
+    extra_f32_b: Option<f32>,
+    extra_i64: Option<i64>,
+    extra_utf8: Option<String>,
+}
+
+impl RowBuilder {
+    fn new(ts_ns: i64, kind: EventKind) -> Self {
+        Self {
+            ts_ns,
+            kind,
+            seq: 0,
+            path_idx: 0,
+            peer_idx: PEER_SELF,
+            qos: 0,
+            bytes: 0,
+            extra_f32: None,
+            extra_f32_b: None,
+            extra_i64: None,
+            extra_utf8: None,
+        }
+    }
+
+    fn with_base(mut self, seq: u64, path_idx: u32, peer_idx: u8, qos: u8, bytes: u32) -> Self {
+        self.seq = seq;
+        self.path_idx = path_idx;
+        self.peer_idx = peer_idx;
+        self.qos = qos;
+        self.bytes = bytes;
+        self
+    }
+
+    fn with_peer(mut self, peer_idx: u8) -> Self {
+        self.peer_idx = peer_idx;
+        self
+    }
+
+    fn with_extra_f32(mut self, v: f32) -> Self {
+        self.extra_f32 = Some(v);
+        self
+    }
+
+    fn with_extra_f32_b(mut self, v: f32) -> Self {
+        self.extra_f32_b = Some(v);
+        self
+    }
+
+    fn with_extra_i64(mut self, v: i64) -> Self {
+        self.extra_i64 = Some(v);
+        self
+    }
+
+    fn with_extra_utf8(mut self, v: String) -> Self {
+        self.extra_utf8 = Some(v);
+        self
     }
 }
 
@@ -588,9 +818,15 @@ mod tests {
         buf.push_backpressure_skipped(3, "/b", 4).unwrap();
         buf.push_gap_detected(4, "bob", 7).unwrap();
         buf.push_gap_filled(5, "bob", 7).unwrap();
+        // T18.2b lifecycle pushes -- mix in a phase + resource +
+        // eot_sent to confirm all four `extra_*` columns stay in
+        // lockstep with the base seven.
+        buf.push_phase(6, "operate").unwrap();
+        buf.push_resource(7, 12.5, 64.0).unwrap();
+        buf.push_eot_sent(8, 0).unwrap();
 
         let n = buf.len();
-        assert_eq!(n, 5);
+        assert_eq!(n, 8);
         assert_eq!(buf.ts_ns.len(), n);
         assert_eq!(buf.kind.len(), n);
         assert_eq!(buf.seq.len(), n);
@@ -598,6 +834,10 @@ mod tests {
         assert_eq!(buf.peer_idx.len(), n);
         assert_eq!(buf.qos.len(), n);
         assert_eq!(buf.bytes.len(), n);
+        assert_eq!(buf.extra_f32.len(), n);
+        assert_eq!(buf.extra_f32_b.len(), n);
+        assert_eq!(buf.extra_i64.len(), n);
+        assert_eq!(buf.extra_utf8.len(), n);
         // Two paths interned (/a, /b); two peers (alice, bob).
         assert_eq!(buf.paths.dict(), &["/a".to_string(), "/b".to_string()]);
         assert_eq!(buf.peers.dict(), &["alice".to_string(), "bob".to_string()]);
@@ -631,6 +871,15 @@ mod tests {
         );
         assert_eq!(EventKind::GapDetected.as_str(), "gap_detected");
         assert_eq!(EventKind::GapFilled.as_str(), "gap_filled");
+        // T18.2b lifecycle kinds -- string forms must match the
+        // legacy JSONL `event` field too.
+        assert_eq!(EventKind::Phase.as_str(), "phase");
+        assert_eq!(EventKind::Connected.as_str(), "connected");
+        assert_eq!(EventKind::EotSent.as_str(), "eot_sent");
+        assert_eq!(EventKind::EotReceived.as_str(), "eot_received");
+        assert_eq!(EventKind::EotTimeout.as_str(), "eot_timeout");
+        assert_eq!(EventKind::Resource.as_str(), "resource");
+        assert_eq!(EventKind::ClockSync.as_str(), "clock_sync");
     }
 
     #[test]
@@ -643,5 +892,164 @@ mod tests {
         assert_eq!(EventKind::BackpressureSkipped as u8, 2);
         assert_eq!(EventKind::GapDetected as u8, 3);
         assert_eq!(EventKind::GapFilled as u8, 4);
+        // T18.2b lifecycle kinds. The 5..=11 encoding is pinned by
+        // `metak-shared/api-contracts/compact-log-schema.md` § Event
+        // kinds. The analyzer indexes into this contract by integer.
+        assert_eq!(EventKind::Phase as u8, 5);
+        assert_eq!(EventKind::Connected as u8, 6);
+        assert_eq!(EventKind::EotSent as u8, 7);
+        assert_eq!(EventKind::EotReceived as u8, 8);
+        assert_eq!(EventKind::EotTimeout as u8, 9);
+        assert_eq!(EventKind::Resource as u8, 10);
+        assert_eq!(EventKind::ClockSync as u8, 11);
+    }
+
+    // ----- T18.2b: lifecycle event push_* methods -----
+    //
+    // Each test asserts the row lands with the right `kind`
+    // discriminant and the right `extra_*` slot populated; all other
+    // slots default to `None` / `0` / `PEER_SELF` per the contract.
+
+    #[test]
+    fn push_phase_populates_extra_utf8_only() {
+        let mut buf = CompactBuffers::new();
+        buf.push_phase(1_000_000, "operate").unwrap();
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.kind[0], EventKind::Phase as u8);
+        assert_eq!(buf.ts_ns[0], 1_000_000);
+        assert_eq!(buf.peer_idx[0], PEER_SELF);
+        assert_eq!(buf.seq[0], 0);
+        assert_eq!(buf.bytes[0], 0);
+        assert_eq!(buf.qos[0], 0);
+        assert!(buf.extra_f32[0].is_none());
+        assert!(buf.extra_f32_b[0].is_none());
+        assert!(buf.extra_i64[0].is_none());
+        assert_eq!(buf.extra_utf8[0].as_deref(), Some("operate"));
+    }
+
+    #[test]
+    fn push_connected_populates_peer_elapsed_and_threading_mode() {
+        let mut buf = CompactBuffers::new();
+        buf.push_connected(2_000_000, Some("alice"), 12.5, "single")
+            .unwrap();
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.kind[0], EventKind::Connected as u8);
+        // peer is interned -> idx 0.
+        assert_eq!(buf.peer_idx[0], 0);
+        assert_eq!(buf.peers.dict(), &["alice".to_string()]);
+        assert_eq!(buf.extra_f32[0], Some(12.5));
+        assert_eq!(buf.extra_utf8[0].as_deref(), Some("single"));
+        assert!(buf.extra_f32_b[0].is_none());
+        assert!(buf.extra_i64[0].is_none());
+    }
+
+    #[test]
+    fn push_connected_with_none_peer_uses_self_sentinel() {
+        // Variants with no peer concept (e.g. VariantDummy in
+        // single-runner self-loopback) call push_connected with
+        // peer=None -- the row stores PEER_SELF without interning a
+        // bogus entry.
+        let mut buf = CompactBuffers::new();
+        buf.push_connected(0, None, 1.0, "single").unwrap();
+        assert_eq!(buf.peer_idx[0], PEER_SELF);
+        assert!(buf.peers.is_empty());
+    }
+
+    #[test]
+    fn push_eot_sent_populates_extra_i64_only() {
+        let mut buf = CompactBuffers::new();
+        buf.push_eot_sent(3_000_000, 42).unwrap();
+        assert_eq!(buf.kind[0], EventKind::EotSent as u8);
+        assert_eq!(buf.extra_i64[0], Some(42));
+        assert_eq!(buf.peer_idx[0], PEER_SELF);
+        assert!(buf.extra_f32[0].is_none());
+        assert!(buf.extra_utf8[0].is_none());
+    }
+
+    #[test]
+    fn push_eot_received_populates_peer_and_extra_i64() {
+        let mut buf = CompactBuffers::new();
+        buf.push_eot_received(4_000_000, "bob", 7).unwrap();
+        assert_eq!(buf.kind[0], EventKind::EotReceived as u8);
+        assert_eq!(buf.peer_idx[0], 0);
+        assert_eq!(buf.peers.dict(), &["bob".to_string()]);
+        assert_eq!(buf.extra_i64[0], Some(7));
+    }
+
+    #[test]
+    fn push_eot_timeout_populates_wait_ms_and_missing_json() {
+        let mut buf = CompactBuffers::new();
+        let missing_json = r#"["alice","bob"]"#;
+        buf.push_eot_timeout(5_000_000, 5000, missing_json).unwrap();
+        assert_eq!(buf.kind[0], EventKind::EotTimeout as u8);
+        assert_eq!(buf.extra_i64[0], Some(5000));
+        assert_eq!(buf.extra_utf8[0].as_deref(), Some(missing_json));
+        assert_eq!(buf.peer_idx[0], PEER_SELF);
+    }
+
+    #[test]
+    fn push_resource_populates_both_extra_f32_slots() {
+        let mut buf = CompactBuffers::new();
+        buf.push_resource(6_000_000, 45.5, 128.0).unwrap();
+        assert_eq!(buf.kind[0], EventKind::Resource as u8);
+        assert_eq!(buf.extra_f32[0], Some(45.5));
+        assert_eq!(buf.extra_f32_b[0], Some(128.0));
+        assert!(buf.extra_i64[0].is_none());
+        assert!(buf.extra_utf8[0].is_none());
+        assert_eq!(buf.peer_idx[0], PEER_SELF);
+    }
+
+    #[test]
+    fn push_clock_sync_populates_peer_offset_and_rtt() {
+        // Reserved for E8; the column mapping is exercised here so
+        // the slot layout cannot drift before E8 lands.
+        let mut buf = CompactBuffers::new();
+        buf.push_clock_sync(7_000_000, "bob", -12_345, 0.75)
+            .unwrap();
+        assert_eq!(buf.kind[0], EventKind::ClockSync as u8);
+        assert_eq!(buf.peer_idx[0], 0);
+        assert_eq!(buf.extra_i64[0], Some(-12_345));
+        assert_eq!(buf.extra_f32[0], Some(0.75));
+        assert!(buf.extra_f32_b[0].is_none());
+        assert!(buf.extra_utf8[0].is_none());
+    }
+
+    #[test]
+    fn push_gap_events_also_populate_extra_i64_per_t18_2b() {
+        // T18.2b: the contract carries `missing_seq` / `recovered_seq`
+        // in the polymorphic `extra_i64` slot, in addition to the
+        // legacy `seq` column population. Analyzers reading either
+        // path must see the same value.
+        let mut buf = CompactBuffers::new();
+        buf.push_gap_detected(1, "bob", 999).unwrap();
+        buf.push_gap_filled(2, "bob", 999).unwrap();
+        assert_eq!(buf.extra_i64[0], Some(999));
+        assert_eq!(buf.extra_i64[1], Some(999));
+        // The legacy `seq` column population is preserved.
+        assert_eq!(buf.seq, vec![999, 999]);
+    }
+
+    #[test]
+    fn write_and_receive_pushes_leave_extras_none() {
+        // Hot-path per-event kinds (write, receive) must NOT
+        // populate any of the polymorphic columns -- analyzers can
+        // discriminate kinds by the `kind` column alone, and the
+        // null discriminants compress to near-zero in Parquet.
+        let mut buf = CompactBuffers::new();
+        buf.push_write(1, "/a", 1, 1, 8).unwrap();
+        buf.push_receive(2, "alice", 1, "/a", 1, 8).unwrap();
+        buf.push_backpressure_skipped(3, "/a", 1).unwrap();
+        for i in 0..buf.len() {
+            assert!(buf.extra_f32[i].is_none(), "row {i} extra_f32 must be None");
+            assert!(
+                buf.extra_f32_b[i].is_none(),
+                "row {i} extra_f32_b must be None"
+            );
+            assert!(buf.extra_i64[i].is_none(), "row {i} extra_i64 must be None");
+            assert!(
+                buf.extra_utf8[i].is_none(),
+                "row {i} extra_utf8 must be None"
+            );
+        }
     }
 }
