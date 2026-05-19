@@ -153,6 +153,72 @@ _WORKLOAD_VPS_HZ_RE = re.compile(r"^(\d+)x(\d+)hz$")
 # the load-intensity ranking. Larger than any plausible vps*hz product.
 _MAX_WORKLOAD_RANK: int = 10**12
 
+# E19 / T19.6: workload-profile distinguished by matplotlib ``hatch``
+# attribute on the bars in the restructured comparison-qos chart and on
+# the new throughput-vs-workload-shape chart. The three profiles map
+# onto the ``PerformanceResult.shape`` value (canonical contract per
+# ``metak-shared/api-contracts/jsonl-log-schema.md`` E19 additions):
+#
+#   shape "scalar" -> scalar-flood profile -> solid fill (no hatch)
+#   shape "array"  -> block-flood profile  -> horizontal-line hatch
+#   shape "struct" -> mixed-types profile  -> checkered hatch
+#
+# Hatch density was picked empirically against the comparison-qos chart
+# size at 150 dpi (target ~30 px per bar half): ``"---"`` is dense
+# enough to remain visible on small bars without bleeding into the
+# adjacent bar; ``"x"`` (single crosshatch) reads as a checker pattern
+# at the same scale and contrasts cleanly with the horizontal lines.
+# ``"+"`` was rejected because at small bar widths it visually fuses
+# into ``"---"`` and the distinction is lost. Legacy / unknown shapes
+# fall back to solid (no hatch) so unparseable data still renders.
+_WORKLOAD_HATCHES: dict[str, str] = {
+    "scalar": "",
+    "array": "---",
+    "struct": "x",
+}
+
+# Display label per shape value -- used in chart legends so the reader
+# sees the workload-profile name (the user-facing vocabulary from
+# BENCHMARK.md § 6) rather than the analyzer-internal shape token.
+_WORKLOAD_LABELS: dict[str, str] = {
+    "scalar": "scalar-flood",
+    "array": "block-flood",
+    "struct": "mixed-types",
+}
+
+# Stable ordering of shapes on the throughput-vs-workload-shape chart's
+# x-axis. Matches the spec's sort: scalar-flood -> block-flood ->
+# mixed-types. Shapes not in this list render after these in
+# alphabetical order so a future shape addition still plots cleanly.
+_WORKLOAD_SHAPE_ORDER: tuple[str, ...] = ("scalar", "array", "struct")
+
+
+def _shape_hatch(shape: str | None) -> str:
+    """Return the matplotlib hatch pattern for a ``PerformanceResult.shape`` value.
+
+    Unknown / null shapes fall back to the ``scalar`` (solid) hatch so
+    legacy / pre-E19 data renders consistently with the scalar-flood
+    convention.
+    """
+    if shape is None:
+        return _WORKLOAD_HATCHES["scalar"]
+    return _WORKLOAD_HATCHES.get(shape, _WORKLOAD_HATCHES["scalar"])
+
+
+def _shape_label(shape: str | None) -> str:
+    """Return the user-facing workload-profile label for a shape value."""
+    if shape is None:
+        return _WORKLOAD_LABELS["scalar"]
+    return _WORKLOAD_LABELS.get(shape, shape)
+
+
+def _shape_sort_key(shape: str) -> tuple[int, str]:
+    """Sort key putting scalar/array/struct in canonical order, others last."""
+    if shape in _WORKLOAD_SHAPE_ORDER:
+        return (_WORKLOAD_SHAPE_ORDER.index(shape), shape)
+    return (len(_WORKLOAD_SHAPE_ORDER), shape)
+
+
 # Small positive epsilon used to clamp lower whisker bounds so the
 # log-scale latency axis does not emit "non-positive value" warnings.
 # Set well below any plausible measurement (10 ns) so it only protects
@@ -443,11 +509,42 @@ def _index_parsed_results(
     rule. The four-component key keeps a single-threaded and a multi-
     threaded spawn of the same (transport, workload, qos) as distinct
     rows so the paired-bar layout can find both.
+
+    Note: callers that need to distinguish ``shape`` (E19 / T19.6 -- the
+    restructured comparison-qos chart and the new throughput-vs-
+    workload-shape chart) should use :func:`_index_parsed_results_with_shape`
+    instead. That index keys on a 5-tuple including the workload-shape
+    so a (transport, workload, qos, mode) slot can hold one bar per
+    observed shape. The 4-tuple version here is retained for the
+    drop-rate heatmap and the latency-CDF charts which intentionally
+    collapse the shape dimension.
     """
     parsed: dict[tuple[str, str, int | None, str | None], PerformanceResult] = {}
     for r in results:
         transport, workload, qos, threading_mode = _split_variant_name(r.variant)
         key = (transport, workload, qos, threading_mode)
+        parsed.setdefault(key, r)
+    return parsed
+
+
+def _index_parsed_results_with_shape(
+    results: list[PerformanceResult],
+) -> dict[tuple[str, str, int | None, str | None, str], PerformanceResult]:
+    """Index results by ``(transport, workload, qos, threading_mode, shape)``.
+
+    E19 / T19.6 index used by the restructured comparison-qos chart and
+    the new throughput-vs-workload-shape chart. Adds the workload shape
+    (``scalar``/``array``/``struct``, defaulting to ``"scalar"`` for
+    legacy data per the api-contracts backward-compat rule) as a fifth
+    key component so a single (transport, workload, qos, mode) slot can
+    hold one bar per observed shape. First entry per key wins -- matches
+    the existing collapse convention.
+    """
+    parsed: dict[tuple[str, str, int | None, str | None, str], PerformanceResult] = {}
+    for r in results:
+        transport, workload, qos, threading_mode = _split_variant_name(r.variant)
+        shape = r.shape if r.shape else "scalar"
+        key = (transport, workload, qos, threading_mode, shape)
         parsed.setdefault(key, r)
     return parsed
 
@@ -460,23 +557,27 @@ def _qos_sort_key(q: int | None) -> tuple[int, int]:
 
 
 def _collect_layout_orders(
-    parsed_keys: list[tuple[str, str, int | None, str | None]],
+    parsed_keys: list[tuple],
 ) -> tuple[list[str], list[str], list[int | None]]:
     """Return ordered transports, workloads, and QoS levels.
 
-    Mirrors the pre-T16.13 ordering: ``TRANSPORT_FAMILIES`` order for
-    transports (with ``other`` appended if present), load-intensity
-    order for workloads, and ascending order for QoS (``None`` last).
+    Accepts any tuple key whose first three components are
+    ``(transport, workload, qos)`` -- both the 4-tuple key from
+    :func:`_index_parsed_results` and the 5-tuple key from
+    :func:`_index_parsed_results_with_shape` are supported. Mirrors the
+    pre-T16.13 ordering: ``TRANSPORT_FAMILIES`` order for transports
+    (with ``other`` appended if present), load-intensity order for
+    workloads, and ascending order for QoS (``None`` last).
     """
-    transports_seen = {t for t, _, _, _ in parsed_keys}
+    transports_seen = {k[0] for k in parsed_keys}
     transport_order: list[str] = [t for t in TRANSPORT_FAMILIES if t in transports_seen]
     if "other" in transports_seen:
         transport_order.append("other")
 
-    workload_set: set[str] = {w for _, w, _, _ in parsed_keys}
+    workload_set: set[str] = {k[1] for k in parsed_keys}
     workload_order: list[str] = sorted(workload_set, key=_workload_load_rank)
 
-    qos_values_seen: set[int | None] = {q for _, _, q, _ in parsed_keys}
+    qos_values_seen: set[int | None] = {k[2] for k in parsed_keys}
     qos_order: list[int | None] = sorted(qos_values_seen, key=_qos_sort_key)
 
     return transport_order, workload_order, qos_order
@@ -571,15 +672,86 @@ def _bar_width_for_slot(n_bars_in_slot: int) -> float:
     return 0.55 / n_bars_in_slot
 
 
+def _slot_subbars_with_shape(
+    transport: str,
+    workload: str,
+    qos: int | None,
+    parsed: dict[tuple[str, str, int | None, str | None, str], PerformanceResult],
+) -> list[tuple[str, str | None]]:
+    """Return the ordered ``(shape, threading_mode)`` sub-bars for a slot.
+
+    E19 / T19.6 expansion of :func:`_slot_threading_modes`. Each
+    sub-bar represents one observed ``(shape, threading_mode)``
+    combination for the given (transport, workload, qos) slot. The
+    ordering is: shapes in canonical order (``scalar`` -> ``array`` ->
+    ``struct``; unknown shapes last) and, within each shape, threading
+    modes in ``single`` -> ``multi`` -> legacy order. Multi-only
+    transports (per E14) still emit only multi bars; the threading
+    suppression rule from :func:`_slot_threading_modes` is preserved.
+
+    Slots with no observations return an empty list.
+    """
+    observed_pairs: set[tuple[str, str | None]] = {
+        (shape, mode)
+        for (t, w, q, mode, shape) in parsed.keys()
+        if t == transport and w == workload and q == qos
+    }
+    if not observed_pairs:
+        return []
+
+    shapes_seen = sorted({s for (s, _m) in observed_pairs}, key=_shape_sort_key)
+
+    is_multi_only = transport in _MULTI_ONLY_TRANSPORTS
+    ordered: list[tuple[str, str | None]] = []
+    for shape in shapes_seen:
+        modes_for_shape = {m for (s, m) in observed_pairs if s == shape}
+        if is_multi_only and "multi" in modes_for_shape:
+            ordered.append((shape, "multi"))
+            continue
+        for mode in ("single", "multi"):
+            if mode in modes_for_shape:
+                ordered.append((shape, mode))
+        if None in modes_for_shape:
+            ordered.append((shape, None))
+    return ordered
+
+
+def _slot_subbar_layout(
+    n_subbars: int,
+) -> tuple[list[float], float]:
+    """Compute x-offsets and bar width for ``n_subbars`` inside a slot.
+
+    The slot occupies ``[-0.5, +0.5]`` around its centre. Bars are
+    spread evenly with a small inter-bar margin so an empty band
+    separates adjacent slots. Bar width is constant within a slot so a
+    visual grouping of slot members is unambiguous.
+    """
+    if n_subbars <= 0:
+        return [], 0.0
+    if n_subbars == 1:
+        return [0.0], 0.78
+    if n_subbars == 2:
+        return [-0.22, 0.22], 0.40
+    # General N-bar spreading. Leave ~30% of slot width as margins so
+    # bars in adjacent slots stay visibly separate; bars are evenly
+    # spaced across the remaining 70%.
+    step = 0.70 / n_subbars
+    start = -0.35 + 0.5 * step
+    return [start + i * step for i in range(n_subbars)], step * 0.85
+
+
 def _collect_target_rates(
-    parsed_keys: list[tuple[str, str, int | None, str | None]],
+    parsed_keys: list[tuple],
 ) -> list[int]:
     """Compute the sorted unique ``vpt * hz`` target rates across workloads.
 
-    ``max`` and unparseable workloads contribute nothing.
+    Accepts any tuple key whose second component is the workload string
+    (i.e. both the 4-tuple and 5-tuple key formats). ``max`` and
+    unparseable workloads contribute nothing.
     """
     target_rates: set[int] = set()
-    for _, workload, _, _ in parsed_keys:
+    for key in parsed_keys:
+        workload = key[1]
         if workload == "max":
             continue
         m = _WORKLOAD_VPS_HZ_RE.match(workload)
@@ -603,31 +775,46 @@ def _bar_tier_marker(workload: str) -> str | None:
 def _generate_comparison_plot_for_qos(
     *,
     qos: int | None,
-    parsed: dict[tuple[str, str, int | None, str | None], PerformanceResult],
+    parsed: dict[tuple[str, str, int | None, str | None, str], PerformanceResult],
     transport_order: list[str],
     workload_order: list[str],
     target_rate_order: list[int],
     output_dir: Path,
     log_throughput: bool,
 ) -> Path:
-    """Render the comparison chart for a single QoS level.
+    """Render the comparison chart for a single QoS level (T19.6 layout).
 
     Slots are (transport, workload) pairs in family-block x
-    load-intensity order. Each slot holds 1-2 bars: single (lighter
-    tone) and/or multi (darker tone). The throughput column reads
-    ``PerformanceResult.receives_per_sec`` -- per T16.14 the project
-    headline metric is *receive* throughput, not write throughput.
-    The target-rate horizontal lines and tier markers still encode
-    the intended *write* rate; the gap between a bar (receives) and
-    its target line (writes) is the visible delivery shortfall.
-    Returns the path of the PNG written.
+    load-intensity order. Each slot holds one bar per observed
+    ``(shape, threading_mode)`` pair (E19 / T19.6 axis expansion); the
+    workload-profile shape (``scalar``/``array``/``struct``) is
+    distinguished by matplotlib ``hatch`` and the threading_mode is
+    distinguished by the family colormap tone (preserving the
+    pre-T19.6 ``single``/``multi`` palette). Variants that don't
+    support multi threading_mode simply emit fewer bars in their group
+    -- no placeholder bars per the locked spec.
+
+    Layout: the two subplots are stacked **vertically** (``nrows=2,
+    ncols=1``) -- receive throughput on top, latency on bottom -- so
+    every slot's x-position aligns across the two metric views and a
+    reader can scan a single column to see both the throughput bar
+    and its corresponding latency-p95 bar without cross-eyeing two
+    side-by-side panels. The pre-T19.6 1x2 horizontal layout is
+    retired (and now unreadable past ~3 workload profiles per slot).
+
+    The throughput column reads ``PerformanceResult.receives_per_sec``
+    -- per T16.14 the project headline metric is *receive* throughput,
+    not write throughput. The target-rate horizontal lines and tier
+    markers still encode the intended *write* rate; the gap between a
+    bar (receives) and its target line (writes) is the visible
+    delivery shortfall. Returns the path of the PNG written.
 
     Figure-width formula: ``max(14.0, 0.55 * n_slots + 4.0)``. The
     coefficient is tuned for the post-E14 6-family x 8-workload (~48
     slots) matrix so each slot gets roughly 30 px of x-axis space at
     150 dpi -- wide enough to read the tick label without zooming.
-    Slots with two bars therefore get ~15 px per bar, still visibly
-    distinct.
+    Slots with 4-6 sub-bars therefore get ~5-7 px per bar; the hatch
+    + colour combination remains legible at that size.
     """
     out_filename = _qos_filename("comparison", qos, log_throughput=log_throughput)
     qos_label = f"qos{qos}" if qos is not None else "n/a"
@@ -636,13 +823,13 @@ def _generate_comparison_plot_for_qos(
     # have no observation for this QoS at all (saves x-axis width on
     # sparse QoS levels).
     slots: list[tuple[str, str]] = []
-    slot_layouts: list[tuple[list[str | None], list[float]]] = []
+    slot_subbars: list[list[tuple[str, str | None]]] = []
     for t in transport_order:
         for w in workload_order:
-            modes, offsets = _slot_layout(t, w, qos, parsed)
-            if modes:
+            subbars = _slot_subbars_with_shape(t, w, qos, parsed)
+            if subbars:
                 slots.append((t, w))
-                slot_layouts.append((modes, offsets))
+                slot_subbars.append(subbars)
 
     if not slots:
         return _empty_plot(output_dir, filename=out_filename)
@@ -651,60 +838,72 @@ def _generate_comparison_plot_for_qos(
     x_centres = np.arange(n_slots, dtype=float)
 
     # Figure size: width grows with slot count (see docstring); height
-    # is a single row plus a legend band.
+    # accommodates two stacked metric panels plus a legend band. The
+    # 2-row vertical layout (T19.6) is the load-bearing structural
+    # change from the pre-T19.6 1x2 layout.
     fig_width = max(14.0, 0.55 * n_slots + 4.0)
-    row_height = 4.0
-    legend_band_height = 1.4
-    fig_height = row_height + legend_band_height
-    fig, axes = plt.subplots(1, 2, figsize=(fig_width, fig_height), squeeze=False)
+    panel_height = 4.0
+    legend_band_height = 1.6
+    fig_height = 2 * panel_height + legend_band_height
+    fig, axes = plt.subplots(
+        nrows=2, ncols=1, figsize=(fig_width, fig_height), squeeze=False
+    )
     ax_tp = axes[0][0]
-    ax_lat = axes[0][1]
+    ax_lat = axes[1][0]
 
-    # Per-bar data. Build flat lists of (x_pos, color, value, marker)
-    # so we can pass everything to ax.bar in one shot per axis.
-    tp_x: list[float] = []
-    tp_y: list[float] = []
-    tp_colors: list[tuple[float, float, float, float]] = []
+    # Per-bar data. Build flat lists of (x_pos, color, hatch, value)
+    # so we can attribute hatch + colour per bar without batching by
+    # group -- matplotlib's ``ax.bar`` accepts a single hatch per call,
+    # so we render slot-by-slot (one ``bar()`` per (shape, mode) group)
+    # and the resulting Patch objects retain their hatch attribute for
+    # the visual-regression test.
+    shapes_present: set[str] = set()
+    modes_present: set[str | None] = set()
+
+    # Track bar tier markers (target write-rate annotations).
     tp_markers: list[tuple[float, float, str]] = []
-    lat_x: list[float] = []
-    lat_y: list[float] = []
-    lat_colors: list[tuple[float, float, float, float]] = []
-    lat_yerr_lower: list[float] = []
-    lat_yerr_upper: list[float] = []
-    bar_widths_tp: list[float] = []
-    bar_widths_lat: list[float] = []
 
-    for (transport, workload), (modes, offsets) in zip(slots, slot_layouts):
-        bar_w = _bar_width_for_slot(len(modes))
-        slot_idx = slots.index((transport, workload))
+    for slot_idx, ((transport, workload), subbars) in enumerate(
+        zip(slots, slot_subbars)
+    ):
+        offsets, bar_w = _slot_subbar_layout(len(subbars))
         slot_centre = x_centres[slot_idx]
         marker = _bar_tier_marker(workload)
-        for mode, off in zip(modes, offsets):
+        for (shape, mode), off in zip(subbars, offsets):
             bar_x = slot_centre + off
             color = _threading_color(transport, mode)
-            r = parsed.get((transport, workload, qos, mode))
-            # Throughput -- T16.14 reads receives_per_sec, not
-            # writes_per_sec. Receive throughput is the headline metric
-            # per metak-shared/overview.md: writers ship at the
-            # requested rate almost always (kernel send buffer absorbs
-            # back-pressure), but the receiver-side drain rate is what
-            # decides whether peers are in sync. With the bars now
-            # showing receive rate, the gap between a bar and the
-            # target-rate line below becomes the visible
-            # delivery-shortfall indicator.
+            hatch = _shape_hatch(shape)
+            shapes_present.add(shape)
+            modes_present.add(mode)
+            r = parsed.get((transport, workload, qos, mode, shape))
+
+            # Throughput (receives_per_sec -- T16.14 headline).
             if r is None:
                 tp_val = float("nan")
             else:
                 tp_val = float(r.receives_per_sec)
             if log_throughput and (np.isnan(tp_val) or tp_val <= 0.0):
                 tp_val = float("nan")
-            tp_x.append(bar_x)
-            tp_y.append(tp_val)
-            tp_colors.append(color)
-            bar_widths_tp.append(bar_w)
+
+            # Each bar is rendered as its own ax.bar() call so the
+            # resulting Patch carries the per-(shape) hatch attribute
+            # uniformly -- batching by ax.bar([x1, x2], [y1, y2], ...)
+            # forces a single hatch across the batch. The overhead is
+            # negligible at the ~50-200 sub-bar scale of this chart.
+            ax_tp.bar(
+                [bar_x],
+                [tp_val],
+                bar_w,
+                color=[color],
+                edgecolor="black",
+                linewidth=0.3,
+                hatch=hatch,
+            )
+
             if marker is not None:
                 tp_markers.append((bar_x, tp_val, marker))
-            # Latency
+
+            # Latency p95 + p50/p99 whiskers.
             if r is None:
                 p50 = p95 = p99 = float("nan")
             else:
@@ -720,35 +919,21 @@ def _generate_comparison_plot_for_qos(
                 lat_val = safe_p95
                 lower = max(safe_p95 - safe_p50, 0.0)
                 upper = max(p99 - safe_p95, 0.0)
-            lat_x.append(bar_x)
-            lat_y.append(lat_val)
-            lat_colors.append(color)
-            lat_yerr_lower.append(lower)
-            lat_yerr_upper.append(upper)
-            bar_widths_lat.append(bar_w)
+            ax_lat.bar(
+                [bar_x],
+                [lat_val],
+                bar_w,
+                color=[color],
+                edgecolor="black",
+                linewidth=0.3,
+                yerr=[[lower], [upper]],
+                capsize=2,
+                ecolor="black",
+                error_kw={"linewidth": 0.6},
+                hatch=hatch,
+            )
 
-    ax_tp.bar(
-        tp_x,
-        tp_y,
-        bar_widths_tp,
-        color=tp_colors,
-        edgecolor="black",
-        linewidth=0.3,
-    )
-    ax_lat.bar(
-        lat_x,
-        lat_y,
-        bar_widths_lat,
-        color=lat_colors,
-        edgecolor="black",
-        linewidth=0.3,
-        yerr=[lat_yerr_lower, lat_yerr_upper],
-        capsize=2,
-        ecolor="black",
-        error_kw={"linewidth": 0.6},
-    )
-
-    # x-axis: slot centres carry the tick labels.
+    # x-axis: slot centres carry the tick labels (both panels).
     slot_tick_labels = [w if w else t for t, w in slots]
     for ax in (ax_tp, ax_lat):
         ax.set_xticks(x_centres)
@@ -827,26 +1012,42 @@ def _generate_comparison_plot_for_qos(
     ax_lat.yaxis.grid(True, which="both", linestyle="--", alpha=0.5)
     ax_lat.set_axisbelow(True)
 
-    # Legend: one entry per (transport, threading_mode) actually used
-    # on this QoS. Reads in family order, single before multi.
-    legend_handles: list[matplotlib.patches.Patch] = []
+    # Legend: two parallel legend strips so each dimension reads
+    # independently. The first (workload profile, by hatch) sits above
+    # the second (transport / threading, by colour). Two separate
+    # ``fig.legend`` calls are used instead of a single combined legend
+    # because matplotlib's per-legend ``title=`` argument is the
+    # cleanest way to call out the dimension each strip encodes.
+    workload_handles: list[matplotlib.patches.Patch] = []
+    for shape in sorted(shapes_present, key=_shape_sort_key):
+        workload_handles.append(
+            matplotlib.patches.Patch(
+                facecolor="white",
+                edgecolor="black",
+                linewidth=0.5,
+                hatch=_shape_hatch(shape),
+                label=_shape_label(shape),
+            )
+        )
+
+    threading_handles: list[matplotlib.patches.Patch] = []
     seen_legend_keys: set[tuple[str, str | None]] = set()
     for transport in transport_order:
         for mode in ("single", "multi", None):
+            if mode not in modes_present:
+                continue
             key = (transport, mode)
             if key in seen_legend_keys:
                 continue
-            # Only add if any slot of this transport actually rendered
-            # this mode for this QoS.
             present = any(
-                t == transport and mode in modes
-                for (t, _w), (modes, _off) in zip(slots, slot_layouts)
+                t == transport and any(m == mode for (_s, m) in subbars)
+                for (t, _w), subbars in zip(slots, slot_subbars)
             )
             if not present:
                 continue
             color = _threading_color(transport, mode)
             label_mode = mode if mode is not None else "legacy"
-            legend_handles.append(
+            threading_handles.append(
                 matplotlib.patches.Patch(
                     facecolor=color,
                     edgecolor="black",
@@ -856,21 +1057,44 @@ def _generate_comparison_plot_for_qos(
             )
             seen_legend_keys.add(key)
 
-    legend_ncol = max(3, min(6, (len(legend_handles) + 2) // 3))
-    legend_rows = (len(legend_handles) + legend_ncol - 1) // legend_ncol
-    row_height_in = 0.22
-    legend_band_in = max(0.6, 0.4 + row_height_in * legend_rows)
-    bottom_reserve = min(0.4, legend_band_in / fig_height)
-    fig.legend(
-        handles=legend_handles,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.005),
-        ncol=legend_ncol,
-        frameon=True,
-        fontsize=8,
-        title="Transport / threading",
-        title_fontsize=9,
+    # Reserve the bottom legend band proportional to the number of
+    # threading rows (the larger of the two legends).
+    threading_ncol = max(3, min(6, (len(threading_handles) + 2) // 3))
+    threading_rows = (
+        (len(threading_handles) + threading_ncol - 1) // threading_ncol
+        if threading_handles
+        else 0
     )
+    workload_rows = 1 if workload_handles else 0
+    row_height_in = 0.22
+    legend_band_in = max(0.8, 0.4 + row_height_in * (threading_rows + workload_rows))
+    bottom_reserve = min(0.30, legend_band_in / fig_height)
+
+    if workload_handles:
+        # Workload (hatch) legend sits just above the threading legend.
+        wl_y = 0.005 + (0.005 + row_height_in * threading_rows / fig_height)
+        fig.legend(
+            handles=workload_handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, wl_y),
+            ncol=min(3, len(workload_handles)),
+            frameon=True,
+            fontsize=8,
+            title="Workload profile (fill pattern)",
+            title_fontsize=9,
+        )
+
+    if threading_handles:
+        fig.legend(
+            handles=threading_handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.005),
+            ncol=threading_ncol,
+            frameon=True,
+            fontsize=8,
+            title="Transport / threading (colour)",
+            title_fontsize=9,
+        )
 
     top_reserve = max(0.6, fig_height - 0.4) / fig_height
     fig.subplots_adjust(
@@ -878,7 +1102,7 @@ def _generate_comparison_plot_for_qos(
         top=top_reserve,
         left=0.07,
         right=0.98,
-        wspace=0.18,
+        hspace=0.45,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -928,7 +1152,10 @@ def generate_comparison_plot(
         out_filename = _qos_filename("comparison", None, log_throughput=log_throughput)
         return [_empty_plot(output_dir, filename=out_filename)]
 
-    parsed = _index_parsed_results(results)
+    # T19.6: index by 5-tuple including the workload shape so a single
+    # (transport, workload, qos, mode) slot can hold one bar per
+    # observed shape.
+    parsed = _index_parsed_results_with_shape(results)
     if not parsed:
         out_filename = _qos_filename("comparison", None, log_throughput=log_throughput)
         return [_empty_plot(output_dir, filename=out_filename)]
@@ -1405,3 +1632,274 @@ def generate_latency_cdf_plot(
         )
         paths.append(out_path)
     return paths
+
+
+# --- E19 / T19.6: throughput-vs-workload-shape chart --------------------------
+
+# Filename emitted by :func:`generate_throughput_vs_workload_shape_plot`.
+# Single PNG: per-variant subplot grid stacks all variants in one image.
+_THROUGHPUT_VS_SHAPE_FILENAME: str = "throughput-vs-workload-shape.png"
+
+
+def _group_results_by_variant_axis(
+    results: list[PerformanceResult],
+) -> dict[tuple[str, str, str | None], dict[tuple[str, int | None], PerformanceResult]]:
+    """Bucket performance results into per-variant-axis cells.
+
+    The "variant axis" key is ``(transport, workload, threading_mode)``
+    -- everything that identifies a variant *except* QoS and the
+    workload-shape profile, both of which become axes within each
+    subplot of the throughput-vs-workload-shape chart. The inner dict
+    keys on ``(shape, qos)`` so a single subplot can carry up to
+    ``len(shapes) * len(qos)`` bars.
+
+    First entry per ``(shape, qos)`` within a variant wins, matching
+    the existing collapse convention in :func:`_index_parsed_results`.
+    """
+    buckets: dict[
+        tuple[str, str, str | None],
+        dict[tuple[str, int | None], PerformanceResult],
+    ] = {}
+    for r in results:
+        transport, workload, qos, threading_mode = _split_variant_name(r.variant)
+        key = (transport, workload, threading_mode)
+        shape = r.shape if r.shape else "scalar"
+        inner = buckets.setdefault(key, {})
+        inner.setdefault((shape, qos), r)
+    return buckets
+
+
+def _variant_axis_label(key: tuple[str, str, str | None]) -> str:
+    """Render a ``(transport, workload, threading_mode)`` tuple as a label."""
+    transport, workload, mode = key
+    parts = [transport]
+    if workload:
+        parts.append(workload)
+    if mode is not None:
+        parts.append(mode)
+    return "-".join(parts)
+
+
+def _generate_throughput_vs_workload_shape_for_axis(
+    *,
+    ax,
+    variant_key: tuple[str, str, str | None],
+    cells: dict[tuple[str, int | None], PerformanceResult],
+    qos_order: list[int | None],
+    shape_order: list[str],
+) -> None:
+    """Render one subplot of the throughput-vs-workload-shape chart.
+
+    The subplot has one bar group per workload shape on the x-axis and
+    one bar per QoS within each group. Bar hatch encodes the shape
+    (consistent with the comparison-qos restructure for cross-chart
+    legibility) and the bar's edge / colour-tone band can be re-used
+    later if a QoS-by-colour scheme is added. For T19.6 the y-axis is
+    locked to ``leaves_per_sec`` (the canonical cross-workload
+    comparable metric per the api-contracts E19 additions).
+    """
+    transport, _workload, threading_mode = variant_key
+    base_color = _threading_color(transport, threading_mode)
+
+    n_shapes = len(shape_order)
+    n_qos = len(qos_order)
+    shape_centres = np.arange(n_shapes, dtype=float)
+
+    # Sub-bar layout per shape group: spread the per-QoS bars evenly
+    # across [-0.4, +0.4] around the shape's centre. Bar width matches
+    # the inter-bar step minus a small margin so adjacent groups stay
+    # visibly separated.
+    if n_qos == 1:
+        per_qos_offsets = [0.0]
+        bar_w = 0.6
+    else:
+        step = 0.8 / n_qos
+        start = -0.4 + 0.5 * step
+        per_qos_offsets = [start + i * step for i in range(n_qos)]
+        bar_w = step * 0.85
+
+    for shape_idx, shape in enumerate(shape_order):
+        hatch = _shape_hatch(shape)
+        for qos_idx, qos in enumerate(qos_order):
+            r = cells.get((shape, qos))
+            if r is None:
+                value = float("nan")
+            else:
+                value = float(r.leaves_per_sec)
+            ax.bar(
+                [shape_centres[shape_idx] + per_qos_offsets[qos_idx]],
+                [value],
+                bar_w,
+                color=[base_color],
+                edgecolor="black",
+                linewidth=0.3,
+                hatch=hatch,
+            )
+
+    ax.set_xticks(shape_centres)
+    ax.set_xticklabels([_shape_label(s) for s in shape_order], rotation=0, fontsize=8)
+    ax.set_ylabel("leaves/s")
+    ax.set_title(_variant_axis_label(variant_key), fontsize=9)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
+
+
+def generate_throughput_vs_workload_shape_plot(
+    results: list[PerformanceResult],
+    output_dir: Path,
+) -> Path:
+    """Render the per-variant throughput-vs-workload-shape chart (T19.6).
+
+    Layout:
+
+    - Per-variant subplot grid (one subplot per unique
+      ``(transport, workload, threading_mode)`` tuple in the dataset).
+    - X-axis on each subplot: workload profile, sorted scalar-flood ->
+      block-flood -> mixed-types (per :data:`_WORKLOAD_SHAPE_ORDER`).
+    - Y-axis: ``PerformanceResult.leaves_per_sec`` -- the canonical
+      cross-workload comparable metric per the api-contracts E19
+      additions.
+    - One bar per QoS within each workload group. The per-shape hatch
+      mirrors the comparison-qos chart so a reader can correlate bars
+      across the two outputs.
+
+    Empty datasets render a single placeholder PNG.
+    """
+    if not results:
+        return _empty_plot(output_dir, filename=_THROUGHPUT_VS_SHAPE_FILENAME)
+
+    buckets = _group_results_by_variant_axis(results)
+    if not buckets:
+        return _empty_plot(output_dir, filename=_THROUGHPUT_VS_SHAPE_FILENAME)
+
+    # Determine global axis orderings from the union of every variant
+    # axis's observations so each subplot's x-axis covers the same
+    # ordered set of shapes (gaps show up as missing bars, not as a
+    # shorter x-axis).
+    shape_set: set[str] = set()
+    qos_set: set[int | None] = set()
+    for cells in buckets.values():
+        for shape, qos in cells.keys():
+            shape_set.add(shape)
+            qos_set.add(qos)
+    shape_order = sorted(shape_set, key=_shape_sort_key)
+    qos_order = sorted(qos_set, key=_qos_sort_key)
+
+    # Stable variant-axis ordering: family order, then workload load-
+    # intensity, then ``single`` before ``multi`` before legacy.
+    def variant_sort_key(
+        key: tuple[str, str, str | None],
+    ) -> tuple[int, tuple[int, int, str], int]:
+        transport, workload, mode = key
+        family_rank = (
+            TRANSPORT_FAMILIES.index(transport)
+            if transport in TRANSPORT_FAMILIES
+            else len(TRANSPORT_FAMILIES)
+        )
+        mode_rank = {"single": 0, "multi": 1, None: 2}.get(mode, 3)
+        return family_rank, _workload_load_rank(workload), mode_rank
+
+    variant_keys = sorted(buckets.keys(), key=variant_sort_key)
+    n_variants = len(variant_keys)
+
+    # Grid shape: prefer a square-ish layout with a width cap so the
+    # subplots stay legible on dense datasets. 3-wide is the sweet spot
+    # for the ~6-9 variant axes in the canonical T19.6 fixture; the
+    # cap auto-extends to 4 cols on larger datasets.
+    ncols = min(4, max(1, n_variants if n_variants <= 3 else 3))
+    nrows = (n_variants + ncols - 1) // ncols
+
+    subplot_w = 4.5
+    subplot_h = 3.2
+    legend_band_height = 1.2
+    fig_width = max(8.0, subplot_w * ncols)
+    fig_height = subplot_h * nrows + legend_band_height
+    fig, axes = plt.subplots(
+        nrows=nrows, ncols=ncols, figsize=(fig_width, fig_height), squeeze=False
+    )
+
+    for idx, variant_key in enumerate(variant_keys):
+        r_idx = idx // ncols
+        c_idx = idx % ncols
+        ax = axes[r_idx][c_idx]
+        _generate_throughput_vs_workload_shape_for_axis(
+            ax=ax,
+            variant_key=variant_key,
+            cells=buckets[variant_key],
+            qos_order=qos_order,
+            shape_order=shape_order,
+        )
+
+    # Hide unused subplot slots so the figure doesn't render empty
+    # axes on the right of the last row.
+    for idx in range(n_variants, nrows * ncols):
+        r_idx = idx // ncols
+        c_idx = idx % ncols
+        axes[r_idx][c_idx].set_axis_off()
+
+    fig.suptitle("Throughput vs workload shape (per variant, leaves/s)", fontsize=11)
+
+    # Two-strip legend: workload (hatch) above QoS (text legend).
+    workload_handles: list[matplotlib.patches.Patch] = []
+    for shape in shape_order:
+        workload_handles.append(
+            matplotlib.patches.Patch(
+                facecolor="white",
+                edgecolor="black",
+                linewidth=0.5,
+                hatch=_shape_hatch(shape),
+                label=_shape_label(shape),
+            )
+        )
+
+    qos_handles: list[matplotlib.patches.Patch] = []
+    for qos in qos_order:
+        label = f"qos{qos}" if qos is not None else "qosNA"
+        qos_handles.append(
+            matplotlib.patches.Patch(
+                facecolor="lightgrey",
+                edgecolor="black",
+                linewidth=0.3,
+                label=label,
+            )
+        )
+
+    bottom_reserve = min(0.20, legend_band_height / fig_height)
+    if workload_handles:
+        fig.legend(
+            handles=workload_handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.05),
+            ncol=min(3, len(workload_handles)),
+            frameon=True,
+            fontsize=8,
+            title="Workload profile (fill pattern)",
+            title_fontsize=9,
+        )
+    if qos_handles:
+        fig.legend(
+            handles=qos_handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.005),
+            ncol=min(4, len(qos_handles)),
+            frameon=True,
+            fontsize=8,
+            title="QoS (one bar per QoS within each workload group)",
+            title_fontsize=9,
+        )
+
+    top_reserve = max(0.6, fig_height - 0.4) / fig_height
+    fig.subplots_adjust(
+        bottom=bottom_reserve,
+        top=top_reserve * 0.96,
+        left=0.07,
+        right=0.98,
+        hspace=0.55,
+        wspace=0.3,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / _THROUGHPUT_VS_SHAPE_FILENAME
+    fig.savefig(str(out_path), dpi=150)
+    plt.close(fig)
+    return out_path

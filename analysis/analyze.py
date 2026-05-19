@@ -596,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
                     generate_comparison_plot,
                     generate_drop_rate_plot,
                     generate_latency_cdf_plot,
+                    generate_throughput_vs_workload_shape_plot,
                 )
             except ImportError:
                 print(
@@ -627,6 +628,17 @@ def main(argv: list[str] | None = None) -> int:
             cdf_paths = generate_latency_cdf_plot(performance_results, output_dir)
             for p in cdf_paths:
                 print(f"Plot saved to: {p}", file=sys.stderr)
+
+            # T19.6: per-variant throughput-vs-workload-shape chart.
+            # Single PNG (one subplot per variant axis); the chart only
+            # carries meaningful data when ``leaf_count`` / ``shape``
+            # are populated -- pre-E19 datasets all fall into the
+            # ``scalar`` shape group and render a single-bar-per-QoS
+            # subplot, which is still useful as a sanity check.
+            shape_plot_path = generate_throughput_vs_workload_shape_plot(
+                performance_results, output_dir
+            )
+            print(f"Plot saved to: {shape_plot_path}", file=sys.stderr)
 
         # Step 5: markdown summary. ``summary_performance.md`` is the
         # operator's one-file walkthrough of the dataset: performance
