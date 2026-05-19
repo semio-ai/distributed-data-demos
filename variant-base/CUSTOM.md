@@ -51,9 +51,12 @@ This crate implements the variant side of two API contracts:
   pass-through, and exit code semantics.
 
 - **JSONL log schema**: `metak-shared/api-contracts/jsonl-log-schema.md`
-  Defines the structured log format. Every line must include `ts`, `variant`,
-  `runner`, `run`, `event`. Event types: `connected`, `phase`, `write`,
-  `receive`, `gap_detected`, `gap_filled`, `resource`.
+  Defines the lifecycle-only structured log format. Every line must
+  include `ts`, `variant`, `runner`, `run`, `event`. Event types:
+  `connected`, `phase`, `eot_sent`, `eot_received`, `eot_timeout`,
+  `resource`. Per-event observations (`write`, `receive`,
+  `backpressure_skipped`, `gap_*`) live in the sibling compact-Parquet
+  file (see `metak-shared/api-contracts/compact-log-schema.md`) post-T19.10.
 
 ## Architecture
 
@@ -562,16 +565,18 @@ for operator visibility, then flushes and exits. The marker is
 how the runner distinguishes a clean run-with-compact-output from
 one that died before it could finalise.
 
-**Dual-emission gate** (`EventSink`): during operate + silent, every
-per-event observation is unconditionally pushed into the compact
-buffers. JSONL emission of the same row is opt-in via the new
-`--legacy-jsonl-events` flag (default **off**). Lifecycle events
+**Single-source EventSink** (T19.10): per-event observations
+(`write`, `receive`, `backpressure_skipped`, `gap_*`) are pushed
+exclusively into the compact buffers — there is no dual-emission gate
+and no `--legacy-jsonl-events` flag. The driver's lifecycle events
 (`phase`, `connected`, `eot_sent`, `eot_received`, `eot_timeout`,
-`resource`) are NEVER routed through `EventSink` -- they remain
-unconditional JSONL because they are low-volume and the runner
-consumes them out-of-band (E15 progress streaming, T11.5 analysis
-markers). The runner-side defaults are unchanged; only the variant
-side decides whether to also emit per-event JSONL.
+`resource`) flow directly to the JSONL stream because they are
+low-volume and the runner consumes them out-of-band (E15 progress
+streaming, T11.5 analysis markers); the same lifecycle rows are also
+mirrored into the compact buffers (T18.2b) so an analyzer that reads
+only the compact-Parquet file has full coverage. Per-event JSONL
+emission was removed in the E19 follow-up cleanup; old pre-T18.2
+JSONL datasets that carry per-event rows are no longer supported.
 
 **Memory ceilings** (`--digest-mem-soft-mb` / `--digest-mem-hard-mb`,
 defaults 1024 / 2048):
@@ -636,9 +641,10 @@ E19 introduces two new workload profiles alongside `scalar-flood` and
   1; array = N; struct = total leaves in the tree.
 - `shape: WriteShape` — enum `{ Scalar, Array, Struct }`.
 
-**Logger emission**: every `write` event (JSONL + compact Parquet)
-carries `leaf_count` and `shape`. Defaults `leaf_count = 1, shape =
-Scalar` for backward compat with `scalar-flood` and `max-throughput`.
+**Logger emission**: every `write` row (compact Parquet) carries
+`leaf_count` and `shape`. Defaults `leaf_count = 1, shape = Scalar`
+for backward compat with `scalar-flood` and `max-throughput`. There
+is no JSONL emission for the `write` event post-T19.10.
 
 **No trait-surface change**: the `Variant` trait's
 `publish(path, &[u8], qos, seq)` signature is unchanged. Payloads
