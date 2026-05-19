@@ -497,6 +497,28 @@ impl VariantConfig {
         Ok(())
     }
 
+    /// Reject `[variant.common]` keys that were removed in the E19 follow-up
+    /// cleanup. The runner used to forward these verbatim via the generic
+    /// `snake_case` -> `--kebab-case` loop, but the matching variant-base
+    /// CLI args are gone (T19.10a). Leaving a stale key in a TOML config
+    /// would either crash the variant with an "unknown argument" error at
+    /// spawn time or, worse, be silently ignored — both confusing. We
+    /// reject at parse time with a clear message pointing at the change.
+    ///
+    /// Currently rejected:
+    /// - `legacy_jsonl_events` — the E18 dual-emission opt-in; per-event
+    ///   observations are compact-Parquet only as of the E19 follow-up.
+    pub fn validate_no_removed_keys(&self) -> Result<()> {
+        if self.common.contains_key("legacy_jsonl_events") {
+            bail!(
+                "`legacy_jsonl_events` was removed in the E19 follow-up cleanup; \
+                 per-event observations are written to compact Parquet only. \
+                 Delete `legacy_jsonl_events` from [variant.common] in this config."
+            );
+        }
+        Ok(())
+    }
+
     /// Resolve the variant's declared supported threading modes.
     ///
     /// Returns `Ok(Some(modes))` when the entry declared `supported_modes`
@@ -655,6 +677,16 @@ impl BenchConfig {
             v.validate_workload_shape_keys().with_context(|| {
                 format!(
                     "config: variant '{}' has invalid workload-shape key",
+                    v.name
+                )
+            })?;
+            // E19 follow-up / T19.10b: reject removed keys at parse time so
+            // operators with stale configs see a clear message rather than
+            // a downstream "unknown argument" failure from the variant or
+            // a silent drop of expected behaviour.
+            v.validate_no_removed_keys().with_context(|| {
+                format!(
+                    "config: variant '{}' has a removed [variant.common] key",
                     v.name
                 )
             })?;
