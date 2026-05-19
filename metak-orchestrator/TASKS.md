@@ -7653,6 +7653,68 @@ verdict and the recommended follow-up `T18.3a` (close the websocket
 compact-buffer gap; option-set documented). The audit is closed; the
 follow-up is orchestrator-filed.
 
+### T18.3a — Close websocket compact-buffer gap [medium]
+
+**Repo**: `variant-base/` (logger surface), `variants/websocket/` (call sites).
+**Owner**: orchestrator → spawn worker.
+**Status**: filed 2026-05-19. **Spawn after T18.5+T18.6 settles** to
+keep concurrent-worker risk low.
+
+**Background**: T18.3 audit (commit `892048a`) found that
+`variants/websocket/src/websocket.rs` calls `Logger::log_receive`
+directly from its Multi-mode `reader_thread_main` (line ~827) and
+its Single-mode T17.5 `drain_current_peer_into_logger` helper (line
+~682). `Logger::log_receive` writes the legacy JSONL line but does
+NOT push into the driver's compact `EventBuffer`. After T18.2 +
+T18.2b shipped the compact-default writer, those receives would be
+missing from `*.compact.parquet`. The receive contract (delivery %,
+latency, integrity) breaks on compact-only data from websocket.
+
+The audit explicitly recommends option (ii) below to preserve the
+T14.10 one-mutex-acquisition optimisation that motivated the
+direct-`Logger::log_receive` pattern in the first place.
+
+**Fix choice** (worker confirms during implementation, may override
+with rationale):
+
+- **Option (ii) — `LoggerHandle::record_receive` (RECOMMENDED)**: add a
+  new method on the public `LoggerHandle` surface that performs both
+  the JSONL line write AND the compact-buffer push under a single
+  mutex acquisition. Internally it delegates to the existing `Logger`
+  + the shared `EventSink`. Websocket's reader thread and T17.5
+  drain helper switch from `Logger::log_receive` to
+  `LoggerHandle::record_receive`. The one-mutex-acquisition cost the
+  T14.10 design optimised for is preserved.
+- **Option (i) — extend `Logger::log_receive` to also push compact**:
+  simpler API but requires `Logger` to hold a reference to the
+  compact buffer, which couples it more tightly to the driver's
+  `EventSink` infrastructure. Likely the wrong layering.
+
+**Files**:
+- `variant-base/src/logger.rs` (or wherever `LoggerHandle` lives) —
+  add `record_receive`. Internal call path: log the legacy JSONL line
+  (if `--legacy-jsonl-events ON`), then push into the compact buffer.
+- `variants/websocket/src/websocket.rs` — replace the two
+  `Logger::log_receive` call sites with `LoggerHandle::record_receive`.
+- Possibly `variant-base/src/driver.rs` if the `LoggerHandle` needs
+  to learn about the `EventSink` (likely already wired by T18.2b).
+- Unit tests in both crates for the new path.
+
+**Tests are mandatory**:
+```
+cargo test --release -p variant-base -p variant-websocket
+cargo clippy --release --workspace --all-targets -- -D warnings
+cargo fmt --check
+```
+
+**Acceptance**:
+- A websocket spawn at `1000x100hz qos4 multi` (T17.5 reproducer)
+  produces a `.compact.parquet` whose receive count matches the
+  legacy JSONL receive count exactly.
+- Multi-mode delivery still 100% per T17.5 acceptance.
+- Single-mode delivery still 100% per T17.5 acceptance.
+- No regression in `cargo test -p variant-websocket`.
+
 ### T18.4 — analysis: load both compact and legacy formats [medium]
 
 **Repo**: `analysis/`.
