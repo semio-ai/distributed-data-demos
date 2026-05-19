@@ -1,0 +1,63 @@
+# T19.8 single-runner fallback config: same three [[variant]] entries
+# as two-runner-workload-shapes.toml, but with `runners = ["alice"]` so
+# Coordinator::new skips multicast join. Used only when the host's
+# multicast plumbing is broken (Windows os error 10065 in multi-runner
+# mode) and a clean E2E sanity-check on the workload + logger +
+# compact-Parquet + analyzer path is still needed.
+#
+# This config is NOT a substitute for the two-runner validation -- it
+# only confirms the single-process pipeline. The two-runner barrier
+# coordination is unexercised here.
+
+run = "wlshapes-single"
+runners = ["alice"]
+default_timeout_secs = 60
+
+
+[[variant_template]]
+name = "dummy-base"
+binary = "target/release/variant-dummy.exe"
+supported_modes = ["single", "multi"]
+
+  [variant_template.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 1
+  values_per_tick = 1000
+  qos = 1
+  threading_modes = ["single"]
+  log_dir = "./logs"
+
+  [variant_template.specific]
+
+
+[[variant]]
+template = "dummy-base"
+name = "dummy-scalar-flood"
+
+  [variant.common]
+  workload = "scalar-flood"
+
+
+[[variant]]
+template = "dummy-base"
+name = "dummy-block-flood"
+
+  [variant.common]
+  workload = "block-flood"
+  blob_size = 100
+
+
+[[variant]]
+template = "dummy-base"
+name = "dummy-mixed-types"
+
+  [variant.common]
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345

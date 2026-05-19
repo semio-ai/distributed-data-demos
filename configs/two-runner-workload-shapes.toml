@@ -1,0 +1,98 @@
+# T19.8 E2E validation: variant-dummy under the three E19 workload profiles
+# (scalar-flood, block-flood, mixed-types) back-to-back on two localhost
+# runners. Workload-shape sensitivity is the dimension under test, not
+# transport diversity, so variant-dummy is the only variant exercised --
+# its in-process self-loopback delivery eliminates network variability and
+# isolates the workload + logger + compact-Parquet pipeline.
+#
+# Invariant under test (E19 / locked spec):
+#   leaves_per_sec is roughly constant across the three workloads since
+#   values_per_tick (= leaves/tick) and tick_rate_hz are identical. Only
+#   ops_per_sec and bytes_per_sec are expected to differ.
+#
+# Expected throughput shape (1000 vpt x 100 Hz, QoS 1):
+#   scalar-flood:  ops_per_sec ~= leaves_per_sec ~= 100000
+#   block-flood:   ops_per_sec ~= 1000, leaves_per_sec ~= 100000,
+#                  bytes_per_sec ~= 100 leaves * 8 B * 1000 ops/s = 800000
+#   mixed-types:   ops_per_sec variable (depends on workload-seed RNG),
+#                  leaves_per_sec ~= 100000 (invariant)
+#
+# Run from the repo root with two terminals (PowerShell):
+#   .\target\release\runner.exe --name alice --config configs\two-runner-workload-shapes.toml
+#   .\target\release\runner.exe --name bob   --config configs\two-runner-workload-shapes.toml
+#
+# Then analyze:
+#   python analysis/analyze.py logs/wlshapes-01-<launch-ts>/ \
+#       --summary --diagrams --output logs/wlshapes-01-<launch-ts>/analysis
+
+run = "wlshapes-01"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+
+# Shared template -- variant-dummy in self-loopback. All three spawns
+# inherit the timing / qos / threading defaults; only the workload key
+# (and its profile-specific parameters) differ per [[variant]].
+
+[[variant_template]]
+name = "dummy-base"
+binary = "target/release/variant-dummy.exe"
+supported_modes = ["single", "multi"]
+
+  [variant_template.common]
+  tick_rate_hz = 100
+  stabilize_secs = 1
+  operate_secs = 5
+  silent_secs = 1
+  values_per_tick = 1000
+  qos = 1
+  threading_modes = ["single"]
+  log_dir = "./logs"
+
+  [variant_template.specific]
+
+
+# ----- scalar-flood --------------------------------------------------------
+# Default profile: one WriteOp per leaf. Each tick emits vpt=1000 ops, each
+# carrying 1 leaf (8 B f64). Expected: ops/s == leaves/s ~= 100000.
+
+[[variant]]
+template = "dummy-base"
+name = "dummy-scalar-flood"
+
+  [variant.common]
+  workload = "scalar-flood"
+
+
+# ----- block-flood ---------------------------------------------------------
+# vpt / blob_size = 1000 / 100 = 10 ops per tick, each carrying a 100-leaf
+# array (800 B). Expected: ops/s ~= 1000, leaves/s ~= 100000, bytes/s
+# ~= 800000.
+
+[[variant]]
+template = "dummy-base"
+name = "dummy-block-flood"
+
+  [variant.common]
+  workload = "block-flood"
+  blob_size = 100
+
+
+# ----- mixed-types ---------------------------------------------------------
+# Random mix of scalar / array / struct WriteOps whose leaves sum to vpt.
+# workload_seed pins the RNG so reruns produce identical workload sequences.
+# See EPICS.md E19 "Locked spec" for the allocation algorithm and
+# api-contracts/toml-config-schema.md for the validation rules.
+
+[[variant]]
+template = "dummy-base"
+name = "dummy-mixed-types"
+
+  [variant.common]
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
