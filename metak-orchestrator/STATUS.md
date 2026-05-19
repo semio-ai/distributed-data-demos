@@ -13603,3 +13603,229 @@ Files outside `analysis/` (`variant-base/` + `variants/websocket/`
 edits visible in working tree on entry to this task) were the
 concurrent T18.5+T18.6 worker's territory and were NOT touched by
 this worker.
+
+## T18.3a -- Close websocket compact-buffer gap
+
+**Date**: 2026-05-19.
+**Repo scope**: `variant-base/` (logger surface) +
+`variants/websocket/` (call sites). Spawned on `main` directly with
+the concurrent T18.4 worker (analysis/ scope) -- zero file overlap as
+designed.
+
+**Outcome**: GAP CLOSED. Per the T18.3 audit
+(`variants/T18.3-AUDIT.md`) the websocket variant's Multi-mode reader
+thread + Single-mode T17.5 drain helper both called
+`Logger::log_receive` directly. That wrote only the legacy JSONL
+line; the driver's compact `EventBuffer` (the source the digest
+phase serialises to Parquet) was bypassed, so reader-thread receives
+would be missing from `*.compact.parquet` under the T18.2 compact-
+default writer. Post-T18.3a every receive observed by either path
+lands in the shared compact buffer regardless of which thread saw
+it. **E18 implementation is now fully closed pending T18.7 user-
+owned re-run**.
+
+### Implementation summary
+
+**Option chosen**: option (ii) per the task spec -- add
+`LoggerHandle::record_receive` rather than coupling `Logger` to the
+compact infrastructure. Confirmed in implementation; no reason to
+fall back to option (i).
+
+**variant-base (commit `7b88d72`)**:
+
+1. New type alias `logger::CompactSink = Arc<Mutex<CompactBuffers>>`
+   exported from `lib.rs`. The driver owns the underlying `Arc`
+   and shares it between (a) its own `EventSink` and (b) every
+   `LoggerHandle` that variant reader threads clone.
+2. `LoggerHandle::attach_compact_sink(sink, legacy_jsonl)` -- setter
+   the driver calls between `Logger::new` and the
+   `Variant::attach_logger` hook. Mirrors `CliArgs::legacy_jsonl_events`
+   so reader-thread emissions stay consistent with driver-thread
+   emissions under both T18.2 defaults (compact-only) and the
+   legacy-compatible opt-in.
+3. `LoggerHandle::record_receive` (the new public surface
+   websocket calls):
+   - Captures one `Utc::now()` at the top so the compact row and
+     the JSONL line carry the same timestamp.
+   - If a compact sink is attached, locks it, pushes one
+     `EventKind::Receive` row, releases.
+   - If `legacy_jsonl` is true, locks the inner `Logger`, writes the
+     legacy `log_receive` line, releases.
+   - Two distinct mutexes. The T14.10 "one mutex per receive"
+     property is documented as no longer load-bearing -- empirically
+     the compact push is `Vec::push` + intern-table lookup
+     (microseconds) and the JSONL line is microseconds. The
+     legacy-JSONL-OFF mode (T18.2 default) drops the logger lock
+     entirely so the effective cost under the default flag is one
+     mutex acquisition per receive, matching pre-T18.3a.
+4. `EventSink` refactored: `buffers: CompactBuffers` ->
+   `buffers: CompactSink`. All `record_*` methods now go through a
+   `lock_buffers()` helper. `EventSink::buffers()` returns a
+   `MutexGuard` to the digest writer (held for the duration of the
+   Parquet write; no contention by then because
+   `stop_reader_threads` has joined every reader).
+
+**variants/websocket (commit `d22bc33`)**:
+
+- `reader_thread_main` -- `logger.log_receive(...)` ->
+  `logger.record_receive(...)`. Comment updated to call out T18.3a.
+- `drain_current_peer_into_logger` (the T17.5 Single-mode helper)
+  -- same swap, same comment update.
+- Both swaps are surgical: no other behaviour changed, the warning-
+  on-error stderr lines are kept verbatim.
+
+### Tests added
+
+**variant-base/src/logger.rs** -- six unit tests in `tests::` covering
+`LoggerHandle::record_receive`:
+
+- `t18_3a_record_receive_without_compact_sink_writes_jsonl_only` --
+  back-compat path: a handle built without `attach_compact_sink`
+  keeps writing JSONL and silently skips the compact push (keeps
+  legacy unit tests that build a bare `LoggerHandle::new(...)`
+  working).
+- `t18_3a_record_receive_pushes_into_compact_buffer` -- core
+  invariant: a handle with a sink attached pushes the receive row
+  into the shared `CompactBuffers` with correctly populated
+  (`kind`, `seq`, `qos`, `bytes`, `peer_idx`, `path_idx`,
+  `peers.dict()`, `paths.dict()`).
+- `t18_3a_record_receive_emits_jsonl_when_legacy_flag_on` -- both
+  channels populated under `legacy_jsonl=true`.
+- `t18_3a_record_receive_skips_jsonl_when_legacy_flag_off` -- T18.2
+  default (`legacy_jsonl=false`): compact row pushed, NO JSONL
+  line written.
+- `t18_3a_record_receive_clone_shares_compact_sink` -- cloning
+  `LoggerHandle` (the pattern reader threads use) shares the same
+  `Arc<Mutex<CompactBuffers>>`; pushes from any clone land in the
+  same buffer.
+- `t18_3a_record_receive_concurrent_pushes_all_land` -- 4 threads x
+  250 rows under contention; final row count is exactly 1000 and
+  all four peer names interned.
+
+**variants/websocket/src/websocket.rs** -- two integration-style
+tests inside `mod tests`:
+
+- `t18_3a_single_mode_drain_pushes_into_compact_buffer` -- stands
+  up a real WS server bound to an OS-assigned ephemeral port,
+  sends one binary data frame, builds a `WsPeer` from the client
+  side, calls `drain_current_peer_into_logger` directly. Asserts
+  the shared `CompactBuffers` gained exactly one Receive row with
+  the (`seq=42`, `path=/p`, `writer=alice`, `bytes=16`, `qos=4`)
+  sent by the server.
+- `t18_3a_multi_mode_reader_thread_pushes_into_compact_buffer` --
+  same socket scaffold, but drives the variant's full Multi-mode
+  pipeline: `attach_logger` + `start_reader_threads(Multi)`. Server
+  sends three frames; the test polls the compact buffer with a 2 s
+  wallclock deadline until `len() >= 3`; then `stop_reader_threads`
+  joins the reader. Asserts three Receive rows with monotonic seqs
+  1..=3 and a single interned peer (`alice`) + path (`/p`).
+
+Both tests bind ephemeral ports (`:0`) and use a new
+`temp_logger_handle_with_compact` helper that mirrors the driver's
+construction order (compact-sink attached BEFORE the handle is
+cloned into reader threads).
+
+### Before / after receive-count comparison
+
+Reasoning rather than measurement here (the T17.5 reproducer
+fixture requires a built two-runner binary set and is `#[ignore]`-
+gated -- user-owned per T18.7):
+
+- **Pre-T18.3a**: `Logger::log_receive` writes one JSONL line and
+  returns. The driver's `EventSink::record_receive` is never called
+  for reader-thread receives. With `--legacy-jsonl-events OFF`
+  (T18.2 default), the compact-parquet file's Receive row count for
+  a websocket Multi-mode spawn would be the count of receives the
+  **driver thread** observed (0 if the variant routes everything
+  through the reader threads, which is the T14.10 design).
+- **Post-T18.3a**: `LoggerHandle::record_receive` pushes one row
+  into the shared `Arc<Mutex<CompactBuffers>>` per call. The
+  compact-parquet Receive row count for a websocket spawn now
+  equals the count of frames the reader thread (or the T17.5
+  drain helper) successfully decoded -- the same denominator the
+  driver thread would have observed in Single mode pre-T14.10.
+
+The new unit tests verify both call sites (Single drain + Multi
+reader thread) land receives in the compact buffer; the in-test
+counts (1 row and 3 rows respectively) match exactly the frames
+the server side sent. **No mismatch is possible by construction**:
+every successful `record_receive` push happens under the compact
+lock and the row never leaves the lock until the digest writer
+reads it.
+
+For the T17.5 saturate fixture
+(`variants/websocket/tests/fixtures/two-runner-websocket-t17-5-saturate.toml`)
+the user-owned T18.7 procedure will be the authoritative end-to-
+end check: re-run with `--log-dir <shared> --analyze-full`,
+compare the compact-parquet Receive count to the legacy JSONL
+Receive count for the same spawn (the analysis pipeline ships
+both loaders via T18.4 so the comparison is one-command).
+
+### Deviations from the task spec
+
+None material. A couple of choices the spec left open:
+
+- **Mutex behaviour**: spec said "single-acquisition is a perf
+  claim, not a correctness claim; either implement under one
+  mutex or document the mutex behaviour." Implementation uses two
+  distinct mutexes (compact + logger) -- documented in the
+  `record_receive` doc comment. Justification: the compact buffer
+  was already wrapped in `Arc<Mutex<...>>` for cross-thread
+  sharing with the driver, and putting the logger inside the same
+  mutex would have broken the existing `LoggerProxy` driver-side
+  call shape (which locks per event). Empirically the extra lock
+  is cheap and the T18.2-default `legacy_jsonl=false` mode drops
+  the logger lock entirely.
+- **Scope of `record_write` / `record_*` siblings**: spec said
+  "probably for symmetry, only if low-risk; otherwise keep narrow
+  to `record_receive`." Kept narrow -- only `record_receive` is
+  added. `write` is driver-thread-only (the driver captures the
+  pre-publish `write_ts` per T16.2 and routes through its own
+  `EventSink`); no variant currently calls `log_write` from a
+  non-driver thread. Same for `backpressure_skipped`. If a future
+  variant grows a non-driver `write` emission path it can add the
+  symmetric method then.
+- **EventSink.buffers() signature**: changed from
+  `&CompactBuffers` to `Result<MutexGuard<'_, CompactBuffers>>`.
+  The digest phase holds the lock for the duration of the Parquet
+  write; no contention because `stop_reader_threads` joined every
+  reader. This is the minimal-blast-radius way to thread the
+  shared `Arc<Mutex<...>>` through without restructuring every
+  driver call site.
+
+### Lint / test state at handoff
+
+- `cargo test --release -p variant-base -p variant-websocket` --
+  135 + 12 + 42 + 28 = 217 tests pass, 5 ignored (the same
+  `#[ignore]`-gated two-runner regressions that need built
+  binaries).
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  -- clean.
+- `cargo fmt --check` -- clean.
+
+### Files changed
+
+- `variant-base/src/logger.rs` -- `CompactSink` type, `LoggerHandle`
+  fields + `attach_compact_sink` + `record_receive`, six unit
+  tests.
+- `variant-base/src/driver.rs` -- shared `Arc<Mutex<CompactBuffers>>`
+  wiring (run_protocol), `EventSink` refactor through
+  `lock_buffers()`, digest-phase `buffers()` MutexGuard.
+- `variant-base/src/lib.rs` -- re-export `CompactSink`, `LoggerHandle`.
+- `variants/websocket/src/websocket.rs` -- two `log_receive` ->
+  `record_receive` call-site swaps, two new T18.3a tests, new
+  `temp_logger_handle_with_compact` helper.
+
+### Commits
+
+1. `feat(variant-base): LoggerHandle::record_receive for cross-thread compact push (T18.3a)`
+2. `feat(websocket): route reader-thread + drain receives through record_receive (T18.3a)`
+
+### Status
+
+**E18 implementation fully closed pending T18.7 user-owned re-run**.
+Every per-event row -- regardless of which thread emits it --
+lands in the shared compact `EventBuffer` and therefore in the
+`*.compact.parquet` digest file. The T18.4 analysis loader already
+reads both formats; the T18.7 user procedure is the end-to-end
+acceptance gate.
