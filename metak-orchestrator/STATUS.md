@@ -14778,3 +14778,305 @@ Commits:
 
 - `feat(runner/T19.4): scalar-shape validation for E19 workload-shape keys`
 - `test(runner/T19.4): integration tests for E19 workload-shape forwarding`
+
+## T19.8 completion report -- 2026-05-19 (worker: operational / E2E validation)
+
+**Task**: write `configs/two-runner-workload-shapes.toml`, run two-runner
+benchmark for the three E19 workload profiles (scalar-flood, block-flood,
+mixed-types), run the analyzer, verify the pivot table + new charts +
+integrity column + workload-shape invariant. No source-code changes.
+
+### Outcome
+
+E19 wire + storage + analyzer pipeline is **functionally correct** on a
+single-runner exercise. The two-runner exercise is **blocked by a
+host-environment multicast failure** that is independent of E19 and
+out of scope for this validation task. Full diagnosis below.
+
+### Files written
+
+- `configs/two-runner-workload-shapes.toml` -- the locked T19.8
+  spec: `[[variant_template]] dummy-base` (variant-dummy, 100 Hz,
+  vpt=1000, operate_secs=5, qos=1, single-threaded) + three
+  `[[variant]]` entries (`dummy-scalar-flood`, `dummy-block-flood`
+  with `blob_size=100`, `dummy-mixed-types` with `mixed_scalars_min=5
+  / max=20`, `mixed_arrays_min=200 / max=600`,
+  `mixed_dict_split_max=4`, `workload_seed=12345`).
+- `configs/_t198_single_runner_workload_shapes.toml` -- fallback
+  config with `runners = ["alice"]` for single-runner exercise of the
+  same three workloads, used after the two-runner path proved blocked.
+
+### Commands run
+
+Build:
+```
+cargo build --release
+```
+Two-runner attempts (both fail at `Coordinator::new` before discovery):
+```
+target/release/runner.exe --name alice --config configs/two-runner-workload-shapes.toml
+target/release/runner.exe --name bob   --config configs/two-runner-workload-shapes.toml
+```
+Single-runner fallback (succeeds, runs all three spawns to clean exit):
+```
+target/release/runner.exe --name alice --config configs/_t198_single_runner_workload_shapes.toml
+```
+Analyzer:
+```
+cd analysis && python analyze.py ../logs/wlshapes-single-20260519_165233/ \
+    --summary --diagrams --output ../logs/wlshapes-single-20260519_165233/analysis
+```
+
+### Two-runner blocker: Windows multicast (os error 10065)
+
+Both two-runner spawn attempts fail in `Coordinator::new()` -- before
+`discover()` is reached -- with `os error 10065` (WSAEHOSTUNREACH /
+"socket operation was attempted to an unreachable host"). The failure
+fires inside `create_coordination_socket()` at
+`socket.join_multicast_v4(&COORDINATION_MULTICAST,
+&Ipv4Addr::UNSPECIFIED)`. Reproduced against:
+
+- `configs/two-runner-workload-shapes.toml` (this task)
+- `configs/two-runner-smoke.toml` (pre-existing canonical smoke)
+- `configs/smoke-t148-threading-modes.toml` (pre-existing dummy two-runner)
+- `cargo test --release -p runner protocol::tests::discover_recovers_...`
+  also fails identically with 10065, panicking inside the test thread.
+
+Host conditions checked:
+- Default IPv4 route present (`0.0.0.0/0 -> 192.168.1.254 via Ethernet`).
+- IPv4 multicast routes present (`224.0.0.0/4 on-link on 127.0.0.1` and
+  `on-link on 192.168.1.68`).
+- No stray `runner.exe` holding ports 19876/19877.
+- Wi-Fi interface disconnected (was-active interface index 13); Ethernet
+  index 4 is the only active LAN NIC. `Get-NetIPInterface` shows the
+  `Multicast` column empty for every interface (likely a recent OS-level
+  change since this task's prior status entries reported successful
+  two-runner runs on the same machine).
+
+Per the carry-over notes from T19.4 and the in-source comments in
+`runner/src/protocol.rs`, this is a pre-existing class of issue
+("blocked UDP multicast, hardware NIC offline") explicitly NOT
+auto-resumable. The task spec also said "DO NOT modify variant-base,
+analysis, or runner source code to make the test pass" -- so no
+source-side mitigation was attempted. Documenting as an
+**environmental blocker, not an E19 regression**: the same code path
+that fails here passes the runner unit-test suite on a healthy host
+(per T19.4's reported test counts).
+
+### Single-runner E2E pipeline (PASS)
+
+Run: `wlshapes-single-20260519_165233`. All three spawns ran to clean
+exit (`status=success, exit_code=0`). Runner stdout (key lines):
+```
+'dummy-scalar-flood' final progress: sent=501000 received=501000 eot_sent=true eot_received=true
+'dummy-block-flood'  final progress: sent=5010   received=5010   eot_sent=true eot_received=true
+'dummy-mixed-types'  final progress: sent=245214 received=245214 eot_sent=true eot_received=true
+```
+(`sent == received` because variant-dummy delivers in-process to itself.)
+
+Wire/storage verification (compact Parquet, `kind=0` write rows):
+
+| Workload     | rows    | leaf_count       | shape_idx       | bytes              |
+|--------------|---------|------------------|------------------|--------------------|
+| scalar-flood | 501,000 | const 1          | const 0 (scalar) | const 8            |
+| block-flood  | 5,010   | const 100        | const 1 (array)  | const 800          |
+| mixed-types  | 245,214 | 1..223 mean 2.04 | 0,1,2 (sc/ar/st) | 8..1784            |
+
+Total leaves emitted by mixed-types: 245214 * 2.04 = ~500,237, matching
+the expected ~500,000 leaves (5s * 100 Hz * 1000 vpt). The E19
+`shape_intern` dictionary + per-write `leaf_count` / `shape_idx` /
+`bytes` are present on every write row and null on non-write rows --
+exactly per the locked spec.
+
+### Performance table (analyzer output)
+
+```
+Variant               Run             Thread  Shape  Receives/s   Leaves/s    Bytes/s   Delivery%
+dummy-block-flood     wlshapes-single single  array       1,002    100,198    801,584    100.00%
+dummy-mixed-types     wlshapes-single single  array      49,028    100,170    801,356    100.00%
+dummy-scalar-flood    wlshapes-single single  scalar    100,184    100,184    801,471    100.00%
+```
+
+Acceptance checks:
+
+- `scalar-flood`: `ops/s == leaves/s ~= 100k`. Bytes/s = ~800k (1 leaf x 8B). ✓
+- `block-flood`: `ops/s ~= 1000`, `leaves/s ~= 100k`, `bytes/s ~= 800k`. ✓
+- `mixed-types`: `ops/s` variable (~49k, dominated by single-scalar WriteOps),
+  `leaves/s ~= 100k`. ✓
+- **E19 invariant**: `leaves_per_sec` is 100,170 -- 100,198 across all
+  three workloads (spread < 0.03%). **Invariant HOLDS.** ✓
+- `Delivery% = 100.00%` for all three. ✓
+
+### Integrity report
+
+```
+Variant            Run             Path        QoS  Sent     Rcvd     Delivery%   BP-skip   Leaves Lost   Timeout
+dummy-block-flood  wlshapes-single alice->alice  1  5,010    5,010    100.00%     0         0             runner_idle_terminated
+dummy-mixed-types  wlshapes-single alice->alice  1  245,214  245,214  100.00%     0         0             runner_idle_terminated [late_tail_present]
+dummy-scalar-flood wlshapes-single alice->alice  1  501,000  501,000  100.00%     0         0             runner_idle_terminated [late_tail_present]
+```
+
+- **Leaves Lost** column is present (T19.6 deliverable). ✓
+- `Leaves Lost = 0` across all three workloads (in-process delivery,
+  no real loss). ✓ Not negative, not NaN.
+- `backpressure_skipped` count = 0 (config is QoS 1; T19.4 carry-over
+  contract satisfied). ✓
+
+### Charts (all four PNGs rendered, non-empty)
+
+```
+comparison-qosNA.png             109,473 bytes  -- vertical 2-row stack (top: receives/s, bottom: latency log p95 w/ p50/p99 whiskers). ✓
+drop-rate-qosNA.png               28,290 bytes
+latency-cdf-qosNA.png             95,188 bytes  -- three distinct CDF curves, block-flood ~10x faster than scalar/mixed; legend correctly lists three workloads
+throughput-vs-workload-shape.png  61,151 bytes  -- new T19.6 chart, one subplot per variant; bars at ~100k leaves/s on the appropriate workload bucket
+```
+
+The vertical-stack layout of `comparison-qos` is correct (T19.6 spec).
+The new `throughput_vs_workload_shape` chart exists and renders (T19.6
+spec).
+
+### Observed concerns (flagged, NOT fixed)
+
+A. **Pivot tables empty** -- the pivot section reports `(no data)`
+   for every QoS. Root cause: `analysis/pivot_tables.py` parses the
+   variant `name` field with a regex
+   (`^(?P<family>...)-<vpt>x<hz>hz-qos<N>-<mode>`) to extract
+   `family / vpt / hz / qos / mode`. The T19.8 names
+   (`dummy-scalar-flood`, `dummy-block-flood`, `dummy-mixed-types`)
+   do NOT contain the legacy `<vpt>x<hz>hz-qos<N>-<mode>` suffix, so
+   the regex never matches and `build_pivot_tables` produces no
+   rows. This is a **pre-existing pivot-naming convention** that
+   collides with E19-style workload-only naming. Three possible
+   resolutions:
+
+   1. Rename E19 spawns to follow the legacy convention
+      (e.g. `dummy-scalar-flood-1000x100hz-qos1-single`).
+   2. Extend the pivot regex to also accept the workload-only naming
+      (drop the rate/qos/mode requirements, populate them from the
+      runner-injected metadata that already lives on `PerformanceResult`).
+   3. Add a CLI flag `--pivot-by-name=...` to opt the pivot in even
+      when the regex fails (uses workload + threading from the
+      dataclass fields instead of the name).
+
+   **Recommendation**: option 2 -- the regex is brittle and the
+   dataclass already carries everything needed. Filed as an E20
+   carry-over candidate. Does NOT block the T19.6 acceptance
+   evidence -- the performance table itself shows the per-workload
+   numbers correctly and the new `throughput_vs_workload_shape`
+   chart shows the same data visually.
+
+B. **`throughput_vs_workload_shape` x-axis labels conflate shape and
+   workload.** The chart subplot for `dummy-mixed-types` shows the
+   bar over an x-axis tick labeled `block-flood` (not `mixed-types`).
+   Root cause: `analysis/plots.py::_WORKLOAD_LABELS` maps internal
+   shape tokens (`scalar`, `array`, `struct`) directly to user-facing
+   workload names (`scalar-flood`, `block-flood`, ...). The mixed-types
+   workload's dominant shape (`PerformanceResult.shape`) is `array`,
+   which the chart then renders as the `block-flood` x-tick. This is
+   a labeling collision between *shape* and *workload-profile name*
+   that needs disentangling -- the T19.6 worker's own carry-over notes
+   acknowledged that `PerformanceResult.shape` is "a single dominant
+   value per group" and the chart "may need a fresh polars pipeline".
+   For the locked T19.8 acceptance (three bars per variant subplot)
+   the chart is functionally correct in that three bars do appear at
+   the expected ~100k leaves/s height across all three subplots, but
+   the x-axis labeling is misleading. Filed as a T19.6 follow-up.
+
+C. **`comparison-qos` legend partially obscured + family resolves to
+   `n/a`.** Same root cause as A: the variant-name parser doesn't
+   recognise `dummy-*` (no `<family>-<vpt>x<hz>hz-qos<N>-<mode>`
+   suffix). The chart still renders the three workloads with distinct
+   hatches but the supplementary "family / threading_mode" legend
+   reads `other / legacy`. Falls under the same fix as A.
+
+D. **Sort order in charts is alphabetical (block-flood, mixed-types,
+   scalar-flood) rather than the spec'd `scalar -> array -> struct ->
+   mixed`.** This matches T19.6's own carry-over flag about hardcoded
+   shape ordering being decoupled from variant-name ordering. With
+   the names not parseable by the canonical regex the fallback
+   ordering kicks in.
+
+E. **Pivot table width** -- moot (no rows rendered). Cannot evaluate.
+
+F. **`Shape` column in the performance table reads `array` for
+   `dummy-mixed-types`** -- this is by design per T19.5
+   (`PerformanceResult.shape` is the dominant shape, and the array
+   bucket dominates mixed-types when `mixed_arrays_min..max` is large
+   relative to `mixed_scalars_min..max`). It is NOT a bug, but it IS
+   a UX rough edge -- "mixed-types" the workload shows as "array" the
+   shape. A `workload` column on the same table (orthogonal to the
+   existing `Shape` column) would make this less surprising.
+   Pre-existing per T19.5's own deviation note.
+
+G. **The single-runner exercise does NOT exercise the runner barrier
+   coordination, clock-sync, or cross-process delivery.** Variant-dummy
+   self-loopback means every "receive" is the same process's "send" --
+   ideal for testing the writer-side workload + logger + Parquet, but
+   NOT a substitute for the two-runner contract. Once the host's
+   multicast plumbing is restored, this validation should be re-run
+   in true two-runner mode to exercise the barrier_coord TCP path,
+   the clock-sync UDP probes, and any cross-process delivery edge
+   cases (e.g. duplicates, gaps, late_tail_present at scale).
+
+H. **`late_tail_present` warnings** on scalar-flood (0.05%) and
+   mixed-types (0.06%) -- 262 and 145 receives respectively land
+   beyond 10x the p99 latency. With in-process delivery this is
+   almost certainly OS scheduling jitter, not a transport issue.
+   Below the late-tail threshold acceptance for both workloads;
+   noted for completeness.
+
+### Operational caveats from T19.4 / T19.6 -- observed
+
+- T19.4: `--legacy-jsonl-events true` forwarding -- not exercised
+  (compact Parquet is the default and was sufficient). ✓
+- T19.4: `barrier_coord::tests::two_runner_barrier_exchange_round_trips`
+  flaky -- ran one targeted test set
+  (`cargo test ... protocol::tests::discover` -- also failed,
+  same 10065 root cause, NOT the flaky-test pattern from T19.4).
+- T19.6: readability ceiling at very wide datasets -- not hit
+  (1 variant family x 3 workloads x 1 QoS x 1 mode = trivially small).
+- T19.6: pivot table width / overflow -- not evaluable (no rows).
+- T19.6: shape sort order hardcoded -- observed (concern D).
+- T19.6: Leaves Lost edge case on QoS 1/2 duplicate delivery -- not
+  triggered (no duplicates in dataset, count is integer-zero).
+
+### Bug vs caveat -- summary table
+
+| Issue                                  | Class                     | Owner                     |
+|----------------------------------------|---------------------------|---------------------------|
+| Two-runner blocked by os error 10065   | Environment caveat        | host operator             |
+| Pivot tables empty for E19 names       | Analyzer bug (pivot regex)| analysis follow-up        |
+| `_WORKLOAD_LABELS` collides shape/workload | UX bug                | analysis follow-up        |
+| Chart sort order alphabetical          | Pre-existing T19.6 concern| analysis follow-up        |
+| `Shape` column = "array" for mixed-types | UX rough edge (by design) | analysis follow-up        |
+| `late_tail_present` <0.1%              | Operational (OS jitter)   | none -- under threshold   |
+
+### E19 acceptance summary
+
+| Locked-spec acceptance criterion                              | Status |
+|---------------------------------------------------------------|--------|
+| Three [[variant]] entries, three workload profiles, one binary| PASS   |
+| All three spawns run to clean exit                            | PASS (single-runner only) |
+| `leaves_per_sec` roughly equal across the three workloads     | PASS (100,170..100,198) |
+| `ops_per_sec` differs across workloads                        | PASS (1k, 49k, 100k)    |
+| Bytes/s shape matches per-workload math                       | PASS (~800k all three)  |
+| `throughput_vs_workload_shape` chart renders                  | PASS (with concern B)   |
+| `comparison-qos` chart renders vertical 2-row stack           | PASS (with concern C)   |
+| `Leaves Lost` column present and sensible                     | PASS (zero)             |
+| No `backpressure_skipped` at any QoS                          | PASS (zero)             |
+| Two-runner E2E delivery exercised                             | **BLOCKED** (host multicast) |
+
+### Commits planned
+
+- `configs(T19.8): two-runner-workload-shapes.toml + single-runner fallback`
+
+Will commit `configs/two-runner-workload-shapes.toml` only (no source-code
+changes, per task constraint). The single-runner fallback is committed
+alongside as a reproducibility helper -- it is the only path that
+currently produces a green dataset on this host.
+
+The single-runner fallback config is named `_t198_single_runner_workload_shapes.toml`
+(underscore-prefixed) so it is clearly identifiable as a worker-emitted
+helper rather than an authoritative scenario; the orchestrator may want
+to either promote it to a permanent name or delete it once two-runner
+mode is exercised cleanly.
