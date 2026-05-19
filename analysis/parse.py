@@ -5,12 +5,21 @@ objects in the new pipeline. Each line is projected directly into a
 columnar row dict matching ``schema.SHARD_SCHEMA`` and accumulated in a
 batch buffer; the buffer is flushed as a polars ``DataFrame`` row group
 to disk by ``cache.py``.
+
+The :func:`detect_source_format` helper also lives here -- it sits at
+the same architectural seam (deciding how to turn a per-spawn source
+file into ``SHARD_SCHEMA`` rows) regardless of whether the file is
+JSONL or the post-T18.2 ``.compact.parquet`` columnar format. The
+compact loader proper lives in ``parse_compact.py`` to keep the legacy
+JSONL projection here single-responsibility.
 """
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
 from typing import Iterator, TextIO
 
 from schema import SHARD_SCHEMA
@@ -18,6 +27,57 @@ from schema import SHARD_SCHEMA
 # Column order is the dict-insertion order of SHARD_SCHEMA; we precompute
 # it once and reuse it everywhere we materialize batches as DataFrames.
 COLUMN_ORDER: tuple[str, ...] = tuple(SHARD_SCHEMA.keys())
+
+
+class SourceFormat(Enum):
+    """Per-spawn source-file format.
+
+    The cache pipeline picks a loader based on this. ``JSONL`` is the
+    legacy per-message JSONL format (one row per event); ``COMPACT`` is
+    the T18.2 ``.compact.parquet`` columnar tagged-union format. The
+    analyzer reads either transparently.
+    """
+
+    JSONL = "jsonl"
+    COMPACT = "compact"
+
+
+def detect_source_format(path: Path) -> SourceFormat | None:
+    """Pick the loader format from a source file's name.
+
+    Returns:
+      - :class:`SourceFormat.COMPACT` for ``*.compact.parquet``.
+      - :class:`SourceFormat.JSONL` for ``*.jsonl``.
+      - ``None`` for any other extension (caller should skip).
+
+    The check is name-based -- file contents are not opened. We match
+    the compact extension first so a hypothetical
+    ``foo.compact.parquet.jsonl`` (unlikely but harmless) would still
+    classify as ``COMPACT`` only when the full ``.compact.parquet``
+    suffix is the actual tail.
+    """
+    name = path.name
+    if name.endswith(".compact.parquet"):
+        return SourceFormat.COMPACT
+    if name.endswith(".jsonl"):
+        return SourceFormat.JSONL
+    return None
+
+
+def source_stem(path: Path) -> str:
+    """Return the canonical ``<variant>-<runner>-<run>`` stem for a source.
+
+    JSONL files yield ``path.stem`` as-is (drop ``.jsonl``); compact
+    files drop the full ``.compact.parquet`` suffix. Keeping the stems
+    aligned across formats means a directory with both ``foo.jsonl``
+    and ``foo.compact.parquet`` is recognised as a single logical spawn
+    and the analyzer can prefer compact unambiguously.
+    """
+    name = path.name
+    if name.endswith(".compact.parquet"):
+        return name[: -len(".compact.parquet")]
+    return path.stem
+
 
 # Common required fields on every JSONL line.
 _REQUIRED_FIELDS: tuple[str, ...] = ("ts", "variant", "runner", "run", "event")
