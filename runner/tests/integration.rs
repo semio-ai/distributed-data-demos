@@ -278,25 +278,42 @@ fn qos_array_produces_per_qos_log_files() {
         "expected both dummy-qos1 and dummy-qos2 log files, got {jsonl_files:?}"
     );
 
-    // Spot-check the qos field inside each log.
+    // Spot-check that each JSONL log's lifecycle records carry the
+    // per-spawn `variant` suffix (e.g. `dummy-qos1`), and that the
+    // sibling `.compact.parquet` exists. Per the T18.2 default the
+    // per-event `qos` field now lives in the compact Parquet sidecar
+    // rather than the JSONL stream (see
+    // `metak-shared/api-contracts/jsonl-log-schema.md` E18 note).
     for file in &jsonl_files {
-        let contents = std::fs::read_to_string(subdirs[0].path().join(file)).unwrap();
-        let expected_qos = if file.contains("dummy-qos1") { 1 } else { 2 };
-        // Find any line with a "qos" field; verify it matches expected.
-        let mut found_qos_record = false;
+        let log_path = subdirs[0].path().join(file);
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let expected_variant = if file.contains("dummy-qos1") {
+            "dummy-qos1"
+        } else {
+            "dummy-qos2"
+        };
+        let mut found_variant_record = false;
         for line in contents.lines() {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
-            if let Some(qos) = v.get("qos").and_then(|q| q.as_i64()) {
+            if let Some(variant) = v.get("variant").and_then(|w| w.as_str()) {
                 assert_eq!(
-                    qos, expected_qos,
-                    "file {file} has qos={qos}, expected {expected_qos}"
+                    variant, expected_variant,
+                    "file {file} has variant={variant}, expected {expected_variant}"
                 );
-                found_qos_record = true;
+                found_variant_record = true;
             }
         }
         assert!(
-            found_qos_record,
-            "file {file} should contain at least one record with a qos field"
+            found_variant_record,
+            "file {file} should contain at least one record with a variant field"
+        );
+
+        // Sibling compact Parquet is where per-event QoS now lives
+        // (T18.2). Its presence demonstrates the spawn ran to digest.
+        let parquet_path = log_path.with_extension("compact.parquet");
+        assert!(
+            parquet_path.exists(),
+            "expected sibling compact Parquet at {parquet_path:?}"
         );
     }
 

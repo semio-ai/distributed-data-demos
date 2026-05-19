@@ -13829,3 +13829,30 @@ lands in the shared compact `EventBuffer` and therefore in the
 `*.compact.parquet` digest file. The T18.4 analysis loader already
 reads both formats; the T18.7 user procedure is the end-to-end
 acceptance gate.
+
+## qos-jsonl-fix
+
+**Diagnosis**: After T18.2 made per-event JSONL emission opt-in via
+`legacy_jsonl_events` (default `false`), the `qos` field no longer
+appears on `write`/`receive`/`backpressure_skipped` JSONL lines for
+default-mode spawns -- those rows now land exclusively in the per-spawn
+`*.compact.parquet`. The integration test
+`runner::tests::qos_array_produces_per_qos_log_files` was still asserting
+that each JSONL log contained at least one record with a `qos` field,
+which is contract-violating only against the pre-T18.2 schema.
+
+**Fix**: Updated the test to verify per-spawn separation using the
+`variant` field (which carries the per-spawn suffix, e.g.
+`dummy-qos1`) and to additionally assert that the sibling
+`*.compact.parquet` exists -- the file where per-event QoS now lives
+under the T18.2 default. No change to `variant-base` (the contract's
+E18 note already documents JSONL as legacy/opt-in).
+
+**Verification**:
+- `cargo test --release -p variant-base -p runner` -- target test passes;
+  only pre-existing flaky `barrier_coord::tests::two_runner_barrier_exchange_round_trips`
+  fails (out of scope per task brief).
+- `cargo clippy --release --workspace --all-targets -- -D warnings` clean.
+- `cargo fmt --check` clean.
+
+**Commit**: (recorded below by the orchestrator)
