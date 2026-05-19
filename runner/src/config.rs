@@ -440,6 +440,63 @@ impl VariantConfig {
         Ok(n)
     }
 
+    /// Validate the E19 workload-shape keys (`blob_size`, `mixed_*`,
+    /// `workload_seed`) in `[variant.common]`. These are scalar-only
+    /// optional integer keys forwarded verbatim by the generic CLI-arg
+    /// loop. The runner does NOT interpret their numeric values (the
+    /// variant rejects invalid combinations at startup with a descriptive
+    /// error); the only invariant enforced here is the type/shape: each
+    /// listed key, when present, MUST be a non-negative integer that
+    /// fits in the documented type. Array forms are rejected outright so
+    /// the keys cannot accidentally feed the existing array-expansion
+    /// mechanism (which is restricted to `tick_rate_hz` /
+    /// `values_per_tick` / `qos` / `threading_modes`).
+    pub fn validate_workload_shape_keys(&self) -> Result<()> {
+        // (key, fits-u32-or-u64). The u64 keys are listed by name; everything
+        // else is a u32.
+        const U32_KEYS: &[&str] = &[
+            "blob_size",
+            "mixed_scalars_min",
+            "mixed_scalars_max",
+            "mixed_arrays_min",
+            "mixed_arrays_max",
+            "mixed_dict_split_max",
+        ];
+        const U64_KEYS: &[&str] = &["workload_seed"];
+
+        for key in U32_KEYS {
+            let Some(val) = self.common.get(*key) else {
+                continue;
+            };
+            if val.is_array() {
+                bail!(
+                    "{key} must be a scalar integer (array form is not supported; \
+                     workload-shape keys do not participate in array expansion)"
+                );
+            }
+            let n = val
+                .as_integer()
+                .with_context(|| format!("{key} must be an integer, got {val:?}"))?;
+            u32::try_from(n).with_context(|| format!("{key} value {n} does not fit in u32"))?;
+        }
+        for key in U64_KEYS {
+            let Some(val) = self.common.get(*key) else {
+                continue;
+            };
+            if val.is_array() {
+                bail!(
+                    "{key} must be a scalar integer (array form is not supported; \
+                     workload-shape keys do not participate in array expansion)"
+                );
+            }
+            let n = val
+                .as_integer()
+                .with_context(|| format!("{key} must be an integer, got {val:?}"))?;
+            u64::try_from(n).with_context(|| format!("{key} value {n} does not fit in u64"))?;
+        }
+        Ok(())
+    }
+
     /// Resolve the variant's declared supported threading modes.
     ///
     /// Returns `Ok(Some(modes))` when the entry declared `supported_modes`
@@ -589,6 +646,17 @@ impl BenchConfig {
             })?;
             v.supported_modes_resolved().with_context(|| {
                 format!("config: variant '{}' has invalid supported_modes", v.name)
+            })?;
+            // E19 / T19.4: scalar-shape enforcement for the workload-shape keys.
+            // Values themselves are not interpreted -- the variant rejects
+            // invalid combinations at startup. We only enforce that the keys,
+            // when present, are non-array integers of the right width so the
+            // generic CLI-arg loop forwards them as `--kebab-case <N>`.
+            v.validate_workload_shape_keys().with_context(|| {
+                format!(
+                    "config: variant '{}' has invalid workload-shape key",
+                    v.name
+                )
             })?;
         }
 
@@ -1972,6 +2040,248 @@ supported_modes = []
         assert!(
             msg.contains("empty supported_modes list"),
             "unexpected error: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // T19.4 / E19: workload-shape key validation (scalar-only).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn workload_shape_keys_scalar_form_parses() {
+        // All seven keys, all set as scalars => validate() succeeds and the
+        // values survive in common as integers ready for CLI forwarding.
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "mixed-types"
+  blob_size = 50
+  mixed_scalars_min = 1
+  mixed_scalars_max = 5
+  mixed_arrays_min = 0
+  mixed_arrays_max = 4
+  mixed_dict_split_max = 3
+  workload_seed = 99
+"#,
+        );
+        cfg.validate().unwrap();
+        let v = &cfg.variant[0];
+        assert_eq!(v.common.get("blob_size").unwrap().as_integer(), Some(50));
+        assert_eq!(
+            v.common.get("mixed_scalars_min").unwrap().as_integer(),
+            Some(1)
+        );
+        assert_eq!(
+            v.common.get("workload_seed").unwrap().as_integer(),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn workload_shape_keys_absent_is_ok() {
+        // A config that does not declare any of the new keys must still
+        // parse and validate cleanly.
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "scalar-flood"
+"#,
+        );
+        cfg.validate().unwrap();
+        // None of the seven keys appear in the parsed common table.
+        let v = &cfg.variant[0];
+        for key in [
+            "blob_size",
+            "mixed_scalars_min",
+            "mixed_scalars_max",
+            "mixed_arrays_min",
+            "mixed_arrays_max",
+            "mixed_dict_split_max",
+            "workload_seed",
+        ] {
+            assert!(
+                v.common.get(key).is_none(),
+                "expected {key} to be absent when omitted from TOML"
+            );
+        }
+    }
+
+    #[test]
+    fn workload_shape_keys_reject_array_form() {
+        // blob_size = [100, 200] must be rejected at parse-time validation:
+        // these keys do NOT participate in array expansion.
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = [100, 200]
+"#;
+        let mut cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("blob_size must be a scalar integer")
+                && msg.contains("array form is not supported"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn workload_shape_keys_reject_array_form_workload_seed() {
+        // Same array-form rejection for the u64 key.
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "mixed-types"
+  workload_seed = [1, 2]
+"#;
+        let mut cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("workload_seed must be a scalar integer"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn workload_shape_keys_reject_non_integer() {
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = "oops"
+"#;
+        let mut cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("blob_size must be an integer"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn workload_shape_keys_inherited_from_template() {
+        // Template declares the workload-shape keys; variant omits them.
+        // After resolve_templates() the variant's common carries them.
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant_template]]
+name = "blockflood-base"
+binary = "./x"
+  [variant_template.common]
+  blob_size = 250
+  workload_seed = 7777
+  workload = "block-flood"
+
+[[variant]]
+template = "blockflood-base"
+name = "v"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  qos = 1
+"#,
+        );
+        cfg.validate().unwrap();
+        let v = &cfg.variant[0];
+        assert_eq!(
+            v.common.get("blob_size").unwrap().as_integer(),
+            Some(250),
+            "template's blob_size must be inherited"
+        );
+        assert_eq!(
+            v.common.get("workload_seed").unwrap().as_integer(),
+            Some(7777),
+            "template's workload_seed must be inherited"
+        );
+        assert_eq!(
+            v.common.get("workload").unwrap().as_str(),
+            Some("block-flood")
+        );
+    }
+
+    #[test]
+    fn workload_shape_keys_variant_overrides_template() {
+        // Variant key wins over template key (existing merge_table_keys
+        // semantics; this test pins that the new keys participate).
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant_template]]
+name = "blockflood-base"
+binary = "./x"
+  [variant_template.common]
+  blob_size = 250
+
+[[variant]]
+template = "blockflood-base"
+name = "v"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 500
+"#,
+        );
+        let v = &cfg.variant[0];
+        assert_eq!(
+            v.common.get("blob_size").unwrap().as_integer(),
+            Some(500),
+            "variant entry's blob_size must win over template"
         );
     }
 }

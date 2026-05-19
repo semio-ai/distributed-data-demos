@@ -579,4 +579,209 @@ binary = "./x"
             "--recv-buffer-kb must appear exactly once"
         );
     }
+
+    // -----------------------------------------------------------------
+    // T19.4 / E19: workload-shape keys forwarded verbatim from
+    // [variant.common] via the generic snake_case -> --kebab-case loop.
+    // -----------------------------------------------------------------
+
+    /// Helper: build a config with the given extra `[variant.common]` keys
+    /// appended after the required ones, then build args for the (single)
+    /// variant. Returns the args vector for assertion.
+    fn build_args_with_common(extra_common: &str) -> Vec<String> {
+        let toml_str = format!(
+            r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  qos = 1
+  workload = "block-flood"
+  {extra_common}
+"#
+        );
+        let config: BenchConfig = toml::from_str(&toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v",
+            1,
+            100,
+            100,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
+            &peers,
+        )
+    }
+
+    /// Helper: assert that the given `--kebab` flag appears exactly once and
+    /// is followed by `expected_value`.
+    fn assert_kebab_flag(args: &[String], flag: &str, expected_value: &str) {
+        let count = args.iter().filter(|a| *a == flag).count();
+        assert_eq!(count, 1, "{flag} must appear exactly once, got {args:?}");
+        let idx = args.iter().position(|a| a == flag).unwrap();
+        assert_eq!(args[idx + 1], expected_value, "{flag} value mismatch");
+    }
+
+    #[test]
+    fn build_args_forwards_blob_size() {
+        let args = build_args_with_common("blob_size = 100");
+        assert_kebab_flag(&args, "--blob-size", "100");
+    }
+
+    #[test]
+    fn build_args_forwards_all_seven_workload_shape_keys() {
+        let extra = "
+        blob_size = 50
+        mixed_scalars_min = 1
+        mixed_scalars_max = 7
+        mixed_arrays_min = 0
+        mixed_arrays_max = 3
+        mixed_dict_split_max = 4
+        workload_seed = 42424242
+        ";
+        let args = build_args_with_common(extra);
+        assert_kebab_flag(&args, "--blob-size", "50");
+        assert_kebab_flag(&args, "--mixed-scalars-min", "1");
+        assert_kebab_flag(&args, "--mixed-scalars-max", "7");
+        assert_kebab_flag(&args, "--mixed-arrays-min", "0");
+        assert_kebab_flag(&args, "--mixed-arrays-max", "3");
+        assert_kebab_flag(&args, "--mixed-dict-split-max", "4");
+        assert_kebab_flag(&args, "--workload-seed", "42424242");
+    }
+
+    #[test]
+    fn build_args_omits_workload_shape_keys_when_absent() {
+        // Backward compat: a TOML that does not declare any of the new keys
+        // must NOT emit any of the seven flags.
+        let args = build_args_with_common("");
+        for flag in [
+            "--blob-size",
+            "--mixed-scalars-min",
+            "--mixed-scalars-max",
+            "--mixed-arrays-min",
+            "--mixed-arrays-max",
+            "--mixed-dict-split-max",
+            "--workload-seed",
+        ] {
+            assert!(
+                !args.contains(&flag.to_string()),
+                "{flag} must not appear when the TOML omits the key, got {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_args_workload_seed_accepts_large_u64() {
+        // workload_seed is documented as a u64; the runner forwards it
+        // verbatim as a stringified integer. TOML's integer type is i64, so
+        // the largest representable value is i64::MAX.
+        let args = build_args_with_common(&format!("workload_seed = {}", i64::MAX));
+        assert_kebab_flag(&args, "--workload-seed", &i64::MAX.to_string());
+    }
+
+    #[test]
+    fn build_args_forwards_blob_size_inherited_from_template() {
+        // Template declares blob_size; variant entry omits it. After
+        // resolve_templates() the variant's common table should carry
+        // blob_size and the generic CLI loop emits --blob-size.
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant_template]]
+name = "blockflood-base"
+binary = "./x"
+  [variant_template.common]
+  blob_size = 250
+  workload = "block-flood"
+
+[[variant]]
+template = "blockflood-base"
+name = "v"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  qos = 1
+"#;
+        let mut config: BenchConfig = toml::from_str(toml_str).unwrap();
+        config.resolve_templates().unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v",
+            1,
+            100,
+            1000,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
+            &peers,
+        );
+        assert_kebab_flag(&args, "--blob-size", "250");
+        // The template's workload value also propagated.
+        assert_kebab_flag(&args, "--workload", "block-flood");
+    }
+
+    #[test]
+    fn build_args_variant_blob_size_overrides_template() {
+        // Both template and variant declare blob_size; the variant entry
+        // wins per the template-merge contract.
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant_template]]
+name = "blockflood-base"
+binary = "./x"
+  [variant_template.common]
+  blob_size = 250
+  workload = "block-flood"
+
+[[variant]]
+template = "blockflood-base"
+name = "v"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  qos = 1
+  blob_size = 500
+"#;
+        let mut config: BenchConfig = toml::from_str(toml_str).unwrap();
+        config.resolve_templates().unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v",
+            1,
+            100,
+            1000,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
+            &peers,
+        );
+        assert_kebab_flag(&args, "--blob-size", "500");
+    }
 }
