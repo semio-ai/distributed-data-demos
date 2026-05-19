@@ -193,8 +193,9 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     lines: list[str] = []
     lines.append("Performance Report")
     # Widen the table to accommodate the (uncorrected) annotation on
-    # any of the four latency cells, plus the new ``Late`` column.
-    sep = "-" * 210
+    # any of the four latency cells, plus the new ``Late`` column, plus
+    # the E19 / T19.5 ``Shape`` / ``Leaves/s`` / ``Bytes/s`` columns.
+    sep = "-" * 250
     lines.append(sep)
 
     # Column widths. The latency columns are widened so that
@@ -203,6 +204,7 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     w_variant = 22
     w_run = 16
     w_thread = 8
+    w_shape = 8
     w_rate = 14
     w_deliv = 11
     w_conn = 13
@@ -212,11 +214,22 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     w_late = 9
     w_tail = 11
 
+    # Column layout (T19.5):
+    # The headline ``Receives/s`` column (== ops/sec on the receive
+    # side; also exposed as the canonical ``ops_per_sec`` field on
+    # PerformanceResult) keeps its T11.5 leading position. ``Leaves/s``
+    # and ``Bytes/s`` are E19 additions surfacing the workload-shape
+    # throughput numbers introduced by the block-flood / mixed-types
+    # workloads. ``Shape`` carries the dominant shape value for the
+    # group (defaults to ``"scalar"`` for legacy / pre-E19 data).
     header = (
         _pad("Variant", w_variant)
         + _pad("Run", w_run)
         + _pad("Thread", w_thread)
+        + _pad("Shape", w_shape)
         + _rpad("Receives/s", w_rate)
+        + _rpad("Leaves/s", w_rate)
+        + _rpad("Bytes/s", w_rate)
         + _rpad("Writes/s(req)", w_rate)
         + _rpad("Delivery%", w_deliv)
         + _rpad("Connect(ms)", w_conn)
@@ -257,7 +270,10 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
             _pad(r.variant, w_variant)
             + _pad(r.run, w_run)
             + _pad(r.threading_mode, w_thread)
+            + _pad(r.shape, w_shape)
             + _rpad(_fmt_rate(r.receives_per_sec), w_rate)
+            + _rpad(_fmt_rate(r.leaves_per_sec), w_rate)
+            + _rpad(_fmt_rate(r.bytes_per_sec), w_rate)
             + _rpad(_fmt_rate(r.writes_per_sec), w_rate)
             + _rpad(_fmt_pct(delivery_pct), w_deliv)
             + _rpad(f"{r.connect_mean_ms:.1f}", w_conn)
