@@ -6,7 +6,8 @@ use tempfile::TempDir;
 use variant_base::cli::{CliArgs, DEFAULT_RECV_BUFFER_KB};
 use variant_base::driver::run_protocol;
 use variant_base::dummy::VariantDummy;
-use variant_base::types::ThreadingMode;
+use variant_base::types::{Qos, ThreadingMode};
+use variant_base::workload::{create_workload_with_params, WorkloadParams, WriteShape};
 
 /// Helper to build the canonical CLI arg list for spawning the
 /// `variant-dummy` binary in tests. `progress_stdout_interval_ms` is
@@ -793,10 +794,11 @@ fn test_compact_parquet_is_written_alongside_jsonl() {
     let meta = reader.metadata();
     assert_eq!(
         meta.file_metadata().schema_descr().num_columns(),
-        11,
-        "compact schema must have exactly 11 columns (T18.2b): 7 base \
+        13,
+        "compact schema must have exactly 13 columns (T18.2b + E19): 7 base \
          (ts_ns, kind, seq, path_idx, peer_idx, qos, bytes) + 4 extras \
-         (extra_f32, extra_f32_b, extra_i64, extra_utf8)"
+         (extra_f32, extra_f32_b, extra_i64, extra_utf8) + 2 E19 \
+         (leaf_count, shape_idx)"
     );
 
     let kv = meta
@@ -1074,4 +1076,343 @@ fn test_compact_parquet_at_least_10x_smaller_than_jsonl() {
         "T18.2 acceptance: parquet must be at least 10x smaller than JSONL; \
          got jsonl={jsonl_size}B parquet={parquet_size}B ratio={ratio:.1}x"
     );
+}
+
+// ---------------------------------------------------------------------------
+// E19 / T19.2: workload-shape integration tests
+//
+// These tests use the workload factory + logger + compact buffer pipeline
+// directly (bypassing `run_protocol`, which cannot yet receive the new
+// workload params from the CLI -- that plumbing lands in T19.3). They
+// validate the end-to-end emission path: WriteOp generation -> JSONL +
+// compact-Parquet row materialisation -> file readback.
+// ---------------------------------------------------------------------------
+
+/// E19 / T19.2: block-flood end-to-end emission.
+///
+/// Construct a `BlockFlood` workload via `create_workload_with_params`,
+/// generate one tick of WriteOps, push each into a fresh `Logger` and
+/// `CompactBuffers`, then read the resulting JSONL back and confirm
+/// every `write` line carries `leaf_count = 100, shape = "array"`. The
+/// compact buffer columns must mirror the same metadata.
+#[test]
+fn test_block_flood_emits_array_shape_through_logger_and_compact() {
+    use std::sync::{Arc, Mutex};
+    use variant_base::compact::CompactBuffers;
+    use variant_base::logger::Logger;
+
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+
+    let params = WorkloadParams {
+        variant: "dummy".to_string(),
+        run: "r1".to_string(),
+        blob_size: Some(100),
+        ..WorkloadParams::default()
+    };
+    let mut wl = create_workload_with_params("block-flood", &params).unwrap();
+    let ops = wl.generate(1000);
+    assert_eq!(ops.len(), 10, "1000 / 100 = 10 WriteOps");
+
+    let mut logger = Logger::new(log_dir, "dummy", "r1", "block-flood-test").unwrap();
+    let buffers = Arc::new(Mutex::new(CompactBuffers::new()));
+
+    let ts = chrono::Utc::now();
+    let mut seq = 0u64;
+    for op in &ops {
+        seq += 1;
+        // Emit through the same paths the driver uses.
+        logger
+            .log_write_at(
+                ts,
+                seq,
+                &op.path,
+                Qos::BestEffort,
+                op.payload.len(),
+                op.leaf_count,
+                op.shape,
+            )
+            .unwrap();
+        buffers
+            .lock()
+            .unwrap()
+            .push_write(
+                ts.timestamp_nanos_opt().unwrap_or(0),
+                &op.path,
+                Qos::BestEffort.as_int(),
+                seq,
+                op.payload.len() as u32,
+                op.leaf_count,
+                op.shape.as_u8(),
+            )
+            .unwrap();
+    }
+    logger.flush().unwrap();
+
+    // JSONL: every write line has leaf_count=100 and shape="array".
+    let path = dir.path().join("dummy-r1-block-flood-test.jsonl");
+    let file = std::fs::File::open(&path).unwrap();
+    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 10);
+    for (i, v) in lines.iter().enumerate() {
+        assert_eq!(v["event"], "write");
+        assert_eq!(v["leaf_count"], 100, "line {i} leaf_count");
+        assert_eq!(v["shape"], "array", "line {i} shape");
+    }
+
+    // Compact buffer columns: all leaf_count=Some(100), shape_idx=Some(1).
+    let buf = buffers.lock().unwrap();
+    assert_eq!(buf.len(), 10);
+    for i in 0..buf.len() {
+        assert_eq!(buf.leaf_count[i], Some(100));
+        assert_eq!(buf.shape_idx[i], Some(1));
+    }
+}
+
+/// E19 / T19.2: mixed-types end-to-end emission.
+///
+/// Generate one tick of mixed-types WriteOps, push each through the
+/// logger + compact pipeline, then validate the JSONL contains rows of
+/// scalar / array / struct shapes and the leaf_count values still sum
+/// to exactly vpt.
+#[test]
+fn test_mixed_types_emits_heterogeneous_shapes_through_logger() {
+    use std::sync::{Arc, Mutex};
+    use variant_base::compact::CompactBuffers;
+    use variant_base::logger::Logger;
+
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+
+    let params = WorkloadParams {
+        variant: "dummy".to_string(),
+        run: "r1".to_string(),
+        mixed_scalars_min: Some(10),
+        mixed_scalars_max: Some(50),
+        mixed_arrays_min: Some(0),
+        mixed_arrays_max: Some(100),
+        mixed_dict_split_max: Some(4),
+        workload_seed: Some(0xABCD_1234),
+        ..WorkloadParams::default()
+    };
+    let mut wl = create_workload_with_params("mixed-types", &params).unwrap();
+    let ops = wl.generate(1000);
+
+    let total_leaves: u32 = ops.iter().map(|o| o.leaf_count).sum();
+    assert_eq!(total_leaves, 1000, "sum of leaf_count must equal vpt");
+
+    let mut logger = Logger::new(log_dir, "dummy", "r1", "mixed-types-test").unwrap();
+    let buffers = Arc::new(Mutex::new(CompactBuffers::new()));
+
+    let ts = chrono::Utc::now();
+    let mut seq = 0u64;
+    for op in &ops {
+        seq += 1;
+        logger
+            .log_write_at(
+                ts,
+                seq,
+                &op.path,
+                Qos::BestEffort,
+                op.payload.len(),
+                op.leaf_count,
+                op.shape,
+            )
+            .unwrap();
+        buffers
+            .lock()
+            .unwrap()
+            .push_write(
+                ts.timestamp_nanos_opt().unwrap_or(0),
+                &op.path,
+                Qos::BestEffort.as_int(),
+                seq,
+                op.payload.len() as u32,
+                op.leaf_count,
+                op.shape.as_u8(),
+            )
+            .unwrap();
+    }
+    logger.flush().unwrap();
+
+    // JSONL: the leaf_count values must sum to 1000 and the shape
+    // strings must include at least scalar / array / struct.
+    let path = dir.path().join("dummy-r1-mixed-types-test.jsonl");
+    let file = std::fs::File::open(&path).unwrap();
+    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    let sum_leaf_count: u64 = lines
+        .iter()
+        .map(|v| v["leaf_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(sum_leaf_count, 1000);
+    let shapes: std::collections::HashSet<&str> =
+        lines.iter().map(|v| v["shape"].as_str().unwrap()).collect();
+    assert!(
+        shapes.contains("scalar"),
+        "mixed-types must produce at least one scalar shape; got {shapes:?}"
+    );
+    // At least one non-scalar shape too -- under the chosen params
+    // the seeded generator emits arrays and/or structs.
+    let non_scalar: usize = shapes.iter().filter(|s| **s != "scalar").count();
+    assert!(
+        non_scalar >= 1,
+        "mixed-types must produce at least one non-scalar shape; got {shapes:?}"
+    );
+}
+
+/// E19 / T19.2 acceptance: the dummy binary integration test the spec
+/// names runs `block-flood vpt=1000 blob_size=100` through the variant
+/// CLI. Since the CLI plumbing for `--blob-size` is owned by T19.3,
+/// this test instead drives `run_protocol` directly against
+/// `VariantDummy` with a workload name that the T19.2 driver
+/// recognises but cannot construct (no `blob_size` plumbing yet) --
+/// and verifies the driver returns a descriptive Err that names the
+/// missing argument. This is the load-bearing acceptance check that
+/// T19.2 wired the workload factory through the driver correctly;
+/// T19.3 will replace this with a positive-path acceptance test once
+/// the CLI arg lands.
+#[test]
+fn test_block_flood_through_driver_errors_until_t19_3_lands() {
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let mut args = test_args(log_dir);
+    args.workload = "block-flood".to_string();
+    let mut dummy = VariantDummy::new(&args.runner);
+    let result = run_protocol(&mut dummy, &args);
+    let err = match result {
+        Err(e) => e,
+        Ok(()) => panic!("expected block-flood without --blob-size to Err"),
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("blob-size") || msg.contains("blob_size"),
+        "error must name the missing arg; got: {msg}"
+    );
+}
+
+/// Same for mixed-types: until T19.3 wires the CLI args, the driver
+/// must Err with a descriptive message naming the first missing
+/// mixed-* parameter.
+#[test]
+fn test_mixed_types_through_driver_errors_until_t19_3_lands() {
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let mut args = test_args(log_dir);
+    args.workload = "mixed-types".to_string();
+    let mut dummy = VariantDummy::new(&args.runner);
+    let result = run_protocol(&mut dummy, &args);
+    let err = match result {
+        Err(e) => e,
+        Ok(()) => panic!("expected mixed-types without --mixed-* args to Err"),
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("mixed-scalars-min")
+            || msg.contains("mixed_scalars_min")
+            || msg.contains("mixed-types requires"),
+        "error must mention the missing mixed-types arg; got: {msg}"
+    );
+}
+
+/// E19 / T19.2: scalar-flood end-to-end via `run_protocol` still emits
+/// `leaf_count = 1, shape = "scalar"` on every write line. This is the
+/// "no regression" smoke test guaranteed by the E19 acceptance: existing
+/// scalar-flood spawns add the two new fields with their default values
+/// and remain otherwise unchanged.
+#[test]
+fn test_scalar_flood_through_driver_emits_scalar_leaf_count_and_shape() {
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let args = test_args(log_dir);
+    let mut dummy = VariantDummy::new(&args.runner);
+    run_protocol(&mut dummy, &args).expect("scalar-flood spawn must complete");
+
+    let log_path = dir.path().join("dummy-test-runner-run01.jsonl");
+    let file = std::fs::File::open(&log_path).unwrap();
+    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    let writes: Vec<&serde_json::Value> = lines.iter().filter(|l| l["event"] == "write").collect();
+    assert!(!writes.is_empty(), "scalar-flood produces write events");
+    for (i, w) in writes.iter().enumerate() {
+        assert_eq!(w["leaf_count"], 1, "scalar-flood write {i} leaf_count");
+        assert_eq!(w["shape"], "scalar", "scalar-flood write {i} shape");
+    }
+}
+
+/// E19 / T19.2: scalar-flood through `run_protocol` also writes
+/// `leaf_count = 1, shape_idx = 0` on every compact `write` row. This
+/// pairs with the JSONL assertion above to lock in the
+/// no-regression contract end-to-end.
+#[test]
+fn test_scalar_flood_through_driver_emits_scalar_columns_in_parquet() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let args = test_args(log_dir);
+    let mut dummy = VariantDummy::new(&args.runner);
+    run_protocol(&mut dummy, &args).expect("scalar-flood spawn must complete");
+
+    let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
+    let reader = SerializedFileReader::new(std::fs::File::open(&parquet_path).unwrap()).unwrap();
+    let rows: Vec<_> = reader
+        .get_row_iter(None)
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    // Filter to write rows only (kind column index 1, EventKind::Write = 0).
+    let mut write_rows = 0usize;
+    for row in &rows {
+        if row.get_int(1).unwrap() == 0 {
+            // leaf_count at col 11, shape_idx at col 12.
+            assert_eq!(row.get_int(11).unwrap(), 1, "scalar-flood leaf_count");
+            assert_eq!(row.get_int(12).unwrap(), 0, "scalar-flood shape_idx");
+            write_rows += 1;
+        }
+    }
+    assert!(write_rows > 0, "expected at least one write row");
+}
+
+/// Use the unused `WriteShape` import to silence the rustc dead-code
+/// warning -- this asserts the canonical strings round-trip through
+/// the Logger's emit path.
+#[test]
+fn test_write_shape_string_roundtrip_through_logger() {
+    use variant_base::logger::Logger;
+
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let mut logger = Logger::new(log_dir, "v", "r", "shape-roundtrip").unwrap();
+    for shape in [WriteShape::Scalar, WriteShape::Array, WriteShape::Struct] {
+        logger
+            .log_write_at(
+                chrono::Utc::now(),
+                shape.as_u8() as u64,
+                "/p",
+                Qos::BestEffort,
+                8,
+                3,
+                shape,
+            )
+            .unwrap();
+    }
+    logger.flush().unwrap();
+    let path = dir.path().join("v-r-shape-roundtrip.jsonl");
+    let file = std::fs::File::open(&path).unwrap();
+    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    assert_eq!(lines[0]["shape"], "scalar");
+    assert_eq!(lines[1]["shape"], "array");
+    assert_eq!(lines[2]["shape"], "struct");
 }
