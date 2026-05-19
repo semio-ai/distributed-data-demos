@@ -62,17 +62,21 @@ class TestUpdateCache:
             )
         assert metas1 == metas2
 
-    def test_rebuild_on_jsonl_mtime_drift(self, tmp_logs: Path) -> None:
+    def test_rebuild_on_source_mtime_drift(self, tmp_logs: Path) -> None:
         metas1 = update_cache(tmp_logs)
-        # Bump mtime of one of the JSONL files into the future.
-        jsonls = sorted(tmp_logs.glob("*.jsonl"))
-        target = jsonls[0]
+        # Bump mtime of one of the compact-Parquet source files into
+        # the future. After the E19 cleanup the compact-Parquet file
+        # is the canonical source for a stem when both formats are
+        # present, so this is the file whose mtime the cache tracks.
+        compacts = sorted(tmp_logs.glob("*.compact.parquet"))
+        target = compacts[0]
+        stem = target.name[: -len(".compact.parquet")]
         future = time.time() + 60
         os.utime(target, (future, future))
 
         metas2 = update_cache(tmp_logs)
-        # The targeted shard's meta must reflect the new mtime
-        assert metas2[target.stem].mtime != metas1[target.stem].mtime
+        # The targeted shard's meta must reflect the new mtime.
+        assert metas2[stem].mtime != metas1[stem].mtime
 
     def test_rebuild_on_schema_version_mismatch(self, tmp_logs: Path) -> None:
         update_cache(tmp_logs)
@@ -286,8 +290,16 @@ class TestClockSyncShardHandling:
     """
 
     def _write_clocksync_run(self, tmp_path: Path) -> Path:
-        """Build a synthetic two-runner run with a clock-sync sibling file."""
-        from helpers import _ts, write_jsonl
+        """Build a synthetic two-runner run with a clock-sync sibling file.
+
+        Post-E19 (T19.10c): per-event events (``write`` / ``receive``)
+        flow into the compact-Parquet sibling; lifecycle events
+        (``phase``) stay in JSONL. The standalone
+        ``<runner>-clock-sync-<run>.jsonl`` sibling log is JSONL-only
+        because the runner emits clock-sync samples directly to that
+        file -- there is no compact-Parquet counterpart for it.
+        """
+        from helpers import _ts, write_jsonl, write_spawn_pair
 
         run = "csync-run01"
         # Variant log for runner alice with one write.
@@ -362,8 +374,20 @@ class TestClockSyncShardHandling:
             },
         ]
 
-        write_jsonl(tmp_path / f"test-variant-alice-{run}.jsonl", alice_variant)
-        write_jsonl(tmp_path / f"test-variant-bob-{run}.jsonl", bob_variant)
+        write_spawn_pair(
+            tmp_path,
+            variant="test-variant",
+            runner="alice",
+            run=run,
+            events=alice_variant,
+        )
+        write_spawn_pair(
+            tmp_path,
+            variant="test-variant",
+            runner="bob",
+            run=run,
+            events=bob_variant,
+        )
         write_jsonl(tmp_path / f"bob-clock-sync-{run}.jsonl", bob_clocksync)
         return tmp_path
 

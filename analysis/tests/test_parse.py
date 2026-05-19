@@ -6,6 +6,8 @@ import io
 import json
 from pathlib import Path
 
+import pytest
+
 from parse import COLUMN_ORDER, iter_rows, parse_timestamp_ns, project_line
 from schema import SHARD_SCHEMA
 
@@ -293,6 +295,14 @@ class TestIterRows:
         assert rows[0]["event"] == "phase"
 
     def test_real_file(self, tmp_path: Path) -> None:
+        """Lifecycle-only JSONL streams round-trip cleanly through ``iter_rows``.
+
+        Post-E19 cleanup (T19.10c) per-event JSONL rows are no longer
+        supported -- they get warned-and-skipped, exercised separately
+        in :class:`TestIterRowsSkipsPreT182PerEventRows`. Here we just
+        confirm the happy path: a file containing only lifecycle rows
+        yields one row per line.
+        """
         path = tmp_path / "x.jsonl"
         events = [
             {
@@ -308,11 +318,8 @@ class TestIterRows:
                 "variant": "test",
                 "runner": "a",
                 "run": "r1",
-                "event": "write",
-                "seq": 1,
-                "path": "/k",
-                "qos": 1,
-                "bytes": 8,
+                "event": "connected",
+                "elapsed_ms": 1.0,
             },
         ]
         with open(path, "w", encoding="utf-8") as f:
@@ -322,10 +329,182 @@ class TestIterRows:
             rows = list(iter_rows(f))
         assert len(rows) == 2
         assert rows[0]["event"] == "phase"
-        assert rows[1]["event"] == "write"
-        assert rows[1]["seq"] == 1
+        assert rows[1]["event"] == "connected"
 
 
 class TestColumnOrder:
     def test_column_order_matches_schema(self) -> None:
         assert COLUMN_ORDER == tuple(SHARD_SCHEMA.keys())
+
+
+class TestIterRowsSkipsPreT182PerEventRows:
+    """T19.10c invariant: per-event JSONL rows are skipped with a warning.
+
+    The post-E19 cleanup contract is that JSONL carries lifecycle
+    events only. Pre-T18.2 datasets that contain per-event rows are no
+    longer supported (per user directive); :func:`iter_rows` warns
+    once per file on stderr and skips the offending rows rather than
+    yielding them.
+
+    Each removed event type
+    (``write`` / ``receive`` / ``backpressure_skipped`` /
+    ``gap_detected`` / ``gap_filled``) is exercised here; the warning
+    is emitted exactly once per file regardless of the number of
+    skipped rows.
+    """
+
+    @staticmethod
+    def _make_line(event: str) -> str:
+        base = {
+            "ts": "2026-04-15T09:35:50.000Z",
+            "variant": "v",
+            "runner": "alice",
+            "run": "r",
+            "event": event,
+        }
+        if event in {"write", "receive"}:
+            base.update({"seq": 1, "path": "/k", "qos": 1, "bytes": 8})
+        if event == "receive":
+            base["writer"] = "bob"
+        if event == "backpressure_skipped":
+            base.update({"path": "/k", "qos": 1})
+        if event == "gap_detected":
+            base.update({"writer": "bob", "missing_seq": 1})
+        if event == "gap_filled":
+            base.update({"writer": "bob", "recovered_seq": 1})
+        return json.dumps(base)
+
+    @pytest.mark.parametrize(
+        "event",
+        ["write", "receive", "backpressure_skipped", "gap_detected", "gap_filled"],
+    )
+    def test_each_removed_event_type_is_skipped(self, event: str, capsys) -> None:
+        """Each removed event type drops out of the yielded row stream."""
+        text = "\n".join(
+            [
+                self._make_line(event),
+                json.dumps(
+                    {
+                        "ts": "2026-04-15T09:35:51.000Z",
+                        "variant": "v",
+                        "runner": "alice",
+                        "run": "r",
+                        "event": "phase",
+                        "phase": "operate",
+                    }
+                ),
+            ]
+        )
+        rows = list(iter_rows(io.StringIO(text)))
+        # Only the lifecycle ``phase`` row survives.
+        assert len(rows) == 1
+        assert rows[0]["event"] == "phase"
+        captured = capsys.readouterr()
+        # The warning message labels the removed event set and explains
+        # why we are dropping the row.
+        assert "ignoring 1 pre-T18.2 per-event JSONL rows" in captured.err
+        assert "compact-Parquet is the only source" in captured.err
+
+    def test_warning_is_one_shot_per_file(self, capsys) -> None:
+        """Many removed rows -> single warning carrying the total count."""
+        lines = []
+        for seq in range(5):
+            lines.append(self._make_line("write"))
+        # Plus a couple of receives so the message aggregates across
+        # different removed event types.
+        for seq in range(3):
+            lines.append(self._make_line("receive"))
+        text = "\n".join(lines)
+        rows = list(iter_rows(io.StringIO(text)))
+        assert rows == []
+        captured = capsys.readouterr()
+        # The warning fires exactly once on stderr (not per row) and
+        # reports the aggregate count.
+        assert captured.err.count("pre-T18.2 per-event JSONL rows") == 1
+        assert "ignoring 8 pre-T18.2 per-event JSONL rows" in captured.err
+
+    def test_no_warning_when_no_removed_rows_present(self, capsys) -> None:
+        """Lifecycle-only streams must not emit the warning."""
+        text = json.dumps(
+            {
+                "ts": "2026-04-15T09:35:50.000Z",
+                "variant": "v",
+                "runner": "alice",
+                "run": "r",
+                "event": "phase",
+                "phase": "connect",
+            }
+        )
+        rows = list(iter_rows(io.StringIO(text)))
+        assert len(rows) == 1
+        captured = capsys.readouterr()
+        assert "pre-T18.2 per-event JSONL rows" not in captured.err
+
+    def test_source_path_appears_in_warning(self, tmp_path: Path, capsys) -> None:
+        """When ``source_path`` is supplied, the file path appears in the
+        warning so operators can locate the offending file."""
+        path = tmp_path / "legacy.jsonl"
+        path.write_text(self._make_line("write") + "\n", encoding="utf-8")
+        with open(path, encoding="utf-8") as f:
+            rows = list(iter_rows(f, source_path=path))
+        assert rows == []
+        captured = capsys.readouterr()
+        assert str(path) in captured.err
+
+    def test_warn_and_skip_through_update_cache(self, tmp_path: Path, capsys) -> None:
+        """End-to-end: a JSONL with legacy per-event rows produces
+        empty per-event tables (warned and skipped), not a crash.
+
+        This is the user-facing acceptance check from the T19.10c
+        spec: pre-T18.2 datasets should warn and skip, never crash
+        the analyzer.
+        """
+        # Drop a pre-T18.2-shaped JSONL with both lifecycle and
+        # per-event rows.
+        from cache import update_cache, scan_shards
+        import polars as pl
+
+        path = tmp_path / "v-alice-run01.jsonl"
+        lines = [
+            json.dumps(
+                {
+                    "ts": "2026-04-15T09:35:50.000Z",
+                    "variant": "v",
+                    "runner": "alice",
+                    "run": "run01",
+                    "event": "phase",
+                    "phase": "operate",
+                }
+            ),
+            self._make_line("write"),
+            self._make_line("receive"),
+            self._make_line("gap_detected"),
+        ]
+        path.write_text("\n".join(lines), encoding="utf-8")
+
+        metas = update_cache(tmp_path)
+        assert "v-alice-run01" in metas
+        # Only the single lifecycle ``phase`` row survives in the shard.
+        assert metas["v-alice-run01"].row_count == 1
+
+        lazy = scan_shards(tmp_path)
+        events = (
+            lazy.select(pl.col("event").cast(pl.Utf8))
+            .collect()
+            .get_column("event")
+            .to_list()
+        )
+        assert events == ["phase"]
+        # No per-event rows survive -- the analyzer's downstream tables
+        # would simply be empty rather than crash.
+        for removed in (
+            "write",
+            "receive",
+            "backpressure_skipped",
+            "gap_detected",
+            "gap_filled",
+        ):
+            assert removed not in events
+
+        captured = capsys.readouterr()
+        assert "pre-T18.2 per-event JSONL rows" in captured.err

@@ -268,18 +268,25 @@ def _build_skew_fixture(
 
     Layout written under ``target_dir`` (treated as the run directory):
 
-    - ``<variant>-alice-<run>.jsonl``: alice writes seq 1..N at her
-      t = 1000 + i ms (her clock).
-    - ``<variant>-bob-<run>.jsonl``: bob receives those writes at his
-      t = 1000 + i + (real_latency + skew) ms (his clock; the +skew is
-      because his clock is ahead of alice's).
+    - ``<variant>-alice-<run>.jsonl`` (+ ``.compact.parquet`` sibling):
+      alice writes seq 1..N at her t = 1000 + i ms (her clock).
+    - ``<variant>-bob-<run>.jsonl`` (+ ``.compact.parquet`` sibling):
+      bob receives those writes at his t = 1000 + i +
+      (real_latency + skew) ms (his clock; the +skew is because his
+      clock is ahead of alice's).
     - ``bob-clock-sync-<run>.jsonl``: bob's clock-sync log records that
       alice's clock is ``-skew_ms`` ms relative to bob's (peer.clock -
       self.clock). The analysis adds this offset to the raw delta to
       recover the real latency.
 
+    Post-E19 (T19.10c): per-event ``write`` / ``receive`` rows are
+    written to the compact-Parquet sibling for each spawn; lifecycle
+    events and clock-sync stay in JSONL.
+
     Returns the run directory path.
     """
+    from helpers import write_spawn_pair  # local import to avoid circulars
+
     base_ns = 1744710950_000_000_000  # arbitrary, matches helpers._ts
 
     # Alice's events on alice's clock.
@@ -423,8 +430,20 @@ def _build_skew_fixture(
     ]
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    _write_jsonl(target_dir / f"{variant}-alice-{run}.jsonl", alice_events)
-    _write_jsonl(target_dir / f"{variant}-bob-{run}.jsonl", bob_events)
+    write_spawn_pair(
+        target_dir,
+        variant=variant,
+        runner="alice",
+        run=run,
+        events=alice_events,
+    )
+    write_spawn_pair(
+        target_dir,
+        variant=variant,
+        runner="bob",
+        run=run,
+        events=bob_events,
+    )
     _write_jsonl(target_dir / f"bob-clock-sync-{run}.jsonl", bob_clocksync)
     return target_dir
 
@@ -520,7 +539,12 @@ class TestPersistentSkewFixture:
     """
 
     def test_corrected_latency(self, tmp_path: Path) -> None:
+        # Post-E19 (T19.10c): copy both the lifecycle JSONL files and
+        # their compact-Parquet siblings (per-event observations live
+        # in the latter since the cleanup).
         for f in _PERSISTENT_SKEW_FIXTURE.glob("*.jsonl"):
+            shutil.copy2(f, tmp_path / f.name)
+        for f in _PERSISTENT_SKEW_FIXTURE.glob("*.compact.parquet"):
             shutil.copy2(f, tmp_path / f.name)
 
         update_cache(tmp_path)

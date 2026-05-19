@@ -12,7 +12,7 @@ _ANALYSIS_ROOT = Path(__file__).resolve().parent.parent
 if str(_ANALYSIS_ROOT) not in sys.path:
     sys.path.insert(0, str(_ANALYSIS_ROOT))
 
-from helpers import _ts, make_event, write_jsonl  # noqa: E402
+from helpers import _ts, make_event, write_spawn_pair  # noqa: E402
 
 
 @pytest.fixture
@@ -271,6 +271,22 @@ def tmp_logs(tmp_path: Path) -> Path:
         make_event("phase", runner="bob", phase="silent", offset_ms=2000),
     ]
 
-    write_jsonl(tmp_path / "test-variant-alice-run01.jsonl", alice_events)
-    write_jsonl(tmp_path / "test-variant-bob-run01.jsonl", bob_events)
+    # Post-E19 cleanup (T19.10c): per-event observations live in the
+    # compact-Parquet sibling file; the JSONL stream is lifecycle-only.
+    # ``write_spawn_pair`` splits each spawn's event list across the
+    # two files for us.
+    write_spawn_pair(
+        tmp_path,
+        variant="test-variant",
+        runner="alice",
+        run="run01",
+        events=alice_events,
+    )
+    write_spawn_pair(
+        tmp_path,
+        variant="test-variant",
+        runner="bob",
+        run="run01",
+        events=bob_events,
+    )
     return tmp_path
