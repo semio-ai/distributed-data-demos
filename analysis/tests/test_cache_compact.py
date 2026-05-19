@@ -33,15 +33,21 @@ from schema import SCHEMA_VERSION
 
 
 class TestDiscoverSources:
-    def test_jsonl_only(self, tmp_logs: Path) -> None:
-        """``tmp_logs`` fixture writes two JSONL files; both surface."""
+    def test_canonical_pair_surfaces_compact(self, tmp_logs: Path) -> None:
+        """``tmp_logs`` writes a JSONL + compact-Parquet pair per spawn.
+
+        Post-E19 (T19.10c) the canonical layout is the per-spawn file
+        pair: lifecycle-only JSONL alongside a compact-Parquet sibling
+        for per-event observations. ``discover_sources`` collapses each
+        stem to a single source -- the compact file wins.
+        """
         sources = discover_sources(tmp_logs)
         assert set(sources.keys()) == {
             "test-variant-alice-run01",
             "test-variant-bob-run01",
         }
         for _stem, (_, fmt) in sources.items():
-            assert fmt is SourceFormat.JSONL
+            assert fmt is SourceFormat.COMPACT
 
     def test_compact_only(self, tmp_path: Path) -> None:
         fx = CompactFixture(variant="v", runner="alice", run="run01")
@@ -281,405 +287,45 @@ class TestUpdateCacheMixedFormats:
 
 
 # ----- Numeric parity: JSONL-only vs compact-only of the same workload -----
-
-
-class TestNumericParityAcrossFormats:
-    """Pivot-table / integrity-style aggregates must match across formats.
-
-    The acceptance criterion from the task: pivot tables / integrity
-    reports / drop-rate heatmaps numerically match between a
-    compact-only run and a JSONL-only run of the same logical workload.
-
-    Here we exercise the cache's projection layer directly -- per-event
-    counts and per-(writer, qos, path) write counts must agree between
-    the two formats. Higher-level pivot / heatmap parity falls out from
-    the existing analyzer tests once the projections agree, but having
-    a focused parity test here keeps regressions on the cache layer
-    itself easy to bisect.
-    """
-
-    def _workload_pair(self, root: Path) -> tuple[Path, Path]:
-        """Drop a JSONL-only run and a compact-only run as sibling dirs.
-
-        Returns ``(jsonl_dir, compact_dir)``.
-        """
-        jsonl_dir = root / "j"
-        compact_dir = root / "c"
-        jsonl_dir.mkdir()
-        compact_dir.mkdir()
-
-        # Identical workload: alice writes seq 1..3 on /k at qos 4;
-        # bob receives all three.
-        alice = [
-            {
-                "ts": _ts(0),
-                "variant": "v",
-                "runner": "alice",
-                "run": "run01",
-                "event": "phase",
-                "phase": "operate",
-            },
-        ]
-        for seq, off in [(1, 100), (2, 200), (3, 300)]:
-            alice.append(
-                {
-                    "ts": _ts(off),
-                    "variant": "v",
-                    "runner": "alice",
-                    "run": "run01",
-                    "event": "write",
-                    "seq": seq,
-                    "path": "/k",
-                    "qos": 4,
-                    "bytes": 8,
-                }
-            )
-        bob = [
-            {
-                "ts": _ts(0),
-                "variant": "v",
-                "runner": "bob",
-                "run": "run01",
-                "event": "phase",
-                "phase": "operate",
-            },
-        ]
-        for seq, off in [(1, 150), (2, 250), (3, 350)]:
-            bob.append(
-                {
-                    "ts": _ts(off),
-                    "variant": "v",
-                    "runner": "bob",
-                    "run": "run01",
-                    "event": "receive",
-                    "writer": "alice",
-                    "seq": seq,
-                    "path": "/k",
-                    "qos": 4,
-                    "bytes": 8,
-                }
-            )
-
-        write_jsonl(jsonl_dir / "v-alice-run01.jsonl", alice)
-        write_jsonl(jsonl_dir / "v-bob-run01.jsonl", bob)
-
-        # Compact mirror of the same workload.
-        base_ns = 1744710950_000_000_000  # matches helpers._ts base
-
-        def ns(off_ms: float) -> int:
-            return base_ns + int(off_ms * 1_000_000)
-
-        fa = CompactFixture(variant="v", runner="alice", run="run01")
-        fa.push_phase(ns(0), "operate")
-        for seq, off in [(1, 100), (2, 200), (3, 300)]:
-            fa.push_write(ns(off), "/k", 4, seq, 8)
-        fa.write(compact_dir / "v-alice-run01.compact.parquet")
-
-        fb = CompactFixture(variant="v", runner="bob", run="run01")
-        fb.push_phase(ns(0), "operate")
-        for seq, off in [(1, 150), (2, 250), (3, 350)]:
-            fb.push_receive(ns(off), "alice", seq, "/k", 4, 8)
-        fb.write(compact_dir / "v-bob-run01.compact.parquet")
-
-        return jsonl_dir, compact_dir
-
-    def test_event_counts_match(self, tmp_path: Path) -> None:
-        jsonl_dir, compact_dir = self._workload_pair(tmp_path)
-        update_cache(jsonl_dir)
-        update_cache(compact_dir)
-        j = scan_shards(jsonl_dir).collect()
-        c = scan_shards(compact_dir).collect()
-
-        # Event counts per kind must agree across the two formats.
-        j_counts = (
-            j.group_by(pl.col("event").cast(pl.Utf8))
-            .agg(pl.len().alias("n"))
-            .sort("event")
-        )
-        c_counts = (
-            c.group_by(pl.col("event").cast(pl.Utf8))
-            .agg(pl.len().alias("n"))
-            .sort("event")
-        )
-        assert j_counts.equals(c_counts)
-
-    def test_write_rows_match(self, tmp_path: Path) -> None:
-        jsonl_dir, compact_dir = self._workload_pair(tmp_path)
-        update_cache(jsonl_dir)
-        update_cache(compact_dir)
-        j = scan_shards(jsonl_dir).collect()
-        c = scan_shards(compact_dir).collect()
-
-        j_writes = (
-            j.filter(pl.col("event") == "write")
-            .select(["seq", "path", "qos"])
-            .sort("seq")
-        )
-        c_writes = (
-            c.filter(pl.col("event") == "write")
-            .select(["seq", "path", "qos"])
-            .sort("seq")
-        )
-        assert j_writes.equals(c_writes)
-
-    def test_receive_rows_match(self, tmp_path: Path) -> None:
-        jsonl_dir, compact_dir = self._workload_pair(tmp_path)
-        update_cache(jsonl_dir)
-        update_cache(compact_dir)
-        j = scan_shards(jsonl_dir).collect()
-        c = scan_shards(compact_dir).collect()
-
-        j_recvs = (
-            j.filter(pl.col("event") == "receive")
-            .select(["seq", "path", "writer", "qos"])
-            .sort("seq")
-        )
-        c_recvs = (
-            c.filter(pl.col("event") == "receive")
-            .select(["seq", "path", "writer", "qos"])
-            .sort("seq")
-        )
-        assert j_recvs.equals(c_recvs)
-
-
-# ----- End-to-end analyzer parity -----
-
-
-class TestRunAnalysisParity:
-    """End-to-end: ``run_analysis`` must produce equivalent reports on
-    JSONL-only vs compact-only directories carrying the same workload.
-
-    This is the acceptance gate from T18.4: pivot tables / integrity /
-    drop-rate aggregates numerically match between a compact-only run
-    and a JSONL-only run of the same logical workload.
-    """
-
-    def _workload_pair(self, root: Path) -> tuple[Path, Path]:
-        """Drop the same two-runner workload as both JSONL and compact."""
-        jsonl_dir = root / "j"
-        compact_dir = root / "c"
-        jsonl_dir.mkdir()
-        compact_dir.mkdir()
-
-        # Alice writes seq 1..5 on /k at qos 4; bob receives all five.
-        alice_jsonl = [
-            {
-                "ts": _ts(0),
-                "variant": "v",
-                "runner": "alice",
-                "run": "run01",
-                "event": "phase",
-                "phase": "connect",
-            },
-            {
-                "ts": _ts(1),
-                "variant": "v",
-                "runner": "alice",
-                "run": "run01",
-                "event": "connected",
-                "elapsed_ms": 1.0,
-                "threading_mode": "single",
-                "recv_buffer_kb": 4096,
-            },
-            {
-                "ts": _ts(2),
-                "variant": "v",
-                "runner": "alice",
-                "run": "run01",
-                "event": "phase",
-                "phase": "operate",
-            },
-        ]
-        for seq, off in [(1, 100), (2, 200), (3, 300), (4, 400), (5, 500)]:
-            alice_jsonl.append(
-                {
-                    "ts": _ts(off),
-                    "variant": "v",
-                    "runner": "alice",
-                    "run": "run01",
-                    "event": "write",
-                    "seq": seq,
-                    "path": "/k",
-                    "qos": 4,
-                    "bytes": 8,
-                }
-            )
-        alice_jsonl.append(
-            {
-                "ts": _ts(1000),
-                "variant": "v",
-                "runner": "alice",
-                "run": "run01",
-                "event": "phase",
-                "phase": "silent",
-            }
-        )
-
-        bob_jsonl = [
-            {
-                "ts": _ts(0),
-                "variant": "v",
-                "runner": "bob",
-                "run": "run01",
-                "event": "phase",
-                "phase": "connect",
-            },
-            {
-                "ts": _ts(1),
-                "variant": "v",
-                "runner": "bob",
-                "run": "run01",
-                "event": "connected",
-                "elapsed_ms": 1.0,
-                "threading_mode": "single",
-                "recv_buffer_kb": 4096,
-            },
-            {
-                "ts": _ts(2),
-                "variant": "v",
-                "runner": "bob",
-                "run": "run01",
-                "event": "phase",
-                "phase": "operate",
-            },
-        ]
-        for seq, off in [(1, 150), (2, 250), (3, 350), (4, 450), (5, 550)]:
-            bob_jsonl.append(
-                {
-                    "ts": _ts(off),
-                    "variant": "v",
-                    "runner": "bob",
-                    "run": "run01",
-                    "event": "receive",
-                    "writer": "alice",
-                    "seq": seq,
-                    "path": "/k",
-                    "qos": 4,
-                    "bytes": 8,
-                }
-            )
-        bob_jsonl.append(
-            {
-                "ts": _ts(1000),
-                "variant": "v",
-                "runner": "bob",
-                "run": "run01",
-                "event": "phase",
-                "phase": "silent",
-            }
-        )
-
-        write_jsonl(jsonl_dir / "v-alice-run01.jsonl", alice_jsonl)
-        write_jsonl(jsonl_dir / "v-bob-run01.jsonl", bob_jsonl)
-
-        # Compact mirror.
-        base_ns = 1744710950_000_000_000
-
-        def ns(off_ms: float) -> int:
-            return base_ns + int(off_ms * 1_000_000)
-
-        fa = CompactFixture(
-            variant="v",
-            runner="alice",
-            run="run01",
-            threading_mode="single",
-            recv_buffer_kb=4096,
-        )
-        fa.push_phase(ns(0), "connect")
-        fa.push_connected(ns(1), "bob", 1.0, "single")
-        fa.push_phase(ns(2), "operate")
-        for seq, off in [(1, 100), (2, 200), (3, 300), (4, 400), (5, 500)]:
-            fa.push_write(ns(off), "/k", 4, seq, 8)
-        fa.push_phase(ns(1000), "silent")
-        fa.write(compact_dir / "v-alice-run01.compact.parquet")
-
-        fb = CompactFixture(
-            variant="v",
-            runner="bob",
-            run="run01",
-            threading_mode="single",
-            recv_buffer_kb=4096,
-        )
-        fb.push_phase(ns(0), "connect")
-        fb.push_connected(ns(1), "alice", 1.0, "single")
-        fb.push_phase(ns(2), "operate")
-        for seq, off in [(1, 150), (2, 250), (3, 350), (4, 450), (5, 550)]:
-            fb.push_receive(ns(off), "alice", seq, "/k", 4, 8)
-        fb.push_phase(ns(1000), "silent")
-        fb.write(compact_dir / "v-bob-run01.compact.parquet")
-
-        return jsonl_dir, compact_dir
-
-    def test_integrity_and_performance_match(self, tmp_path: Path) -> None:
-        """End-to-end ``run_analysis`` output is equivalent across formats.
-
-        Compares the IntegrityResult and PerformanceResult dataclass
-        fields that downstream consumers (CLI tables, CSV export,
-        diagrams) rely on. Equality is exact on counts and within a
-        small tolerance on float aggregates -- the two formats encode
-        the same wall-clock timestamps so latency math agrees to the
-        nanosecond.
-        """
-        from analyze import run_analysis
-
-        jsonl_dir, compact_dir = self._workload_pair(tmp_path)
-        update_cache(jsonl_dir)
-        update_cache(compact_dir)
-
-        j_integrity, j_performance = run_analysis(jsonl_dir, do_summary=True)
-        c_integrity, c_performance = run_analysis(compact_dir, do_summary=True)
-
-        # One IntegrityResult / PerformanceResult per (variant, run,
-        # writer, receiver) pair. Same workload -> same shape.
-        assert len(j_integrity) == len(c_integrity)
-        assert len(j_performance) == len(c_performance)
-        assert j_integrity and j_performance, (
-            "regression: empty analyzer output indicates the pipeline "
-            "is no longer building anything"
-        )
-
-        # Match by (variant, run, writer, receiver, qos) so order
-        # differences are tolerated.
-        def _ikey(ir):
-            return (ir.variant, ir.run, ir.writer, ir.receiver, ir.qos)
-
-        j_map = {_ikey(ir): ir for ir in j_integrity}
-        c_map = {_ikey(ir): ir for ir in c_integrity}
-        assert set(j_map.keys()) == set(c_map.keys())
-        for key, jr in j_map.items():
-            cr = c_map[key]
-            assert jr.write_count == cr.write_count
-            assert jr.receive_count == cr.receive_count
-            assert jr.duplicates == cr.duplicates
-            assert jr.out_of_order == cr.out_of_order
-            assert abs(jr.delivery_pct - cr.delivery_pct) < 1e-9, (
-                f"delivery_pct mismatch on {key}: "
-                f"jsonl={jr.delivery_pct} compact={cr.delivery_pct}"
-            )
+#
+# Removed by T19.10c. Post-E19 cleanup, the JSONL stream is
+# lifecycle-only; "JSONL-only with per-event rows" is no longer a
+# supported source shape (``parse.iter_rows`` warns once and skips
+# per-event JSONL rows when it encounters them). The remaining
+# format-transparency surface is the compact-Parquet path, exercised
+# directly by ``TestUpdateCacheCompactOnly`` above. End-to-end pivot
+# parity for the canonical per-spawn file pair is exercised by the
+# ``tmp_logs`` fixture in ``test_analyze`` / ``test_cache``.
 
 
 # ----- Schema version bump -----
 
 
 class TestSchemaVersionBump:
-    def test_schema_version_bumped_to_5(self) -> None:
-        """T19.5 bumped the cache schema version to 5 (E19 additions).
+    def test_schema_version_bumped_to_6(self) -> None:
+        """T19.10c bumped the cache schema version to 6 (E19 cleanup).
 
-        T18.4 had bumped it to 4 for the compact-parquet ingest. T19.5
-        bumps again because ``SHARD_SCHEMA`` gained ``leaf_count``,
-        ``shape``, and ``bytes`` columns that the downstream lazy
-        pipeline references unconditionally.
+        Version history relevant to this layer:
+        - v3: T11.5 added ``threading_mode``.
+        - v4: T18.4 added compact-parquet ingest.
+        - v5: T19.5 added ``leaf_count`` / ``shape`` / ``bytes`` columns.
+        - v6: T19.10c stripped per-event rows out of the JSONL parser.
+          Columns are unchanged, but any v5 cache built from a pre-T18.2
+          JSONL with per-event rows contains rows that the post-cleanup
+          analyzer would have dropped -- bumping forces a rebuild so
+          those phantom rows are recomputed under the lifecycle-only
+          rule.
         """
         from schema import SCHEMA_VERSION as v
 
-        assert v == "5"
+        assert v == "6"
 
     def test_legacy_v3_cache_is_invalidated(self, tmp_path: Path) -> None:
         """A cache with an older schema version triggers a wipe.
 
         The previous test name pinned v3 -> bumped-version invalidation;
-        the same behaviour applies to v4 (the post-T18.4 version) being
-        invalidated by the T19.5 bump to v5.
+        the same behaviour applies to any older version (v3 / v4 / v5)
+        being invalidated by the T19.10c bump to v6.
         """
         # Drop a fake legacy cache with the v3 sentinel and an orphan
         # shard. The next update_cache call should wipe it because the

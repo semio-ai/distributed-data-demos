@@ -45,7 +45,18 @@ import polars as pl
 # ``bytes`` from writes onto correlated receives, and performance.py
 # derives ``leaves_per_sec`` / ``bytes_per_sec``. Bumping forces a
 # rebuild so existing caches get the new columns.
-SCHEMA_VERSION: str = "5"
+#
+# Bumped to "6" by T19.10c (E19 cleanup): the JSONL stream is now
+# lifecycle-only -- per-event rows (``write`` / ``receive`` /
+# ``backpressure_skipped`` / ``gap_detected`` / ``gap_filled``) are
+# read exclusively from compact-Parquet. ``parse.iter_rows`` warns and
+# skips any pre-T18.2 per-event JSONL rows it encounters. The columnar
+# layout of ``SHARD_SCHEMA`` is unchanged, but the source semantics
+# differ: any v5 cache that was built from a pre-T18.2 JSONL with
+# per-event rows now contains rows that the post-cleanup analyzer
+# would have dropped. Bumping forces a rebuild so those phantom rows
+# are recomputed under the lifecycle-only rule.
+SCHEMA_VERSION: str = "6"
 
 # Flat columnar event schema. One row per JSONL line. Event-specific
 # fields share the same row; columns that don't apply to a given event
@@ -104,14 +115,14 @@ SHARD_SCHEMA: dict[str, pl.DataType] = {
     # > 1 for block-flood / mixed-types). ``shape`` is one of
     # ``"scalar"`` / ``"array"`` / ``"struct"``. Both are populated only
     # on ``write`` rows; correlate.py propagates them onto matching
-    # ``receive`` rows by the (writer, seq, path) key. Legacy JSONL /
-    # compact-Parquet pre-E19 default to ``leaf_count = 1`` and
+    # ``receive`` rows by the (writer, seq, path) key. Pre-E19
+    # compact-Parquet files default to ``leaf_count = 1`` and
     # ``shape = "scalar"`` per the api-contracts.
     "leaf_count": pl.UInt32,
     "shape": pl.Utf8,
     # Serialized payload size for ``write`` / ``receive`` events. The
-    # JSONL contract has always recorded this on the per-event line, but
-    # the analysis pipeline previously dropped it. E19 introduces
+    # compact-Parquet contract records this on every per-event row; the
+    # analysis pipeline previously dropped it. E19 introduces
     # ``bytes_per_sec`` as a headline throughput metric so we now keep
     # the value in-schema. Null on event types that have no payload
     # (phase / connected / resource / etc.).
