@@ -1,3 +1,4 @@
+mod analyze;
 mod barrier_coord;
 mod cli_args;
 mod clock_sync;
@@ -158,6 +159,31 @@ struct Cli {
     /// clear error.
     #[arg(long)]
     log_dir: Option<PathBuf>,
+
+    /// Run the analysis tool over the final log directory after the
+    /// matrix completes (T18.6).
+    ///
+    /// When set, **only the lexicographically lowest-named runner**
+    /// (the typical `alice` in an `alice`/`bob` pair) shells out to
+    /// `python analysis/analyze.py <log-dir> --summary --dump
+    /// --diagrams --output <log-dir>/analysis` after every spawn has
+    /// finished and the summary has been printed. The other runners
+    /// exit cleanly with no analysis side-effects so concurrent writes
+    /// to `<log-dir>/analysis/` are impossible.
+    ///
+    /// Python interpreter resolution: tries `python3` first, falls
+    /// back to `python`; if neither resolves, the analysis is skipped
+    /// with a clear warning on the runner's stderr (the benchmark
+    /// itself still exits 0 because the matrix succeeded).
+    ///
+    /// Repo-root detection: walks up from the runner binary location
+    /// until it finds `analysis/analyze.py`. Documented in
+    /// `runner/CUSTOM.md` "Auto-analysis after the matrix".
+    ///
+    /// A non-zero Python exit is surfaced as a runner-level warning,
+    /// not a hard failure — the benchmark already succeeded.
+    #[arg(long, default_value_t = false)]
+    analyze_full: bool,
 }
 
 /// Exit code returned to the OS when a coordination barrier hits its timeout.
@@ -1006,6 +1032,15 @@ fn run(cli: &Cli) -> Result<()> {
 
     // Print summary table.
     print_summary(&bench_config.run, &summary);
+
+    // T18.6: optional post-matrix analyzer invocation. Only the
+    // lowest-sorted-name runner shells out so concurrent writes to
+    // `<log-dir>/analysis/` are impossible. Soft-fail on Python errors --
+    // the benchmark itself already completed. We run this even on partial
+    // failures so the analyzer can still report on whatever was collected.
+    if cli.analyze_full {
+        let _ = analyze::run_post_matrix_analysis(&cli.name, &bench_config.runners, &run_log_dir);
+    }
 
     // Resume-mode summary line: count reused vs executed vs failed.
     if cli.resume {

@@ -705,3 +705,77 @@ and passing it as the `log_dir_resolved` override into
 file at the chosen path even though its own
 `[variant.common].log_dir = "./logs"` declaration is unchanged from
 the coding-standards default.
+### Auto-analysis after the matrix (T18.6)
+
+When the runner is launched with `--analyze-full`, the
+**lexicographically lowest-named runner** in `runners` (the typical
+`alice` in an `alice` / `bob` pair) shells out to the Python analyzer
+after the matrix completes:
+
+```
+python analysis/analyze.py <log-dir> --summary --dump --diagrams --output <log-dir>/analysis
+```
+
+The other runner(s) skip analysis cleanly. The lowest-sorted-name rule
+matches the pair-convention used elsewhere (websocket / webrtc / hybrid
+TCP pairing, resume_manifest exchange, progress channel, barrier
+channel) so operators do not need to learn a new convention for the
+analyzer.
+
+**Repo-root detection.** The runner walks up from the runner binary
+location (`std::env::current_exe().parent()`) looking for a directory
+that contains `analysis/analyze.py`. The walkup is bounded by
+`REPO_WALKUP_LIMIT = 8` to keep filesystem traversal cheap even when
+the binary lives outside the workspace (e.g. an operator copying
+`runner.exe` to a shared deploy folder). Expected layout:
+
+```
+<repo-root>/
+  analysis/
+    analyze.py     <-- the walkup target
+    cache.py
+    ...
+  runner/
+    src/
+    target/release/runner(.exe)   <-- typical exe location
+  target/release/runner(.exe)     <-- workspace-rooted build (also typical)
+```
+
+Both `runner/target/release/runner` and `target/release/runner` work
+because the walkup checks every parent up to the limit, not just one
+specific level.
+
+**Python resolution.** The analyzer is invoked via
+`Command::new(<resolved-python>)`, where `<resolved-python>` is the
+first of `python3`, `python` that responds to `<exe> --version` with
+any exit status (we treat the spawn-success boolean as the existence
+check; the version output itself is discarded). When neither resolves,
+the runner emits a `WARN` line and continues -- the matrix already
+succeeded, so the analyzer not being installed is a degraded-but-
+non-fatal outcome.
+
+**Working directory.** The analyzer is spawned with
+`current_dir(<repo-root>/analysis)` so any relative imports inside
+`analyze.py` resolve consistently with the manual invocation pattern
+documented in `analysis/AGENTS.md`.
+
+**Non-fatal Python exit.** Any non-zero exit from the analyzer (or a
+spawn error) is surfaced as a `WARN:` line on the runner's stderr and
+does NOT change the runner's overall exit status. The benchmark itself
+already completed; the analyzer being unable to render diagrams is a
+degraded artifact, not a benchmark failure.
+
+The contract lines the integration test
+`t18_6_analyze_full_invokes_analyzer_after_matrix` pins:
+
+- The line beginning `[runner:<name>] running analysis:` (announces
+  the invocation before the spawn).
+- The optional `[runner:<name>] analysis complete:` (analyzer exit 0).
+- The optional `[runner:<name>] WARN: analysis exited Some(<code>) ...`
+  (analyzer non-zero exit).
+
+The pair-convention skip path emits:
+
+```
+[runner:<name>] --analyze-full set, but this runner is not the lowest-sorted name ('<lowest>'); skipping analysis
+```
