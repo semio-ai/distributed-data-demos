@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 
-use crate::cli::CliArgs;
+use crate::cli::{CliArgs, BLOCK_SIZE_SANITY_BYTES, DEFAULT_BLOB_SIZE};
 use crate::compact::CompactBuffers;
 use crate::compact_writer::{
     compact_parquet_path, write_compact_parquet, CompactParquetMeta, CompactWriterOptions,
@@ -473,6 +473,144 @@ pub fn warn_strict_qos_violation_once() -> bool {
     }
 }
 
+/// Validate the E19 workload-shape CLI args against the selected
+/// workload profile (T19.3) and materialize the per-profile defaults
+/// the driver passes to the workload factory.
+///
+/// Returns the [`WorkloadParams`] the driver should hand to
+/// `create_workload_with_params`. Returns Err with a descriptive
+/// message BEFORE any phase emission when the spec's constraints
+/// (see `metak-shared/api-contracts/variant-cli.md` E19 additions) are
+/// violated. This mirrors the existing `max-throughput + qos 3/4`
+/// rejection pattern from T17.2.
+///
+/// The `--blob-size` default is materialized here (not at the clap
+/// layer) so the CLI field remains a true `Option<u32>` and operators
+/// who pass an empty `--blob-size` flag still get a clear error rather
+/// than silent defaulting.
+fn validate_and_build_workload_params(config: &CliArgs) -> Result<WorkloadParams> {
+    let mut params = WorkloadParams {
+        variant: config.variant.clone(),
+        run: config.run.clone(),
+        blob_size: config.blob_size,
+        mixed_scalars_min: config.mixed_scalars_min,
+        mixed_scalars_max: config.mixed_scalars_max,
+        mixed_arrays_min: config.mixed_arrays_min,
+        mixed_arrays_max: config.mixed_arrays_max,
+        mixed_dict_split_max: config.mixed_dict_split_max,
+        workload_seed: config.workload_seed,
+    };
+
+    match config.workload.as_str() {
+        "block-flood" => {
+            // Default --blob-size to 100 when omitted (E19 contract).
+            let blob = params.blob_size.unwrap_or(DEFAULT_BLOB_SIZE);
+            if blob == 0 {
+                return Err(anyhow!(
+                    "block-flood requires --blob-size > 0 (got 0); see \
+                     metak-shared/api-contracts/variant-cli.md E19 additions"
+                ));
+            }
+            if !config.values_per_tick.is_multiple_of(blob) {
+                return Err(anyhow!(
+                    "block-flood requires --values-per-tick ({}) to be divisible by \
+                     --blob-size ({}); the remainder is {}. See \
+                     metak-shared/api-contracts/variant-cli.md E19 additions.",
+                    config.values_per_tick,
+                    blob,
+                    config.values_per_tick % blob
+                ));
+            }
+            // Persist the materialized default so the workload factory
+            // receives the same value the validation just blessed.
+            params.blob_size = Some(blob);
+
+            // Block-size sanity warning (stderr, NOT Err): when the
+            // per-WriteOp payload exceeds the UDP-datagram-fragment-
+            // sized threshold, surface a hint to the operator. One
+            // line, similar in style to the T17.2 contract-violation
+            // warning emitted in `warn_strict_qos_violation_once`.
+            //
+            // The check uses `checked_mul` so an over-large `blob_size`
+            // (e.g. `u32::MAX`) does not panic in debug builds.
+            let payload_bytes = blob.checked_mul(8);
+            if payload_bytes
+                .map(|b| b > BLOCK_SIZE_SANITY_BYTES)
+                .unwrap_or(true)
+            {
+                eprintln!(
+                    "[variant] warning: --blob-size {blob} produces \
+                     per-WriteOp payloads of ~{} bytes (> {} sanity threshold); \
+                     check variant-specific buffer / MTU hints",
+                    payload_bytes
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "overflow".to_string()),
+                    BLOCK_SIZE_SANITY_BYTES,
+                );
+            }
+        }
+        "mixed-types" => {
+            // All five mixed_* args are required when workload is
+            // `mixed-types`. We surface the first missing arg with a
+            // descriptive error so operators can fix their config one
+            // step at a time.
+            let scalars_min = params.mixed_scalars_min.ok_or_else(|| {
+                anyhow!(
+                    "mixed-types requires --mixed-scalars-min; see variant-cli.md E19 additions"
+                )
+            })?;
+            let scalars_max = params.mixed_scalars_max.ok_or_else(|| {
+                anyhow!(
+                    "mixed-types requires --mixed-scalars-max; see variant-cli.md E19 additions"
+                )
+            })?;
+            let _arrays_min = params.mixed_arrays_min.ok_or_else(|| {
+                anyhow!("mixed-types requires --mixed-arrays-min; see variant-cli.md E19 additions")
+            })?;
+            let arrays_max = params.mixed_arrays_max.ok_or_else(|| {
+                anyhow!("mixed-types requires --mixed-arrays-max; see variant-cli.md E19 additions")
+            })?;
+            let dict_split_max = params.mixed_dict_split_max.ok_or_else(|| {
+                anyhow!(
+                    "mixed-types requires --mixed-dict-split-max; see variant-cli.md E19 additions"
+                )
+            })?;
+
+            if dict_split_max < 2 {
+                return Err(anyhow!(
+                    "mixed-types requires --mixed-dict-split-max >= 2 (got {dict_split_max}); \
+                     see metak-shared/api-contracts/variant-cli.md E19 additions"
+                ));
+            }
+            if scalars_max > config.values_per_tick {
+                return Err(anyhow!(
+                    "mixed-types requires --mixed-scalars-max ({scalars_max}) <= \
+                     --values-per-tick ({}); see variant-cli.md E19 additions",
+                    config.values_per_tick
+                ));
+            }
+            let arrays_budget = config.values_per_tick.saturating_sub(scalars_min);
+            if arrays_max > arrays_budget {
+                return Err(anyhow!(
+                    "mixed-types requires --mixed-arrays-max ({arrays_max}) <= \
+                     (--values-per-tick - --mixed-scalars-min) = ({} - {scalars_min}) = {}; \
+                     see variant-cli.md E19 additions",
+                    config.values_per_tick,
+                    arrays_budget
+                ));
+            }
+        }
+        // Other profiles (scalar-flood, max-throughput, future
+        // profiles) ignore the E19 workload-shape args entirely. We do
+        // NOT reject extra args here -- forwarding unused args is
+        // harmless and keeps the runner-side TOML config uniform across
+        // workload selections.
+        _ => {}
+    }
+
+    Ok(params)
+}
+
 /// Run the full test protocol: connect, stabilize, operate, silent.
 ///
 /// The driver owns the logger and all support modules. The variant only
@@ -494,6 +632,15 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
             qos.as_int()
         ));
     }
+
+    // T19.3: validate the E19 workload-shape CLI args against the
+    // selected workload profile and materialize per-profile defaults
+    // (notably `--blob-size = 100` for `block-flood`). This runs BEFORE
+    // any logger init / phase emission so an operator passing an
+    // incompatible combination sees a clean stderr message and no
+    // partial JSONL stub. The returned `WorkloadParams` is what we
+    // hand to `create_workload_with_params` below.
+    let workload_params = validate_and_build_workload_params(config)?;
 
     // T17.2: Reset the one-shot QoS-3/4 violation warning guard so a
     // misbehaving variant in THIS spawn produces exactly one stderr
@@ -537,20 +684,12 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     );
     let mut seq_gen = SeqGenerator::new();
     let mut resource_monitor = ResourceMonitor::new();
-    // E19 / T19.2: build a `WorkloadParams` struct for the workload
-    // factory. The variant CLI plumbing for the new workload params
-    // (`--blob-size`, `--mixed-*`, `--workload-seed`) lands in T19.3;
-    // until then the struct carries only the spawn identifiers
-    // (variant + run) which the `mixed-types` fallback-seed path
-    // consumes. `scalar-flood` / `max-throughput` ignore the params
-    // entirely. `block-flood` / `mixed-types` selected without T19.3's
-    // CLI wiring will Err here with a descriptive message naming the
-    // missing arg.
-    let workload_params = WorkloadParams {
-        variant: config.variant.clone(),
-        run: config.run.clone(),
-        ..WorkloadParams::default()
-    };
+    // E19 / T19.3: hand the validated `WorkloadParams` (built above
+    // by `validate_and_build_workload_params`) to the workload factory.
+    // The factory's per-profile required-arg checks are now redundant
+    // with the driver's validation step but remain in place as a
+    // defensive backstop for any future call site that bypasses the
+    // driver (e.g. direct workload construction from a test).
     let mut workload = create_workload_with_params(&config.workload, &workload_params)?;
 
     // Stdout progress emitter (E15 / T15.1).
@@ -1078,7 +1217,8 @@ mod tests {
 
     use crate::cli::{CliArgs, DEFAULT_RECV_BUFFER_KB};
     use crate::driver::{
-        reset_strict_qos_violation_warning, run_protocol, warn_strict_qos_violation_once,
+        reset_strict_qos_violation_warning, run_protocol, validate_and_build_workload_params,
+        warn_strict_qos_violation_once,
     };
     use crate::types::{Qos, ReceivedUpdate, ThreadingMode};
     use crate::variant_trait::Variant;
@@ -1155,6 +1295,18 @@ mod tests {
             // exercise the compact-only path flip this off
             // explicitly.
             legacy_jsonl_events: true,
+            // E19 / T19.3: leave the workload-shape args unset in the
+            // default base_args. Driver unit tests that exercise the
+            // `block-flood` / `mixed-types` paths populate the args
+            // they need explicitly. `scalar-flood` and `max-throughput`
+            // ignore these fields entirely.
+            blob_size: None,
+            mixed_scalars_min: None,
+            mixed_scalars_max: None,
+            mixed_arrays_min: None,
+            mixed_arrays_max: None,
+            mixed_dict_split_max: None,
+            workload_seed: None,
             extra: vec!["--peers".to_string(), peers.to_string()],
         }
     }
@@ -2942,6 +3094,242 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("max-throughput"), "error: {msg}");
         assert!(msg.contains("QoS"), "error: {msg}");
+    }
+
+    // ---- T19.3: E19 workload-shape validation ----
+
+    /// `block-flood` with `--blob-size 0` is rejected at startup with
+    /// a descriptive error and no logger file is created.
+    #[test]
+    fn block_flood_with_zero_blob_size_is_rejected_at_startup() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "block-flood".to_string();
+        args.operate_secs = 1;
+        args.values_per_tick = 100;
+        args.blob_size = Some(0);
+
+        let mut variant = StubVariant::new("stub");
+        let err = run_protocol(&mut variant, &args)
+            .expect_err("block-flood --blob-size=0 must be rejected at startup");
+        let msg = err.to_string();
+        assert!(msg.contains("block-flood"), "error: {msg}");
+        assert!(
+            msg.contains("> 0"),
+            "error must explain >0 constraint: {msg}"
+        );
+        let log_path = dir.path().join("test-alice-run01.jsonl");
+        assert!(
+            !log_path.exists(),
+            "rejection must happen before logger creates the JSONL file"
+        );
+    }
+
+    /// `block-flood` with `vpt % blob_size != 0` is rejected at
+    /// startup with a divisibility error.
+    #[test]
+    fn block_flood_with_indivisible_blob_size_is_rejected_at_startup() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "block-flood".to_string();
+        args.operate_secs = 1;
+        args.values_per_tick = 1000;
+        args.blob_size = Some(300);
+
+        let mut variant = StubVariant::new("stub");
+        let err = run_protocol(&mut variant, &args)
+            .expect_err("block-flood vpt=1000 blob_size=300 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("divisible"),
+            "error must explain divisibility: {msg}"
+        );
+        assert!(msg.contains("1000"), "error must name vpt: {msg}");
+        assert!(msg.contains("300"), "error must name blob_size: {msg}");
+        let log_path = dir.path().join("test-alice-run01.jsonl");
+        assert!(!log_path.exists());
+    }
+
+    /// `block-flood` without `--blob-size` defaults to `blob_size = 100`
+    /// at the validation step, so vpt=100 is accepted and the spawn
+    /// proceeds past validation without error.
+    #[test]
+    fn block_flood_without_blob_size_defaults_to_100() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "block-flood".to_string();
+        args.operate_secs = 1;
+        args.values_per_tick = 100;
+        // Leave args.blob_size = None.
+        let params = validate_and_build_workload_params(&args)
+            .expect("vpt=100 with default blob_size=100 must validate");
+        assert_eq!(params.blob_size, Some(100));
+    }
+
+    /// `mixed-types` with any of the five required args missing is
+    /// rejected at startup with a message naming the first missing
+    /// argument. We check each of the five paths in isolation.
+    #[test]
+    fn mixed_types_missing_each_required_arg_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "mixed-types".to_string();
+        args.operate_secs = 1;
+        args.values_per_tick = 100;
+        // Populate all five then null one at a time and confirm
+        // each null produces a descriptive error.
+        let fully_populated = |a: &mut CliArgs| {
+            a.mixed_scalars_min = Some(5);
+            a.mixed_scalars_max = Some(20);
+            a.mixed_arrays_min = Some(5);
+            a.mixed_arrays_max = Some(40);
+            a.mixed_dict_split_max = Some(4);
+        };
+
+        let cases = [
+            ("mixed_scalars_min", "--mixed-scalars-min"),
+            ("mixed_scalars_max", "--mixed-scalars-max"),
+            ("mixed_arrays_min", "--mixed-arrays-min"),
+            ("mixed_arrays_max", "--mixed-arrays-max"),
+            ("mixed_dict_split_max", "--mixed-dict-split-max"),
+        ];
+        for (field, flag) in cases {
+            fully_populated(&mut args);
+            match field {
+                "mixed_scalars_min" => args.mixed_scalars_min = None,
+                "mixed_scalars_max" => args.mixed_scalars_max = None,
+                "mixed_arrays_min" => args.mixed_arrays_min = None,
+                "mixed_arrays_max" => args.mixed_arrays_max = None,
+                "mixed_dict_split_max" => args.mixed_dict_split_max = None,
+                _ => unreachable!(),
+            }
+            let err = validate_and_build_workload_params(&args).expect_err(field);
+            let msg = err.to_string();
+            assert!(
+                msg.contains(flag),
+                "missing {field} must mention {flag} in error; got: {msg}"
+            );
+            assert!(
+                msg.contains("mixed-types requires"),
+                "error must use the canonical wording; got: {msg}"
+            );
+        }
+    }
+
+    /// `mixed-types` with `--mixed-dict-split-max 1` is rejected.
+    #[test]
+    fn mixed_types_with_dict_split_max_below_two_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "mixed-types".to_string();
+        args.operate_secs = 1;
+        args.values_per_tick = 100;
+        args.mixed_scalars_min = Some(5);
+        args.mixed_scalars_max = Some(20);
+        args.mixed_arrays_min = Some(5);
+        args.mixed_arrays_max = Some(40);
+        args.mixed_dict_split_max = Some(1);
+
+        let err = validate_and_build_workload_params(&args)
+            .expect_err("--mixed-dict-split-max=1 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(">= 2"),
+            "error must explain >= 2 constraint: {msg}"
+        );
+        assert!(
+            msg.contains("1"),
+            "error must name the offending value: {msg}"
+        );
+    }
+
+    /// `mixed-types` with `--mixed-scalars-max > --values-per-tick` is rejected.
+    #[test]
+    fn mixed_types_scalars_max_above_vpt_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "mixed-types".to_string();
+        args.operate_secs = 1;
+        args.values_per_tick = 100;
+        args.mixed_scalars_min = Some(5);
+        args.mixed_scalars_max = Some(101); // > vpt
+        args.mixed_arrays_min = Some(5);
+        args.mixed_arrays_max = Some(40);
+        args.mixed_dict_split_max = Some(4);
+
+        let err = validate_and_build_workload_params(&args)
+            .expect_err("scalars_max > vpt must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("--mixed-scalars-max"), "error: {msg}");
+        assert!(msg.contains("--values-per-tick"), "error: {msg}");
+    }
+
+    /// `mixed-types` with `--mixed-arrays-max > --values-per-tick -
+    /// --mixed-scalars-min` is rejected.
+    #[test]
+    fn mixed_types_arrays_max_above_remaining_budget_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "mixed-types".to_string();
+        args.operate_secs = 1;
+        args.values_per_tick = 100;
+        args.mixed_scalars_min = Some(20);
+        args.mixed_scalars_max = Some(50);
+        args.mixed_arrays_min = Some(0);
+        args.mixed_arrays_max = Some(81); // > 100 - 20 = 80
+        args.mixed_dict_split_max = Some(4);
+
+        let err = validate_and_build_workload_params(&args)
+            .expect_err("arrays_max > vpt - scalars_min must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("--mixed-arrays-max"), "error: {msg}");
+        assert!(msg.contains("--mixed-scalars-min"), "error: {msg}");
+    }
+
+    /// Positive: a valid `mixed-types` configuration passes validation
+    /// and produces a `WorkloadParams` whose Option fields match the
+    /// CliArgs verbatim.
+    #[test]
+    fn mixed_types_valid_config_passes_validation() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "mixed-types".to_string();
+        args.operate_secs = 1;
+        args.values_per_tick = 1000;
+        args.mixed_scalars_min = Some(10);
+        args.mixed_scalars_max = Some(100);
+        args.mixed_arrays_min = Some(20);
+        args.mixed_arrays_max = Some(400);
+        args.mixed_dict_split_max = Some(4);
+        args.workload_seed = Some(0xDEAD_BEEF);
+
+        let params = validate_and_build_workload_params(&args)
+            .expect("valid mixed-types config must pass validation");
+        assert_eq!(params.mixed_scalars_min, Some(10));
+        assert_eq!(params.mixed_scalars_max, Some(100));
+        assert_eq!(params.mixed_arrays_min, Some(20));
+        assert_eq!(params.mixed_arrays_max, Some(400));
+        assert_eq!(params.mixed_dict_split_max, Some(4));
+        assert_eq!(params.workload_seed, Some(0xDEAD_BEEF));
+    }
+
+    /// `scalar-flood` and `max-throughput` ignore the workload-shape
+    /// args entirely. Even when nonsense values are present, validation
+    /// passes (the args are inert for these profiles).
+    #[test]
+    fn scalar_profiles_ignore_workload_shape_args() {
+        let dir = TempDir::new().unwrap();
+        let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
+        args.workload = "scalar-flood".to_string();
+        args.operate_secs = 1;
+        args.values_per_tick = 10;
+        args.blob_size = Some(0); // nonsense -- would Err under block-flood
+        args.mixed_dict_split_max = Some(1); // nonsense -- would Err under mixed-types
+        validate_and_build_workload_params(&args)
+            .expect("scalar-flood must ignore E19 workload-shape args");
+        args.workload = "max-throughput".to_string();
+        validate_and_build_workload_params(&args)
+            .expect("max-throughput must ignore E19 workload-shape args");
     }
 
     #[test]

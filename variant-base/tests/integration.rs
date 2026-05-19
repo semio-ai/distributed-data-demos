@@ -104,6 +104,17 @@ fn test_args_with_mode(log_dir: &str, threading_mode: ThreadingMode) -> CliArgs 
         // integration tests that pre-date T18.2 -- their assertions
         // explicitly count `write` and `receive` lines.
         legacy_jsonl_events: true,
+        // E19 / T19.3: the integration-test default exercises
+        // `scalar-flood`, which ignores all workload-shape args.
+        // Tests that need to exercise `block-flood` / `mixed-types`
+        // build their own args (see the dedicated E19 tests below).
+        blob_size: None,
+        mixed_scalars_min: None,
+        mixed_scalars_max: None,
+        mixed_arrays_min: None,
+        mixed_arrays_max: None,
+        mixed_dict_split_max: None,
+        workload_seed: None,
         // Single-runner self-loopback peers list -> empty expected set
         // -> EOT phase terminates immediately with no `eot_timeout`.
         extra: vec!["--peers".to_string(), "test-runner=127.0.0.1".to_string()],
