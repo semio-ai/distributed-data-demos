@@ -14208,3 +14208,392 @@ All clean. Test counts:
   `SHAPE_INTERN`, `create_workload_with_params`).
 - `variant-base/tests/integration.rs` — 7 new E19 integration tests
   + updated num_columns assertion (11 -> 13).
+
+## T19.6 — analysis: plots + pivot extension + integrity leaves-lost [worker complete]
+
+**Scope**: `analysis/` only. Three deliverables from the locked T19.6
+spec plus two T19.5 carry-overs.
+
+### Deliverables
+
+1. Restructured `comparison-qos` chart -- vertical 2-row stack +
+   `(shape, threading_mode)` per-slot subdivision.
+2. New `throughput_vs_workload_shape` chart -- per-variant subplot
+   grid with workload-profile on the x-axis and `leaves_per_sec`
+   on the y-axis.
+3. T19.5 carry-over: `Leaves Lost` column on the integrity report.
+4. T19.5 carry-over: `workload` / `shape` as optional pivot
+   dimensions on `pivot_tables.py` and as first-class CSV columns.
+
+### Files changed
+
+- `analysis/plots.py`:
+  - Added `_WORKLOAD_HATCHES` (scalar=solid, array=`"---"`,
+    struct=`"x"`), `_WORKLOAD_LABELS` (scalar-flood / block-flood /
+    mixed-types user-facing tokens), `_WORKLOAD_SHAPE_ORDER`
+    (scalar->array->struct), `_shape_hatch`, `_shape_label`,
+    `_shape_sort_key`.
+  - Added `_index_parsed_results_with_shape` (5-tuple index
+    `(transport, workload, qos, mode, shape)`); existing 4-tuple
+    `_index_parsed_results` retained for drop-rate + latency-CDF
+    which intentionally collapse the shape dimension.
+  - Added `_slot_subbars_with_shape` + `_slot_subbar_layout` for the
+    per-slot sub-bar enumeration and x-offset arithmetic.
+  - Rewrote `_generate_comparison_plot_for_qos` for the vertical
+    2-row layout (nrows=2, ncols=1). Each ax.bar call is per-bar
+    so the resulting Patch carries the per-shape hatch attribute
+    uniformly (batching forces a single hatch across the batch).
+    Legend split into two strips (workload by hatch, threading by
+    colour).
+  - Added `generate_throughput_vs_workload_shape_plot`, single
+    PNG output per dataset, one subplot per
+    `(transport, workload, threading_mode)` axis. Grid auto-sizes
+    (max 4 cols).
+- `analysis/analyze.py`: wired the new chart into the `--diagrams`
+  path; printed alongside the existing three chart families.
+- `analysis/integrity.py`:
+  - `IntegrityResult` gains `ops_lost` and `leaves_lost` fields
+    (defaults `0` for back-compat with any external dataclass
+    constructor).
+  - `_sum_leaves_written_per_writer` + `_sum_leaves_received_per_pair`
+    joins thread the per-pair leaf totals through `integrity_for_group`.
+    Pre-T19.5 caches without the `leaf_count` column degrade
+    gracefully to a count-based fallback (treats every write as
+    one leaf), matching the api-contracts backward-compat rule.
+- `analysis/tables.py`: `Leaves Lost` column on the integrity
+  report (positioned after `BP-skip`, before `Timeout`). Existing
+  column order preserved; separator width bumped to 185 chars.
+- `analysis/pivot_tables.py`:
+  - `build_pivot_tables` and `format_pivot_*` accept an
+    `include_shape: bool = False` kwarg. When True, rows expand
+    into `(family, mode, shape)` and the row label reads e.g.
+    `custom-udp-multi/array`.
+  - `_row_label` introspects the row-key tuple length so both
+    2-tuple and 3-tuple keys render correctly.
+  - `format_pivot_table` computes the row-label column width
+    dynamically from the actual row keys -- shape-aware labels
+    (longer) no longer truncate.
+  - Long-form CSV gains `workload`, `shape`, `leaves_per_sec`,
+    `bytes_per_sec` columns. `workload` carries the user-facing
+    profile name from BENCHMARK.md S6 (scalar-flood etc.) and
+    `shape` carries the analyzer-internal token.
+- `analysis/tests/test_workload_shape_plots.py`: 17 new tests
+  pinning the hatch / colour palette, the vertical 2-row layout,
+  per-bar `Patch.get_hatch()` attribute, slot subdivision, two-strip
+  legend, smoke PNGs for both charts, the leaves/s y-axis label, and
+  cross-chart hatch consistency.
+- `analysis/tests/test_integrity.py`: 4 new tests in
+  `TestIntegrityLeavesLost` covering legacy=ops_lost, block-flood
+  arithmetic identity (`leaves_lost == ops_lost * leaf_count`),
+  full-delivery=0, and mixed-types leaf-count summation.
+- `analysis/tests/test_pivot_tables.py`: 5 new tests in
+  `TestPivotShapeAware` covering default-mode preservation,
+  shape-aware row expansion, render-without-crash, CSV columns
+  populated for E19 data, and CSV legacy fall-through to
+  scalar-flood.
+
+### Tests run
+
+- `cd analysis && python -m pytest tests/ -v` -> 416 passed, 6
+  skipped, 0 failed. The 6 skips are the pre-existing
+  integration tests that require absent `logs/` real-data
+  fixtures. 26 new tests added by this task (17 + 4 + 5); the
+  existing 390 still pass with no modifications required.
+- `python -m ruff check .` -> clean.
+- `python -m ruff format .` -> clean (formatter applied to
+  `plots.py`, `integrity.py`, and both new test files; no manual
+  cleanup needed).
+
+### Design choices on chart layout
+
+- **Hatch picks**: locked spec offered alternatives (`"-"` vs
+  `"---"` for array; `"+"` vs `"x"` for struct). I picked `"---"`
+  and `"x"` because at the post-E14 chart density (~30 px per bar
+  half at 150 dpi), `"-"` is too sparse to read on small bars and
+  `"+"` visually fuses into the horizontal `"---"` pattern. `"x"`
+  (crosshatch) reads as a checker pattern at the same scale and
+  contrasts cleanly with the horizontal lines. Tests assert on the
+  *category* of each hatch (starts with `-`; contains `x`) so
+  density tweaks don't break them.
+- **One ax.bar() call per bar**: matplotlib applies a single hatch
+  across all bars in a batched ax.bar call. The chart has up to
+  ~50-200 sub-bars per QoS, well below any performance threshold,
+  so I render bar-by-bar and let each Patch carry its own hatch
+  attribute. The visual-regression test relies on this -- batched
+  rendering with a single hatch would pass the smoke test but
+  fail the hatch-attribute assertion.
+- **Vertical layout reserves more bottom space**: the two-strip
+  legend (workload hatches above two-row threading legend) needs
+  ~1.6 in vs the pre-T19.6 1.4 in single legend. Top reserve
+  unchanged.
+- **`throughput_vs_workload_shape` is a single PNG**: spec said
+  "per-variant subplot grid (one subplot per variant in the
+  dataset)" with one bar group per QoS within each subplot.
+  Grid auto-sizes (3 cols by default, 4 for large datasets); each
+  subplot is 4.5x3.2 in so a typical 6-9 variant dataset renders
+  on a single readable image. Alternative considered: one PNG
+  per QoS (sibling to comparison-qosN.png). Rejected -- the
+  per-QoS variation here is small (QoS is the within-subplot axis,
+  not the cross-PNG axis) and a single image is easier to share /
+  embed in markdown summaries.
+
+### Deviations from the locked spec
+
+- The spec text said "One bar group per QoS within each subplot --
+  OR a sibling chart per QoS, whichever fits visually. Worker's
+  call." I picked **one bar group per QoS within each subplot**.
+  Rationale above.
+- The spec text said the new chart's y-axis is `leaves_per_sec`;
+  I respected that and did not add a second-y `ops_per_sec`
+  axis. Operators who want the op-rate view can read it off the
+  comparison-qos chart (which renders `receives_per_sec`) and
+  cross-reference by shape via the consistent hatch palette.
+- Spec called out a "two separate legends (workload + threading)"
+  option. I went with that (vs the "2-row combined legend"
+  alternative) because the dimensions encode independent properties
+  and a combined legend's row x col combinatorics would balloon to
+  9-18 entries on the post-E14 6-family canonical dataset.
+
+### Open concerns for T19.8 (E2E validation)
+
+- The new chart's subplot grid auto-sizes for up to ~12 variants
+  cleanly; beyond that the per-subplot size shrinks below the
+  readability threshold. T19.8 should sanity-check the chart
+  on a real two-runner three-workload dataset.
+- `IntegrityResult.leaves_lost` may slightly undercount on QoS 1/2
+  in pathological duplicate-delivery scenarios -- the formula is
+  `leaves_written - leaves_received`, so a duplicate receive
+  reduces the apparent loss. The `duplicates` column on the same
+  row catches this for the human reader; a more rigorous
+  "scalar-leaves dropped (de-duped)" metric would need a
+  separate aggregation pass. Out of scope for T19.6 per the spec
+  text which talks about `lost_ops * leaf_count`.
+- Pivot tables in `include_shape=True` mode produce 2-3x the row
+  count vs default mode on E19+ datasets. The dump format /
+  markdown embedding may need a paginated render on wide datasets;
+  current implementation just emits the whole grid. T19.8 should
+  flag if a real dataset hits readability issues.
+- The shape ordering (scalar -> array -> struct) is hardcoded
+  in `plots._WORKLOAD_SHAPE_ORDER` and the inline `shape_order_local`
+  in `pivot_tables.build_pivot_tables`. If a future workload
+  shape is added (e.g. `"map"`) the insertion point is those two
+  constants. Both renderers fall back to alphabetical for unknown
+  shapes so a new value will render correctly without a code
+  change -- it just won't get a canonical sort position until
+  those constants are updated.
+
+### Commits
+
+1. `analysis(T19.6): Leaves Lost integrity column + leaf-level loss accounting` (b0f87b8)
+2. `analysis(T19.6): workload + shape as optional pivot dimensions` (2d00013)
+3. `analysis(T19.6): restructure comparison-qos + new throughput-vs-workload-shape chart` (91893af)
+
+### Status
+
+**T19.6 implementation complete**. All 416 analysis tests pass.
+Charts pass smoke + visual-regression assertions on the locked
+three-workload fixture. Awaiting T19.8 E2E validation on a real
+two-runner dataset.
+
+## T19.3 — variant-base: CLI plumbing + validation [DONE 2026-05-19]
+
+Worker spawn for E19 Wave 2. Exposes the new E19 workload-shape
+parameters on the variant CLI, materializes the per-profile default
+for `--blob-size`, validates the per-profile required-arg set at
+driver startup, and inverts T19.2's two transient placeholder tests
+into positive acceptance tests for the new validation behaviour. No
+trait-surface changes; no concrete-variant code edits needed (E19
+invariant holds — variants pick up the new CLI args automatically
+via `CliArgs`).
+
+### What was implemented
+
+**`variant-base/src/cli.rs`** — adds seven new optional CLI fields to
+`CliArgs` (E19 / T19.3):
+
+- `blob_size: Option<u32>` (`--blob-size`)
+- `mixed_scalars_min: Option<u32>` (`--mixed-scalars-min`)
+- `mixed_scalars_max: Option<u32>` (`--mixed-scalars-max`)
+- `mixed_arrays_min: Option<u32>` (`--mixed-arrays-min`)
+- `mixed_arrays_max: Option<u32>` (`--mixed-arrays-max`)
+- `mixed_dict_split_max: Option<u32>` (`--mixed-dict-split-max`)
+- `workload_seed: Option<u64>` (`--workload-seed`)
+
+All fields are `Option<T>` at the clap layer (no `default_value_t`),
+matching the locked spec's "profile-conditional" semantics. The
+`--blob-size` default (`100`) is materialized at the validation step
+(see below), not at the clap layer, so an explicit `--blob-size 0`
+produces a clear error rather than silently defaulting. Two new
+public constants document the materialized values:
+`DEFAULT_BLOB_SIZE = 100` and `BLOCK_SIZE_SANITY_BYTES = 65_536`.
+
+**`variant-base/src/driver.rs`** — new private helper
+`validate_and_build_workload_params(&CliArgs) -> Result<WorkloadParams>`
+that:
+
+1. Materializes `--blob-size = 100` for `block-flood` when the flag
+   is omitted (and only then -- explicit `0` is still rejected).
+2. Returns a descriptive `Err` BEFORE any phase / logger emission
+   when any of the locked-spec constraints are violated. The
+   `max-throughput + qos 3/4` rejection pattern from T17.2 is the
+   exact template (anyhow!() with a contract-doc pointer).
+3. Emits a one-shot stderr block-size sanity warning when
+   `blob_size * 8 > 65_536`, matching the locked-spec wording.
+
+The error messages added (all named in the unit tests below):
+
+- `"block-flood requires --blob-size > 0 (got 0); see metak-shared/api-contracts/variant-cli.md E19 additions"`
+- `"block-flood requires --values-per-tick (N) to be divisible by --blob-size (M); the remainder is R. See metak-shared/api-contracts/variant-cli.md E19 additions."`
+- `"mixed-types requires --mixed-scalars-min; see variant-cli.md E19 additions"` (and one per missing arg)
+- `"mixed-types requires --mixed-dict-split-max >= 2 (got N); ..."`
+- `"mixed-types requires --mixed-scalars-max (N) <= --values-per-tick (V); ..."`
+- `"mixed-types requires --mixed-arrays-max (N) <= (--values-per-tick - --mixed-scalars-min) = (V - S) = R; ..."`
+- Block-size sanity warning (stderr, NOT Err):
+  `"[variant] warning: --blob-size N produces per-WriteOp payloads of ~(N*8) bytes (> 65536 sanity threshold); check variant-specific buffer / MTU hints"`
+
+`run_protocol` now calls this validator at the top (right after the
+T17.2 max-throughput + qos check, before any logger init) and uses
+its returned `WorkloadParams` instead of the T19.2-era
+`WorkloadParams { variant, run, ..default() }` shim.
+
+`base_args` (driver unit-test fixture) and `test_args` (integration
+fixture) both gained the seven new `None` fields so existing tests
+still compile against the extended struct.
+
+### Fate of T19.2's two `*_through_driver_errors_until_t19_3_lands` tests
+
+Per T19.2's own completion note: "the two new 'errors-until-T19.3-lands'
+integration tests will start failing once the CLI args land; T19.3
+should delete or invert them as part of its work". Both were
+**inverted** rather than deleted, because the positive-path counterpart
+is exactly what the T19.3 acceptance evidence calls for:
+
+- `test_block_flood_through_driver_errors_until_t19_3_lands` ->
+  `test_block_flood_through_driver_defaults_blob_size_to_100`. Now
+  asserts the locked-spec default: `block-flood vpt=100` with no
+  `--blob-size` flag completes and emits JSONL writes with
+  `leaf_count=100, shape="array"`.
+- `test_mixed_types_through_driver_errors_until_t19_3_lands` ->
+  `test_mixed_types_without_required_args_is_rejected_at_startup`.
+  Still tests the rejection path, but now also asserts the JSONL
+  is NOT created (i.e. rejection happens before any logger
+  emission) -- the T17.2-style stricter check.
+
+Three further positive-path integration tests were added:
+
+- `test_block_flood_through_driver_with_explicit_blob_size_completes`
+  — the spec-named `block-flood vpt=1000 blob_size=100` acceptance.
+- `test_mixed_types_through_driver_with_sensible_defaults_completes`
+  — full mixed-types spawn with sensible params + a seeded RNG;
+  asserts leaf-count divisibility by vpt and at least two distinct
+  shapes appearing across the writes.
+- `test_block_flood_indivisible_blob_size_is_rejected_at_startup` —
+  the spec-named `vpt=1000 blob_size=300` rejection.
+
+### Smoke-test results against existing variants
+
+`block-flood vpt=1000 blob_size=100` through `--legacy-jsonl-events`:
+
+- **variant-dummy** (`target/release/variant-dummy.exe`): exit 0,
+  1010 JSONL `write` lines each with `shape="array"` and
+  `leaf_count=100`. Compact Parquet emitted alongside.
+- **variant-custom-udp** (`target/release/variant-custom-udp.exe`,
+  rebuilt to pick up the new `CliArgs` fields): exit 0, 1010 JSONL
+  `write` lines each with `shape="array"` and `leaf_count=100`.
+  Compact Parquet emitted alongside.
+
+The variant binaries needed only a recompile against the new
+variant-base; **no source changes in any concrete variant**. The
+E19 invariant ("no code changes needed in concrete variants") holds
+end-to-end. Full workspace `cargo build --release` succeeded across
+all seven concrete variants (websocket, hybrid, custom-udp, quic,
+zenoh, webrtc, variant-dummy) without edits.
+
+Mixed-types via variant-dummy: exit 0, 5732 writes producing all
+three shape categories (scalar 2673, array 1189, struct 1870) with
+per-tick leaf-sum invariant preserved.
+
+Block-size sanity warning: confirmed via `--workload block-flood
+--values-per-tick 9000 --blob-size 9000` (72_000 bytes/WriteOp) —
+the stderr warning fires once at startup, the spawn still completes
+cleanly with exit 0.
+
+### Tests run + results
+
+```
+cargo build --release -p variant-base
+cargo test --release -p variant-base
+cargo clippy --release -p variant-base --all-targets -- -D warnings
+cargo fmt -p variant-base -- --check
+cargo build --release          (full workspace)
+```
+
+All clean. Test counts:
+- **173 unit tests pass** (was 162 pre-T19.3; +11 new driver-side
+  validation tests + 2 new CLI-parse tests).
+- **22 integration tests pass** (was 19 pre-T19.3; +3 net new
+  positive-path tests, +0 deletions, 2 inversions of the T19.2
+  placeholders).
+- workspace build OK across all variants.
+
+### Deviations from the locked spec
+
+None of substance. Two minor judgement calls worth noting:
+
+1. **Positive-path inversion over deletion** for the two
+   `*_through_driver_errors_until_t19_3_lands` tests. The completion
+   spec said "Delete or invert them — worker's judgment which".
+   Inverting preserves the spec's "spawn produces non-empty JSONL
+   with leaf_count=100, shape=array" acceptance assertion that
+   would otherwise need a separate new test; the existing test
+   skeleton was already the right shape.
+2. **Workload factory's own required-arg checks left in place**.
+   `create_workload_with_params` still returns Err on missing
+   `--blob-size` / `--mixed-*` even though the driver's pre-check
+   now catches the same cases first. The factory-side checks are
+   defensive against future call sites that bypass the driver
+   (e.g. direct workload construction from a unit test). The cost
+   is duplication of two short error-message paths; the benefit is
+   that workload construction stays self-defending.
+
+### Open concerns for T19.4 (runner-side TOML + forwarding)
+
+- **TOML keys**: per the locked schema
+  (`metak-shared/api-contracts/toml-config-schema.md` E19 additions),
+  `[variant.common]` gains seven new optional keys: `blob_size`,
+  `mixed_scalars_min`, `mixed_scalars_max`, `mixed_arrays_min`,
+  `mixed_arrays_max`, `mixed_dict_split_max`, `workload_seed`. The
+  runner must forward each as `--kebab-case` using the existing
+  `snake_case -> --kebab-case` convention. The variant CLI now
+  accepts all seven; T19.4's plumbing is purely pass-through (no
+  interpretation needed on the runner side).
+- **Backward compat**: existing TOML configs (which never specify
+  these keys) MUST keep parsing. The variant CLI defaults are
+  designed so a `scalar-flood` / `max-throughput` spawn without
+  any of the new args behaves identically to pre-E19; T19.4's
+  integration test should pin this.
+- **Validation is variant-side**: per the locked spec the runner
+  does NOT interpret the new keys. If an operator writes a
+  malformed combination (e.g. `mixed-types` without all five
+  `mixed_*` keys), the variant rejects at startup with the
+  descriptive errors listed above, and the runner records the
+  failure normally. No runner-side validation is needed for T19.4.
+- **No array-expansion**: per the locked spec, the new keys do NOT
+  participate in E9/E14 array expansion. They are scalar-only.
+
+### Files changed
+
+- `variant-base/src/cli.rs` — seven new `Option<T>` fields on
+  `CliArgs` + two new public constants (`DEFAULT_BLOB_SIZE`,
+  `BLOCK_SIZE_SANITY_BYTES`) + two new CLI-parse unit tests.
+- `variant-base/src/driver.rs` — new
+  `validate_and_build_workload_params` helper called at the top
+  of `run_protocol`; replaces the T19.2 `WorkloadParams` shim
+  site. Eleven new driver-side unit tests covering each
+  rejection / acceptance branch. `base_args` fixture gains the
+  new None fields.
+- `variant-base/tests/integration.rs` — inversion + extension of
+  the two T19.2 placeholders (now positive-path tests); three new
+  integration tests for full `run_protocol`-driven block-flood
+  and mixed-types coverage; `test_args` fixture gains the new
+  None fields.
