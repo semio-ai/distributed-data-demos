@@ -13122,3 +13122,126 @@ adding `variants/T18.3-AUDIT.md`.
 
 **Artifacts**: `variants/T18.3-AUDIT.md` (the audit document
 itself, with one section per variant and the gap analysis above).
+
+## T18.2b
+
+**Status**: done. Ready for T18.4 (analyzer compact loader).
+
+**Goal**: extend the T18.2 compact buffer + Parquet writer so every
+JSONL lifecycle event also lands in `compact_events`. After T18.2b,
+`--legacy-jsonl-events OFF` produces a parquet the analyzer can fully
+consume without any JSONL stream -- phase boundaries, connect
+metrics, EOT markers, and resource samples are all in the compact
+file.
+
+**Implementation summary**:
+
+- `variant-base/src/compact.rs`: `EventKind` enum extended with
+  variants 5..=11 (`Phase`, `Connected`, `EotSent`, `EotReceived`,
+  `EotTimeout`, `Resource`, `ClockSync`); numeric discriminants
+  pinned per `metak-shared/api-contracts/compact-log-schema.md`
+  § Event kinds. `CompactBuffers` gains four nullable polymorphic
+  columns (`extra_f32`, `extra_f32_b`, `extra_i64`, `extra_utf8`)
+  and one `push_*` helper per new kind. `push_gap_detected` /
+  `push_gap_filled` also populate `extra_i64` now (T18.2b contract
+  routes `missing_seq` / `recovered_seq` through the polymorphic
+  slot in addition to the legacy `seq` column). Internal
+  `RowBuilder` consolidates the per-kind helpers so all 11 column
+  vectors stay in lockstep. `ROW_BYTES_ESTIMATE` bumped 32 -> 64 to
+  absorb the `Option<T>` discriminant cost on the four new columns.
+
+- `variant-base/src/compact_writer.rs`: schema goes 7 -> 11
+  columns; the four extras are `OPTIONAL` with `extra_utf8` marked
+  `UTF8` logical/converted-type so polars / pyarrow decode it as a
+  string. Three private `collect_optional_*` helpers split
+  `Option<T>` into (defined values, def-levels) for the parquet
+  crate's standard nullable-column writer path.
+
+- `variant-base/src/driver.rs`: `EventSink` gains buffer-only
+  `record_phase` / `record_connected` / `record_eot_sent` /
+  `record_resource`. Every JSONL `log_*` call site in
+  `run_protocol` for a lifecycle event also calls the matching
+  `sink.record_*` so the compact buffer captures it. Lifecycle
+  JSONL emission stays unconditional (runner consumes it
+  out-of-band for E15 progress streaming + T11.5 markers).
+
+**Tests** (all on `cargo test --release -p variant-base`):
+
+- Per-kind unit tests in `compact.rs::tests`: one
+  `push_<kind>_populates_<slot>` test per new lifecycle kind
+  (`push_phase_populates_extra_utf8_only`,
+  `push_connected_populates_peer_elapsed_and_threading_mode`,
+  `push_eot_sent_populates_extra_i64_only`,
+  `push_eot_received_populates_peer_and_extra_i64`,
+  `push_eot_timeout_populates_wait_ms_and_missing_json`,
+  `push_resource_populates_both_extra_f32_slots`,
+  `push_clock_sync_populates_peer_offset_and_rtt`),
+  plus `write_and_receive_pushes_leave_extras_none` and
+  `push_gap_events_also_populate_extra_i64_per_t18_2b`.
+  `event_kind_names_match_legacy_jsonl_event_strings` /
+  `event_kind_discriminants_are_stable` extended to cover 5..=11.
+  Total: 29 unit tests in `compact.rs::tests`.
+
+- Round-trip test in `compact_writer.rs::tests`:
+  `lifecycle_event_kinds_round_trip_through_parquet` drives every
+  new lifecycle kind through the writer + reader and asserts the
+  correct `extra_*` slot decodes back to the value the `push_*`
+  helper supplied. `writes_valid_parquet_file_for_empty_buffers`
+  updated 7 -> 11 columns. `writes_and_reads_back_expected_rows`
+  extended to verify `extra_i64` carries the gap seq value.
+
+- Integration test in `tests/integration.rs`:
+  `test_compact_parquet_contains_lifecycle_events_when_jsonl_off`
+  spawns VariantDummy with `--legacy-jsonl-events OFF`, reads the
+  parquet, filters by `kind`, and asserts exact row counts for
+  Phase (5: connect / stabilize / operate / silent / digest),
+  Connected (1), EotSent (1), and `>= 1` for Resource. Also
+  asserts EotReceived / EotTimeout / ClockSync are absent under
+  the dummy's single-runner self-loopback configuration.
+  `test_compact_parquet_is_written_alongside_jsonl` updated:
+  column count 7 -> 11 and the parquet-vs-JSONL row-count
+  assertion now matches the FULL JSONL line count rather than
+  the per-event subset.
+
+**Test command results**:
+
+- `cargo test --release -p variant-base`: 129 unit + 12
+  integration pass (was 121 + 11 before T18.2b).
+- `cargo clippy --release --workspace --all-targets -- -D warnings`: clean.
+- `cargo fmt -p variant-base -- --check`: clean.
+
+**Commits**:
+
+1. `feat(variant-base): extend compact buffers + Parquet schema
+   for lifecycle events (T18.2b)` -- `3590523` -- `compact.rs`
+   (528 += / 71 -=) + `compact_writer.rs` (256 += / 8 -=).
+2. `feat(variant-base): mirror lifecycle events into compact
+   buffers from driver (T18.2b)` -- `1e71ad3` -- `driver.rs`
+   (72 += / 6 -=) + `tests/integration.rs` (126 += / 12 -=).
+
+**Deviations from spec**: none material.
+
+- The task description listed `clock_sync` as "reserved for E8 --
+  implement the column mapping but the call site may stay absent
+  until E8 lands". Done: `EventKind::ClockSync = 11` is wired
+  through `CompactBuffers::push_clock_sync` and the parquet
+  round-trip test exercises it, but no driver call site emits it.
+- The aux-event note in the T18.3 status section above
+  ("driver's own lifecycle/aux events go through LoggerProxy and
+  are NOT pushed into the compact buffer either") is resolved by
+  this task for the driver-owned lifecycle events. The websocket
+  T17.5 / Multi-mode reader-thread `LoggerHandle::log_receive`
+  bypass remains -- that's the explicit T18.3a follow-up.
+
+**Concurrent-worker note**: this task ran on `main` alongside
+T18.3 (audit) and T18.5+T18.6 (runner CLI). File overlap was
+zero -- T18.3 only added `variants/T18.3-AUDIT.md` + STATUS.md
+text; T18.5/T18.6 touched `runner/` only. Two clean
+fast-forward commits landed without rebase/reset/stash.
+
+**Ready for T18.4 (analyzer compact loader)**: the parquet file
+produced by `--legacy-jsonl-events OFF` is now fully
+self-contained. The analyzer can dispatch on `kind` to discriminate
+event types; the per-kind `extra_*` slot mapping in
+`metak-shared/api-contracts/compact-log-schema.md` § Event kinds
+is the authoritative reference.
