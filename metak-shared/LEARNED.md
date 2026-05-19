@@ -186,3 +186,82 @@ green at default parallelism. Long-term follow-up: lower the runner-
 crate test parallelism in `Cargo.toml` (`[profile.test]` or `harness`
 config) so the lock isn't needed; for now it is the cheapest correct
 fix and is documented in the helper's doc comment.
+
+## Zenoh QoS3/QoS4 on localhost is an expected stall, not a regression
+
+**Discovery (smoke-01-20260519_143351, 2026-05-19)**: in the
+`two-runner-smoke.toml` matrix, every Zenoh QoS3/QoS4 run **except**
+`zenoh-10x1000hz-qos3/qos4` (10 keys × 1000 Hz) exits with code 2 and
+stderr:
+
+```
+[variant] watchdog: no progress in 30s during operate phase -- internal stall; self-exiting
+```
+
+i.e. the T15.11 variant-base watchdog fires after 30 s of zero
+progress in the `operate` phase. The JSONL ends cleanly at the
+`operate` phase event with no `progress` records — the publisher task
+is wedged inside Zenoh from the very first put.
+
+**Root cause is structural, not a bug**:
+
+1. Zenoh natively exposes only **two** congestion-control levels
+   (`CongestionControl::Drop` and `CongestionControl::Block`), not the
+   project's four QoS tiers. The variant maps QoS1/QoS2 → `Drop`
+   (best-effort) and QoS3/QoS4 → `Block` (reliable).
+2. DESIGN.md § 6.5 mandates **100 % delivery, zero
+   `backpressure_skipped`** for reliable QoS. Native `CC=Block` alone
+   does not get us there: T16.12 catalogued an asymmetric stall at
+   sustained ≥ 50K msg/s where one peer's `publisher.put(...).await`
+   parks indefinitely while the other continues publishing.
+3. T17.8 added an **application-level credit/window protocol** on
+   top of `CC=Block` — receivers publish max-seq watermarks every
+   25 ms on `bench/__ack__/<recv>/<writer>`; senders block on a
+   `WindowGate` condvar when any peer falls > 2048 messages behind.
+   This eliminates the deadlock by gating the driver thread cleanly
+   instead of letting Zenoh's internal Block queue wedge.
+4. **On localhost** the credit/window protocol still loses against
+   contention: both peers share one tokio runtime + one Zenoh
+   localhost stack, the ack-side-channel competes with the data
+   path for the same routing locks, and the gate cannot keep up.
+   The T15.11 watchdog then converts the wedge into a clean
+   self-exit with flushed JSONL.
+
+The only QoS3/QoS4 fixture that survives localhost (`10x1000hz`)
+has just 10 keys, so the per-publisher state and the credit-window
+math both fit comfortably under the contention budget. Every
+≥ 100-key reliable fixture wedges.
+
+CUSTOM.md flags this explicitly at
+[variants/zenoh/CUSTOM.md:504-509](../variants/zenoh/CUSTOM.md):
+
+> T17.10 (production two-machine matrix re-run on real hardware) is
+> the canonical acceptance gate for "100 % delivery"; the local
+> single-machine harness shows wide run-to-run variance because the
+> two peers share the same tokio runtime + Zenoh localhost stack
+> (extra contention not present on a real two-machine deployment).
+
+**Implication**: when reading smoke output, treat Zenoh QoS3/QoS4
+`variant_self_killed_idle` rows on localhost as **expected**, not
+failures. The canonical acceptance signal for the Zenoh reliable
+path is the cross-machine smoke (T17.10 / the upcoming two-machine
+matrix run filed 2026-05-19). Do not file regression tasks against
+localhost-only Zenoh QoS3/QoS4 stalls. Other variants (custom-udp,
+QUIC, hybrid) implement reliability themselves and do NOT show this
+pattern on localhost; the localhost cliff is Zenoh-specific.
+
+**Sanity check on cross-machine runs**: the Zenoh QoS3/QoS4 rows
+should reclassify to `runner_idle_terminated` with ≥ 99 % delivery
+in both directions across at least the 100-key fixtures. If the
+1000-key fixtures still stall cross-machine, the credit/window
+sizing (`QOS_STRICT_WINDOW = 2048`, `ACK_EMIT_INTERVAL = 25 ms`)
+likely needs tuning — see
+[variants/zenoh/CUSTOM.md:440-458](../variants/zenoh/CUSTOM.md)
+for the knobs.
+
+**Diagnostic shorthand for future smoke triage**: if a Zenoh
+QoS3/QoS4 spawn fails, check stderr for the watchdog line first.
+Presence of that line + clean JSONL terminus at the `operate` phase
+event = the known structural stall, not new damage. Absence of the
+line + truncated JSONL = a genuinely new failure mode and worth
+investigating.

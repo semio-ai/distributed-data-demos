@@ -38,6 +38,9 @@
     },
     {
       "path": "analysis"
+    },
+    {
+      "path": "../../shared/ddd"
     }
   ],
   "settings": {

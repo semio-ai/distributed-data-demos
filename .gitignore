@@ -35,3 +35,4 @@ target-*/
 __pycache__/
 /.claude/worktrees
 /runner/logs
+/analysis/tests/fixtures/two-runner-skew50ms

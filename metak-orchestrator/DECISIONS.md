@@ -653,3 +653,85 @@ remains the cheapest reversible knob.
   guarantee" subsection documenting the T-impl.4 verification chain.
 
 ---
+
+## D? (open): is the strict-no-skip QoS3/QoS4 contract right for Zenoh?
+
+**Filed 2026-05-19** after walking the Zenoh QoS3/QoS4 stall path in
+`smoke-01-20260519_143351`. Not a decision yet — the user is about to
+launch a cross-machine smoke that will inform it. Capturing the
+question while context is fresh.
+
+### The question
+
+DESIGN.md § 6.5 mandates **100 % delivery, zero
+`backpressure_skipped`** for reliable QoS tiers (QoS3 / QoS4). For
+the variants we built ourselves (custom-udp, QUIC, hybrid,
+websocket) this is straightforward: we control the reliability
+layer and can shape it to fit the contract.
+
+For Zenoh, reliability lives inside the framework as
+`CongestionControl::Block`. Native CC=Block alone deadlocks
+asymmetrically at sustained ≥ 50K msg/s (T16.12), so we layered an
+application-level credit/window protocol over it (T17.8) — receivers
+publish max-seq watermarks on a side channel, senders gate on a
+condvar when any peer falls > 2048 messages behind. **We are
+effectively re-implementing flow control above the framework that's
+supposed to handle it.**
+
+Three concerns:
+
+1. **Fairness of comparison**: the headline metric is **receive
+   throughput** (per overview.md "cross-cutting goals"). Zenoh's
+   reliable path runs at whatever rate the credit/window allows,
+   which is set by our window size + ack interval, NOT by what
+   Zenoh's transport can natively sustain. Other variants' reliable
+   numbers come out of their actual transport. We may be measuring
+   "how well our window protocol throttles Zenoh" rather than
+   "Zenoh's reliable throughput".
+2. **Localhost vs cross-machine variance**: the credit/window still
+   loses on localhost at ≥ 100 keys (T15.11 watchdog fires —
+   smoke-01 evidence). CUSTOM.md treats T17.10 (cross-machine) as
+   the canonical gate. If the cross-machine run still shows wide
+   variance, the contract may be unmeetable in practice.
+3. **Conceptual coherence**: variants that fundamentally can't meet
+   strict-no-skip without re-implementing flow control are arguably
+   in a different category from those that meet it natively. The
+   honest analysis output may be a separate "framework-mediated
+   reliable" column rather than treating Zenoh QoS3/QoS4 as the same
+   measurement as custom-udp QoS3/QoS4.
+
+### Options to choose between (after cross-machine results)
+
+- **A. Keep strict-no-skip as-is.** Accept that Zenoh's reliable
+  numbers reflect the credit/window's throttle, not native Zenoh.
+  Lowest churn; preserves uniform contract.
+- **B. Relax to "≥ 99 % delivery, log skips honestly".** Drop the
+  credit/window layer entirely; let `CC=Block` apply native pressure
+  and `try_publish` return `Ok(false)` when the bridge fills. Adds a
+  `backpressure_skipped` count to Zenoh's reliable rows that other
+  variants don't show, but measures the native transport. Analysis
+  comparison plots get an honesty footnote.
+- **C. Split the reliable category.** Two distinct contracts in
+  DESIGN.md § 6.5: "natively reliable" (custom-udp / QUIC / hybrid /
+  websocket — strict no-skip) and "framework-reliable" (Zenoh —
+  best-effort within framework's flow control + bounded skip).
+  Plots and tables show the two categories separately.
+
+### Inputs needed before deciding
+
+- Cross-machine smoke result for `two-runner-smoke.toml` Zenoh
+  QoS3/QoS4 rows (about to be launched).
+- If cross-machine still stalls at ≥ 100 keys: option B or C is
+  forced. If cross-machine is clean: A is viable.
+- Sanity-check whether other framework-mediated transports we add
+  later (NATS, MQTT, Kafka if any) would face the same question.
+  If yes, C generalises better than A or B.
+
+### Out of scope right now
+
+- Tuning `QOS_STRICT_WINDOW` / `ACK_EMIT_INTERVAL` — only worth it
+  if option A is the chosen direction.
+- Revisiting whether Zenoh belongs in the variant matrix at all —
+  it does (per overview.md "high-level framework approach").
+
+---

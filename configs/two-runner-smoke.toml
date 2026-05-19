@@ -1,0 +1,942 @@
+# Smoke subset of two-runner-all-variants.toml: five variant families, each
+# pinned to a single threading mode, across five (values_per_tick, tick_rate_hz)
+# sweeps, and now crossed with the three E19 workload profiles
+# (scalar-flood, block-flood, mixed-types). Intended as a fast sanity sweep
+# before running the full matrix and as a smoke check that all three
+# workload shapes spawn cleanly on every transport.
+#
+# (family, mode) pairs:
+#   zenoh      multi
+#   hybrid     single
+#   quic       multi
+#   websocket  single
+#   webrtc     multi
+#
+# Sweeps (applied to every family, in this order):
+#   10x1000hz    (values_per_tick = 10,   tick_rate_hz = 1000)
+#   100x100hz    (values_per_tick = 100,  tick_rate_hz = 100)
+#   1000x10hz    (values_per_tick = 1000, tick_rate_hz = 10)
+#   100x1000hz   (values_per_tick = 100,  tick_rate_hz = 1000)
+#   1000x100hz   (values_per_tick = 1000, tick_rate_hz = 100)
+#
+# Workloads (applied to every (family, sweep), in this order):
+#   scalar    workload = "scalar-flood"  -- one leaf per WriteOp, vpt ops/tick
+#   block     workload = "block-flood"   -- vpt/blob_size ops/tick of blob_size leaves
+#   mixed     workload = "mixed-types"   -- heterogeneous scalar/array/struct mix
+#
+# Per-sweep workload parameters (chosen so vpt % blob_size == 0 and the
+# mixed-types constraints hold; see workload.rs + toml-config-schema.md):
+#
+#   vpt=10   -> blob=10  (1 op of 10 leaves);  mixed: scalars 1..3,  arrays 2..6,   split=2
+#   vpt=100  -> blob=10  (10 ops of 10 leaves); mixed: scalars 2..10, arrays 20..60, split=3
+#   vpt=1000 -> blob=100 (10 ops of 100 leaves); mixed: scalars 5..20, arrays 200..600, split=4
+#
+# Rationale: block-flood targets ~10 ops/tick where the divisibility budget
+# allows (vpt=100 and vpt=1000); for vpt=10 we degenerate to 1 op/tick since
+# any other blob_size either violates divisibility or collapses to scalars.
+# Mixed-types ranges scale with vpt to keep the mix non-degenerate while
+# satisfying scalars_max <= vpt and arrays_max <= vpt - scalars_min.
+# workload_seed = 12345 everywhere for reproducibility across reruns.
+#
+# Spawn count math (per runner):
+#   sweeps x workloads = 5 x 3 = 15 [[variant]] entries per family
+#   zenoh / quic / webrtc (multi):   15 x 4 qos x 1 mode = 60 each -> 180
+#   hybrid (single):                 15 x 4 qos x 1 mode =          60
+#   websocket (single, qos [3,4]):   15 x 2 qos x 1 mode =          30
+#   Grand total = 270 spawns per runner
+#
+# Run from the repo root with two terminals (PowerShell):
+#   .\target\release\runner.exe --name alice --config configs\two-runner-smoke.toml
+#   .\target\release\runner.exe --name bob   --config configs\two-runner-smoke.toml
+#
+# Structure mirrors two-runner-all-variants.toml: one [[variant_template]] per
+# family carrying the shared common + specific defaults, and one [[variant]]
+# per (sweep, workload) declaring only its differing fields. Each family's
+# template pins threading_modes to its single requested mode, so
+# supported_modes is omitted on the [[variant]] entries (the runner only
+# attempts the one requested mode). The template no longer pins a workload;
+# each [[variant]] declares its own workload + profile-specific params.
+# websocket keeps qos = [3, 4] in its template since it only supports
+# reliable QoS; the other families inherit the default qos = 1..=4 expansion.
+
+run = "smoke-01"
+runners = ["alice", "bob"]
+default_timeout_secs = 120
+
+
+# --- Zenoh (multi) ----------------------------------------------------------
+
+[[variant_template]]
+name = "zenoh-base"
+binary = "target/release/variant-zenoh.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  log_dir = "./logs"
+  threading_modes = ["multi"]
+  [variant_template.specific]
+  zenoh_mode = "peer"
+
+# vpt=10, tick=1000Hz
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-10x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "scalar-flood"
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-10x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-10x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 3
+  mixed_arrays_min = 2
+  mixed_arrays_max = 6
+  mixed_dict_split_max = 2
+  workload_seed = 12345
+
+# vpt=100, tick=100Hz
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-100x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "scalar-flood"
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-100x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-100x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 2
+  mixed_scalars_max = 10
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 3
+  workload_seed = 12345
+
+# vpt=1000, tick=10Hz
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-1000x10hz-scalar"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-1000x10hz-block"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-1000x10hz-mixed"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# vpt=100, tick=1000Hz
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-100x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "scalar-flood"
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-100x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-100x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 2
+  mixed_scalars_max = 10
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 3
+  workload_seed = 12345
+
+# vpt=1000, tick=100Hz
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+
+# --- Hybrid UDP/TCP (single) ------------------------------------------------
+
+[[variant_template]]
+name = "hybrid-base"
+binary = "target/release/variant-hybrid.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  log_dir = "./logs"
+  threading_modes = ["single"]
+  [variant_template.specific]
+  multicast_group = "239.0.0.1:19503"
+  tcp_base_port = 19900
+
+# vpt=10, tick=1000Hz
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-10x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "scalar-flood"
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-10x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-10x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 3
+  mixed_arrays_min = 2
+  mixed_arrays_max = 6
+  mixed_dict_split_max = 2
+  workload_seed = 12345
+
+# vpt=100, tick=100Hz
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-100x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "scalar-flood"
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-100x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-100x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 2
+  mixed_scalars_max = 10
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 3
+  workload_seed = 12345
+
+# vpt=1000, tick=10Hz
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-1000x10hz-scalar"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-1000x10hz-block"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-1000x10hz-mixed"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# vpt=100, tick=1000Hz
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-100x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "scalar-flood"
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-100x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-100x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 2
+  mixed_scalars_max = 10
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 3
+  workload_seed = 12345
+
+# vpt=1000, tick=100Hz
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+
+# --- QUIC (multi) -----------------------------------------------------------
+
+[[variant_template]]
+name = "quic-base"
+binary = "target/release/variant-quic.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  log_dir = "./logs"
+  threading_modes = ["multi"]
+  [variant_template.specific]
+  base_port = 19930
+
+# vpt=10, tick=1000Hz
+[[variant]]
+template = "quic-base"
+name = "quic-10x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "scalar-flood"
+
+[[variant]]
+template = "quic-base"
+name = "quic-10x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "quic-base"
+name = "quic-10x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 3
+  mixed_arrays_min = 2
+  mixed_arrays_max = 6
+  mixed_dict_split_max = 2
+  workload_seed = 12345
+
+# vpt=100, tick=100Hz
+[[variant]]
+template = "quic-base"
+name = "quic-100x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "scalar-flood"
+
+[[variant]]
+template = "quic-base"
+name = "quic-100x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "quic-base"
+name = "quic-100x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 2
+  mixed_scalars_max = 10
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 3
+  workload_seed = 12345
+
+# vpt=1000, tick=10Hz
+[[variant]]
+template = "quic-base"
+name = "quic-1000x10hz-scalar"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "quic-base"
+name = "quic-1000x10hz-block"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "quic-base"
+name = "quic-1000x10hz-mixed"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# vpt=100, tick=1000Hz
+[[variant]]
+template = "quic-base"
+name = "quic-100x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "scalar-flood"
+
+[[variant]]
+template = "quic-base"
+name = "quic-100x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "quic-base"
+name = "quic-100x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 2
+  mixed_scalars_max = 10
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 3
+  workload_seed = 12345
+
+# vpt=1000, tick=100Hz
+[[variant]]
+template = "quic-base"
+name = "quic-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "quic-base"
+name = "quic-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "quic-base"
+name = "quic-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+
+# --- WebSocket (single) -----------------------------------------------------
+
+[[variant_template]]
+name = "websocket-base"
+binary = "target/release/variant-websocket.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  log_dir = "./logs"
+  qos = [3, 4]
+  threading_modes = ["single"]
+  [variant_template.specific]
+  ws_base_port = 19960
+
+# vpt=10, tick=1000Hz
+[[variant]]
+template = "websocket-base"
+name = "websocket-10x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "scalar-flood"
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-10x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-10x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 3
+  mixed_arrays_min = 2
+  mixed_arrays_max = 6
+  mixed_dict_split_max = 2
+  workload_seed = 12345
+
+# vpt=100, tick=100Hz
+[[variant]]
+template = "websocket-base"
+name = "websocket-100x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "scalar-flood"
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-100x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-100x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 2
+  mixed_scalars_max = 10
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 3
+  workload_seed = 12345
+
+# vpt=1000, tick=10Hz
+[[variant]]
+template = "websocket-base"
+name = "websocket-1000x10hz-scalar"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-1000x10hz-block"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-1000x10hz-mixed"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# vpt=100, tick=1000Hz
+[[variant]]
+template = "websocket-base"
+name = "websocket-100x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "scalar-flood"
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-100x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-100x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 2
+  mixed_scalars_max = 10
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 3
+  workload_seed = 12345
+
+# vpt=1000, tick=100Hz
+[[variant]]
+template = "websocket-base"
+name = "websocket-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+
+# --- WebRTC (multi) ---------------------------------------------------------
+
+[[variant_template]]
+name = "webrtc-base"
+binary = "target/release/variant-webrtc.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  log_dir = "./logs"
+  threading_modes = ["multi"]
+  [variant_template.specific]
+  signaling_base_port = 19980
+  media_base_port = 20000
+
+# vpt=10, tick=1000Hz
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-10x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "scalar-flood"
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-10x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-10x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 3
+  mixed_arrays_min = 2
+  mixed_arrays_max = 6
+  mixed_dict_split_max = 2
+  workload_seed = 12345
+
+# vpt=100, tick=100Hz
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-100x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "scalar-flood"
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-100x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-100x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 2
+  mixed_scalars_max = 10
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 3
+  workload_seed = 12345
+
+# vpt=1000, tick=10Hz
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x10hz-scalar"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x10hz-block"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x10hz-mixed"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# vpt=100, tick=1000Hz
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-100x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "scalar-flood"
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-100x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-100x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 2
+  mixed_scalars_max = 10
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 3
+  workload_seed = 12345
+
+# vpt=1000, tick=100Hz
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
