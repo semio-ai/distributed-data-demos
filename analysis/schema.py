@@ -21,7 +21,18 @@ import polars as pl
 # fail the schema-equality check; bumping forces a rebuild from the
 # source JSONL so all shards carry the new column (null for pre-E14
 # connected lines).
-SCHEMA_VERSION: str = "3"
+#
+# Bumped to "4" by T18.4 (E18): the cache pipeline now ingests the
+# T18.2 ``.compact.parquet`` source format in addition to legacy JSONL.
+# The compact loader's projected output differs from the JSONL-derived
+# projection in a few non-load-bearing places -- specifically the
+# ``clock_sync`` slot mapping (``offset_ns -> offset_ms`` via the
+# polymorphic ``extra_i64`` column) and the EOT field handling (the
+# ``eot_id`` / ``wait_ms`` columns are sourced from the compact
+# ``extra_i64`` slot, with an unsigned cast). Bumping forces a
+# rebuild so caches built from JSONL on a v3 run get re-projected
+# through the unified v4 pipeline when a compact file appears.
+SCHEMA_VERSION: str = "4"
 
 # Flat columnar event schema. One row per JSONL line. Event-specific
 # fields share the same row; columns that don't apply to a given event

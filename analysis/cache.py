@@ -1,10 +1,11 @@
 """Per-shard Parquet cache for analysis logs.
 
 Replaces the Phase 1 monolithic pickle cache with one Parquet shard
-plus a JSON sidecar per source JSONL file. Layout::
+plus a JSON sidecar per source file. Layout::
 
     <logs-dir>/
-        <name>-<runner>-<run>.jsonl              # source logs (untouched)
+        <name>-<runner>-<run>.jsonl              # legacy JSONL source (untouched)
+        <name>-<runner>-<run>.compact.parquet    # T18.2 compact source (untouched)
         ...
         .cache/
             <name>-<runner>-<run>.parquet
@@ -16,16 +17,22 @@ A shard is **stale** when any of:
 
 * sidecar missing or malformed
 * ``schema_version`` mismatch with ``schema.SCHEMA_VERSION``
-* sidecar ``mtime`` < JSONL ``mtime``
+* sidecar ``mtime`` < source ``mtime``
 * shard parquet missing
 
-Stale shards are rebuilt by streaming the JSONL line-by-line through
-``parse.iter_rows`` and writing fixed-size row-group batches via polars.
-This keeps peak memory bounded by the batch buffer rather than by the
-file size: a 2.1 GB JSONL file is ingested with at most a single batch
-of 100k rows in RAM at any moment.
+Stale shards are rebuilt by streaming the source file (legacy JSONL
+line-by-line, or compact-parquet via a single columnar read) through
+the appropriate loader, then writing the projected
+``SHARD_SCHEMA``-shaped DataFrame as a Parquet shard. For JSONL the
+loader runs in fixed-size row-group batches so peak memory is bounded
+by the batch buffer rather than by the file size.
 
-Orphan shards (no matching JSONL) are removed.
+For each ``<stem>``, when both ``<stem>.compact.parquet`` and
+``<stem>.jsonl`` exist (the variant ran with ``--legacy-jsonl-events``
+ON), the compact file wins -- it carries the same data in a tighter,
+faster-to-load form.
+
+Orphan shards (no matching source file in either format) are removed.
 """
 
 from __future__ import annotations
@@ -41,7 +48,8 @@ from typing import Iterator
 
 import polars as pl
 
-from parse import COLUMN_ORDER, iter_rows
+from parse import COLUMN_ORDER, SourceFormat, detect_source_format, iter_rows
+from parse_compact import read_compact_parquet
 from schema import SCHEMA_VERSION, SHARD_SCHEMA
 
 CACHE_DIRNAME: str = ".cache"
@@ -261,104 +269,141 @@ def _build_shard_worker(args: tuple) -> tuple[str, ShardMeta]:
 
     Must be defined at module scope (and not be a closure) so that it
     can be pickled and dispatched to a worker process.
+
+    The ``args`` tuple is
+    ``(stem, source_path, source_format_value, parquet_path, meta_path, batch_rows)``.
+    The source format is passed as the ``SourceFormat.value`` string so
+    the pickle is small and resilient to enum-import order across
+    worker processes.
     """
-    jsonl_str, parquet_str, meta_str, batch_rows = args
+    stem, source_str, source_format_value, parquet_str, meta_str, batch_rows = args
+    source_format = SourceFormat(source_format_value)
     meta = _build_shard(
-        Path(jsonl_str),
+        Path(source_str),
         Path(parquet_str),
         Path(meta_str),
+        source_format=source_format,
         batch_rows=batch_rows,
     )
-    # Return the JSONL stem so the parent can index by it.
-    return Path(jsonl_str).stem, meta
+    return stem, meta
 
 
 def _build_shard(
-    jsonl_path: Path,
+    source_path: Path,
     parquet_path: Path,
     meta_path: Path,
     *,
+    source_format: SourceFormat,
     batch_rows: int = DEFAULT_BATCH_ROWS,
 ) -> ShardMeta:
-    """Stream-build the Parquet shard for ``jsonl_path``.
+    """Build the Parquet shard for ``source_path`` (JSONL or compact).
 
-    Memory is bounded by ``batch_rows``: at most one batch and one
-    DataFrame/Arrow buffer at a time. Flushes the sidecar only after the
-    Parquet write fully succeeds.
+    Dispatches by ``source_format``:
 
-    Strategy: collect each batch into a polars DataFrame (typed via
-    ``SHARD_SCHEMA``) and concatenate them at the very end before a
-    single ``write_parquet`` call. The DataFrames hold compact columnar
-    Arrow buffers (rather than Python row-dicts) so the tail batches are
-    much smaller than the JSONL bytes they came from. The two-stage
-    "rows -> small typed DataFrame -> single concat" approach beats both:
+    - :class:`SourceFormat.JSONL` -- stream-parse the JSONL file
+      line-by-line through ``parse.iter_rows``, batching into typed
+      polars DataFrames sized by ``batch_rows`` before a single
+      concat + write.
+    - :class:`SourceFormat.COMPACT` -- read the entire compact-parquet
+      file in one shot via ``parse_compact.read_compact_parquet``;
+      ``batch_rows`` is unused on this path because the columnar
+      compact format is already compact in memory (the file is sized
+      so the whole thing fits comfortably under the analyzer's RSS
+      budget -- the compact format exists precisely to compress what
+      JSONL bloats).
 
-    - Calling ``write_parquet`` per batch (no append API in polars).
-    - Holding all rows as Python dicts before a single conversion.
-
-    A 2.1 GB JSONL file (~7M rows) yields ~70 batched DataFrames whose
-    aggregate Arrow size stays well under 1 GB, fitting the acceptance
-    criterion for the largest single shard.
+    Both paths produce the same ``SHARD_SCHEMA``-shaped Parquet shard,
+    so the analyzer's downstream lazy frame doesn't see the difference.
+    The sidecar is flushed only after the Parquet write fully
+    succeeds.
     """
     cache_dir_path = parquet_path.parent
     cache_dir_path.mkdir(parents=True, exist_ok=True)
 
-    typed_batches: list[pl.DataFrame] = []
-    row_count = 0
     variant: str | None = None
     run: str | None = None
     is_clocksync: bool | None = None
+    row_count = 0
 
-    with open(jsonl_path, encoding="utf-8") as stream:
-        for batch in _batches(iter_rows(stream), batch_rows):
-            df = pl.DataFrame(batch, schema=SHARD_SCHEMA, orient="row")
-            if variant is None and df.height > 0:
-                # Recover (variant, run) and the clock-sync flag once
-                # from the first non-empty batch's first row. By log
-                # convention every line in a variant JSONL has the
-                # same (variant, run); cache it now so the warm path
-                # skips the per-shard mini Parquet read.
-                first = df.row(0, named=True)
-                v = first.get("variant")
-                r = first.get("run")
-                e = first.get("event")
-                if v is not None:
-                    variant = str(v)
-                if r is not None:
-                    run = str(r)
-                # Mirror the two-check rule in ``_is_clocksync_shard``:
-                # a shard is clock-sync-only if its first row's event
-                # is one of the known clock-sync event names OR if its
-                # variant is empty (broadcast-only sibling log).
-                if e is not None or v is not None:
-                    e_str = str(e) if e is not None else ""
-                    v_str = str(v) if v is not None else ""
-                    is_clocksync = (
-                        e_str
-                        in (
-                            "clock_sync",
-                            "clock_sync_sample",
+    if source_format is SourceFormat.JSONL:
+        typed_batches: list[pl.DataFrame] = []
+        with open(source_path, encoding="utf-8") as stream:
+            for batch in _batches(iter_rows(stream), batch_rows):
+                df = pl.DataFrame(batch, schema=SHARD_SCHEMA, orient="row")
+                if variant is None and df.height > 0:
+                    # Recover (variant, run) + clock-sync flag once
+                    # from the first non-empty batch's first row.
+                    first = df.row(0, named=True)
+                    v = first.get("variant")
+                    r = first.get("run")
+                    e = first.get("event")
+                    if v is not None:
+                        variant = str(v)
+                    if r is not None:
+                        run = str(r)
+                    if e is not None or v is not None:
+                        e_str = str(e) if e is not None else ""
+                        v_str = str(v) if v is not None else ""
+                        is_clocksync = (
+                            e_str
+                            in (
+                                "clock_sync",
+                                "clock_sync_sample",
+                            )
+                            or v_str == ""
                         )
-                        or v_str == ""
-                    )
-            row_count += df.height
-            typed_batches.append(df)
+                row_count += df.height
+                typed_batches.append(df)
 
-    if not typed_batches:
-        empty = pl.DataFrame(schema=SHARD_SCHEMA)
-        empty = empty.select(list(COLUMN_ORDER))
-        empty.write_parquet(parquet_path, compression="snappy")
-    else:
-        combined = pl.concat(typed_batches, how="vertical")
+        if not typed_batches:
+            empty = pl.DataFrame(schema=SHARD_SCHEMA)
+            empty = empty.select(list(COLUMN_ORDER))
+            empty.write_parquet(parquet_path, compression="snappy")
+        else:
+            combined = pl.concat(typed_batches, how="vertical")
+            combined = combined.select(list(COLUMN_ORDER))
+            combined.write_parquet(parquet_path, compression="snappy")
+
+        del typed_batches
+
+    elif source_format is SourceFormat.COMPACT:
+        # The compact loader returns the full projected DataFrame in
+        # one go; there is no streaming API at this layer because the
+        # compact format itself is the compression step the streaming
+        # JSONL path was trying to bound. Even a 30 s / 100K msg/s
+        # spawn is on the order of a few MB on disk and ~100 MB
+        # expanded, well within the analyzer's per-shard budget.
+        combined = read_compact_parquet(source_path)
         combined = combined.select(list(COLUMN_ORDER))
+        row_count = combined.height
+        if row_count > 0:
+            first = combined.row(0, named=True)
+            v = first.get("variant")
+            r = first.get("run")
+            e = first.get("event")
+            if v is not None:
+                variant = str(v)
+            if r is not None:
+                run = str(r)
+            if e is not None or v is not None:
+                e_str = str(e) if e is not None else ""
+                v_str = str(v) if v is not None else ""
+                is_clocksync = (
+                    e_str
+                    in (
+                        "clock_sync",
+                        "clock_sync_sample",
+                    )
+                    or v_str == ""
+                )
         combined.write_parquet(parquet_path, compression="snappy")
 
-    # Free any references before flushing meta.
-    del typed_batches
+    else:  # pragma: no cover -- exhaustive enum check
+        raise ValueError(f"unsupported source format: {source_format!r}")
 
-    jsonl_mtime = jsonl_path.stat().st_mtime
+    source_mtime = source_path.stat().st_mtime
     meta = ShardMeta(
-        mtime=jsonl_mtime,
+        mtime=source_mtime,
         row_count=row_count,
         schema_version=SCHEMA_VERSION,
         variant=variant,
@@ -367,6 +412,65 @@ def _build_shard(
     )
     _write_meta(meta_path, meta)
     return meta
+
+
+def discover_sources(logs_dir: Path) -> dict[str, tuple[Path, SourceFormat]]:
+    """Discover per-spawn source files under ``logs_dir``.
+
+    Returns a dict mapping ``stem`` -> ``(source_path, source_format)``.
+    A stem is the canonical ``<variant>-<runner>-<run>`` triple shared
+    by both formats:
+
+    - ``<stem>.jsonl`` (legacy per-message JSONL)
+    - ``<stem>.compact.parquet`` (T18.2 columnar compact format)
+
+    When **both** files exist for the same stem (the variant ran with
+    ``--legacy-jsonl-events`` set), the compact file wins -- it
+    carries the same data more efficiently. The legacy JSONL is left
+    on disk for live-debugging / tail-f purposes but is not cached.
+
+    Files in any other format are silently skipped. The function is
+    name-based (does not open the files) so it stays fast on the
+    multi-thousand-file two-machine 40 GB scenario.
+    """
+    sources: dict[str, tuple[Path, SourceFormat]] = {}
+    # Two passes: JSONL first, then compact. The compact-overrides-jsonl
+    # rule falls out naturally because the second pass simply replaces
+    # whatever the first pass put down.
+    for entry in sorted(logs_dir.iterdir() if logs_dir.exists() else ()):
+        if not entry.is_file():
+            continue
+        fmt = detect_source_format(entry)
+        if fmt is not SourceFormat.JSONL:
+            continue
+        sources[entry.stem] = (entry, fmt)
+    for entry in sorted(logs_dir.iterdir() if logs_dir.exists() else ()):
+        if not entry.is_file():
+            continue
+        fmt = detect_source_format(entry)
+        if fmt is not SourceFormat.COMPACT:
+            continue
+        stem = entry.name[: -len(".compact.parquet")]
+        sources[stem] = (entry, fmt)
+    return sources
+
+
+# Back-compat shim. Some callers (older tests, third-party scripts)
+# imported the previous name. Keep the alias pointing at the modern
+# implementation so import sites don't break; the alias intentionally
+# returns a JSONL-only view to preserve the original signature.
+def discover_jsonl(logs_dir: Path) -> list[Path]:
+    """Return JSONL source files under ``logs_dir`` (back-compat shim).
+
+    Prefer :func:`discover_sources` for new code -- it also surfaces
+    compact-parquet sources. This shim is kept so any import-by-name
+    site that predates T18.4 keeps working without a search/replace.
+    """
+    return [
+        path
+        for path, fmt in discover_sources(logs_dir).values()
+        if fmt is SourceFormat.JSONL
+    ]
 
 
 def _remove_orphan_shards(logs_dir: Path, valid_stems: set[str]) -> None:
@@ -458,14 +562,17 @@ def update_cache(
     # warm wall-time on the 40 GB dataset.
     indexed_metas: dict[str, ShardMeta] = _read_global_index(logs_dir)
 
-    jsonl_files = sorted(logs_dir.glob("*.jsonl"))
-    valid_stems: set[str] = {p.stem for p in jsonl_files}
+    # Discover per-spawn source files in BOTH formats (JSONL + compact).
+    # ``discover_sources`` already implements the
+    # "compact wins when both exist" rule, so callers downstream see
+    # one source file per stem.
+    sources = discover_sources(logs_dir)
+    valid_stems: set[str] = set(sources.keys())
 
     metas: dict[str, ShardMeta] = {}
-    stale_jobs: list[tuple[str, str, str, int]] = []
+    stale_jobs: list[tuple[str, str, str, str, str, int]] = []
 
-    for jsonl_path in jsonl_files:
-        stem = jsonl_path.stem
+    for stem, (source_path, source_format) in sources.items():
         parquet_path, meta_path = shard_paths(logs_dir, stem)
 
         existing_meta: ShardMeta | None = indexed_metas.get(stem)
@@ -474,9 +581,16 @@ def update_cache(
             # caches built before the index extension still work.
             existing_meta = _read_meta(meta_path)
 
-        if _is_stale(jsonl_path, existing_meta, parquet_path):
+        if _is_stale(source_path, existing_meta, parquet_path):
             stale_jobs.append(
-                (str(jsonl_path), str(parquet_path), str(meta_path), batch_rows)
+                (
+                    stem,
+                    str(source_path),
+                    source_format.value,
+                    str(parquet_path),
+                    str(meta_path),
+                    batch_rows,
+                )
             )
         else:
             metas[stem] = existing_meta  # type: ignore[assignment]
@@ -487,9 +601,10 @@ def update_cache(
         # overhead. Useful for tests and small datasets.
         if n_workers <= 1 or len(stale_jobs) == 1:
             for job in stale_jobs:
-                jsonl_str = job[0]
+                # job[0] is the stem (canonical <variant>-<runner>-<run>
+                # triple, format-agnostic).
                 if on_progress is not None:
-                    on_progress(Path(jsonl_str).stem)
+                    on_progress(job[0])
                 stem, meta = _build_shard_worker(job)
                 metas[stem] = meta
         else:
@@ -499,7 +614,7 @@ def update_cache(
                 }
                 if on_progress is not None:
                     for job in stale_jobs:
-                        on_progress(Path(job[0]).stem)
+                        on_progress(job[0])
                 for future in as_completed(futures):
                     stem, meta = future.result()
                     metas[stem] = meta
