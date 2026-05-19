@@ -10,19 +10,47 @@ The :func:`detect_source_format` helper also lives here -- it sits at
 the same architectural seam (deciding how to turn a per-spawn source
 file into ``SHARD_SCHEMA`` rows) regardless of whether the file is
 JSONL or the post-T18.2 ``.compact.parquet`` columnar format. The
-compact loader proper lives in ``parse_compact.py`` to keep the legacy
-JSONL projection here single-responsibility.
+compact loader proper lives in ``parse_compact.py`` to keep the JSONL
+projection here single-responsibility.
+
+Post-E19 cleanup (T19.10c) invariant: the JSONL stream carries
+**lifecycle events only** (``phase``, ``connected``, ``eot_sent``,
+``eot_received``, ``eot_timeout``, ``resource``, ``clock_sync``).
+Per-event observations (``write`` / ``receive`` /
+``backpressure_skipped`` / ``gap_detected`` / ``gap_filled``) flow
+exclusively through the compact-Parquet path. :func:`iter_rows` warns
+once per file and skips any pre-T18.2 per-event rows it encounters on
+disk; in-memory consumers that call :func:`project_line` directly
+(e.g. test fixtures modelling the post-cache lazy frame) are
+unaffected because they bypass the file-iteration layer.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Iterator, TextIO
 
 from schema import SHARD_SCHEMA
+
+# Event types that were removed from the JSONL stream in the E19
+# cleanup. If a JSONL file on disk contains any of these (only possible
+# for pre-T18.2 datasets that pre-date the dual-emission gate's
+# removal), we skip the row and emit a one-shot per-file warning. They
+# are still valid ``event`` values in ``SHARD_SCHEMA`` -- the compact
+# loader produces them from ``.compact.parquet`` files.
+_REMOVED_JSONL_EVENTS: frozenset[str] = frozenset(
+    {
+        "write",
+        "receive",
+        "backpressure_skipped",
+        "gap_detected",
+        "gap_filled",
+    }
+)
 
 # Column order is the dict-insertion order of SHARD_SCHEMA; we precompute
 # it once and reuse it everywhere we materialize batches as DataFrames.
@@ -293,11 +321,15 @@ def project_line(line: str) -> dict | None:
 
     # Workload-shape dimension (E19 / T19.5). ``leaf_count`` defaults
     # to ``1`` and ``shape`` to ``"scalar"`` on ``write`` events when
-    # the fields are absent (pre-E19 logs). On non-``write`` rows we
-    # leave both null so the column semantics ("populated only on write
-    # rows") remain unambiguous -- correlate.py propagates them onto
-    # receives by the (writer, seq, path) key. The wire is opaque, so
-    # receive events do not carry these fields directly.
+    # the fields are absent (used by in-memory test fixtures that
+    # synthesise ``write`` rows directly via :func:`project_line`;
+    # production file ingestion of ``write`` rows now flows through
+    # the compact-Parquet loader, not :func:`iter_rows`). On
+    # non-``write`` rows we leave both null so the column semantics
+    # ("populated only on write rows") remain unambiguous --
+    # correlate.py propagates them onto receives by the
+    # (writer, seq, path) key. The wire is opaque, so receive events
+    # do not carry these fields directly.
     leaf_count: int | None
     shape: str | None
     if event_type == "write":
@@ -367,12 +399,38 @@ def project_line(line: str) -> dict | None:
     }
 
 
-def iter_rows(stream: TextIO) -> Iterator[dict]:
+def iter_rows(
+    stream: TextIO, *, source_path: Path | str | None = None
+) -> Iterator[dict]:
     """Yield projected row dicts from an open JSONL text stream.
 
-    Skips lines that fail to parse.
+    Skips lines that fail to parse. Also enforces the post-E19 invariant
+    that JSONL carries lifecycle events only: per-event rows
+    (``write`` / ``receive`` / ``backpressure_skipped`` /
+    ``gap_detected`` / ``gap_filled``) -- only possible from pre-T18.2
+    datasets that pre-date the dual-emission gate's removal -- are
+    skipped, and a one-shot warning is emitted on stderr identifying
+    the offending file and the total per-event row count.
+
+    ``source_path`` is purely diagnostic (used in the warning message);
+    pass it when calling from the file-loading path so the operator can
+    locate the legacy file. In-memory callers (tests) can omit it.
     """
+    removed_count = 0
     for line in stream:
         row = project_line(line)
-        if row is not None:
-            yield row
+        if row is None:
+            continue
+        if row["event"] in _REMOVED_JSONL_EVENTS:
+            removed_count += 1
+            continue
+        yield row
+    if removed_count > 0:
+        label = str(source_path) if source_path is not None else "<jsonl stream>"
+        print(
+            f"{label}: ignoring {removed_count} pre-T18.2 per-event JSONL "
+            "rows (event in {write, receive, backpressure_skipped, "
+            "gap_detected, gap_filled}); compact-Parquet is the only "
+            "source for per-event data since the E19 cleanup",
+            file=sys.stderr,
+        )

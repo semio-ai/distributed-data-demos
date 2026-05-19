@@ -4,7 +4,7 @@ Replaces the Phase 1 monolithic pickle cache with one Parquet shard
 plus a JSON sidecar per source file. Layout::
 
     <logs-dir>/
-        <name>-<runner>-<run>.jsonl              # legacy JSONL source (untouched)
+        <name>-<runner>-<run>.jsonl              # lifecycle JSONL source (untouched)
         <name>-<runner>-<run>.compact.parquet    # T18.2 compact source (untouched)
         ...
         .cache/
@@ -20,17 +20,29 @@ A shard is **stale** when any of:
 * sidecar ``mtime`` < source ``mtime``
 * shard parquet missing
 
-Stale shards are rebuilt by streaming the source file (legacy JSONL
+Stale shards are rebuilt by streaming the source file (JSONL
 line-by-line, or compact-parquet via a single columnar read) through
 the appropriate loader, then writing the projected
 ``SHARD_SCHEMA``-shaped DataFrame as a Parquet shard. For JSONL the
 loader runs in fixed-size row-group batches so peak memory is bounded
 by the batch buffer rather than by the file size.
 
+Post-E19 cleanup (T19.10): each spawn writes a **per-spawn file pair**
+to its log directory -- a lifecycle-only ``<stem>.jsonl`` and a
+per-event ``<stem>.compact.parquet``. Both are merged into the same
+shard by ``_build_shard`` -- the JSONL contributes lifecycle rows
+(``phase`` / ``connected`` / ``eot_*`` / ``resource`` / ``clock_sync``)
+and the compact-Parquet contributes per-event rows (``write`` /
+``receive`` / ``backpressure_skipped`` / ``gap_*``). Pre-T18.2
+datasets that contain per-event rows directly in JSONL are no longer
+supported -- :func:`parse.iter_rows` warns once per such file and
+skips those rows.
+
 For each ``<stem>``, when both ``<stem>.compact.parquet`` and
-``<stem>.jsonl`` exist (the variant ran with ``--legacy-jsonl-events``
-ON), the compact file wins -- it carries the same data in a tighter,
-faster-to-load form.
+``<stem>.jsonl`` exist (the post-cleanup norm), the compact file wins
+for shard derivation. Lifecycle events are mirrored into both files
+by variant-base since T18.2b, so picking one source still yields a
+complete row set for the spawn.
 
 Orphan shards (no matching source file in either format) are removed.
 """
@@ -328,7 +340,9 @@ def _build_shard(
     if source_format is SourceFormat.JSONL:
         typed_batches: list[pl.DataFrame] = []
         with open(source_path, encoding="utf-8") as stream:
-            for batch in _batches(iter_rows(stream), batch_rows):
+            for batch in _batches(
+                iter_rows(stream, source_path=source_path), batch_rows
+            ):
                 df = pl.DataFrame(batch, schema=SHARD_SCHEMA, orient="row")
                 if variant is None and df.height > 0:
                     # Recover (variant, run) + clock-sync flag once
@@ -421,13 +435,18 @@ def discover_sources(logs_dir: Path) -> dict[str, tuple[Path, SourceFormat]]:
     A stem is the canonical ``<variant>-<runner>-<run>`` triple shared
     by both formats:
 
-    - ``<stem>.jsonl`` (legacy per-message JSONL)
-    - ``<stem>.compact.parquet`` (T18.2 columnar compact format)
+    - ``<stem>.jsonl`` (lifecycle-only JSONL since the E19 cleanup --
+      ``phase`` / ``connected`` / ``eot_*`` / ``resource`` /
+      ``clock_sync``)
+    - ``<stem>.compact.parquet`` (T18.2 columnar compact format,
+      per-event observations + mirrored lifecycle rows)
 
-    When **both** files exist for the same stem (the variant ran with
-    ``--legacy-jsonl-events`` set), the compact file wins -- it
-    carries the same data more efficiently. The legacy JSONL is left
-    on disk for live-debugging / tail-f purposes but is not cached.
+    When **both** files exist for the same stem (the post-cleanup norm
+    -- variant-base now always writes the pair), the compact file
+    wins for shard derivation: lifecycle events are mirrored into
+    compact-Parquet by variant-base (T18.2b) so one source still
+    yields a complete row set. The lifecycle JSONL is left on disk
+    for live-debugging / tail-f purposes but is not cached.
 
     Files in any other format are silently skipped. The function is
     name-based (does not open the files) so it stays fast on the
