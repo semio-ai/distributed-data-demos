@@ -13856,3 +13856,125 @@ E18 note already documents JSONL as legacy/opt-in).
 - `cargo fmt --check` clean.
 
 **Commit**: (recorded below by the orchestrator)
+
+## T19.5 — analysis: parse + correlate + per-shape metrics [worker complete]
+
+**Scope**: `analysis/` only. Read the new `leaf_count` / `shape` (and
+`bytes`) fields off JSONL/compact write events, propagate them to
+correlated receives, and surface three distinct throughput numbers
+(`ops_per_sec`, `leaves_per_sec`, `bytes_per_sec`) on
+`PerformanceResult` plus the dominant `shape`.
+
+**Files changed**:
+
+- `analysis/schema.py`: bumped `SCHEMA_VERSION` 4 -> 5. Added three new
+  columns to `SHARD_SCHEMA`: `leaf_count: UInt32`, `shape: Utf8`,
+  `bytes: Int64`.
+- `analysis/parse.py`: project `leaf_count` (default `1` on `write`
+  rows, null elsewhere), `shape` (default `"scalar"` on `write` rows,
+  null elsewhere), and `bytes` from JSONL lines into the new columns.
+- `analysis/parse_compact.py`: read the `shape_intern` KV-metadata
+  dictionary (with `shapes` alias + `["scalar"]` fallback for legacy
+  files), resolve `shape_idx -> shape_str`, project `leaf_count` /
+  `shape` onto the write-row output, and propagate `bytes` on
+  write/receive rows. Added `shapes: list[str]` field to `CompactMeta`.
+- `analysis/correlate.py`: extended `DeliveryRecord` and
+  `DELIVERY_COLUMNS` with `leaf_count` / `shape` / `bytes`. The
+  writes-side projection in `correlate_lazy` is column-presence-aware
+  (`collect_schema().names()`) so caches built before SCHEMA_VERSION 5
+  still degrade gracefully via default-value `pl.lit` expressions.
+  `deliveries_to_records` populates the new fields with the
+  documented defaults when absent.
+- `analysis/performance.py`: added `ops_per_sec`, `leaves_per_sec`,
+  `bytes_per_sec`, `shape` fields to `PerformanceResult`. New helper
+  `_shape_aggregates` window-scopes the deliveries by each writer's
+  operate window (matching the T16.16 writer-clock accounting in
+  `_write_receive_counts`) and sums `leaf_count` + `bytes`. Helper
+  `_dominant_shape` picks the lex-first non-null shape.
+- `analysis/tables.py`: extended the performance table with `Shape`,
+  `Leaves/s`, `Bytes/s` columns. `Receives/s` retained its existing
+  T11.5 column name and position (so `tests/test_tables.py` and any
+  external regex consumer don't break); `Ops/s` is exposed at the
+  dataclass level under `ops_per_sec`.
+- `analysis/tests/test_workload_shape.py`: new test file covering the
+  T19.5 spec — 10 tests across legacy-defaults, mixed-leaf_count
+  propagation, scalar-flood identity, block-flood arithmetic, and a
+  compact-parquet round-trip with the `shape_intern` dictionary.
+- `analysis/tests/test_cache_compact.py`: renamed
+  `test_schema_version_bumped_to_4` -> `_bumped_to_5` and updated the
+  docstring; the legacy-invalidation case keeps its mechanism (v3 ->
+  current is still a wipe).
+
+**Tests run**:
+
+- `cd analysis && python -m pytest tests/ -v` -> 390 passed, 6
+  skipped, 0 failed (skipped are the pre-existing integration tests
+  that require the absent `logs/` real-data fixtures). 380 of 390
+  were already in the suite pre-T19.5 and all still pass; the 10
+  new tests cover the locked spec slices.
+- `python -m ruff check .` -> clean.
+- `python -m ruff format .` -> clean (formatter applied to
+  `correlate.py`, `performance.py`, and the new test file).
+
+**Test coverage of the locked spec**:
+
+| Spec line                                              | Test                                                      |
+|--------------------------------------------------------|-----------------------------------------------------------|
+| Legacy JSONL parses with `leaf_count = 1`, `shape = "scalar"` | `test_legacy_write_defaults_to_scalar_with_one_leaf`     |
+| Non-write rows leave both columns null                 | `test_non_write_event_leaves_columns_null`                 |
+| Explicit values round-trip through `project_line`      | `test_explicit_leaf_count_and_shape_round_trip`            |
+| Re-run on pre-E19 logs -> same numbers + defaults      | `test_legacy_perf_result_defaults_match_pre_e19_numbers`   |
+| Mixed `leaf_count` write -> correlate -> performance   | `test_mixed_leaf_counts_sum_into_leaves_per_sec`           |
+| Unmatched receive drops (no phantom leaf inheritance)  | `test_unmatched_receive_does_not_get_leaf_count`           |
+| Block-flood: `leaves_per_sec == ops_per_sec * blob_size` | `test_constant_blob_size_yields_arithmetic_identity`     |
+| scalar-flood: `leaves_per_sec == ops_per_sec`          | `test_scalar_flood_collapses_to_ops_per_sec`               |
+| Compact-parquet `shape_intern` round-trip              | `test_compact_parquet_with_leaf_count_and_shape`           |
+| Legacy data implicit scalar identity                   | `test_legacy_data_falls_into_scalar_branch`                |
+
+**Deviations from spec**:
+
+- The task description mentioned an `analysis/integrity.py` change
+  for "leaves-lost rate". I did NOT modify `integrity.py` in this
+  task: the existing integrity surface tracks operations per
+  (writer, receiver, qos) pair, and deriving a "lost leaves" number
+  requires either (a) recomputing per-pair sums or (b) widening the
+  `IntegrityResult` dataclass. The locked spec's headline metric is
+  `leaves_per_sec` (already done) and the three required unit tests
+  in TASKS.md don't reference leaves-lost. Surfacing it cleanly is
+  a small follow-up that should land alongside T19.6's plot
+  refactor where the integrity-side leaf bookkeeping has a natural
+  home. Flagged for orchestrator review — happy to add it in a
+  follow-up commit on T19.6 spawn if desired.
+- Bumped `SCHEMA_VERSION` to 5 rather than treating the new columns
+  as purely additive. Rationale: the downstream lazy pipeline
+  (`correlate.py`, `performance.py`) references the new columns
+  unconditionally, so existing cache shards built without them
+  would crash. The version bump forces a one-time cache rebuild
+  on first run, which is the canonical mechanism for this scenario
+  and matches the precedent from T11.5 (threading_mode column).
+  The correlate-side projection is also defensive
+  (`collect_schema().names()` guard) so the pipeline degrades to
+  defaults if a downstream consumer somehow feeds in a pre-v5
+  cache directly.
+- Kept the table column header `Receives/s` (existing T11.5 name)
+  rather than renaming to `Ops/s`. The dataclass field `ops_per_sec`
+  is the workload-shape vocabulary surface; the table is what users
+  actually see and renaming would break existing reports / external
+  scrapers. The two columns are conceptually identical (count of
+  received WriteOps over the operate window).
+
+**Open concerns for T19.6**:
+
+- The `shape` column on `PerformanceResult` is a single dominant
+  value per group, which works for the locked invariant (one
+  workload profile per spawn). If T19.6 needs to render mixed-shape
+  data per group, it should pivot off the delivery-level
+  `leaf_count` / `shape` columns directly via a fresh polars
+  pipeline rather than via `PerformanceResult.shape`.
+- `pivot_tables.py` was NOT extended in this task. T19.6 calls out
+  `workload`/`shape` pivot dimensions explicitly — those land
+  alongside the chart updates.
+- The compact-parquet `shape_intern` key name is currently accepted
+  under either `shape_intern` (canonical) or `shapes` (alias).
+  When T19.2 lands on the writer side, the loader will need to
+  drop the alias if the contract pins one canonical key name.
