@@ -186,12 +186,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _has_source_files(directory: Path) -> bool:
+    """True iff ``directory`` directly contains any per-spawn source file.
+
+    Accepts both legacy ``.jsonl`` and the T18.2 ``.compact.parquet``
+    format -- either flavour counts as a populated log directory. Used
+    by :func:`resolve_logs_dir` to decide whether to descend into a
+    sub-run.
+    """
+    if not directory.is_dir():
+        return False
+    for entry in directory.iterdir():
+        if not entry.is_file():
+            continue
+        name = entry.name
+        if name.endswith(".compact.parquet") or name.endswith(".jsonl"):
+            return True
+    return False
+
+
 def resolve_logs_dir(logs_dir: Path) -> Path:
-    """If ``logs_dir`` has no .jsonl files, auto-select the latest sub-run."""
-    if list(logs_dir.glob("*.jsonl")):
+    """If ``logs_dir`` has no source files, auto-select the latest sub-run.
+
+    A directory counts as populated when it contains at least one
+    ``.jsonl`` or ``.compact.parquet`` file directly. The two-format
+    detection mirrors the cache layer's ``discover_sources`` so a
+    log directory the runner wrote in compact-only mode is recognised.
+    """
+    if _has_source_files(logs_dir):
         return logs_dir
     candidates = sorted(
-        d for d in logs_dir.iterdir() if d.is_dir() and list(d.glob("*.jsonl"))
+        d for d in logs_dir.iterdir() if d.is_dir() and _has_source_files(d)
     )
     if candidates:
         selected = candidates[-1]
