@@ -21,6 +21,11 @@ runners = ["<string>", ...]             # e.g. ["a", "b", "c"]
 # Can be overridden per variant.
 default_timeout_secs = <integer>        # e.g. 120
 
+# OPTIONAL: runner-scoped settings (T18.5). Nothing in here gets forwarded
+# to variants as CLI args; it only configures the runner process itself.
+[runner]
+log_dir = "<path>"                      # optional; override the base log directory.
+
 # OPTIONAL: reusable variant defaults referenced by `[[variant]]` entries.
 # Templates do NOT spawn — they only provide defaults. See "Variant Templates".
 [[variant_template]]
@@ -264,6 +269,44 @@ dimensions.
 ## Known Deviations
 
 _None yet._
+
+---
+
+## E18 additions: `[runner]` section and `log_dir` override
+
+Approved 2026-05-19. Adds a top-level `[runner]` section for runner-scoped
+settings that do not need to be forwarded to variants. The first such
+setting is `log_dir`.
+
+### `[runner] log_dir = "<path>"`
+
+Optional. Overrides the base log directory the runner uses for its own
+coordination logs (clock-sync JSONL) AND injects into every spawned
+variant's `--log-dir`. The full per-run path becomes
+`<log_dir>/<run>-<launch_ts>/`.
+
+Precedence (highest wins) — handled inside `runner/src/main.rs`:
+
+1. `--log-dir <path>` CLI flag (operator override).
+2. `[runner] log_dir = "..."` (this TOML key).
+3. First `[variant.common].log_dir` found in the config (legacy
+   fallback that pre-dates T18.5; combined with the
+   coding-standards `log_dir = "./logs"` invariant this is the
+   typical path).
+4. `./logs` (final fallback when nothing else is set).
+
+Cross-platform: UNC paths on Windows (`\\server\share\bench-logs`) and
+mounted NFS / SMB paths on Linux are accepted verbatim. The runner
+validates writability at startup (creates the directory if missing,
+writes a tiny probe file, deletes it). A non-writable path aborts the
+run BEFORE discovery with a clear error.
+
+The `[variant.common].log_dir` invariant in
+`metak-shared/coding-standards.md` is unchanged: every config and every
+test fixture continues to declare `log_dir = "./logs"` in
+`[variant.common]`. The new `[runner].log_dir` and `--log-dir` CLI
+flag are operator-level overrides that take effect at runner startup;
+they do NOT change what variant configs look like on disk.
 
 ---
 
