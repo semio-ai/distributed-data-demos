@@ -276,26 +276,6 @@ pub struct CliArgs {
     #[arg(long, default_value_t = DEFAULT_DIGEST_MEM_HARD_MB)]
     pub digest_mem_hard_mb: u32,
 
-    /// Opt in to emitting per-event JSONL lines (`write`, `receive`,
-    /// `backpressure_skipped`, `gap_detected`, `gap_filled`) in
-    /// addition to the compact Parquet output. Off by default once
-    /// T18.2 lands: the compact file carries the same information at
-    /// 30-50x less disk footprint.
-    ///
-    /// When set, the variant produces BOTH the legacy
-    /// `<variant>-<runner>-<run>.jsonl` file and the new
-    /// `<variant>-<runner>-<run>.compact.parquet` file. The two are
-    /// guaranteed to contain the same per-event rows under the same
-    /// spawn -- handy for live debugging or for tooling that has not
-    /// yet been ported to read the compact format.
-    ///
-    /// Lifecycle events (`connected`, `phase`, `eot_sent`,
-    /// `eot_received`, `eot_timeout`, `resource`) ALWAYS go to JSONL
-    /// regardless of this flag; only the high-volume per-event lines
-    /// are gated on it. See T18.2 / E18.
-    #[arg(long, default_value_t = false)]
-    pub legacy_jsonl_events: bool,
-
     // -- E19 workload-shape params (T19.3) --
     //
     // All optional at the clap layer because they only apply to the

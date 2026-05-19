@@ -24,8 +24,8 @@ use crate::workload::{create_workload_with_params, WorkloadParams, WriteShape};
 /// UNIX epoch. Uses `timestamp_nanos_opt` and falls back to `0` on
 /// the (unreachable in practice) overflow path so the buffer push
 /// never has to surface an error -- the resulting row is still
-/// recoverable and the JSONL stream (when enabled) carries the
-/// authoritative timestamp.
+/// recoverable and the compact Parquet file is the authoritative
+/// store for per-event observations post-T19.10.
 #[inline]
 fn ts_nanos(ts: DateTime<Utc>) -> i64 {
     ts.timestamp_nanos_opt().unwrap_or(0)
@@ -67,36 +67,6 @@ impl<'a> LoggerProxy<'a> {
             .log_connected(launch_ts, elapsed_ms, threading_mode, recv_buffer_kb)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn log_write_at(
-        &mut self,
-        ts: DateTime<Utc>,
-        seq: u64,
-        path: &str,
-        qos: Qos,
-        bytes: usize,
-        leaf_count: u32,
-        shape: WriteShape,
-    ) -> Result<()> {
-        self.lock()?
-            .log_write_at(ts, seq, path, qos, bytes, leaf_count, shape)
-    }
-
-    fn log_backpressure_skipped(&mut self, path: &str, qos: Qos) -> Result<()> {
-        self.lock()?.log_backpressure_skipped(path, qos)
-    }
-
-    fn log_receive(
-        &mut self,
-        writer: &str,
-        seq: u64,
-        path: &str,
-        qos: Qos,
-        bytes: usize,
-    ) -> Result<()> {
-        self.lock()?.log_receive(writer, seq, path, qos, bytes)
-    }
-
     fn log_eot_sent(&mut self, eot_id: u64) -> Result<()> {
         self.lock()?.log_eot_sent(eot_id)
     }
@@ -129,29 +99,23 @@ pub enum MemCheckOutcome {
     HardCrossed { current_mb: u64, threshold_mb: u32 },
 }
 
-/// Dual-emission sink for per-event AND lifecycle event rows.
+/// Single-source sink for per-event observations (T19.10).
 ///
-/// During operate + silent, every event the driver would historically
-/// have logged as a JSONL line is also pushed into the compact
-/// columnar buffers ([`CompactBuffers`]). At digest time the buffers
-/// are serialised to a single Parquet file.
-///
-/// JSONL emission of high-volume per-event rows (`write`, `receive`,
-/// `backpressure_skipped`, `gap_*`) is **opt-in** via
-/// `legacy_jsonl_events`. When off (the T18.2 default), each
-/// `record_*` call writes to the compact buffers only -- saving the
-/// ~200 byte JSONL line that the analysis pipeline does not need
-/// once T18.3-T18.6 land.
+/// Every per-event observation (`write`, `receive`,
+/// `backpressure_skipped`, `gap_*`) the driver emits is pushed into
+/// the compact columnar buffers ([`CompactBuffers`]); at digest time
+/// the buffers are serialised to a single Parquet file. There is no
+/// dual-emission gate — per-event data lives exclusively in
+/// compact-Parquet now.
 ///
 /// **T18.2b**: Lifecycle events (`phase`, `connected`, `eot_sent`,
-/// `eot_received`, `eot_timeout`, `resource`, `clock_sync`) are now
-/// ALSO captured by this sink. They are unconditionally emitted to
-/// the JSONL stream (low-volume, runner reads them out-of-band for
+/// `eot_received`, `eot_timeout`, `resource`, `clock_sync`) are
+/// ALSO mirrored through this sink. They are unconditionally emitted
+/// to the JSONL stream (low-volume, runner reads them out-of-band for
 /// E15 progress streaming) AND mirrored into the compact buffers so
-/// the analyzer's compact-only loader (T18.4+) does not need a
-/// side-car JSONL file to find phase boundaries / connect metrics /
-/// resource samples.
-struct EventSink<'a> {
+/// the analyzer's compact-only loader does not need a side-car JSONL
+/// file to find phase boundaries / connect metrics / resource samples.
+struct EventSink {
     /// Shared compact-buffer sink. T18.3a wraps the buffers in
     /// `Arc<Mutex<CompactBuffers>>` so cross-thread emitters (the
     /// `LoggerHandle::record_receive` path used by websocket reader
@@ -159,14 +123,8 @@ struct EventSink<'a> {
     /// same instance the digest phase later serialises. The driver
     /// thread is the only contender outside reader threads; lock
     /// contention is microsecond-scale per push and not on the hot
-    /// path of any T18.2 benchmark.
+    /// path of any benchmark.
     buffers: CompactSink,
-    /// Underlying JSONL logger. The proxy is borrowed mutably so the
-    /// sink can emit on the legacy path when enabled.
-    logger: LoggerProxy<'a>,
-    /// True iff per-event JSONL emission is enabled. Set from
-    /// `CliArgs::legacy_jsonl_events`.
-    legacy_jsonl: bool,
     /// Soft memory ceiling in bytes (`digest_mem_soft_mb * 1 MiB`).
     soft_ceiling_bytes: u64,
     /// Hard memory ceiling in bytes (`digest_mem_hard_mb * 1 MiB`).
@@ -177,18 +135,10 @@ struct EventSink<'a> {
     soft_warning_emitted: bool,
 }
 
-impl<'a> EventSink<'a> {
-    fn new(
-        buffers: CompactSink,
-        logger: LoggerProxy<'a>,
-        legacy_jsonl: bool,
-        soft_mb: u32,
-        hard_mb: u32,
-    ) -> Self {
+impl EventSink {
+    fn new(buffers: CompactSink, soft_mb: u32, hard_mb: u32) -> Self {
         Self {
             buffers,
-            logger,
-            legacy_jsonl,
             soft_ceiling_bytes: u64::from(soft_mb) * 1024 * 1024,
             hard_ceiling_bytes: u64::from(hard_mb) * 1024 * 1024,
             soft_warning_emitted: false,
@@ -209,7 +159,7 @@ impl<'a> EventSink<'a> {
     /// by the caller per the T16.2 contract.
     ///
     /// E19 / T19.2: `leaf_count` and `shape` carry the workload-shape
-    /// metadata to both emission paths. Scalar-flood / max-throughput
+    /// metadata into the compact row. Scalar-flood / max-throughput
     /// pass `(1, WriteShape::Scalar)`; block-flood / mixed-types pass
     /// whatever the per-WriteOp generator produced.
     #[allow(clippy::too_many_arguments)]
@@ -232,10 +182,6 @@ impl<'a> EventSink<'a> {
             leaf_count,
             shape.as_u8(),
         )?;
-        if self.legacy_jsonl {
-            self.logger
-                .log_write_at(ts, seq, path, qos, bytes, leaf_count, shape)?;
-        }
         Ok(())
     }
 
@@ -243,9 +189,6 @@ impl<'a> EventSink<'a> {
     fn record_backpressure_skipped(&mut self, path: &str, qos: Qos) -> Result<()> {
         self.lock_buffers()?
             .push_backpressure_skipped(ts_nanos(Utc::now()), path, qos.as_int())?;
-        if self.legacy_jsonl {
-            self.logger.log_backpressure_skipped(path, qos)?;
-        }
         Ok(())
     }
 
@@ -266,9 +209,6 @@ impl<'a> EventSink<'a> {
             qos.as_int(),
             bytes as u32,
         )?;
-        if self.legacy_jsonl {
-            self.logger.log_receive(writer, seq, path, qos, bytes)?;
-        }
         Ok(())
     }
 
@@ -667,18 +607,19 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // digest-phase Parquet writer sees a complete row set regardless
     // of which thread observed the event.
     let shared_buffers: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
-    logger_handle.attach_compact_sink(Arc::clone(&shared_buffers), config.legacy_jsonl_events);
-    // The legacy `logger` variable continues to be used for
-    // lifecycle events (`phase`, `connected`, `eot_sent`,
-    // `resource`). High-volume per-event rows go through `sink`
-    // (which itself owns its own `LoggerProxy` for the gated
-    // legacy-JSONL emission path).
+    // The trailing `false` is a vestigial back-compat parameter retained
+    // for the 2-arg signature in-tree tests in concrete variants still
+    // use; it is ignored — per-event JSONL emission was removed in
+    // T19.10. See `LoggerHandle::attach_compact_sink`.
+    logger_handle.attach_compact_sink(Arc::clone(&shared_buffers), false);
+    // The `logger` variable carries lifecycle events (`phase`,
+    // `connected`, `eot_sent`, `resource`) into the JSONL stream
+    // directly. Per-event observations (write, receive, etc.) flow
+    // exclusively through `sink` into the compact buffers — no JSONL
+    // emission for those kinds post-T19.10.
     let mut logger = LoggerProxy::new(&logger_handle);
-    let sink_logger = LoggerProxy::new(&logger_handle);
     let mut sink = EventSink::new(
         shared_buffers,
-        sink_logger,
-        config.legacy_jsonl_events,
         config.digest_mem_soft_mb,
         config.digest_mem_hard_mb,
     );
@@ -1289,12 +1230,6 @@ mod tests {
             // / hard ceiling paths override these explicitly.
             digest_mem_soft_mb: crate::cli::DEFAULT_DIGEST_MEM_SOFT_MB,
             digest_mem_hard_mb: crate::cli::DEFAULT_DIGEST_MEM_HARD_MB,
-            // Legacy per-event JSONL stream stays ON in driver unit
-            // tests so existing assertions about `write`/`receive`
-            // lines keep working unchanged. Tests that need to
-            // exercise the compact-only path flip this off
-            // explicitly.
-            legacy_jsonl_events: true,
             // E19 / T19.3: leave the workload-shape args unset in the
             // default base_args. Driver unit tests that exercise the
             // `block-flood` / `mixed-types` paths populate the args
@@ -1318,6 +1253,34 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
             .collect()
+    }
+
+    /// Read every `kind` discriminant from the canonical
+    /// `test-<runner>-run01.compact.parquet` file. Used by the driver
+    /// unit tests that previously asserted on per-event JSONL line
+    /// counts and now key on compact-Parquet rows after T19.10.
+    fn read_compact_kinds(log_dir: &Path, runner: &str) -> Vec<i32> {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::record::RowAccessor;
+
+        let path = log_dir.join(format!("test-{runner}-run01.compact.parquet"));
+        let reader = SerializedFileReader::new(File::open(&path).expect("compact parquet exists"))
+            .expect("parquet reader builds");
+        reader
+            .get_row_iter(None)
+            .unwrap()
+            .flatten()
+            // Column 1 = `kind` (per compact-log-schema § Event kinds /
+            // compact_writer's column ordering).
+            .map(|r| r.get_int(1).unwrap())
+            .collect()
+    }
+
+    /// Count rows of a specific [`crate::compact::EventKind`] in the
+    /// compact-Parquet kind column produced by [`read_compact_kinds`].
+    fn count_compact_kind(kinds: &[i32], kind: crate::compact::EventKind) -> usize {
+        let target = kind as i32;
+        kinds.iter().filter(|&&k| k == target).count()
     }
 
     #[test]
@@ -1510,7 +1473,10 @@ mod tests {
     fn test_backpressured_variant_logs_skipped_not_write() {
         // Short config: 1s operate, 10 Hz tick, 5 values per tick.
         // Expected: ~10 ticks * 5 values = ~50 backpressure_skipped
-        // events, zero write events, and publish() never called.
+        // rows in compact-Parquet, zero write rows, and publish()
+        // never called. Post-T19.10 the JSONL stream carries lifecycle
+        // events only, so we read counts from the compact file.
+        use crate::compact::EventKind;
         let dir = TempDir::new().unwrap();
         let mut args = base_args(
             dir.path().to_str().unwrap(),
@@ -1526,32 +1492,18 @@ mod tests {
         let mut variant = AlwaysBackpressuredVariant::new();
         run_protocol(&mut variant, &args).expect("protocol completes");
 
-        let lines = read_log(dir.path(), "alice");
-        let write_events: Vec<&serde_json::Value> =
-            lines.iter().filter(|l| l["event"] == "write").collect();
-        let skip_events: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "backpressure_skipped")
-            .collect();
+        let kinds = read_compact_kinds(dir.path(), "alice");
+        let write_count = count_compact_kind(&kinds, EventKind::Write);
+        let skip_count = count_compact_kind(&kinds, EventKind::BackpressureSkipped);
 
         assert_eq!(
-            write_events.len(),
-            0,
-            "no `write` events should be emitted when try_publish returns Ok(false)"
+            write_count, 0,
+            "no `write` rows should be emitted when try_publish returns Ok(false)"
         );
         assert!(
-            !skip_events.is_empty(),
-            "expected at least one `backpressure_skipped` event over a 1s operate phase"
+            skip_count > 0,
+            "expected at least one `backpressure_skipped` row over a 1s operate phase"
         );
-        // Every skip event must carry path and qos and the common fields.
-        for ev in &skip_events {
-            assert!(ev.get("path").is_some(), "skip event missing path");
-            assert!(ev.get("qos").is_some(), "skip event missing qos");
-            assert!(ev.get("ts").is_some(), "skip event missing ts");
-            assert_eq!(ev["runner"], "alice");
-            assert_eq!(ev["variant"], "test");
-            assert_eq!(ev["run"], "run01");
-        }
         // The default impl was bypassed -- the override saw every call.
         assert_eq!(
             variant.publish_calls, 0,
@@ -1561,11 +1513,10 @@ mod tests {
             variant.try_publish_calls > 0,
             "try_publish() should be called for every intended value"
         );
-        // Sanity: there were as many try_publish calls as skip events.
+        // Sanity: there were as many try_publish calls as skip rows.
         assert_eq!(
-            variant.try_publish_calls as usize,
-            skip_events.len(),
-            "every Ok(false) call should produce exactly one `backpressure_skipped` event"
+            variant.try_publish_calls as usize, skip_count,
+            "every Ok(false) call should produce exactly one `backpressure_skipped` row"
         );
     }
 
@@ -1626,18 +1577,21 @@ mod tests {
         // `variant.try_publish(...)`. We verify by having a mock
         // variant record `Utc::now()` inside its `try_publish`
         // implementation and asserting that the `ts` field on the
-        // emitted `write` JSONL event is strictly less than that
+        // emitted compact-Parquet write row is strictly less than that
         // observation.
         //
-        // Pre-fix (capture AFTER try_publish): `write_ts` would be
+        // Pre-T16.2 (capture AFTER try_publish): `write_ts` would be
         // >= `observed_inside_publish` (often equal at coarse clock
         // resolution, sometimes greater because the log call ran
         // after publish returned).
         //
-        // Post-fix (capture BEFORE try_publish): `write_ts` is
+        // Post-T16.2 (capture BEFORE try_publish): `write_ts` is
         // captured before the mock variant gets a chance to record
         // its own timestamp, so `write_ts < observed_inside_publish`
         // is required.
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::record::RowAccessor;
+
         let dir = TempDir::new().unwrap();
         let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         // One tick, one value, no stabilize, no silent. The operate
@@ -1655,18 +1609,25 @@ mod tests {
             .observed_inside_publish
             .expect("try_publish should have been called at least once");
 
-        let lines = read_log(dir.path(), "alice");
-        let write_events: Vec<&serde_json::Value> =
-            lines.iter().filter(|l| l["event"] == "write").collect();
+        // Read the compact-Parquet file: pull (ts_ns, kind) and filter
+        // to write rows (kind == 0). The first such row's ts_ns is the
+        // write_ts the driver captured.
+        let parquet_path = dir.path().join("test-alice-run01.compact.parquet");
+        let reader = SerializedFileReader::new(File::open(&parquet_path).unwrap()).unwrap();
+        let write_ts_nanos: Vec<i64> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .flatten()
+            .filter(|r| r.get_int(1).unwrap() == crate::compact::EventKind::Write as i32)
+            .map(|r| r.get_long(0).unwrap())
+            .collect();
         assert!(
-            !write_events.is_empty(),
-            "expected at least one `write` event"
+            !write_ts_nanos.is_empty(),
+            "expected at least one `write` row in compact-Parquet"
         );
 
-        let first_write_ts_str = write_events[0]["ts"].as_str().unwrap();
-        let first_write_ts = chrono::DateTime::parse_from_rfc3339(first_write_ts_str)
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let first_write_ts =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(write_ts_nanos[0]);
 
         // The contract is "write_ts is captured NO LATER THAN the
         // publish call observes it". On the pre-T16.2 code path the
@@ -1842,41 +1803,33 @@ mod tests {
         args.silent_secs = 0;
         args.values_per_tick = 1;
 
+        use crate::compact::EventKind;
+
         let mut variant = OnceBackpressuredVariant::new();
         let start = std::time::Instant::now();
         run_protocol(&mut variant, &args).expect("protocol completes");
         let elapsed = start.elapsed();
 
-        let lines = read_log(dir.path(), "alice");
-        let write_events: Vec<&serde_json::Value> =
-            lines.iter().filter(|l| l["event"] == "write").collect();
-        let skip_events: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "backpressure_skipped")
-            .collect();
+        let kinds = read_compact_kinds(dir.path(), "alice");
+        let write_count = count_compact_kind(&kinds, EventKind::Write);
+        let skip_count = count_compact_kind(&kinds, EventKind::BackpressureSkipped);
 
         eprintln!(
-            "max_throughput_yields_on_first_backpressure: elapsed={:?}, writes={}, skips={}",
-            elapsed,
-            write_events.len(),
-            skip_events.len()
+            "max_throughput_yields_on_first_backpressure: elapsed={elapsed:?}, writes={write_count}, skips={skip_count}"
         );
 
         assert_eq!(
-            skip_events.len(),
-            1,
-            "exactly one backpressure_skipped event expected; got {}",
-            skip_events.len()
+            skip_count, 1,
+            "exactly one backpressure_skipped row expected; got {skip_count}"
         );
         // With a 1s operate window and only the FIRST call returning
-        // Ok(false), we should accumulate thousands of `write` events.
+        // Ok(false), we should accumulate thousands of `write` rows.
         // A sleep(1ms) on the first skip would NOT prevent this -- but
         // would push the total wall-clock above 1s by ~15ms on Windows
         // (negligible). The strong evidence here is the write count.
         assert!(
-            write_events.len() > 100,
-            "expected many `write` events after the single skip; got {}",
-            write_events.len()
+            write_count > 100,
+            "expected many `write` rows after the single skip; got {write_count}"
         );
         // Sanity-bound the wall-clock: 1s operate + EOT no-op +
         // a few ms of stabilize/silent/logger I/O. If something
@@ -1911,30 +1864,26 @@ mod tests {
         args.tick_rate_hz = 1;
         args.values_per_tick = 1; // one try_publish per outer iter -> each iter triggers back-off
 
+        use crate::compact::EventKind;
+
         let mut variant = AlwaysBackpressuredVariant::new();
         let start = std::time::Instant::now();
         run_protocol(&mut variant, &args).expect("protocol completes");
         let elapsed = start.elapsed();
 
-        let lines = read_log(dir.path(), "alice");
-        let skip_events: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "backpressure_skipped")
-            .collect();
+        let kinds = read_compact_kinds(dir.path(), "alice");
+        let skip_count = count_compact_kind(&kinds, EventKind::BackpressureSkipped);
 
         eprintln!(
-            "max_throughput_sleeps_after_consecutive: elapsed={:?}, skips={}, try_publish_calls={}",
-            elapsed,
-            skip_events.len(),
+            "max_throughput_sleeps_after_consecutive: elapsed={elapsed:?}, skips={skip_count}, try_publish_calls={}",
             variant.try_publish_calls
         );
 
         // Lower bound: pacing should still let SOME skips happen
         // (at least more than one per ~15ms tick over 1s on Windows).
         assert!(
-            skip_events.len() >= 5,
-            "expected at least 5 backpressure_skipped events over 1s; got {}",
-            skip_events.len()
+            skip_count >= 5,
+            "expected at least 5 backpressure_skipped rows over 1s; got {skip_count}"
         );
         // Upper bound: the key assertion -- the loop is paced by the
         // sleep granularity, NOT free-spinning. Free-spin would push
@@ -1942,10 +1891,8 @@ mod tests {
         // to a few thousand to absorb fast Linux scheduling, but
         // anything above that means the back-off didn't fire.
         assert!(
-            skip_events.len() < 5000,
-            "max-throughput should be paced (not free-spinning); got {} skips in {:?}",
-            skip_events.len(),
-            elapsed
+            skip_count < 5000,
+            "max-throughput should be paced (not free-spinning); got {skip_count} skips in {elapsed:?}"
         );
     }
 
@@ -1967,44 +1914,37 @@ mod tests {
         args.tick_rate_hz = 1;
         args.values_per_tick = 1; // simplest pattern: each outer iter is exactly one call
 
+        use crate::compact::EventKind;
+
         let mut variant = AlternatingBackpressuredVariant::new();
         let start = std::time::Instant::now();
         run_protocol(&mut variant, &args).expect("protocol completes");
         let elapsed = start.elapsed();
 
-        let lines = read_log(dir.path(), "alice");
-        let write_events: Vec<&serde_json::Value> =
-            lines.iter().filter(|l| l["event"] == "write").collect();
-        let skip_events: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "backpressure_skipped")
-            .collect();
+        let kinds = read_compact_kinds(dir.path(), "alice");
+        let write_count = count_compact_kind(&kinds, EventKind::Write);
+        let skip_count = count_compact_kind(&kinds, EventKind::BackpressureSkipped);
 
         eprintln!(
-            "max_throughput_resets_on_success: elapsed={:?}, writes={}, skips={}",
-            elapsed,
-            write_events.len(),
-            skip_events.len()
+            "max_throughput_resets_on_success: elapsed={elapsed:?}, writes={write_count}, skips={skip_count}"
         );
 
         // Both event types should be present and roughly equal (the
         // pattern alternates 1:1).
         assert!(
-            !write_events.is_empty(),
-            "expected `write` events from the alternating pattern"
+            write_count > 0,
+            "expected `write` rows from the alternating pattern"
         );
         assert!(
-            !skip_events.is_empty(),
-            "expected `backpressure_skipped` events from the alternating pattern"
+            skip_count > 0,
+            "expected `backpressure_skipped` rows from the alternating pattern"
         );
         // 1:1 ratio within a small slack (off-by-one if loop ends on a
         // false).
-        let diff = write_events.len().abs_diff(skip_events.len());
+        let diff = write_count.abs_diff(skip_count);
         assert!(
             diff <= 1,
-            "expected ~equal write and skip counts in alternating pattern; got writes={}, skips={}",
-            write_events.len(),
-            skip_events.len()
+            "expected ~equal write and skip counts in alternating pattern; got writes={write_count}, skips={skip_count}"
         );
 
         // KEY assertion: if every false had triggered sleep(1ms), in
@@ -2019,10 +1959,8 @@ mod tests {
         // Linux, so we set the bar at 5000+ to unambiguously rule out
         // the sleep path on either platform.
         assert!(
-            skip_events.len() > 5000,
-            "reset-on-success should bypass sleep; got only {} skips in {:?} (expected >5000, indicating yield-only path)",
-            skip_events.len(),
-            elapsed
+            skip_count > 5000,
+            "reset-on-success should bypass sleep; got only {skip_count} skips in {elapsed:?} (expected >5000, indicating yield-only path)"
         );
     }
 
@@ -2042,24 +1980,19 @@ mod tests {
         args.tick_rate_hz = 10;
         args.values_per_tick = 5;
 
+        use crate::compact::EventKind;
+
         let mut variant = AlwaysBackpressuredVariant::new();
         let start = std::time::Instant::now();
         run_protocol(&mut variant, &args).expect("protocol completes");
         let elapsed = start.elapsed();
 
-        let lines = read_log(dir.path(), "alice");
-        let skip_events: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "backpressure_skipped")
-            .collect();
-        let write_events: Vec<&serde_json::Value> =
-            lines.iter().filter(|l| l["event"] == "write").collect();
+        let kinds = read_compact_kinds(dir.path(), "alice");
+        let skip_count = count_compact_kind(&kinds, EventKind::BackpressureSkipped);
+        let write_count = count_compact_kind(&kinds, EventKind::Write);
 
         eprintln!(
-            "scalar_flood_unchanged: elapsed={:?}, skips={}, writes={}",
-            elapsed,
-            skip_events.len(),
-            write_events.len()
+            "scalar_flood_unchanged: elapsed={elapsed:?}, skips={skip_count}, writes={write_count}"
         );
 
         // Expected = tick_rate_hz * operate_secs * vpt = 10 * 1 * 5 = 50.
@@ -2070,15 +2003,12 @@ mod tests {
         let low = expected.saturating_sub(args.values_per_tick as usize * 2);
         let high = expected + args.values_per_tick as usize * 2;
         assert!(
-            (low..=high).contains(&skip_events.len()),
-            "scalar-flood skip count should equal ticks*vpt (~{expected}); got {} (range {}..={})",
-            skip_events.len(),
-            low,
-            high
+            (low..=high).contains(&skip_count),
+            "scalar-flood skip count should equal ticks*vpt (~{expected}); got {skip_count} (range {low}..={high})"
         );
-        assert!(
-            write_events.is_empty(),
-            "always-backpressured variant should produce no `write` events"
+        assert_eq!(
+            write_count, 0,
+            "always-backpressured variant should produce no `write` rows"
         );
 
         // Wall-clock: roughly operate_secs (1s) with no extra back-off.
@@ -2096,8 +2026,9 @@ mod tests {
     #[test]
     fn test_default_try_publish_falls_through_to_publish() {
         // A variant that does not override try_publish must behave
-        // identically to today: every value -> one `write` event, zero
-        // `backpressure_skipped` events.
+        // identically to today: every value -> one `write` row in
+        // compact-Parquet, zero `backpressure_skipped` rows.
+        use crate::compact::EventKind;
         let dir = TempDir::new().unwrap();
         let mut args = base_args(dir.path().to_str().unwrap(), "alice", "alice=127.0.0.1");
         args.tick_rate_hz = 10;
@@ -2108,27 +2039,22 @@ mod tests {
         let mut variant = CountingPublishVariant::new();
         run_protocol(&mut variant, &args).expect("protocol completes");
 
-        let lines = read_log(dir.path(), "alice");
-        let write_events: Vec<&serde_json::Value> =
-            lines.iter().filter(|l| l["event"] == "write").collect();
-        let skip_events: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "backpressure_skipped")
-            .collect();
+        let kinds = read_compact_kinds(dir.path(), "alice");
+        let write_count = count_compact_kind(&kinds, EventKind::Write);
+        let skip_count = count_compact_kind(&kinds, EventKind::BackpressureSkipped);
 
         assert!(
-            !write_events.is_empty(),
-            "default try_publish should produce at least one `write` event over a 1s operate phase"
+            write_count > 0,
+            "default try_publish should produce at least one `write` row over a 1s operate phase"
         );
-        assert!(
-            skip_events.is_empty(),
-            "default try_publish must not emit any `backpressure_skipped` events"
-        );
-        // Every write event corresponds to one publish() call.
         assert_eq!(
-            variant.publish_calls as usize,
-            write_events.len(),
-            "publish() call count should match `write` event count"
+            skip_count, 0,
+            "default try_publish must not emit any `backpressure_skipped` rows"
+        );
+        // Every write row corresponds to one publish() call.
+        assert_eq!(
+            variant.publish_calls as usize, write_count,
+            "publish() call count should match `write` row count"
         );
     }
 
@@ -2912,25 +2838,21 @@ mod tests {
         // NOT trip it.
         reset_strict_qos_violation_warning();
 
+        use crate::compact::EventKind;
         let mut variant = AlwaysBackpressuredVariant::new();
         run_protocol(&mut variant, &args).expect("protocol completes");
 
-        let lines = read_log(dir.path(), "alice");
-        let write_events: Vec<&serde_json::Value> =
-            lines.iter().filter(|l| l["event"] == "write").collect();
-        let skip_events: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "backpressure_skipped")
-            .collect();
+        let kinds = read_compact_kinds(dir.path(), "alice");
+        let write_count = count_compact_kind(&kinds, EventKind::Write);
+        let skip_count = count_compact_kind(&kinds, EventKind::BackpressureSkipped);
 
-        assert!(
-            write_events.is_empty(),
-            "QoS 1 always-false: no `write` events expected; got {}",
-            write_events.len()
+        assert_eq!(
+            write_count, 0,
+            "QoS 1 always-false: no `write` rows expected; got {write_count}"
         );
         assert!(
-            !skip_events.is_empty(),
-            "QoS 1 always-false: expected at least one `backpressure_skipped`"
+            skip_count > 0,
+            "QoS 1 always-false: expected at least one `backpressure_skipped` row"
         );
         // The strict-QoS one-shot warning must NOT have fired in this
         // spawn. We probe by calling the helper after run_protocol; if
@@ -2964,37 +2886,31 @@ mod tests {
 
         reset_strict_qos_violation_warning();
 
+        use crate::compact::EventKind;
         let mut variant = StrictRetryVariant::new(true);
         run_protocol(&mut variant, &args).expect("protocol completes");
 
-        let lines = read_log(dir.path(), "alice");
-        let write_events: Vec<&serde_json::Value> =
-            lines.iter().filter(|l| l["event"] == "write").collect();
-        let skip_events: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "backpressure_skipped")
-            .collect();
+        let kinds = read_compact_kinds(dir.path(), "alice");
+        let write_count = count_compact_kind(&kinds, EventKind::Write);
+        let skip_count = count_compact_kind(&kinds, EventKind::BackpressureSkipped);
 
         assert!(
-            !write_events.is_empty(),
-            "QoS 3 retry: expected at least one `write` event after retry"
+            write_count > 0,
+            "QoS 3 retry: expected at least one `write` row after retry"
         );
         assert_eq!(
-            skip_events.len(),
-            0,
-            "QoS 3/4 MUST NOT emit `backpressure_skipped` events (DESIGN.md § 6.5); got {}",
-            skip_events.len()
+            skip_count, 0,
+            "QoS 3/4 MUST NOT emit `backpressure_skipped` rows (DESIGN.md § 6.5); got {skip_count}"
         );
         // Every published seq should yield exactly one `write` row.
         // The variant returned `Ok(false)` exactly once per seq, so
-        // try_publish_calls == 2 * write_events.len().
+        // try_publish_calls == 2 * write_count.
         assert_eq!(
             variant.try_publish_calls as usize,
-            2 * write_events.len(),
+            2 * write_count,
             "expected exactly 2 try_publish calls per write under once-false-then-true: \
-             calls={}, writes={}",
+             calls={}, writes={write_count}",
             variant.try_publish_calls,
-            write_events.len()
         );
         // The one-shot warning must have fired during the spawn. A
         // post-run call to the helper returns `false` if the guard was
@@ -3023,19 +2939,13 @@ mod tests {
 
         reset_strict_qos_violation_warning();
 
+        use crate::compact::EventKind;
         let mut variant = StrictRetryVariant::new(true);
         run_protocol(&mut variant, &args).expect("protocol completes");
 
-        let lines = read_log(dir.path(), "alice");
-        let skip_events: Vec<&serde_json::Value> = lines
-            .iter()
-            .filter(|l| l["event"] == "backpressure_skipped")
-            .collect();
-        assert_eq!(
-            skip_events.len(),
-            0,
-            "QoS 4 must not emit backpressure_skipped"
-        );
+        let kinds = read_compact_kinds(dir.path(), "alice");
+        let skip_count = count_compact_kind(&kinds, EventKind::BackpressureSkipped);
+        assert_eq!(skip_count, 0, "QoS 4 must not emit backpressure_skipped");
 
         let post_run_first_trip = warn_strict_qos_violation_once();
         assert!(
