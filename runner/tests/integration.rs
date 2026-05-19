@@ -2595,3 +2595,222 @@ fn t18_6_analyze_full_skips_when_runner_is_not_lowest_name() {
         "--log-dir must appear in --help, got:\n{help}"
     );
 }
+
+// ---------------------------------------------------------------------
+// T19.4 / E19: workload-shape param forwarding
+// ---------------------------------------------------------------------
+//
+// `[variant.common].blob_size` (and the rest of the seven new keys) must
+// pass through the runner verbatim as `--kebab-case <N>` CLI args. The
+// unit tests in `cli_args.rs` already pin the args-vector shape; the two
+// integration tests below close the loop end-to-end:
+//
+// 1. `t19_4_workload_shape_args_forwarded_to_child_process`: uses the
+//    `arg-echo` helper as the spawned binary so the test inspects the
+//    actual argv handed to the child process. Locks in that every one
+//    of the seven new keys lands on the CLI with the kebab-case name
+//    and the configured value -- across both [variant.common] direct
+//    declaration and template inheritance.
+//
+// 2. `t19_4_block_flood_runs_to_completion_with_variant_dummy`: runs an
+//    actual `variant-dummy` subprocess under `workload = "block-flood"`
+//    with `blob_size = 100`. Exit-status success proves the variant
+//    accepted the forwarded args (block-flood validates
+//    `values_per_tick % blob_size == 0` at startup and exits non-zero
+//    if the flags are mis-forwarded). Verifies the JSONL `operate`
+//    phase event carries `profile = "block-flood"` as a redundant
+//    cross-check that the workload arg landed.
+
+#[test]
+fn t19_4_workload_shape_args_forwarded_to_child_process() {
+    // Construct a config that declares all seven new keys in
+    // [variant.common] (and a sixth via a [[variant_template]] to lock in
+    // the template-inheritance path), spawn arg-echo, then assert the
+    // captured argv has every flag with the configured value.
+    let arg_echo = arg_echo_binary();
+    let tmp_dir = std::env::temp_dir().join("runner_t19_4_argv_test");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let out_path = tmp_dir.join("captured-args.json");
+    let log_dir = tmp_dir.join("logs");
+
+    let arg_echo_escaped = arg_echo.replace('\\', "/");
+    let log_dir_escaped = log_dir.to_string_lossy().replace('\\', "/");
+    // workload_seed is declared on the template; the variant entry
+    // overrides blob_size to verify the variant-wins merge for new keys.
+    let config_content = format!(
+        r#"run = "t19_4_argv"
+runners = ["self"]
+default_timeout_secs = 10
+
+[[variant_template]]
+name = "shape-base"
+binary = "{arg_echo_escaped}"
+  [variant_template.common]
+  workload_seed = 999
+
+[[variant]]
+template = "shape-base"
+name = "echo"
+timeout_secs = 5
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 0
+  operate_secs = 0
+  silent_secs = 0
+  workload = "mixed-types"
+  values_per_tick = 100
+  qos = 1
+  log_dir = "{log_dir_escaped}"
+  blob_size = 100
+  mixed_scalars_min = 1
+  mixed_scalars_max = 5
+  mixed_arrays_min = 0
+  mixed_arrays_max = 4
+  mixed_dict_split_max = 3
+
+  [variant.specific]
+"#
+    );
+    let config_path = tmp_dir.join("t19-4-argv.toml");
+    std::fs::write(&config_path, &config_content).unwrap();
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("self")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .env("ARG_ECHO_OUT", out_path.to_str().unwrap())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stderr ---\n{stderr}");
+    assert!(
+        output.status.success(),
+        "runner should exit 0, got {:?}\nstderr: {stderr}",
+        output.status.code()
+    );
+
+    let captured_json = std::fs::read_to_string(&out_path).expect("captured args file");
+    let captured: Vec<String> = serde_json::from_str(&captured_json).unwrap();
+    eprintln!("--- captured argv ---\n{captured:?}");
+
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> &'a str {
+        let idx = args
+            .iter()
+            .position(|a| a == flag)
+            .unwrap_or_else(|| panic!("flag {flag} not present in captured argv: {args:?}"));
+        let count = args.iter().filter(|a| *a == flag).count();
+        assert_eq!(count, 1, "{flag} must appear exactly once, got {args:?}");
+        &args[idx + 1]
+    }
+
+    // Six u32 keys declared on the variant entry.
+    assert_eq!(flag_value(&captured, "--blob-size"), "100");
+    assert_eq!(flag_value(&captured, "--mixed-scalars-min"), "1");
+    assert_eq!(flag_value(&captured, "--mixed-scalars-max"), "5");
+    assert_eq!(flag_value(&captured, "--mixed-arrays-min"), "0");
+    assert_eq!(flag_value(&captured, "--mixed-arrays-max"), "4");
+    assert_eq!(flag_value(&captured, "--mixed-dict-split-max"), "3");
+    // The seventh key was declared on the template only; template
+    // inheritance must carry it through into the spawned argv.
+    assert_eq!(flag_value(&captured, "--workload-seed"), "999");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn t19_4_block_flood_runs_to_completion_with_variant_dummy() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-logs-t19-4");
+    let _ = std::fs::remove_dir_all(&log_dir);
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg("tests/fixtures/block-flood-blob-size.toml")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}");
+    eprintln!("--- stderr ---\n{stderr}");
+
+    // Exit-status check: variant-dummy validates the workload-shape args
+    // at startup (`values_per_tick % blob_size == 0` etc.) and exits
+    // non-zero if anything is mis-forwarded. A clean exit therefore
+    // proves the runner forwarded blob_size = 100 correctly.
+    assert!(
+        output.status.success(),
+        "runner should exit 0 with block-flood + blob_size=100, got {:?}\nstderr: {stderr}",
+        output.status.code()
+    );
+    assert!(
+        stdout.contains("dummy-blockflood") && stdout.contains("success"),
+        "spawn summary should show dummy-blockflood succeeded, stdout: {stdout}"
+    );
+
+    // Cross-check: the variant's JSONL records `profile = "block-flood"`
+    // in its `phase=operate` lifecycle event. T18.2 routes high-volume
+    // `write` events to compact Parquet by default, so we read the
+    // lifecycle event rather than per-write leaf_count.
+    assert!(log_dir.exists(), "expected log dir {log_dir:?}");
+    let subdirs: Vec<PathBuf> = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.path())
+        .collect();
+    let jsonl_files: Vec<PathBuf> = subdirs
+        .iter()
+        .flat_map(|d| std::fs::read_dir(d).unwrap())
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("dummy-blockflood-"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        jsonl_files.len(),
+        1,
+        "expected exactly one variant JSONL file, got {jsonl_files:?}"
+    );
+
+    let body = std::fs::read_to_string(&jsonl_files[0]).unwrap();
+    let mut saw_operate_block_flood = false;
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let val: serde_json::Value =
+            serde_json::from_str(line).expect("each JSONL line must parse as JSON");
+        if val.get("event").and_then(|v| v.as_str()) == Some("phase")
+            && val.get("phase").and_then(|v| v.as_str()) == Some("operate")
+            && val.get("profile").and_then(|v| v.as_str()) == Some("block-flood")
+        {
+            saw_operate_block_flood = true;
+            break;
+        }
+    }
+    assert!(
+        saw_operate_block_flood,
+        "expected a `phase=operate, profile=block-flood` event in JSONL:\n{body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&log_dir);
+}

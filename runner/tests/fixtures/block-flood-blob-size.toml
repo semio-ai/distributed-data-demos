@@ -1,0 +1,23 @@
+run = "t19_4"
+runners = ["local"]
+default_timeout_secs = 30
+
+[[variant]]
+name = "dummy-blockflood"
+binary = "../target/release/variant-dummy.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 0
+  operate_secs = 1
+  silent_secs = 0
+  workload = "block-flood"
+  # values_per_tick % blob_size == 0 (100 % 100 == 0) so each tick
+  # emits exactly one block-flood WriteOp with leaf_count = blob_size.
+  values_per_tick = 100
+  blob_size = 100
+  workload_seed = 12345
+  qos = 1
+  log_dir = "./test-logs-t19-4"
+
+  [variant.specific]
