@@ -646,3 +646,62 @@ The exact line shape above is part of the T14.8 contract; the
 `integration.rs` test
 `threading_modes_capability_gating_skips_unsupported_with_notice`
 pins it.
+
+### Base log directory selection (T18.5)
+
+The runner picks a single `base_log_dir` at startup that drives:
+
+- The per-run session subfolder (`<base_log_dir>/<run>-<launch_ts>/`) the
+  runner's own clock-sync JSONL lives in.
+- Every spawned variant's `--log-dir` override, so variant JSONL files
+  land next to the runner's coordination logs without the operator
+  needing to set `log_dir` per variant.
+
+Precedence (highest wins):
+
+1. `--log-dir <path>` CLI flag.
+2. `[runner] log_dir = "..."` in the TOML config.
+3. The first `[variant.common].log_dir` found in any `[[variant]]`
+   entry (legacy pre-T18.5 fallback; the config-side
+   `log_dir = "./logs"` invariant from
+   `metak-shared/coding-standards.md` makes this the typical path).
+4. `./logs` (final fallback for ad-hoc single-runner runs with no
+   variant `log_dir` set).
+
+The chosen value is announced on stderr at startup:
+
+```
+[runner:<name>] base log dir: <path> (source: <one-of-the-four-above>)
+```
+
+After selection the runner runs `validate_log_dir_writable(&path)`:
+`create_dir_all` the path, write a tiny `.runner-write-probe` file,
+delete it. Any failure aborts the run **before discovery** with an
+`anyhow::Error` describing the offending path AND the underlying I/O
+error. The exit code is the standard non-zero anyhow path -- NOT 75
+(`EX_TEMPFAIL`), because a non-writable shared folder is an operator
+config / permissions issue that re-launching with `--resume` will not
+fix.
+
+Cross-platform notes:
+
+- **Windows UNC paths.** `\\server\share\bench-logs` is treated as an
+  opaque filesystem path -- the `[runner]` TOML accepts literal
+  strings (single-quoted in TOML) so the leading backslashes survive
+  without manual escaping. The probe write covers both reachable and
+  permission-denied cases.
+- **Linux / macOS NFS / SMB mounts.** Treated like any local path; if
+  the mount is not available at runner startup the probe fails with
+  the kernel's actual ENOENT / EACCES surfaced through `anyhow`.
+- **Path separators in `[runner] log_dir`.** Mixed `/` and `\` are
+  fine on Windows because the kernel canonicalises before
+  create_dir_all. On Linux, use `/`.
+
+The base log dir IS NOT the runner's working directory -- variants
+inherit the runner's CWD as usual. Instead the runner builds the
+variant's `--log-dir` argument by joining `<base_log_dir>/<log_subdir>`
+and passing it as the `log_dir_resolved` override into
+`cli_args::build_variant_args`. The variant therefore opens its JSONL
+file at the chosen path even though its own
+`[variant.common].log_dir = "./logs"` declaration is unchanged from
+the coding-standards default.

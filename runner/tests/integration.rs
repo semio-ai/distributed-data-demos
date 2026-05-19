@@ -2131,3 +2131,320 @@ fn t15_4_safety_net_fires_when_max_spawn_secs_is_tight() {
 
     let _ = std::fs::remove_dir_all(&log_dir);
 }
+
+// ---------------------------------------------------------------------
+// T18.5: --log-dir CLI flag + [runner] log_dir TOML key.
+// ---------------------------------------------------------------------
+
+/// Build a minimal single-runner config that points at variant-dummy and
+/// declares its `log_dir` as `./logs` (per the project-wide invariant in
+/// `metak-shared/coding-standards.md`). The runner's `--log-dir` flag is
+/// what redirects output for these tests.
+fn build_minimal_single_runner_config(run: &str) -> String {
+    format!(
+        r#"run = "{run}"
+runners = ["local"]
+default_timeout_secs = 30
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 0
+  operate_secs = 1
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 2
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+"#
+    )
+}
+
+#[test]
+fn t18_5_log_dir_cli_flag_redirects_variant_output() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join("runner_t18_5_cli");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let custom_log_dir = tmp.join("shared-folder").join("bench-logs");
+    let config_path = tmp.join("config.toml");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(
+        &config_path,
+        build_minimal_single_runner_config("t18-5-cli"),
+    )
+    .unwrap();
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--log-dir")
+        .arg(&custom_log_dir)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}");
+    eprintln!("--- stderr ---\n{stderr}");
+    assert!(
+        output.status.success(),
+        "runner should exit 0 with --log-dir, got {:?}",
+        output.status.code()
+    );
+
+    // Stderr must announce the chosen base log dir and the source.
+    assert!(
+        stderr.contains("--log-dir CLI flag"),
+        "stderr must mention 'source: --log-dir CLI flag', got:\n{stderr}"
+    );
+
+    // Variant JSONL must land under the requested directory (in a
+    // <run>-<ts> subfolder), not under the config's `./logs`.
+    assert!(
+        custom_log_dir.exists(),
+        "the --log-dir path must have been created"
+    );
+    let subdirs: Vec<_> = std::fs::read_dir(&custom_log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert!(
+        !subdirs.is_empty(),
+        "expected a timestamped subfolder under {custom_log_dir:?}"
+    );
+    let jsonl_count: usize = subdirs
+        .iter()
+        .flat_map(|d| std::fs::read_dir(d.path()).unwrap())
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .count();
+    assert!(
+        jsonl_count > 0,
+        "expected at least one .jsonl in the --log-dir subfolder, got {jsonl_count}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn t18_5_log_dir_toml_key_redirects_variant_output() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join("runner_t18_5_toml");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let toml_log_dir = tmp.join("toml-driven").join("bench-logs");
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Build a config WITH a [runner] section setting log_dir. The variant
+    // still declares its legacy `./logs` log_dir; the runner-section path
+    // must win (T18.5 precedence rule).
+    let toml_path_escaped = toml_log_dir.to_string_lossy().replace('\\', "/");
+    let config_content = format!(
+        r#"run = "t18-5-toml"
+runners = ["local"]
+default_timeout_secs = 30
+
+[runner]
+log_dir = "{toml_path_escaped}"
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 0
+  operate_secs = 1
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 2
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+"#
+    );
+    let config_path = tmp.join("config.toml");
+    std::fs::write(&config_path, &config_content).unwrap();
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(&config_path)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}");
+    eprintln!("--- stderr ---\n{stderr}");
+    assert!(
+        output.status.success(),
+        "runner should exit 0 with [runner] log_dir, got {:?}",
+        output.status.code()
+    );
+
+    // Stderr must announce the TOML source.
+    assert!(
+        stderr.contains("[runner] log_dir TOML key"),
+        "stderr must mention 'source: [runner] log_dir TOML key', got:\n{stderr}"
+    );
+
+    assert!(
+        toml_log_dir.exists(),
+        "the TOML-declared log_dir must have been created"
+    );
+    let subdirs: Vec<_> = std::fs::read_dir(&toml_log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert!(
+        !subdirs.is_empty(),
+        "expected a timestamped subfolder under {toml_log_dir:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn t18_5_log_dir_cli_overrides_toml() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join("runner_t18_5_override");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let cli_log_dir = tmp.join("cli-wins");
+    let toml_log_dir = tmp.join("toml-loses");
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let toml_path_escaped = toml_log_dir.to_string_lossy().replace('\\', "/");
+    let config_content = format!(
+        r#"run = "t18-5-override"
+runners = ["local"]
+default_timeout_secs = 30
+
+[runner]
+log_dir = "{toml_path_escaped}"
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 0
+  operate_secs = 1
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 2
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+"#
+    );
+    let config_path = tmp.join("config.toml");
+    std::fs::write(&config_path, &config_content).unwrap();
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--log-dir")
+        .arg(&cli_log_dir)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stderr ---\n{stderr}");
+    assert!(output.status.success(), "runner should exit 0");
+
+    // CLI wins.
+    assert!(
+        stderr.contains("--log-dir CLI flag"),
+        "stderr must say 'source: --log-dir CLI flag' when both are set, got:\n{stderr}"
+    );
+
+    assert!(cli_log_dir.exists(), "CLI path must be used");
+    // TOML path should NOT have been touched by the runner. (It may still
+    // exist if validate_log_dir_writable created it from a prior run, but we
+    // never ran with TOML-only here so the directory should still be
+    // absent.)
+    assert!(
+        !toml_log_dir.exists(),
+        "TOML-declared path must NOT be created when --log-dir overrides"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn t18_5_log_dir_unwritable_path_aborts_with_clear_error() {
+    // We need a path that create_dir_all cannot create. The portable way is
+    // to point at a path whose parent is a file (not a directory) -- the
+    // kernel rejects this on every platform.
+    let tmp = std::env::temp_dir().join("runner_t18_5_unwritable");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let blocker = tmp.join("blocker.txt");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    // A path BELOW a regular file is unconditionally rejected by both
+    // Windows (ENOTDIR equivalent) and Unix (ENOTDIR).
+    let unwritable = blocker.join("nested");
+
+    let config_path = tmp.join("config.toml");
+    std::fs::write(
+        &config_path,
+        build_minimal_single_runner_config("t18-5-unwritable"),
+    )
+    .unwrap();
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--log-dir")
+        .arg(&unwritable)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stderr ---\n{stderr}");
+    assert!(
+        !output.status.success(),
+        "runner must abort when --log-dir is not writable"
+    );
+    assert!(
+        stderr.contains("writability check failed") || stderr.contains("not writable"),
+        "error must mention writability failure, got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+

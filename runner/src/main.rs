@@ -135,6 +135,29 @@ struct Cli {
     /// need to raise it.
     #[arg(long, default_value_t = 300)]
     max_spawn_secs: u32,
+
+    /// Override the base log directory for this run (T18.5).
+    ///
+    /// When set, the runner uses this path as the parent of the
+    /// per-run session subfolder for both its own coordination logs
+    /// (clock-sync JSONL) AND every spawned variant's `--log-dir`. The
+    /// path is cross-platform: UNC paths on Windows (`\\server\share\...`)
+    /// and mounted NFS / SMB paths on Linux are treated as opaque
+    /// filesystem paths.
+    ///
+    /// Precedence (highest wins):
+    /// 1. `--log-dir <path>` (this CLI flag).
+    /// 2. `[runner] log_dir = "..."` in the TOML config.
+    /// 3. The first `[variant.common].log_dir` found in the config
+    ///    (legacy fallback).
+    /// 4. `./logs` (final fallback when nothing else is set).
+    ///
+    /// The runner validates writability at startup (creates the
+    /// directory if missing, writes a tiny probe file, deletes it).
+    /// A non-writable path aborts the run before discovery with a
+    /// clear error.
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
 }
 
 /// Exit code returned to the OS when a coordination barrier hits its timeout.
@@ -242,17 +265,46 @@ fn run(cli: &Cli) -> Result<()> {
     );
 
     // Resolve base log directory up front — both fresh-mode subfolder
-    // generation and resume-mode latest-folder selection need it. Variants
-    // may declare their own `log_dir` in `[variant.common]`; we use the first
-    // one we find as the canonical run directory (this matches the existing
-    // behavior further down in the loop). Fallback to `./logs` so single-
-    // runner runs without a configured log_dir still work.
-    let base_log_dir = bench_config
+    // generation and resume-mode latest-folder selection need it. T18.5
+    // precedence:
+    //   1. `--log-dir <path>` CLI flag (operator override; highest).
+    //   2. `[runner] log_dir = "..."` TOML key.
+    //   3. First `[variant.common].log_dir` found in the config
+    //      (legacy fallback that pre-dates T18.5).
+    //   4. `./logs` (final fallback for ad-hoc single-runner runs).
+    //
+    // The chosen value is then writability-probed (create_dir_all + write
+    // a tiny probe file + delete) so a typo'd UNC path or unmounted NFS
+    // mount fails fast BEFORE discovery, with a clear error message.
+    let (base_log_dir, base_log_dir_source) = if let Some(cli_path) = cli.log_dir.as_ref() {
+        (cli_path.to_string_lossy().to_string(), "--log-dir CLI flag")
+    } else if let Some(runner_path) = bench_config.runner_log_dir() {
+        (runner_path.to_string(), "[runner] log_dir TOML key")
+    } else if let Some(variant_path) = bench_config
         .variant
         .iter()
         .find_map(|v| v.common.get("log_dir"))
         .map(cli_args::toml_value_to_string)
-        .unwrap_or_else(|| "./logs".to_string());
+    {
+        (variant_path, "[variant.common].log_dir (legacy fallback)")
+    } else {
+        ("./logs".to_string(), "default './logs'")
+    };
+    eprintln!(
+        "[runner:{}] base log dir: {} (source: {})",
+        cli.name, base_log_dir, base_log_dir_source
+    );
+
+    // Validate the chosen base log dir is writable. Cross-platform: works for
+    // UNC paths (Windows), mounted NFS / SMB (Linux), local disk, etc. Fails
+    // fast with a clear error if create_dir_all or the probe write fails.
+    if let Err(e) = config::validate_log_dir_writable(std::path::Path::new(&base_log_dir)) {
+        bail!(
+            "log directory writability check failed: {e:#} \
+             (source: {base_log_dir_source}; \
+             ensure the path exists or can be created and is writable by this process)"
+        );
+    }
 
     // Generate a proposed log subfolder name before discovery so it can be
     // negotiated with other runners. The leader (first in the runners list)
@@ -739,12 +791,26 @@ fn run(cli: &Cli) -> Result<()> {
             .format("%Y-%m-%dT%H:%M:%S%.9fZ")
             .to_string();
 
-        // Resolve the log directory: if the variant config has a log_dir,
-        // append the run subfolder.
-        let log_dir_resolved = variant.common.get("log_dir").map(|log_dir_val| {
-            let base = cli_args::toml_value_to_string(log_dir_val);
-            format!("{}/{}", base, log_subdir)
-        });
+        // Resolve the log directory the variant child writes JSONL into.
+        // T18.5 precedence:
+        //   - If the runner has a base override (--log-dir or [runner].log_dir),
+        //     ALWAYS use it (with the session subfolder appended) so the
+        //     variant writes alongside the runner's own coordination logs.
+        //   - Otherwise fall back to `[variant.common].log_dir` if the variant
+        //     declared one (legacy pre-T18.5 behaviour).
+        //   - Otherwise (no variant log_dir either) we pass `None` and the
+        //     variant uses its own CLI default. The default-`./logs` branch
+        //     above already handled the operator-facing "where does this
+        //     end up" question.
+        let runner_override_base = cli.log_dir.is_some() || bench_config.runner_log_dir().is_some();
+        let log_dir_resolved = if runner_override_base {
+            Some(format!("{base_log_dir}/{log_subdir}"))
+        } else {
+            variant.common.get("log_dir").map(|log_dir_val| {
+                let base = cli_args::toml_value_to_string(log_dir_val);
+                format!("{}/{}", base, log_subdir)
+            })
+        };
 
         let args = cli_args::build_variant_args(
             variant,

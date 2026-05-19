@@ -261,6 +261,11 @@ pub struct BenchConfig {
     /// to `DEFAULT_INTER_QOS_GRACE_MS`.
     #[serde(default)]
     pub inter_qos_grace_ms: Option<u64>,
+    /// Optional `[runner]` section: runner-scoped settings that do not get
+    /// forwarded to variants. Added in T18.5 for the shared-folder /
+    /// network-path output use-case.
+    #[serde(default)]
+    pub runner: Option<RunnerSection>,
     /// Reusable variant defaults referenced by `[[variant]]` entries via
     /// `template = "<name>"`. Templates do not spawn.
     #[serde(default, rename = "variant_template")]
@@ -268,6 +273,23 @@ pub struct BenchConfig {
     /// Variant definitions, executed in order.
     #[serde(default)]
     pub variant: Vec<VariantConfig>,
+}
+
+/// `[runner]` TOML section. Holds runner-scoped settings; nothing in here is
+/// forwarded to variants as CLI args.
+///
+/// T18.5: adds `log_dir`, the base output directory for the runner's own
+/// coordination logs AND the working directory under which spawned variants'
+/// `--log-dir` resolves. CLI `--log-dir` overrides this. When both are
+/// absent, the legacy `[variant.common].log_dir` fallback (then `./logs`)
+/// still applies.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RunnerSection {
+    /// Base log directory for this runner. Cross-platform: UNC paths on
+    /// Windows (`\\server\share\...`), mounted NFS/SMB paths on Linux are
+    /// both fine — the value is treated as an opaque filesystem path.
+    #[serde(default)]
+    pub log_dir: Option<String>,
 }
 
 /// A reusable set of variant defaults, referenced by `[[variant]]` entries
@@ -578,6 +600,46 @@ impl BenchConfig {
         self.inter_qos_grace_ms
             .unwrap_or(DEFAULT_INTER_QOS_GRACE_MS)
     }
+
+    /// Optional base log directory declared by `[runner] log_dir = "..."`.
+    /// T18.5: when set, this is the runner-scoped override that takes
+    /// precedence over `[variant.common].log_dir` (and is itself overridden
+    /// by the runner's `--log-dir` CLI flag).
+    pub fn runner_log_dir(&self) -> Option<&str> {
+        self.runner.as_ref().and_then(|r| r.log_dir.as_deref())
+    }
+}
+
+/// Validate that `path` is writable by this process. Used by the runner at
+/// startup to fail fast when `--log-dir` (or `[runner].log_dir`) points at a
+/// directory the runner cannot write to — e.g. an unmounted network share,
+/// a read-only filesystem, or a typo'd UNC path. The check is cross-platform
+/// (no platform-specific permission bit poking): we create the directory tree
+/// if it does not exist, write a tiny probe file, then delete it.
+///
+/// Errors include the offending path AND the underlying I/O error so an
+/// operator can diagnose without re-running.
+pub fn validate_log_dir_writable(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path).with_context(|| {
+        format!(
+            "log_dir is not writable: failed to create directory '{}'",
+            path.display()
+        )
+    })?;
+
+    let probe = path.join(".runner-write-probe");
+    // Write a tiny payload; the contents are irrelevant beyond confirming
+    // we can hold an open file handle in the destination.
+    std::fs::write(&probe, b"ok").with_context(|| {
+        format!(
+            "log_dir is not writable: failed to write probe file '{}'",
+            probe.display()
+        )
+    })?;
+    // Best-effort cleanup. Probe-file leakage is benign; the next run reuses
+    // the same name and rewrites it.
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// Merge keys from `source` into `target`. Existing keys in `target` are
@@ -1782,6 +1844,109 @@ supported_modes = ["single", "weird"]
         assert!(
             msg.contains("invalid threading_mode 'weird'"),
             "unexpected error: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // T18.5: [runner] section + log_dir accessor + writability probe.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn runner_log_dir_absent_when_section_missing() {
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+"#;
+        let cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.runner_log_dir().is_none());
+        assert!(cfg.runner.is_none());
+    }
+
+    #[test]
+    fn runner_log_dir_absent_when_section_empty() {
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[runner]
+"#;
+        let cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.runner_log_dir().is_none());
+        // The section itself parses to `Some(default)`.
+        assert!(cfg.runner.is_some());
+    }
+
+    #[test]
+    fn runner_log_dir_parses_when_set() {
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[runner]
+log_dir = "/mnt/shared/bench-logs"
+"#;
+        let cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.runner_log_dir(), Some("/mnt/shared/bench-logs"));
+    }
+
+    #[test]
+    fn runner_log_dir_accepts_unc_path_on_windows() {
+        // Path is treated as opaque; backslashes survive TOML's basic-string
+        // parser only when escaped. Use a literal-string (single quotes) form
+        // here so the UNC root is preserved verbatim.
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[runner]
+log_dir = '\\fileserver\bench\logs'
+"#;
+        let cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.runner_log_dir(), Some(r"\\fileserver\bench\logs"));
+    }
+
+    #[test]
+    fn validate_log_dir_writable_succeeds_on_temp_dir() {
+        let dir = std::env::temp_dir().join("runner_log_dir_probe_ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        validate_log_dir_writable(&dir).expect("temp dir must be writable");
+        // Probe should have been cleaned up.
+        assert!(!dir.join(".runner-write-probe").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_log_dir_writable_creates_parents() {
+        // Nested-and-missing parent chain is fine — create_dir_all should
+        // materialize the whole tree.
+        let dir = std::env::temp_dir()
+            .join("runner_log_dir_probe_nested")
+            .join("a")
+            .join("b")
+            .join("c");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("runner_log_dir_probe_nested"));
+        validate_log_dir_writable(&dir).expect("nested path must be created");
+        assert!(dir.exists());
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("runner_log_dir_probe_nested"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_log_dir_writable_fails_for_unwritable_root() {
+        // On Unix, /proc is read-only for ordinary processes. Pick a path
+        // beneath it that we know cannot be created. (Windows has no equally
+        // portable "always-fails" path; the writable-path case is exercised
+        // by the other tests.)
+        let dir = std::path::Path::new("/proc/sys/runner-log-dir-probe");
+        let err = validate_log_dir_writable(dir).expect_err("must fail on /proc subtree");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not writable") && msg.contains("/proc/sys/runner-log-dir-probe"),
+            "error should mention the path and the writability: {msg}"
         );
     }
 
