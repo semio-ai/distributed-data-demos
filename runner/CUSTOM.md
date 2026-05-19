@@ -807,3 +807,27 @@ multiple workload shapes write multiple `[[variant]]` entries
 
 See `metak-shared/api-contracts/toml-config-schema.md` E19 additions
 for the full schema and validation rules.
+
+## Removed `[variant.common]` keys (T19.10b)
+
+Some keys that the runner previously forwarded verbatim have been
+removed from the variant-base CLI. To avoid silent regressions on
+stale operator configs, the runner rejects them at parse time inside
+`VariantConfig::validate_no_removed_keys` (called from
+`BenchConfig::validate`). Each entry below maps a removed TOML key to
+the change that retired it:
+
+| Removed key | Retired in | Replacement / rationale |
+|---|---|---|
+| `legacy_jsonl_events` | E19 follow-up (T19.10a) | Per-event observations are written to compact Parquet only; the E18 dual-emission JSONL opt-in is gone. |
+
+The rejection is parse-time rather than a silent skip on purpose —
+the brief for T19.10b explicitly preferred a visible failure so
+operators delete the stale key from their config instead of being
+confused by a missing per-event JSONL on a working spawn. The
+diagnostic mentions the key name and the cleanup that removed it so
+the fix is obvious.
+
+When a future variant-base release removes another forwarded key, add
+it to the rejection list in `validate_no_removed_keys` (with a clear
+message) and a row to the table above.
