@@ -15080,3 +15080,80 @@ The single-runner fallback config is named `_t198_single_runner_workload_shapes.
 helper rather than an authoritative scenario; the orchestrator may want
 to either promote it to a permanent name or delete it once two-runner
 mode is exercised cleanly.
+
+---
+
+## T19.9 — analysis: post-validation UX fixes — LANDED (orchestrator-rescued)
+
+**Status**: code landed in commit `a264ff5`; worker did NOT write its own
+status entry because it hit the Claude account rate limit
+("resets 9pm Europe/Lisbon") on its final step.
+
+**What landed** (worker-authored, orchestrator-committed):
+
+- `analysis/pivot_tables.py` — pivot regex no longer falls back to
+  `n/a` when variant names lack the `-<vpt>x<hz>hz-qos<N>` suffix.
+  Prefers actual data columns over name-parsing for qos and
+  threading_mode; falls back to the full variant name as the "family"
+  key when no suffix is detectable.
+- `analysis/plots.py` — `throughput_vs_workload_shape` chart x-axis
+  now labeled by workload name (scalar-flood / block-flood /
+  mixed-types), not by dominant shape. Canonical sort order applied
+  to shape and workload axes via new module constants
+  `CANONICAL_SHAPE_ORDER` / `CANONICAL_WORKLOAD_ORDER`.
+- `analysis/performance.py` — supporting changes for the new sort
+  order propagation.
+- `analysis/tests/test_pivot_tables.py` (+182 lines) and
+  `analysis/tests/test_workload_shape_plots.py` (+173 lines) cover
+  unsuffixed-name parsing, sort-order assertions, and chart-label
+  visual regression.
+- `analysis/CUSTOM.md` updated to reflect the canonical orders.
+
+**Tests**: `pytest -q` → 428 passed, 6 skipped (T19.6 baseline was
+416/6; net +12).
+
+**Caveats from the orchestrator rescue**:
+
+- Commit granularity is coarser than the worker would have produced.
+  The worker's plan was one commit per issue (#2+#4 pivot regex; #3
+  chart x-axis; #5 sort order). The rescue is a single bundled commit
+  because splitting post-hoc across `plots.py` / `pivot_tables.py` for
+  orthogonal concerns is not reliably doable without rerunning the
+  worker.
+- Issue #6 (`Shape` column shows `array` for `mixed-types` because
+  `PerformanceResult.shape` is a single dominant value) was explicitly
+  excluded from T19.9 scope per the orchestrator's brief. T19.5's
+  worker had flagged the right escape hatch: pivot off delivery-level
+  columns directly rather than `PerformanceResult.shape`. Not yet
+  filed as a task; surface to user before opening one.
+
+**Adjacent stranded work**:
+
+- `Cargo.lock` carried an uncommitted `rand = "0.8"` entry from T19.2's
+  variant-base change. Landed in commit `b1a85ef`.
+
+## T19.10 — Legacy JSONL cleanup — FILED (workers pending)
+
+**Status**: scope locked and contracts updated 2026-05-19 per user
+directive ("we don't have or want to ever keep any legacy behaviour,
+clear it out please"; "we won't ever need to load historic data in
+jsonl, just use it for the lifecycle event log"). Three implementation
+workers (T19.10a variant-base, T19.10b runner, T19.10c analysis) are
+queued but NOT YET SPAWNED because:
+
+1. The Claude account rate limit hit by T19.9 is still in effect until
+   9pm Europe/Lisbon. Any spawn before then returns the same limit
+   error.
+2. T19.10c (analysis) further depends on T19.9 having landed; the
+   commit-`a264ff5` rescue satisfies that.
+
+**Order of operations once rate-limit resets**:
+
+1. Spawn T19.10a + T19.10b in parallel (independent repos).
+2. After T19.10a + T19.10b land, spawn T19.10c.
+
+See TASKS.md for the full per-sub-task spec. Contracts already
+updated (`jsonl-log-schema.md` strips per-event sections;
+`compact-log-schema.md` drops the "Coexistence with legacy JSONL"
+section and gains a "Per-spawn file pair" + aggregate-throughput
+narrative).
