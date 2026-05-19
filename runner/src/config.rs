@@ -2316,4 +2316,126 @@ name = "v"
             "variant entry's blob_size must win over template"
         );
     }
+
+    // -----------------------------------------------------------------
+    // T19.10b: rejection of removed [variant.common] keys.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validation_rejects_legacy_jsonl_events_true() {
+        // `legacy_jsonl_events` was the E18 dual-emission opt-in. The
+        // matching --legacy-jsonl-events CLI flag was removed from
+        // variant-base in T19.10a; the runner must reject the stale key
+        // at parse time with a clear message so operators delete it
+        // from their config rather than discover the regression at
+        // spawn time.
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "scalar-flood"
+  legacy_jsonl_events = true
+"#;
+        let mut cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("legacy_jsonl_events")
+                && msg.contains("removed in the E19 follow-up cleanup"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_legacy_jsonl_events_false() {
+        // Same rejection regardless of the value; the key itself is the
+        // signal that the config is stale.
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "scalar-flood"
+  legacy_jsonl_events = false
+"#;
+        let mut cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("legacy_jsonl_events"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_legacy_jsonl_events_inherited_from_template() {
+        // Templates participate in resolve_templates() before validate()
+        // runs, so a stale key in a `[[variant_template]].common` table
+        // propagates into the variant's common table and the same
+        // rejection applies.
+        let toml_str = r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant_template]]
+name = "base"
+binary = "./x"
+  [variant_template.common]
+  legacy_jsonl_events = true
+
+[[variant]]
+template = "base"
+name = "v"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "scalar-flood"
+"#;
+        let mut cfg: BenchConfig = toml::from_str(toml_str).unwrap();
+        cfg.resolve_templates().unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("legacy_jsonl_events"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_accepts_config_without_legacy_jsonl_events() {
+        // Sanity: a config that never mentions the key validates normally.
+        let cfg = parse(
+            r#"
+run = "t"
+runners = ["a"]
+default_timeout_secs = 10
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "scalar-flood"
+"#,
+        );
+        cfg.validate()
+            .expect("config without legacy_jsonl_events must validate");
+    }
 }
