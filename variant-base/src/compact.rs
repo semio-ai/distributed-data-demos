@@ -33,6 +33,8 @@
 //! | `extra_f32_b` | `Option<f32>` | second polymorphic numeric slot (T18.2b) |
 //! | `extra_i64` | `Option<i64>` | polymorphic int slot (T18.2b) |
 //! | `extra_utf8` | `Option<String>` | polymorphic string slot (T18.2b) |
+//! | `leaf_count` | `Option<u32>` | workload-shape leaf count (E19; null on non-`write` rows) |
+//! | `shape_idx` | `Option<u8>` | workload-shape index (E19; null on non-`write` rows) |
 //!
 //! Paths and peers are interned **lazily**: the first time the variant
 //! observes a new path/peer it allocates an index and stores the string
@@ -369,6 +371,17 @@ pub struct CompactBuffers {
     pub extra_f32_b: Vec<Option<f32>>,
     pub extra_i64: Vec<Option<i64>>,
     pub extra_utf8: Vec<Option<String>>,
+
+    // E19 / T19.2: workload-shape columns. Populated on `write` rows
+    // only; null on every other event kind. The `shape_idx` column is
+    // an index into the `shape_intern` dictionary
+    // `["scalar", "array", "struct"]` stored in the file's KV
+    // metadata. `leaf_count` is the number of scalar leaves carried by
+    // the WriteOp (scalar = 1; array = element count; struct = total
+    // leaves in the tree). See
+    // `metak-shared/api-contracts/compact-log-schema.md` § E19.
+    pub leaf_count: Vec<Option<u32>>,
+    pub shape_idx: Vec<Option<u8>>,
 }
 
 impl CompactBuffers {
@@ -399,6 +412,15 @@ impl CompactBuffers {
     /// Push a `write` event row. The driver supplies the pre-publish
     /// `write_ts` here (matching the same T16.2 invariant as the
     /// JSONL `log_write_at`).
+    ///
+    /// `leaf_count` and `shape_idx` carry the E19 workload-shape
+    /// metadata. Callers that produce scalar-only payloads (e.g.
+    /// pre-E19 callers or `scalar-flood`) should pass `leaf_count = 1`
+    /// and `shape_idx = 0` (Scalar). The columns are nullable in the
+    /// Parquet wire format; the in-memory representation stores
+    /// `Some(_)` on every `write` row so the per-column `Vec` lengths
+    /// stay in lockstep.
+    #[allow(clippy::too_many_arguments)]
     pub fn push_write(
         &mut self,
         ts_ns: i64,
@@ -406,11 +428,15 @@ impl CompactBuffers {
         qos: u8,
         seq: u64,
         bytes: u32,
+        leaf_count: u32,
+        shape_idx: u8,
     ) -> Result<(), InternError> {
         let path_idx = self.paths.intern(path)?;
         self.push_row(
             RowBuilder::new(ts_ns, EventKind::Write)
-                .with_base(seq, path_idx, PEER_SELF, qos, bytes),
+                .with_base(seq, path_idx, PEER_SELF, qos, bytes)
+                .with_leaf_count(leaf_count)
+                .with_shape_idx(shape_idx),
         );
         Ok(())
     }
@@ -610,6 +636,8 @@ impl CompactBuffers {
         self.extra_f32_b.push(row.extra_f32_b);
         self.extra_i64.push(row.extra_i64);
         self.extra_utf8.push(row.extra_utf8);
+        self.leaf_count.push(row.leaf_count);
+        self.shape_idx.push(row.shape_idx);
     }
 }
 
@@ -630,6 +658,8 @@ struct RowBuilder {
     extra_f32_b: Option<f32>,
     extra_i64: Option<i64>,
     extra_utf8: Option<String>,
+    leaf_count: Option<u32>,
+    shape_idx: Option<u8>,
 }
 
 impl RowBuilder {
@@ -646,6 +676,8 @@ impl RowBuilder {
             extra_f32_b: None,
             extra_i64: None,
             extra_utf8: None,
+            leaf_count: None,
+            shape_idx: None,
         }
     }
 
@@ -680,6 +712,16 @@ impl RowBuilder {
 
     fn with_extra_utf8(mut self, v: String) -> Self {
         self.extra_utf8 = Some(v);
+        self
+    }
+
+    fn with_leaf_count(mut self, v: u32) -> Self {
+        self.leaf_count = Some(v);
+        self
+    }
+
+    fn with_shape_idx(mut self, v: u8) -> Self {
+        self.shape_idx = Some(v);
         self
     }
 }
@@ -761,7 +803,7 @@ mod tests {
     #[test]
     fn push_write_populates_columns() {
         let mut buf = CompactBuffers::new();
-        buf.push_write(1_000_000_000, "/bench/0", 1, 42, 128)
+        buf.push_write(1_000_000_000, "/bench/0", 1, 42, 128, 1, 0)
             .unwrap();
         assert_eq!(buf.len(), 1);
         assert_eq!(buf.ts_ns, vec![1_000_000_000]);
@@ -813,7 +855,7 @@ mod tests {
     #[test]
     fn mixed_pushes_keep_column_lengths_in_lockstep() {
         let mut buf = CompactBuffers::new();
-        buf.push_write(1, "/a", 1, 1, 8).unwrap();
+        buf.push_write(1, "/a", 1, 1, 8, 1, 0).unwrap();
         buf.push_receive(2, "alice", 1, "/a", 1, 8).unwrap();
         buf.push_backpressure_skipped(3, "/b", 4).unwrap();
         buf.push_gap_detected(4, "bob", 7).unwrap();
@@ -838,6 +880,10 @@ mod tests {
         assert_eq!(buf.extra_f32_b.len(), n);
         assert_eq!(buf.extra_i64.len(), n);
         assert_eq!(buf.extra_utf8.len(), n);
+        // E19: leaf_count / shape_idx columns must stay in lockstep
+        // with the existing 11 columns.
+        assert_eq!(buf.leaf_count.len(), n);
+        assert_eq!(buf.shape_idx.len(), n);
         // Two paths interned (/a, /b); two peers (alice, bob).
         assert_eq!(buf.paths.dict(), &["/a".to_string(), "/b".to_string()]);
         assert_eq!(buf.peers.dict(), &["alice".to_string(), "bob".to_string()]);
@@ -848,7 +894,8 @@ mod tests {
         let mut buf = CompactBuffers::new();
         let baseline = buf.approx_bytes();
         for i in 0..1000 {
-            buf.push_write(i as i64, "/p", 1, i as u64, 8).unwrap();
+            buf.push_write(i as i64, "/p", 1, i as u64, 8, 1, 0)
+                .unwrap();
         }
         let after_rows = buf.approx_bytes();
         // 1000 rows + one path entry; should grow by at least
@@ -1036,7 +1083,7 @@ mod tests {
         // discriminate kinds by the `kind` column alone, and the
         // null discriminants compress to near-zero in Parquet.
         let mut buf = CompactBuffers::new();
-        buf.push_write(1, "/a", 1, 1, 8).unwrap();
+        buf.push_write(1, "/a", 1, 1, 8, 1, 0).unwrap();
         buf.push_receive(2, "alice", 1, "/a", 1, 8).unwrap();
         buf.push_backpressure_skipped(3, "/a", 1).unwrap();
         for i in 0..buf.len() {
@@ -1049,6 +1096,70 @@ mod tests {
             assert!(
                 buf.extra_utf8[i].is_none(),
                 "row {i} extra_utf8 must be None"
+            );
+        }
+        // E19: write rows DO populate leaf_count / shape_idx;
+        // receive / backpressure_skipped leave them null.
+        assert_eq!(buf.leaf_count[0], Some(1));
+        assert_eq!(buf.shape_idx[0], Some(0));
+        assert!(buf.leaf_count[1].is_none());
+        assert!(buf.shape_idx[1].is_none());
+        assert!(buf.leaf_count[2].is_none());
+        assert!(buf.shape_idx[2].is_none());
+    }
+
+    // ----- E19 / T19.2: leaf_count + shape_idx on write rows -----
+
+    #[test]
+    fn push_write_records_leaf_count_and_shape_idx() {
+        let mut buf = CompactBuffers::new();
+        // Block-flood-shaped row: leaf_count=100, shape=Array (idx=1).
+        buf.push_write(1, "/bench/block/0", 1, 1, 800, 100, 1)
+            .unwrap();
+        // Struct-shaped row: leaf_count=42, shape=Struct (idx=2).
+        buf.push_write(2, "/bench/mixed/dict/flat", 1, 2, 336, 42, 2)
+            .unwrap();
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.leaf_count, vec![Some(100), Some(42)]);
+        assert_eq!(buf.shape_idx, vec![Some(1), Some(2)]);
+        // The base columns continue to be populated as before.
+        assert_eq!(buf.seq, vec![1, 2]);
+        assert_eq!(buf.bytes, vec![800, 336]);
+    }
+
+    #[test]
+    fn push_write_legacy_scalar_defaults() {
+        // Pre-E19 callers (e.g. scalar-flood) pass leaf_count=1,
+        // shape_idx=0. Both columns must still be populated -- the
+        // analyzer's defaults are intern[0]="scalar", leaf_count=1.
+        let mut buf = CompactBuffers::new();
+        buf.push_write(1, "/bench/0", 1, 1, 8, 1, 0).unwrap();
+        assert_eq!(buf.leaf_count, vec![Some(1)]);
+        assert_eq!(buf.shape_idx, vec![Some(0)]);
+    }
+
+    #[test]
+    fn non_write_kinds_leave_leaf_count_and_shape_null() {
+        // Only `write` rows populate the E19 columns. Every other
+        // event kind must leave them null so the analyzer can treat
+        // null as "not applicable" without a per-kind decoder branch.
+        let mut buf = CompactBuffers::new();
+        buf.push_receive(1, "alice", 1, "/p", 1, 8).unwrap();
+        buf.push_backpressure_skipped(2, "/p", 1).unwrap();
+        buf.push_gap_detected(3, "alice", 5).unwrap();
+        buf.push_gap_filled(4, "alice", 5).unwrap();
+        buf.push_phase(5, "operate").unwrap();
+        buf.push_connected(6, None, 1.0, "single").unwrap();
+        buf.push_eot_sent(7, 1).unwrap();
+        buf.push_resource(8, 1.0, 2.0).unwrap();
+        for i in 0..buf.len() {
+            assert!(
+                buf.leaf_count[i].is_none(),
+                "row {i} leaf_count must be None on non-write kind"
+            );
+            assert!(
+                buf.shape_idx[i].is_none(),
+                "row {i} shape_idx must be None on non-write kind"
             );
         }
     }

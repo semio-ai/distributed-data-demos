@@ -24,6 +24,8 @@
 //!     optional float       extra_f32_b; // T18.2b polymorphic numeric slot
 //!     optional int64       extra_i64;   // T18.2b polymorphic int slot
 //!     optional binary      extra_utf8;  // T18.2b polymorphic string slot
+//!     optional int32       leaf_count;  // E19 -- u32 cast to i32; null on non-write rows
+//!     optional int32       shape_idx;   // E19 -- u8 cast to i32; null on non-write rows
 //! }
 //! ```
 //!
@@ -85,6 +87,7 @@ use parquet::format::KeyValue;
 use parquet::schema::types::Type;
 
 use crate::compact::CompactBuffers;
+use crate::workload::SHAPE_INTERN;
 
 /// Logical schema version recorded in the file's KV metadata. Bumped
 /// when the column set changes shape (rename, retype, add/remove).
@@ -232,6 +235,24 @@ fn build_schema() -> Arc<Type> {
                 .build()
                 .expect("extra_utf8 schema build"),
         ),
+        // E19 / T19.2: workload-shape columns. Both are nullable
+        // (OPTIONAL) -- analyzers receive None on rows whose event
+        // kind is not `write`. `leaf_count` is u32 widened to i32 (the
+        // value is always <= vpt, far below i32::MAX); `shape_idx` is
+        // a u8 widened to i32 indexing the `shape_intern` KV
+        // dictionary.
+        Arc::new(
+            Type::primitive_type_builder("leaf_count", PhysicalType::INT32)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()
+                .expect("leaf_count schema build"),
+        ),
+        Arc::new(
+            Type::primitive_type_builder("shape_idx", PhysicalType::INT32)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()
+                .expect("shape_idx schema build"),
+        ),
     ];
     Arc::new(
         Type::group_type_builder("compact_events")
@@ -258,6 +279,15 @@ fn build_writer_properties(
 ) -> Result<WriterProperties, CompactWriterError> {
     let paths_json = serde_json::to_string(paths)?;
     let peers_json = serde_json::to_string(peers)?;
+    // E19 / T19.2: the `shape_intern` dictionary maps shape_idx ->
+    // string ("scalar", "array", "struct"). Stored in KV metadata
+    // alongside the path / peer dictionaries so the analyzer can
+    // decode shape_idx without a side-car file. The dictionary is
+    // constant across spawns (the writer pins it via
+    // `workload::SHAPE_INTERN`), but we serialise it per file so the
+    // contract remains "everything analysis needs is in the file".
+    let shape_intern_vec: Vec<&str> = SHAPE_INTERN.to_vec();
+    let shape_intern_json = serde_json::to_string(&shape_intern_vec)?;
 
     let kv = vec![
         KeyValue {
@@ -271,6 +301,10 @@ fn build_writer_properties(
         KeyValue {
             key: "peers".to_string(),
             value: Some(peers_json),
+        },
+        KeyValue {
+            key: "shape_intern".to_string(),
+            value: Some(shape_intern_json),
         },
         KeyValue {
             key: "variant".to_string(),
@@ -448,6 +482,22 @@ pub fn write_compact_parquet(
             col.close()?;
         }
 
+        // E19 / T19.2 -- leaf_count: Option<u32> -> i32
+        let (vals_i32, defs) = collect_optional_u32_as_i32(&buffers.leaf_count);
+        if let Some(mut col) = row_group.next_column()? {
+            col.typed::<Int32Type>()
+                .write_batch(&vals_i32, Some(&defs), None)?;
+            col.close()?;
+        }
+
+        // E19 / T19.2 -- shape_idx: Option<u8> -> i32
+        let (vals_i32, defs) = collect_optional_u8_as_i32(&buffers.shape_idx);
+        if let Some(mut col) = row_group.next_column()? {
+            col.typed::<Int32Type>()
+                .write_batch(&vals_i32, Some(&defs), None)?;
+            col.close()?;
+        }
+
         row_group.close()?;
     }
     writer.close()?;
@@ -488,6 +538,42 @@ fn collect_optional_i64(col: &[Option<i64>]) -> (Vec<i64>, Vec<i16>) {
         match v {
             Some(x) => {
                 vals.push(*x);
+                defs.push(1);
+            }
+            None => defs.push(0),
+        }
+    }
+    (vals, defs)
+}
+
+/// Split an `Option<u32>` column into (defined values widened to i32,
+/// def-levels). See [`collect_optional_f32`] for invariants. The
+/// Parquet column type is INT32; analysis reinterprets the bit pattern
+/// as u32 when needed.
+fn collect_optional_u32_as_i32(col: &[Option<u32>]) -> (Vec<i32>, Vec<i16>) {
+    let mut vals = Vec::with_capacity(col.len());
+    let mut defs = Vec::with_capacity(col.len());
+    for v in col {
+        match v {
+            Some(x) => {
+                vals.push(*x as i32);
+                defs.push(1);
+            }
+            None => defs.push(0),
+        }
+    }
+    (vals, defs)
+}
+
+/// Split an `Option<u8>` column into (defined values widened to i32,
+/// def-levels). See [`collect_optional_f32`] for invariants.
+fn collect_optional_u8_as_i32(col: &[Option<u8>]) -> (Vec<i32>, Vec<i16>) {
+    let mut vals = Vec::with_capacity(col.len());
+    let mut defs = Vec::with_capacity(col.len());
+    for v in col {
+        match v {
+            Some(x) => {
+                vals.push(i32::from(*x));
                 defs.push(1);
             }
             None => defs.push(0),
@@ -542,9 +628,9 @@ mod tests {
 
     fn populated_buffers() -> CompactBuffers {
         let mut buf = CompactBuffers::new();
-        buf.push_write(1_000_000_000, "/bench/0", 1, 1, 128)
+        buf.push_write(1_000_000_000, "/bench/0", 1, 1, 128, 1, 0)
             .unwrap();
-        buf.push_write(1_000_001_000, "/bench/1", 1, 2, 128)
+        buf.push_write(1_000_001_000, "/bench/1", 1, 2, 128, 1, 0)
             .unwrap();
         buf.push_receive(1_000_002_000, "bob", 1, "/bench/0", 1, 128)
             .unwrap();
@@ -569,12 +655,12 @@ mod tests {
         .unwrap();
         assert!(size > 0, "even empty files have a Parquet footer");
         // Read it back -- should have zero rows and the expected schema
-        // (7 base columns + 4 T18.2b extra columns = 11).
+        // (7 base columns + 4 T18.2b extra columns + 2 E19 columns = 13).
         let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
         let meta = reader.metadata();
         assert_eq!(meta.num_row_groups(), 1);
         assert_eq!(meta.file_metadata().num_rows(), 0);
-        assert_eq!(meta.file_metadata().schema_descr().num_columns(), 11);
+        assert_eq!(meta.file_metadata().schema_descr().num_columns(), 13);
     }
 
     #[test]
@@ -757,6 +843,68 @@ mod tests {
         let peers_json = lookup.get("peers").expect("peers key");
         let peers: Vec<String> = serde_json::from_str(peers_json).unwrap();
         assert_eq!(peers, vec!["bob".to_string()]);
+
+        // E19 / T19.2: the shape_intern dictionary must be present
+        // and contain the canonical ["scalar", "array", "struct"].
+        let shape_json = lookup
+            .get("shape_intern")
+            .expect("shape_intern key must be present in KV metadata");
+        let shapes: Vec<String> = serde_json::from_str(shape_json).unwrap();
+        assert_eq!(
+            shapes,
+            vec![
+                "scalar".to_string(),
+                "array".to_string(),
+                "struct".to_string()
+            ]
+        );
+    }
+
+    /// E19 / T19.2: write rows must carry leaf_count + shape_idx, and
+    /// the values must round-trip through the Parquet writer.
+    #[test]
+    fn write_rows_carry_leaf_count_and_shape_idx() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("e19.compact.parquet");
+        let mut buf = CompactBuffers::new();
+        // Scalar (shape_idx=0, leaf_count=1)
+        buf.push_write(100, "/bench/0", 1, 1, 8, 1, 0).unwrap();
+        // Array (shape_idx=1, leaf_count=100)
+        buf.push_write(200, "/bench/block/0", 1, 2, 800, 100, 1)
+            .unwrap();
+        // Struct (shape_idx=2, leaf_count=42)
+        buf.push_write(300, "/bench/mixed/dict/flat", 1, 3, 336, 42, 2)
+            .unwrap();
+        // A receive row -- both new columns must remain null.
+        buf.push_receive(400, "alice", 2, "/bench/block/0", 1, 800)
+            .unwrap();
+
+        write_compact_parquet(
+            &path,
+            &buf,
+            &sample_meta(),
+            &CompactWriterOptions::default(),
+        )
+        .unwrap();
+
+        let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        let rows: Vec<_> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        // Columns: 0..=10 are pre-E19; column 11 = leaf_count,
+        // column 12 = shape_idx.
+        assert_eq!(rows[0].get_int(11).unwrap(), 1);
+        assert_eq!(rows[0].get_int(12).unwrap(), 0);
+        assert_eq!(rows[1].get_int(11).unwrap(), 100);
+        assert_eq!(rows[1].get_int(12).unwrap(), 1);
+        assert_eq!(rows[2].get_int(11).unwrap(), 42);
+        assert_eq!(rows[2].get_int(12).unwrap(), 2);
+        // Receive row: both columns null.
+        assert!(rows[3].get_int(11).is_err());
+        assert!(rows[3].get_int(12).is_err());
     }
 
     #[test]
