@@ -18,7 +18,7 @@ use crate::seq::SeqGenerator;
 use crate::types::{Phase, Qos, ThreadingMode};
 use crate::variant_trait::Variant;
 use crate::watchdog::Watchdog;
-use crate::workload::create_workload;
+use crate::workload::{create_workload_with_params, WorkloadParams, WriteShape};
 
 /// Convert a `chrono::DateTime<Utc>` to whole nanoseconds since the
 /// UNIX epoch. Uses `timestamp_nanos_opt` and falls back to `0` on
@@ -67,6 +67,7 @@ impl<'a> LoggerProxy<'a> {
             .log_connected(launch_ts, elapsed_ms, threading_mode, recv_buffer_kb)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn log_write_at(
         &mut self,
         ts: DateTime<Utc>,
@@ -74,8 +75,11 @@ impl<'a> LoggerProxy<'a> {
         path: &str,
         qos: Qos,
         bytes: usize,
+        leaf_count: u32,
+        shape: WriteShape,
     ) -> Result<()> {
-        self.lock()?.log_write_at(ts, seq, path, qos, bytes)
+        self.lock()?
+            .log_write_at(ts, seq, path, qos, bytes, leaf_count, shape)
     }
 
     fn log_backpressure_skipped(&mut self, path: &str, qos: Qos) -> Result<()> {
@@ -203,6 +207,12 @@ impl<'a> EventSink<'a> {
 
     /// Record a `write` event. The pre-publish `write_ts` is supplied
     /// by the caller per the T16.2 contract.
+    ///
+    /// E19 / T19.2: `leaf_count` and `shape` carry the workload-shape
+    /// metadata to both emission paths. Scalar-flood / max-throughput
+    /// pass `(1, WriteShape::Scalar)`; block-flood / mixed-types pass
+    /// whatever the per-WriteOp generator produced.
+    #[allow(clippy::too_many_arguments)]
     fn record_write(
         &mut self,
         ts: DateTime<Utc>,
@@ -210,11 +220,21 @@ impl<'a> EventSink<'a> {
         path: &str,
         qos: Qos,
         bytes: usize,
+        leaf_count: u32,
+        shape: WriteShape,
     ) -> Result<()> {
-        self.lock_buffers()?
-            .push_write(ts_nanos(ts), path, qos.as_int(), seq, bytes as u32)?;
+        self.lock_buffers()?.push_write(
+            ts_nanos(ts),
+            path,
+            qos.as_int(),
+            seq,
+            bytes as u32,
+            leaf_count,
+            shape.as_u8(),
+        )?;
         if self.legacy_jsonl {
-            self.logger.log_write_at(ts, seq, path, qos, bytes)?;
+            self.logger
+                .log_write_at(ts, seq, path, qos, bytes, leaf_count, shape)?;
         }
         Ok(())
     }
@@ -517,7 +537,21 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     );
     let mut seq_gen = SeqGenerator::new();
     let mut resource_monitor = ResourceMonitor::new();
-    let mut workload = create_workload(&config.workload)?;
+    // E19 / T19.2: build a `WorkloadParams` struct for the workload
+    // factory. The variant CLI plumbing for the new workload params
+    // (`--blob-size`, `--mixed-*`, `--workload-seed`) lands in T19.3;
+    // until then the struct carries only the spawn identifiers
+    // (variant + run) which the `mixed-types` fallback-seed path
+    // consumes. `scalar-flood` / `max-throughput` ignore the params
+    // entirely. `block-flood` / `mixed-types` selected without T19.3's
+    // CLI wiring will Err here with a descriptive message naming the
+    // missing arg.
+    let workload_params = WorkloadParams {
+        variant: config.variant.clone(),
+        run: config.run.clone(),
+        ..WorkloadParams::default()
+    };
+    let mut workload = create_workload_with_params(&config.workload, &workload_params)?;
 
     // Stdout progress emitter (E15 / T15.1).
     //
@@ -739,7 +773,15 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
                 let mut strict_attempts: u32 = 0;
                 loop {
                     if variant.try_publish(&op.path, &op.payload, qos, seq)? {
-                        sink.record_write(write_ts, seq, &op.path, qos, op.payload.len())?;
+                        sink.record_write(
+                            write_ts,
+                            seq,
+                            &op.path,
+                            qos,
+                            op.payload.len(),
+                            op.leaf_count,
+                            op.shape,
+                        )?;
                         progress.inc_sent();
                         break;
                     }
@@ -757,7 +799,15 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
                     }
                 }
             } else if variant.try_publish(&op.path, &op.payload, qos, seq)? {
-                sink.record_write(write_ts, seq, &op.path, qos, op.payload.len())?;
+                sink.record_write(
+                    write_ts,
+                    seq,
+                    &op.path,
+                    qos,
+                    op.payload.len(),
+                    op.leaf_count,
+                    op.shape,
+                )?;
                 progress.inc_sent();
                 if max_throughput {
                     consecutive_skipped = 0;
