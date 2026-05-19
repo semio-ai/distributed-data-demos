@@ -7,7 +7,7 @@ use variant_base::cli::{CliArgs, DEFAULT_RECV_BUFFER_KB};
 use variant_base::driver::run_protocol;
 use variant_base::dummy::VariantDummy;
 use variant_base::types::{Qos, ThreadingMode};
-use variant_base::workload::{create_workload_with_params, WorkloadParams, WriteShape};
+use variant_base::workload::{create_workload_with_params, WorkloadParams};
 
 /// Helper to build the canonical CLI arg list for spawning the
 /// `variant-dummy` binary in tests. `progress_stdout_interval_ms` is
@@ -95,15 +95,10 @@ fn test_args_with_mode(log_dir: &str, threading_mode: ThreadingMode) -> CliArgs 
         watchdog_secs: 0,
         // T18.2 / E18: defaults match the CLI defaults so existing
         // smoke tests do not need to think about the new flags.
-        // Tests that exercise the compact-only path or the soft /
-        // hard ceiling thresholds build their own args from
-        // scratch.
+        // Tests that exercise the soft / hard ceiling thresholds
+        // build their own args from scratch.
         digest_mem_soft_mb: variant_base::cli::DEFAULT_DIGEST_MEM_SOFT_MB,
         digest_mem_hard_mb: variant_base::cli::DEFAULT_DIGEST_MEM_HARD_MB,
-        // Keep the legacy per-event JSONL stream ON in the
-        // integration tests that pre-date T18.2 -- their assertions
-        // explicitly count `write` and `receive` lines.
-        legacy_jsonl_events: true,
         // E19 / T19.3: the integration-test default exercises
         // `scalar-flood`, which ignores all workload-shape args.
         // Tests that need to exercise `block-flood` / `mixed-types`
@@ -137,6 +132,10 @@ fn read_log(log_dir: &str) -> Vec<serde_json::Value> {
 
 #[test]
 fn test_full_protocol_with_dummy() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+    use variant_base::compact::EventKind;
+
     let dir = TempDir::new().unwrap();
     let log_dir = dir.path().to_str().unwrap();
     let args = test_args(log_dir);
@@ -156,10 +155,23 @@ fn test_full_protocol_with_dummy() {
         assert!(line.get("event").is_some(), "line {} missing 'event'", i);
     }
 
+    // Post-T19.10: the JSONL stream carries lifecycle events only --
+    // no per-event rows.
+    for line in &lines {
+        let event = line["event"].as_str().unwrap();
+        assert!(
+            !matches!(
+                event,
+                "write" | "receive" | "backpressure_skipped" | "gap_detected" | "gap_filled"
+            ),
+            "post-T19.10: per-event '{event}' must not appear in JSONL"
+        );
+    }
+
     // Collect event types in order.
     let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
 
-    // Phase events must appear in order: connect, stabilize, operate, silent.
+    // Phase events must appear in order: connect, stabilize, operate, silent, digest.
     let phase_events: Vec<(&str, Option<&str>)> = lines
         .iter()
         .filter(|l| l["event"] == "phase")
@@ -210,33 +222,6 @@ fn test_full_protocol_with_dummy() {
     let elapsed = connected[0]["elapsed_ms"].as_f64().unwrap();
     assert!(elapsed >= 0.0, "elapsed_ms should be non-negative");
 
-    // Write events: check monotonic seq numbers.
-    let write_seqs: Vec<u64> = lines
-        .iter()
-        .filter(|l| l["event"] == "write")
-        .map(|l| l["seq"].as_u64().unwrap())
-        .collect();
-    assert!(
-        !write_seqs.is_empty(),
-        "should have at least one write event"
-    );
-    for window in write_seqs.windows(2) {
-        assert!(
-            window[1] > window[0],
-            "write seq numbers should be monotonically increasing: {} -> {}",
-            window[0],
-            window[1]
-        );
-    }
-
-    // Receive events: should exist for each write (dummy echoes).
-    let receive_count = events.iter().filter(|&&e| e == "receive").count();
-    assert_eq!(
-        receive_count,
-        write_seqs.len(),
-        "every write should have a matching receive (dummy echoes)"
-    );
-
     // Resource events should exist (at least one during the operate phase).
     let resource_count = events.iter().filter(|&&e| e == "resource").count();
     assert!(
@@ -244,23 +229,52 @@ fn test_full_protocol_with_dummy() {
         "should have at least one resource event"
     );
 
-    // Verify events appear in expected order groups:
-    // connect phase -> connected -> stabilize phase -> operate phase -> writes/receives/resources -> silent phase
-    let first_phase_idx = events.iter().position(|&e| e == "phase").unwrap();
-    let connected_idx = events.iter().position(|&e| e == "connected").unwrap();
-    assert!(
-        connected_idx > first_phase_idx,
-        "connected should come after first phase event"
-    );
-
-    let first_write_idx = events.iter().position(|&e| e == "write").unwrap();
-    let last_silent_phase_idx = lines
-        .iter()
-        .rposition(|l| l["event"] == "phase" && l["phase"] == "silent")
+    // -- Compact-Parquet inspection (per-event observations live here
+    //    exclusively post-T19.10) --
+    let parquet_path =
+        std::path::Path::new(log_dir).join("dummy-test-runner-run01.compact.parquet");
+    let reader = SerializedFileReader::new(std::fs::File::open(&parquet_path).unwrap()).unwrap();
+    let rows: Vec<_> = reader
+        .get_row_iter(None)
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
+
+    // Collect write seqs (column 2 = `seq`, column 1 = `kind`).
+    let mut write_seqs: Vec<i64> = rows
+        .iter()
+        .filter(|r| r.get_int(1).unwrap() == EventKind::Write as i32)
+        .map(|r| r.get_long(2).unwrap())
+        .collect();
     assert!(
-        first_write_idx < last_silent_phase_idx,
-        "writes should occur before silent phase"
+        !write_seqs.is_empty(),
+        "compact parquet should have at least one write row"
+    );
+    // Driver hands seqs in monotonic order on each push; sanity check.
+    let original = write_seqs.clone();
+    write_seqs.sort_unstable();
+    assert_eq!(
+        original, write_seqs,
+        "write seq numbers should be monotonically increasing in append order"
+    );
+    for window in write_seqs.windows(2) {
+        assert!(
+            window[1] > window[0],
+            "write seq numbers should be strictly increasing: {} -> {}",
+            window[0],
+            window[1]
+        );
+    }
+
+    // Receive rows: should exist for each write (dummy echoes).
+    let receive_count = rows
+        .iter()
+        .filter(|r| r.get_int(1).unwrap() == EventKind::Receive as i32)
+        .count();
+    assert_eq!(
+        receive_count,
+        write_seqs.len(),
+        "every write should have a matching receive (dummy echoes)"
     );
 }
 
@@ -333,10 +347,15 @@ fn test_variant_dummy_binary_exit_code() {
 }
 
 /// Run VariantDummy end-to-end in `single` and `multi` modes and
-/// verify the expected JSONL event sequence is produced for both
-/// (T14.1 integration acceptance).
+/// verify the expected lifecycle JSONL sequence + per-event
+/// compact-Parquet rows are produced for both (T14.1 integration
+/// acceptance, updated for T19.10).
 #[test]
 fn test_variant_dummy_runs_in_both_threading_modes() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+    use variant_base::compact::EventKind;
+
     for mode in [ThreadingMode::Single, ThreadingMode::Multi] {
         let dir = TempDir::new().unwrap();
         let log_dir = dir.path().to_str().unwrap();
@@ -396,10 +415,26 @@ fn test_variant_dummy_runs_in_both_threading_modes() {
             "post-T15.8 driver never emits eot_timeout in {mode} mode"
         );
 
-        // The dummy echoes every publish; we expect both writes and
-        // matching receives during the operate phase.
-        let writes = events.iter().filter(|&&e| e == "write").count();
-        let receives = events.iter().filter(|&&e| e == "receive").count();
+        // The dummy echoes every publish; compact-Parquet must have a
+        // write and a matching receive row for each op.
+        let parquet_path =
+            std::path::Path::new(log_dir).join("dummy-test-runner-run01.compact.parquet");
+        let reader =
+            SerializedFileReader::new(std::fs::File::open(&parquet_path).unwrap()).unwrap();
+        let kinds: Vec<i32> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .flatten()
+            .map(|r| r.get_int(1).unwrap())
+            .collect();
+        let writes = kinds
+            .iter()
+            .filter(|&&k| k == EventKind::Write as i32)
+            .count();
+        let receives = kinds
+            .iter()
+            .filter(|&&k| k == EventKind::Receive as i32)
+            .count();
         assert!(writes > 0, "expected at least one write in {mode} mode");
         assert_eq!(
             writes, receives,
@@ -687,6 +722,10 @@ fn test_variant_dummy_idle_detection_short_circuits_operate() {
 /// shape as QoS 1/2.
 #[test]
 fn test_variant_dummy_smoke_every_qos_level() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+    use variant_base::compact::EventKind;
+
     for qos in 1u8..=4u8 {
         let dir = TempDir::new().unwrap();
         let log_dir = dir.path().to_str().unwrap();
@@ -697,20 +736,36 @@ fn test_variant_dummy_smoke_every_qos_level() {
         run_protocol(&mut dummy, &args)
             .unwrap_or_else(|e| panic!("protocol completes at QoS {qos}: {e}"));
 
-        let path = std::path::Path::new(log_dir).join("dummy-test-runner-run01.jsonl");
-        let file = std::fs::File::open(&path).expect("log file should exist");
-        let reader = std::io::BufReader::new(file);
-        let lines: Vec<serde_json::Value> = reader
-            .lines()
-            .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-            .collect();
+        // Per-event observations are compact-Parquet only post-T19.10.
+        let parquet_path =
+            std::path::Path::new(log_dir).join("dummy-test-runner-run01.compact.parquet");
+        let reader =
+            SerializedFileReader::new(std::fs::File::open(&parquet_path).unwrap()).unwrap();
+        let rows: Vec<_> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
 
-        let writes = lines.iter().filter(|l| l["event"] == "write").count();
-        let receives = lines.iter().filter(|l| l["event"] == "receive").count();
-        let skipped = lines
-            .iter()
-            .filter(|l| l["event"] == "backpressure_skipped")
-            .count();
+        let mut writes = 0usize;
+        let mut receives = 0usize;
+        let mut skipped = 0usize;
+        for row in &rows {
+            let kind = row.get_int(1).unwrap();
+            if kind == EventKind::Write as i32 {
+                writes += 1;
+                // Column 5 = qos.
+                assert_eq!(
+                    row.get_int(5).unwrap() as u8,
+                    qos,
+                    "QoS {qos}: write row's qos column must match requested level"
+                );
+            } else if kind == EventKind::Receive as i32 {
+                receives += 1;
+            } else if kind == EventKind::BackpressureSkipped as i32 {
+                skipped += 1;
+            }
+        }
 
         assert!(writes > 0, "QoS {qos}: expected at least one write");
         assert_eq!(
@@ -721,15 +776,6 @@ fn test_variant_dummy_smoke_every_qos_level() {
             skipped, 0,
             "QoS {qos}: VariantDummy never reports backpressure"
         );
-
-        // QoS field must round-trip on every write event.
-        for w in lines.iter().filter(|l| l["event"] == "write") {
-            assert_eq!(
-                w["qos"].as_u64().unwrap(),
-                u64::from(qos),
-                "QoS {qos}: write.qos must match requested level"
-            );
-        }
     }
 }
 
@@ -769,9 +815,9 @@ fn test_variant_dummy_progress_stdout_zero_disables_emission() {
 
 /// T18.2 acceptance: an in-process `VariantDummy` run must produce a
 /// well-formed `<variant>-<runner>-<run>.compact.parquet` file
-/// alongside the legacy JSONL, and the file must contain at least one
-/// row per `write` JSONL event observed in the same run. The schema
-/// must match the documented seven-column layout.
+/// alongside the lifecycle JSONL, and the file must contain per-event
+/// rows for every observation the run produced. The schema must match
+/// the documented 13-column layout.
 #[test]
 fn test_compact_parquet_is_written_alongside_jsonl() {
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -783,16 +829,12 @@ fn test_compact_parquet_is_written_alongside_jsonl() {
     let mut dummy = VariantDummy::new(&args.runner);
     run_protocol(&mut dummy, &args).expect("protocol should complete");
 
-    // The legacy JSONL must still exist (legacy_jsonl_events is on in
-    // this test's args).
+    // The lifecycle JSONL file must exist (post-T19.10 it carries only
+    // phase / connected / eot_* / resource lines).
     let jsonl_path = dir.path().join("dummy-test-runner-run01.jsonl");
-    assert!(
-        jsonl_path.exists(),
-        "legacy JSONL must be written when legacy_jsonl_events = true"
-    );
+    assert!(jsonl_path.exists(), "lifecycle JSONL file must be written");
 
-    // The new compact parquet file MUST exist regardless of the
-    // legacy flag.
+    // The compact parquet file MUST exist alongside the JSONL.
     let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
     assert!(
         parquet_path.exists(),
@@ -826,41 +868,22 @@ fn test_compact_parquet_is_written_alongside_jsonl() {
     assert!(lookup.contains_key("paths"));
     assert!(lookup.contains_key("peers"));
 
-    // Cross-check: T18.2b made the compact buffer cover lifecycle
-    // events too (`phase`, `connected`, `eot_sent`, `resource`).
-    // The compact row count therefore equals the count of EVERY
-    // JSONL event line, not only the per-event subset.
-    let jsonl_lines: Vec<serde_json::Value> = std::fs::read_to_string(&jsonl_path)
-        .unwrap()
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let jsonl_event_rows = jsonl_lines.len() as i64;
-    assert_eq!(
-        meta.file_metadata().num_rows(),
-        jsonl_event_rows,
-        "T18.2b: compact row count must equal the number of JSONL event lines \
-         (per-event + lifecycle)"
-    );
     // VariantDummy echoes every write -> at least one row per write.
     assert!(meta.file_metadata().num_rows() > 0);
 }
 
-/// T18.2 acceptance: with `--legacy-jsonl-events` disabled (the new
-/// default), per-event JSONL lines (`write`, `receive`,
-/// `backpressure_skipped`) MUST NOT appear in the JSONL stream, but
-/// the lifecycle events (`phase`, `connected`, `eot_sent`, `resource`)
-/// MUST still be present, and the compact Parquet file MUST contain
-/// the full per-event row set.
+/// T19.10 acceptance: post-cleanup, per-event JSONL lines (`write`,
+/// `receive`, `backpressure_skipped`, `gap_*`) MUST NOT appear in the
+/// JSONL stream regardless of any flag. Lifecycle events (`phase`,
+/// `connected`, `eot_sent`, `resource`) MUST still be present, and the
+/// compact Parquet file MUST contain the full per-event row set.
 #[test]
-fn test_compact_only_mode_suppresses_per_event_jsonl_but_keeps_lifecycle() {
+fn test_per_event_rows_are_compact_parquet_only_post_t19_10() {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
     let dir = TempDir::new().unwrap();
     let log_dir = dir.path().to_str().unwrap();
-    let mut args = test_args(log_dir);
-    args.legacy_jsonl_events = false;
+    let args = test_args(log_dir);
 
     let mut dummy = VariantDummy::new(&args.runner);
     run_protocol(&mut dummy, &args).expect("protocol should complete");
@@ -875,7 +898,7 @@ fn test_compact_only_mode_suppresses_per_event_jsonl_but_keeps_lifecycle() {
 
     let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
 
-    // Per-event rows must be absent.
+    // Per-event rows must be absent under any configuration.
     for event in [
         "write",
         "receive",
@@ -885,7 +908,7 @@ fn test_compact_only_mode_suppresses_per_event_jsonl_but_keeps_lifecycle() {
     ] {
         assert!(
             !events.contains(&event),
-            "event '{event}' must NOT appear in JSONL when legacy_jsonl_events = false"
+            "event '{event}' must NOT appear in JSONL post-T19.10"
         );
     }
 
@@ -904,34 +927,32 @@ fn test_compact_only_mode_suppresses_per_event_jsonl_but_keeps_lifecycle() {
         "must still have eot_sent event"
     );
 
-    // The compact Parquet file must still contain the per-event rows.
+    // The compact Parquet file must contain the per-event rows.
     let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
     let reader = SerializedFileReader::new(std::fs::File::open(&parquet_path).unwrap()).unwrap();
     assert!(
         reader.metadata().file_metadata().num_rows() > 0,
-        "compact-only mode must STILL accumulate rows in the Parquet file"
+        "compact Parquet file must accumulate rows post-T19.10"
     );
 }
 
 /// T18.2b acceptance: every lifecycle event the JSONL stream emits
 /// MUST also appear as a row in the compact `compact_events` table.
 ///
-/// Run VariantDummy with `--legacy-jsonl-events` OFF so the JSONL
-/// stream contains ONLY lifecycle events; cross-check that the
-/// compact parquet contains a row for each lifecycle kind the
-/// analyzer's existing pipeline depends on (`phase`, `connected`,
-/// `eot_sent`, `resource`). After T18.4 lands, the analyzer can
-/// drop the JSONL dependency entirely.
+/// Cross-check that the compact parquet contains a row for each
+/// lifecycle kind the analyzer's pipeline depends on (`phase`,
+/// `connected`, `eot_sent`, `resource`). Post-T19.10 the JSONL stream
+/// carries lifecycle events only; per-event observations live
+/// exclusively in compact-Parquet.
 #[test]
-fn test_compact_parquet_contains_lifecycle_events_when_jsonl_off() {
+fn test_compact_parquet_contains_lifecycle_events_mirrored_from_jsonl() {
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use parquet::record::RowAccessor;
     use variant_base::compact::EventKind;
 
     let dir = TempDir::new().unwrap();
     let log_dir = dir.path().to_str().unwrap();
-    let mut args = test_args(log_dir);
-    args.legacy_jsonl_events = false;
+    let args = test_args(log_dir);
     // Operate long enough that the resource sampler (every 100 ms)
     // produces at least a couple of samples -- the existing
     // test_args sets operate_secs = 1, so at least ~10 samples are
@@ -1038,82 +1059,35 @@ fn test_digest_mem_hard_ceiling_aborts_spawn() {
     );
 }
 
-/// T18.2 acceptance: the file-size win. A realistic spawn (5 s
-/// scalar-flood at 1000 Hz x 100 vpt = 500 K events) must produce a
-/// Parquet file at least 10x smaller than the equivalent JSONL.
-///
-/// We run with `legacy_jsonl_events = true` to get both files in
-/// the same spawn, then compare their on-disk sizes. The acceptance
-/// criterion is 10x because conservative -- the target in the epic
-/// is 30-50x, and we want to absorb scheduler jitter, the variant
-/// dummy's worst-case behaviour, and any future overhead while still
-/// catching regressions.
-///
-/// Smaller-than-realistic operate windows would not exercise the
-/// compression payoff because the Parquet footer + KV metadata is a
-/// fixed-cost overhead (~1.5 KiB). At 500 K rows the per-row cost
-/// dominates and the ratio is stable.
-#[test]
-fn test_compact_parquet_at_least_10x_smaller_than_jsonl() {
-    let dir = TempDir::new().unwrap();
-    let log_dir = dir.path().to_str().unwrap();
-    let mut args = test_args(log_dir);
-    args.tick_rate_hz = 1000;
-    args.operate_secs = 2;
-    args.silent_secs = 0;
-    args.values_per_tick = 100;
-    args.legacy_jsonl_events = true;
-    // Disable resource sampling noise to keep the comparison clean.
-    args.operate_idle_secs = 0;
-    // Bump the ceilings well above what the run produces.
-    args.digest_mem_soft_mb = 256;
-    args.digest_mem_hard_mb = 512;
-
-    let mut dummy = VariantDummy::new(&args.runner);
-    run_protocol(&mut dummy, &args).expect("protocol must complete");
-
-    let jsonl_path = dir.path().join("dummy-test-runner-run01.jsonl");
-    let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
-
-    let jsonl_size = std::fs::metadata(&jsonl_path).unwrap().len();
-    let parquet_size = std::fs::metadata(&parquet_path).unwrap().len();
-
-    assert!(jsonl_size > 0);
-    assert!(parquet_size > 0);
-    let ratio = jsonl_size as f64 / parquet_size as f64;
-    eprintln!("compact size win: jsonl={jsonl_size}B parquet={parquet_size}B ratio={ratio:.1}x");
-    assert!(
-        ratio >= 10.0,
-        "T18.2 acceptance: parquet must be at least 10x smaller than JSONL; \
-         got jsonl={jsonl_size}B parquet={parquet_size}B ratio={ratio:.1}x"
-    );
-}
+// (T19.10) The previous `test_compact_parquet_at_least_10x_smaller_than_jsonl`
+// acceptance test was removed: it relied on the dual-emission path
+// (`--legacy-jsonl-events` ON) to produce both files in the same spawn
+// for an on-disk size comparison. With per-event JSONL deleted, the
+// JSONL stream now contains only lifecycle events and the size-ratio
+// metric is no longer meaningful. The compact-Parquet file remains
+// the sole per-event log; its size win is no longer measured by a
+// JSONL baseline.
 
 // ---------------------------------------------------------------------------
 // E19 / T19.2: workload-shape integration tests
 //
-// These tests use the workload factory + logger + compact buffer pipeline
-// directly (bypassing `run_protocol`, which cannot yet receive the new
-// workload params from the CLI -- that plumbing lands in T19.3). They
-// validate the end-to-end emission path: WriteOp generation -> JSONL +
-// compact-Parquet row materialisation -> file readback.
+// These tests use the workload factory + compact buffer pipeline
+// directly (bypassing `run_protocol`). They validate the end-to-end
+// emission path: WriteOp generation -> compact-Parquet row
+// materialisation. Post-T19.10 there is no JSONL byproduct on the
+// per-event path.
 // ---------------------------------------------------------------------------
 
-/// E19 / T19.2: block-flood end-to-end emission.
+/// E19 / T19.2: block-flood compact-buffer emission.
 ///
 /// Construct a `BlockFlood` workload via `create_workload_with_params`,
-/// generate one tick of WriteOps, push each into a fresh `Logger` and
-/// `CompactBuffers`, then read the resulting JSONL back and confirm
-/// every `write` line carries `leaf_count = 100, shape = "array"`. The
-/// compact buffer columns must mirror the same metadata.
+/// generate one tick of WriteOps, push each into a fresh
+/// `CompactBuffers`, then read the column data back and confirm every
+/// write row carries `leaf_count = 100, shape_idx = 1 (array)`.
 #[test]
-fn test_block_flood_emits_array_shape_through_logger_and_compact() {
+fn test_block_flood_emits_array_shape_through_compact_buffer() {
     use std::sync::{Arc, Mutex};
     use variant_base::compact::CompactBuffers;
-    use variant_base::logger::Logger;
-
-    let dir = TempDir::new().unwrap();
-    let log_dir = dir.path().to_str().unwrap();
 
     let params = WorkloadParams {
         variant: "dummy".to_string(),
@@ -1125,25 +1099,11 @@ fn test_block_flood_emits_array_shape_through_logger_and_compact() {
     let ops = wl.generate(1000);
     assert_eq!(ops.len(), 10, "1000 / 100 = 10 WriteOps");
 
-    let mut logger = Logger::new(log_dir, "dummy", "r1", "block-flood-test").unwrap();
     let buffers = Arc::new(Mutex::new(CompactBuffers::new()));
-
     let ts = chrono::Utc::now();
     let mut seq = 0u64;
     for op in &ops {
         seq += 1;
-        // Emit through the same paths the driver uses.
-        logger
-            .log_write_at(
-                ts,
-                seq,
-                &op.path,
-                Qos::BestEffort,
-                op.payload.len(),
-                op.leaf_count,
-                op.shape,
-            )
-            .unwrap();
         buffers
             .lock()
             .unwrap()
@@ -1158,21 +1118,6 @@ fn test_block_flood_emits_array_shape_through_logger_and_compact() {
             )
             .unwrap();
     }
-    logger.flush().unwrap();
-
-    // JSONL: every write line has leaf_count=100 and shape="array".
-    let path = dir.path().join("dummy-r1-block-flood-test.jsonl");
-    let file = std::fs::File::open(&path).unwrap();
-    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
-    assert_eq!(lines.len(), 10);
-    for (i, v) in lines.iter().enumerate() {
-        assert_eq!(v["event"], "write");
-        assert_eq!(v["leaf_count"], 100, "line {i} leaf_count");
-        assert_eq!(v["shape"], "array", "line {i} shape");
-    }
 
     // Compact buffer columns: all leaf_count=Some(100), shape_idx=Some(1).
     let buf = buffers.lock().unwrap();
@@ -1183,20 +1128,15 @@ fn test_block_flood_emits_array_shape_through_logger_and_compact() {
     }
 }
 
-/// E19 / T19.2: mixed-types end-to-end emission.
+/// E19 / T19.2: mixed-types compact-buffer emission.
 ///
 /// Generate one tick of mixed-types WriteOps, push each through the
-/// logger + compact pipeline, then validate the JSONL contains rows of
-/// scalar / array / struct shapes and the leaf_count values still sum
-/// to exactly vpt.
+/// compact pipeline, then validate the row count, leaf_count total,
+/// and that shapes include at least scalar and one non-scalar variant.
 #[test]
-fn test_mixed_types_emits_heterogeneous_shapes_through_logger() {
+fn test_mixed_types_emits_heterogeneous_shapes_through_compact_buffer() {
     use std::sync::{Arc, Mutex};
     use variant_base::compact::CompactBuffers;
-    use variant_base::logger::Logger;
-
-    let dir = TempDir::new().unwrap();
-    let log_dir = dir.path().to_str().unwrap();
 
     let params = WorkloadParams {
         variant: "dummy".to_string(),
@@ -1215,24 +1155,11 @@ fn test_mixed_types_emits_heterogeneous_shapes_through_logger() {
     let total_leaves: u32 = ops.iter().map(|o| o.leaf_count).sum();
     assert_eq!(total_leaves, 1000, "sum of leaf_count must equal vpt");
 
-    let mut logger = Logger::new(log_dir, "dummy", "r1", "mixed-types-test").unwrap();
     let buffers = Arc::new(Mutex::new(CompactBuffers::new()));
-
     let ts = chrono::Utc::now();
     let mut seq = 0u64;
     for op in &ops {
         seq += 1;
-        logger
-            .log_write_at(
-                ts,
-                seq,
-                &op.path,
-                Qos::BestEffort,
-                op.payload.len(),
-                op.leaf_count,
-                op.shape,
-            )
-            .unwrap();
         buffers
             .lock()
             .unwrap()
@@ -1247,33 +1174,33 @@ fn test_mixed_types_emits_heterogeneous_shapes_through_logger() {
             )
             .unwrap();
     }
-    logger.flush().unwrap();
 
-    // JSONL: the leaf_count values must sum to 1000 and the shape
-    // strings must include at least scalar / array / struct.
-    let path = dir.path().join("dummy-r1-mixed-types-test.jsonl");
-    let file = std::fs::File::open(&path).unwrap();
-    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
-    let sum_leaf_count: u64 = lines
+    let buf = buffers.lock().unwrap();
+    assert_eq!(buf.len(), ops.len());
+
+    // Sum of leaf_count across all rows must equal 1000.
+    let sum_leaf_count: u32 = buf
+        .leaf_count
         .iter()
-        .map(|v| v["leaf_count"].as_u64().unwrap())
+        .map(|v| v.expect("write rows carry leaf_count"))
         .sum();
     assert_eq!(sum_leaf_count, 1000);
-    let shapes: std::collections::HashSet<&str> =
-        lines.iter().map(|v| v["shape"].as_str().unwrap()).collect();
+
+    // Shape diversity: at least one scalar (shape_idx == 0) AND at
+    // least one non-scalar (shape_idx > 0). The intern dictionary uses
+    // 0 = scalar, 1 = array, 2 = struct.
+    let shape_indices: std::collections::HashSet<u8> = buf
+        .shape_idx
+        .iter()
+        .map(|v| v.expect("write rows carry shape_idx"))
+        .collect();
     assert!(
-        shapes.contains("scalar"),
-        "mixed-types must produce at least one scalar shape; got {shapes:?}"
+        shape_indices.contains(&0),
+        "mixed-types must produce at least one scalar (shape_idx=0); got {shape_indices:?}"
     );
-    // At least one non-scalar shape too -- under the chosen params
-    // the seeded generator emits arrays and/or structs.
-    let non_scalar: usize = shapes.iter().filter(|s| **s != "scalar").count();
     assert!(
-        non_scalar >= 1,
-        "mixed-types must produce at least one non-scalar shape; got {shapes:?}"
+        shape_indices.iter().any(|&i| i > 0),
+        "mixed-types must produce at least one non-scalar shape; got {shape_indices:?}"
     );
 }
 
@@ -1286,6 +1213,10 @@ fn test_mixed_types_emits_heterogeneous_shapes_through_logger() {
 /// that contract, so this test now asserts the positive path.
 #[test]
 fn test_block_flood_through_driver_defaults_blob_size_to_100() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+    use variant_base::compact::EventKind;
+
     let dir = TempDir::new().unwrap();
     let log_dir = dir.path().to_str().unwrap();
     let mut args = test_args(log_dir);
@@ -1298,21 +1229,21 @@ fn test_block_flood_through_driver_defaults_blob_size_to_100() {
     let mut dummy = VariantDummy::new(&args.runner);
     run_protocol(&mut dummy, &args).expect("block-flood with default blob_size must complete");
 
-    let log_path = dir.path().join("dummy-test-runner-run01.jsonl");
-    let file = std::fs::File::open(&log_path).unwrap();
-    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
-    let writes: Vec<&serde_json::Value> = lines.iter().filter(|l| l["event"] == "write").collect();
-    assert!(
-        !writes.is_empty(),
-        "block-flood produces write events under the default blob_size"
-    );
-    for (i, w) in writes.iter().enumerate() {
-        assert_eq!(w["leaf_count"], 100, "block-flood write {i} leaf_count");
-        assert_eq!(w["shape"], "array", "block-flood write {i} shape");
+    let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
+    let reader = SerializedFileReader::new(std::fs::File::open(&parquet_path).unwrap()).unwrap();
+    let mut write_rows = 0usize;
+    for row in reader.get_row_iter(None).unwrap().flatten() {
+        if row.get_int(1).unwrap() == EventKind::Write as i32 {
+            // Column 11 = leaf_count, column 12 = shape_idx (1 = array).
+            assert_eq!(row.get_int(11).unwrap(), 100, "block-flood leaf_count");
+            assert_eq!(row.get_int(12).unwrap(), 1, "block-flood shape_idx=array");
+            write_rows += 1;
+        }
     }
+    assert!(
+        write_rows > 0,
+        "block-flood produces write rows under the default blob_size"
+    );
 }
 
 /// E19 / T19.3: a `mixed-types` spawn that omits any of the five
@@ -1347,12 +1278,16 @@ fn test_mixed_types_without_required_args_is_rejected_at_startup() {
 }
 
 /// E19 / T19.3 acceptance: a full `block-flood vpt=1000 blob_size=100`
-/// spawn completes through `run_protocol` and emits JSONL `write`
-/// events carrying `leaf_count = 100, shape = "array"`. Pairs the
-/// "block-flood validation passes" assertion with the smoke-test
-/// requirement from the task spec.
+/// spawn completes through `run_protocol` and emits compact-Parquet
+/// write rows carrying `leaf_count = 100, shape_idx = 1 (array)`.
+/// Pairs the "block-flood validation passes" assertion with the
+/// smoke-test requirement from the task spec.
 #[test]
 fn test_block_flood_through_driver_with_explicit_blob_size_completes() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+    use variant_base::compact::EventKind;
+
     let dir = TempDir::new().unwrap();
     let log_dir = dir.path().to_str().unwrap();
     let mut args = test_args(log_dir);
@@ -1362,26 +1297,30 @@ fn test_block_flood_through_driver_with_explicit_blob_size_completes() {
     let mut dummy = VariantDummy::new(&args.runner);
     run_protocol(&mut dummy, &args).expect("block-flood vpt=1000 blob_size=100 must complete");
 
-    let log_path = dir.path().join("dummy-test-runner-run01.jsonl");
-    let file = std::fs::File::open(&log_path).unwrap();
-    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
-    let writes: Vec<&serde_json::Value> = lines.iter().filter(|l| l["event"] == "write").collect();
-    assert!(!writes.is_empty(), "block-flood produces write events");
-    for (i, w) in writes.iter().enumerate() {
-        assert_eq!(w["leaf_count"], 100, "block-flood write {i} leaf_count");
-        assert_eq!(w["shape"], "array", "block-flood write {i} shape");
+    let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
+    let reader = SerializedFileReader::new(std::fs::File::open(&parquet_path).unwrap()).unwrap();
+    let mut write_rows = 0usize;
+    for row in reader.get_row_iter(None).unwrap().flatten() {
+        if row.get_int(1).unwrap() == EventKind::Write as i32 {
+            assert_eq!(row.get_int(11).unwrap(), 100, "block-flood leaf_count");
+            assert_eq!(row.get_int(12).unwrap(), 1, "block-flood shape_idx=array");
+            write_rows += 1;
+        }
     }
+    assert!(write_rows > 0, "block-flood produces write rows");
 }
 
 /// E19 / T19.3 acceptance: a full `mixed-types` spawn with sensible
-/// defaults completes through `run_protocol` and emits JSONL `write`
-/// events whose leaf_count values sum to `values_per_tick` per tick
-/// and whose shapes include at least two of the three categories.
+/// defaults completes through `run_protocol` and emits compact-Parquet
+/// write rows whose leaf_count values sum to a positive multiple of
+/// `values_per_tick` and whose shape_idx values include at least two
+/// of the three categories (scalar=0, array=1, struct=2).
 #[test]
 fn test_mixed_types_through_driver_with_sensible_defaults_completes() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+    use variant_base::compact::EventKind;
+
     let dir = TempDir::new().unwrap();
     let log_dir = dir.path().to_str().unwrap();
     let mut args = test_args(log_dir);
@@ -1397,34 +1336,30 @@ fn test_mixed_types_through_driver_with_sensible_defaults_completes() {
     let mut dummy = VariantDummy::new(&args.runner);
     run_protocol(&mut dummy, &args).expect("mixed-types with sensible defaults must complete");
 
-    let log_path = dir.path().join("dummy-test-runner-run01.jsonl");
-    let file = std::fs::File::open(&log_path).unwrap();
-    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
-    let writes: Vec<&serde_json::Value> = lines.iter().filter(|l| l["event"] == "write").collect();
-    assert!(!writes.is_empty(), "mixed-types produces write events");
+    let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
+    let reader = SerializedFileReader::new(std::fs::File::open(&parquet_path).unwrap()).unwrap();
+    let mut total_leaves: i64 = 0;
+    let mut shapes: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut write_rows = 0usize;
+    for row in reader.get_row_iter(None).unwrap().flatten() {
+        if row.get_int(1).unwrap() == EventKind::Write as i32 {
+            total_leaves += row.get_int(11).unwrap() as i64;
+            shapes.insert(row.get_int(12).unwrap());
+            write_rows += 1;
+        }
+    }
+    assert!(write_rows > 0, "mixed-types produces write rows");
 
-    // Sum of leaf_count must equal vpt * tick_count. tick_count is hard
-    // to pin precisely (operate_secs=1, tick_rate_hz=10 produces ~10
-    // ticks), so we instead assert the per-tick invariant: leaf_count
-    // is divisible by vpt across all writes belonging to whole ticks.
-    let total_leaves: u64 = writes
-        .iter()
-        .map(|w| w["leaf_count"].as_u64().unwrap())
-        .sum();
-    assert!(
-        total_leaves > 0 && total_leaves.is_multiple_of(args.values_per_tick as u64),
-        "total leaves ({total_leaves}) must be a positive multiple of vpt ({})",
+    // Sum of leaf_count must be a positive multiple of vpt.
+    assert!(total_leaves > 0);
+    assert_eq!(
+        total_leaves % (args.values_per_tick as i64),
+        0,
+        "total leaves ({total_leaves}) must be a multiple of vpt ({})",
         args.values_per_tick
     );
 
-    // Shapes diversity: at least two distinct shape strings appear.
-    let shapes: std::collections::HashSet<&str> = writes
-        .iter()
-        .map(|w| w["shape"].as_str().unwrap())
-        .collect();
+    // Shapes diversity: at least two distinct shape indices appear.
     assert!(
         shapes.len() >= 2,
         "mixed-types must produce more than one shape; got {shapes:?}"
@@ -1458,37 +1393,11 @@ fn test_block_flood_indivisible_blob_size_is_rejected_at_startup() {
     );
 }
 
-/// E19 / T19.2: scalar-flood end-to-end via `run_protocol` still emits
-/// `leaf_count = 1, shape = "scalar"` on every write line. This is the
-/// "no regression" smoke test guaranteed by the E19 acceptance: existing
-/// scalar-flood spawns add the two new fields with their default values
-/// and remain otherwise unchanged.
-#[test]
-fn test_scalar_flood_through_driver_emits_scalar_leaf_count_and_shape() {
-    let dir = TempDir::new().unwrap();
-    let log_dir = dir.path().to_str().unwrap();
-    let args = test_args(log_dir);
-    let mut dummy = VariantDummy::new(&args.runner);
-    run_protocol(&mut dummy, &args).expect("scalar-flood spawn must complete");
-
-    let log_path = dir.path().join("dummy-test-runner-run01.jsonl");
-    let file = std::fs::File::open(&log_path).unwrap();
-    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
-    let writes: Vec<&serde_json::Value> = lines.iter().filter(|l| l["event"] == "write").collect();
-    assert!(!writes.is_empty(), "scalar-flood produces write events");
-    for (i, w) in writes.iter().enumerate() {
-        assert_eq!(w["leaf_count"], 1, "scalar-flood write {i} leaf_count");
-        assert_eq!(w["shape"], "scalar", "scalar-flood write {i} shape");
-    }
-}
-
-/// E19 / T19.2: scalar-flood through `run_protocol` also writes
+/// E19 / T19.2: scalar-flood through `run_protocol` writes
 /// `leaf_count = 1, shape_idx = 0` on every compact `write` row. This
-/// pairs with the JSONL assertion above to lock in the
-/// no-regression contract end-to-end.
+/// is the "no regression" smoke test guaranteed by the E19 acceptance:
+/// existing scalar-flood spawns add the two new fields with their
+/// default values and remain otherwise unchanged.
 #[test]
 fn test_scalar_flood_through_driver_emits_scalar_columns_in_parquet() {
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -1520,37 +1429,8 @@ fn test_scalar_flood_through_driver_emits_scalar_columns_in_parquet() {
     assert!(write_rows > 0, "expected at least one write row");
 }
 
-/// Use the unused `WriteShape` import to silence the rustc dead-code
-/// warning -- this asserts the canonical strings round-trip through
-/// the Logger's emit path.
-#[test]
-fn test_write_shape_string_roundtrip_through_logger() {
-    use variant_base::logger::Logger;
-
-    let dir = TempDir::new().unwrap();
-    let log_dir = dir.path().to_str().unwrap();
-    let mut logger = Logger::new(log_dir, "v", "r", "shape-roundtrip").unwrap();
-    for shape in [WriteShape::Scalar, WriteShape::Array, WriteShape::Struct] {
-        logger
-            .log_write_at(
-                chrono::Utc::now(),
-                shape.as_u8() as u64,
-                "/p",
-                Qos::BestEffort,
-                8,
-                3,
-                shape,
-            )
-            .unwrap();
-    }
-    logger.flush().unwrap();
-    let path = dir.path().join("v-r-shape-roundtrip.jsonl");
-    let file = std::fs::File::open(&path).unwrap();
-    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
-    assert_eq!(lines[0]["shape"], "scalar");
-    assert_eq!(lines[1]["shape"], "array");
-    assert_eq!(lines[2]["shape"], "struct");
-}
+// (T19.10) Removed `test_write_shape_string_roundtrip_through_logger`:
+// it asserted on per-event JSONL write lines produced by
+// `Logger::log_write_at`, which no longer exists. Compact-Parquet
+// shape_idx round-tripping is covered by the block-flood /
+// mixed-types / scalar-flood Parquet tests above.
