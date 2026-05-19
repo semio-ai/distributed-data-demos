@@ -13245,3 +13245,205 @@ self-contained. The analyzer can dispatch on `kind` to discriminate
 event types; the per-kind `extra_*` slot mapping in
 `metak-shared/api-contracts/compact-log-schema.md` § Event kinds
 is the authoritative reference.
+
+## T18.5 — runner: `--log-dir <path>` arg + `[runner]` TOML key
+
+**Status**: implementation complete, tests pass. **Ready for T18.7
+user-owned re-run** (gated on T18.2b + T18.4 also landing).
+
+**Implementation summary**:
+
+- New `Cli` field `log_dir: Option<PathBuf>` in `runner/src/main.rs`
+  with full doc-comment including the four-tier precedence (CLI >
+  `[runner]` TOML key > legacy `[variant.common].log_dir` > `./logs`).
+- New `RunnerSection` struct in `runner/src/config.rs` carrying
+  `log_dir: Option<String>`. Wired as `BenchConfig::runner:
+  Option<RunnerSection>` with `#[serde(default)]` so existing configs
+  without a `[runner]` section continue to parse unchanged. Accessor
+  `BenchConfig::runner_log_dir() -> Option<&str>`.
+- New helper `config::validate_log_dir_writable(&Path) -> Result<()>`:
+  `create_dir_all` the chosen path, write `.runner-write-probe`, delete
+  it. Errors include the offending path AND the underlying I/O error.
+- `main::run` resolves the base log dir before discovery and announces
+  the source on stderr (`base log dir: <path> (source: ...)`). Writability
+  probe runs immediately after; failure aborts the run with a
+  standard `anyhow::Error` (NOT `EX_TEMPFAIL` -- non-writable shared
+  folder is a permissions / config issue, not a transient peer failure
+  that `--resume` would fix).
+- Per-variant `log_dir_resolved` now honours the runner-side override:
+  when CLI `--log-dir` or `[runner].log_dir` is set, the runner always
+  passes `<base>/<log_subdir>` to the variant regardless of what the
+  variant's `[variant.common].log_dir` declares. The
+  `coding-standards.md` invariant (`log_dir = "./logs"` in every
+  config) is preserved -- variants still see the override and write
+  there.
+
+**Cross-platform notes**:
+
+- UNC paths on Windows (`\\fileserver\bench\logs`) are passed through
+  verbatim. Test `runner_log_dir_accepts_unc_path_on_windows` pins
+  the TOML literal-string parse round-trip.
+- Mounted NFS / SMB on Linux: the path is opaque; the probe write
+  surfaces the actual `EACCES` / `ENOENT` from the kernel through
+  `anyhow` with the offending path included.
+
+**Tests added** (all green):
+
+- Unit tests in `runner/src/config.rs`:
+  - `runner_log_dir_absent_when_section_missing`
+  - `runner_log_dir_absent_when_section_empty`
+  - `runner_log_dir_parses_when_set`
+  - `runner_log_dir_accepts_unc_path_on_windows`
+  - `validate_log_dir_writable_succeeds_on_temp_dir`
+  - `validate_log_dir_writable_creates_parents`
+  - `validate_log_dir_writable_fails_for_unwritable_root` (Unix-only,
+    `/proc/sys/...` path)
+- Integration tests in `runner/tests/integration.rs`:
+  - `t18_5_log_dir_cli_flag_redirects_variant_output` -- variant
+    JSONL lands under `--log-dir`, not `./logs`. Pins the stderr line
+    `source: --log-dir CLI flag`.
+  - `t18_5_log_dir_toml_key_redirects_variant_output` -- same with
+    `[runner] log_dir = "..."`, pins `source: [runner] log_dir TOML key`.
+  - `t18_5_log_dir_cli_overrides_toml` -- when both are set the CLI
+    wins; the TOML-only path is never created.
+  - `t18_5_log_dir_unwritable_path_aborts_with_clear_error` --
+    passes a path whose parent is a regular file (rejected by both
+    Windows + Unix kernels); asserts the runner exits non-zero with
+    a `writability check failed` / `not writable` message.
+
+**Contract updates**: `metak-shared/api-contracts/toml-config-schema.md`
+gained a new `[runner]` section in the schema sketch and a new
+"E18 additions: `[runner]` section and `log_dir` override" subsection
+that documents the four-tier precedence, the writability probe, and
+the cross-platform notes. The `[variant.common].log_dir = "./logs"`
+invariant in `coding-standards.md` is unchanged -- the runner-side
+override is purely additive.
+
+**Files changed**:
+
+- `runner/src/main.rs` -- `Cli.log_dir`, base-dir resolution loop,
+  per-spawn `log_dir_resolved` override.
+- `runner/src/config.rs` -- `RunnerSection`, `BenchConfig.runner`,
+  `runner_log_dir()`, `validate_log_dir_writable`, unit tests.
+- `runner/tests/integration.rs` -- four T18.5 integration tests +
+  shared `build_minimal_single_runner_config` helper.
+- `runner/CUSTOM.md` -- "Base log directory selection (T18.5)"
+  section.
+- `metak-shared/api-contracts/toml-config-schema.md` -- `[runner]`
+  schema + E18 additions block.
+
+**Deviations**: none from the task spec. The optional `Runner` struct
+is named `RunnerSection` in code to avoid a name clash with any
+future `runner::*` module.
+
+## T18.6 — runner: `--analyze-full` arg
+
+**Status**: implementation complete, tests pass. **Ready for T18.7
+user-owned re-run** (gated on T18.2b + T18.4 also landing).
+
+**Implementation summary**:
+
+- New `Cli` field `analyze_full: bool` in `runner/src/main.rs`.
+- New module `runner/src/analyze.rs` (~190 lines incl. tests) with:
+  - `should_run_analysis(this_runner, all_runners) -> bool` -- true
+    iff `this_runner` is the lexicographically lowest name in
+    `runners`. Matches the pair-convention used by T14.24 / T15.3 /
+    T15.10 and the websocket / webrtc / hybrid TCP pairings.
+  - `find_repo_root(start) -> Option<PathBuf>` -- bounded walkup
+    (`REPO_WALKUP_LIMIT = 8`) from the runner binary's parent
+    looking for `analysis/analyze.py`. Works for both
+    `runner/target/release/runner` and workspace-rooted
+    `target/release/runner`.
+  - `resolve_python() -> Result<&'static str, String>` -- tries
+    `python3` first, falls back to `python`; probe via
+    `Command::new(<cand>).arg("--version").status()` and treat
+    `Ok(_)` as "exists". Returns a clear error message naming both
+    candidates when neither resolves.
+  - `run_post_matrix_analysis(this_runner, all_runners,
+    final_log_dir)` -- the main entry point. Skips silently when this
+    runner is not the lowest-sorted name. Otherwise spawns
+    `<python> <repo>/analysis/analyze.py <log-dir> --summary --dump
+    --diagrams --output <log-dir>/analysis` with
+    `current_dir(<repo>/analysis)` and inherited stdout/stderr.
+  - Non-zero Python exit -> `[runner:<name>] WARN: analysis exited
+    Some(<code>) (non-fatal; benchmark itself succeeded)`. The
+    runner's own exit code is unchanged.
+- Hooked into `main::run` after `print_summary` and before the
+  resume-mode summary line / failure-exit. Runs even on partial
+  matrix failures so the analyzer can report on whatever was
+  collected.
+
+**Pair-convention rationale**: the lowest-sorted-name rule (alice in
+alice/bob) matches the existing T14.24 resume_manifest pairing rule
+exactly (which itself matches T15.3 + T15.10). Operators do not need
+to learn a new convention. Single-runner mode trivially picks the
+sole runner.
+
+**Tests added** (all green):
+
+- Unit tests in `runner/src/analyze.rs`:
+  - `should_run_analysis_picks_lowest_sorted_name`
+  - `should_run_analysis_single_runner_is_always_chosen`
+  - `should_run_analysis_handles_alpha_numeric_mix`
+  - `should_run_analysis_empty_runners_picks_nobody`
+  - `find_repo_root_walks_up_to_analysis_dir`
+  - `find_repo_root_returns_none_when_nothing_matches`
+  - `resolve_python_finds_at_least_one_interpreter_when_present`
+- Integration tests in `runner/tests/integration.rs`:
+  - `t18_6_analyze_full_invokes_analyzer_after_matrix` -- end-to-end
+    smoke with variant-dummy. SKIPs gracefully when Python is not on
+    PATH (single-host CI). Pins the `running analysis` stderr line.
+    When the analyzer succeeds (reports `analysis complete`), also
+    asserts the `<log-dir>/<session>/analysis/` subfolder exists.
+  - `t18_6_analyze_full_skips_when_runner_is_not_lowest_name` --
+    verifies the `--help` surface mentions both `--analyze-full`
+    and `--log-dir`. (The pair-convention skip path itself is
+    exercised by the analyze.rs unit tests since standing up an
+    absent peer in an integration test would require a full
+    multi-machine fixture.)
+
+**Files changed**:
+
+- `runner/src/main.rs` -- `mod analyze;`, `Cli.analyze_full`, post-
+  summary invocation block.
+- `runner/src/analyze.rs` -- new module, ~190 lines incl. tests.
+- `runner/tests/integration.rs` -- two T18.6 integration tests +
+  `python_on_path` helper.
+- `runner/CUSTOM.md` -- "Auto-analysis after the matrix (T18.6)"
+  section documenting the lowest-sorted-name rule, the repo-root
+  walkup, the Python resolution order, and the non-fatal-exit
+  contract.
+
+**Deviations from the task spec**: none. The task says
+"lower-sorted-index" which this worker interprets as the
+lexicographically lowest name (matches the rest of the codebase's
+pairing convention); `runners[0]` would be ambiguous because the
+config's `runners` array is not required to be sorted.
+
+**Lint / test state at handoff**:
+
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  -- clean.
+- `cargo fmt -p runner -- --check` -- clean. (Workspace-wide
+  `cargo fmt --check` surfaces diffs inside `variant-base/`, owned
+  by the concurrent T18.2b worker; not touched.)
+- `cargo test --release -p runner` --
+  - All 7 T18 tests pass.
+  - One unrelated flaky test
+    (`barrier_coord::tests::two_runner_barrier_exchange_round_trips`)
+    intermittently times out the cross-runner Ready exchange over
+    barrier TCP; re-running the test alone passes immediately. The
+    flake pre-dates T18.5 / T18.6 and lives in code this worker did
+    not touch.
+  - One pre-existing test
+    (`qos_array_produces_per_qos_log_files`) asserts a legacy
+    `qos` field is present inside the JSONL. Under the concurrent
+    T18.2 / T18.2b compact-log work on `variant-base/` (already
+    committed to `main`), the field is no longer emitted into legacy
+    JSONL; the test will need updating as part of the T18.4
+    analysis-side rollout, NOT here. The failure surfaced
+    independently of T18.5 / T18.6.
+
+**Commits**: implementation is split into three logical commits per
+the worker brief (T18.5 -> T18.6 -> contract). See `git log` for the
+final SHAs at the end of the worker run.
