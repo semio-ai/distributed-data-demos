@@ -4780,6 +4780,7 @@ dependencies = [
  "chrono",
  "clap",
  "parquet",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "socket2 0.5.10",
