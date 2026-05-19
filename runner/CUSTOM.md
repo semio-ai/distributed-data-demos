@@ -779,3 +779,31 @@ The pair-convention skip path emits:
 ```
 [runner:<name>] --analyze-full set, but this runner is not the lowest-sorted name ('<lowest>'); skipping analysis
 ```
+
+## Workload-shape params (T19.4 / E19)
+
+E19 adds new optional `[variant.common]` keys that the runner must
+forward to the variant CLI verbatim:
+
+| TOML key | CLI arg | Used by |
+|---|---|---|
+| `blob_size` | `--blob-size` | `block-flood` |
+| `mixed_scalars_min` | `--mixed-scalars-min` | `mixed-types` |
+| `mixed_scalars_max` | `--mixed-scalars-max` | `mixed-types` |
+| `mixed_arrays_min` | `--mixed-arrays-min` | `mixed-types` |
+| `mixed_arrays_max` | `--mixed-arrays-max` | `mixed-types` |
+| `mixed_dict_split_max` | `--mixed-dict-split-max` | `mixed-types` |
+| `workload_seed` | `--workload-seed` | all profiles |
+
+Follow the existing `snake_case` → `--kebab-case` forwarding
+convention. The runner does NOT validate workload-param values — the
+variant rejects invalid combinations at startup with a descriptive
+Err.
+
+These keys do NOT participate in the existing array-expansion
+mechanism (E9 / E14). They are scalar-only. Configs that want
+multiple workload shapes write multiple `[[variant]]` entries
+(typically via a shared `[[variant_template]]`).
+
+See `metak-shared/api-contracts/toml-config-schema.md` E19 additions
+for the full schema and validation rules.

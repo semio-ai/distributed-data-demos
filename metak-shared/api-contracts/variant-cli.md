@@ -190,3 +190,53 @@ emitter thread is not spawned. Pre-E15 runner integration tests work
 unchanged because they do not pass the new flag, and clap's default
 for the arg is `1000` -- which is a no-op for tests that never read
 the child's stdout.
+
+---
+
+## E19 additions: workload-shape CLI args
+
+Approved 2026-05-19. Variant-base CLI gains the new workload-param
+args. Forwarded by the runner from `[variant.common]` per the TOML
+schema E19 additions.
+
+### `--blob-size <u32>`
+
+Used by `--workload block-flood`. Number of scalar leaves per WriteOp.
+Default `100`. Validation: `values_per_tick % blob_size == 0`.
+
+### `--mixed-scalars-min <u32>`, `--mixed-scalars-max <u32>`
+
+Used by `--workload mixed-types`. Bounds on standalone scalar WriteOps
+per tick. Both required when workload is `mixed-types`.
+
+### `--mixed-arrays-min <u32>`, `--mixed-arrays-max <u32>`
+
+Used by `--workload mixed-types`. Bounds on total leaves allocated to
+array WriteOps. `mixed_arrays_max` also bounds the number of distinct
+array WriteOps generated. Both required when workload is `mixed-types`.
+
+### `--mixed-dict-split-max <u32>`
+
+Used by `--workload mixed-types`. Max branching factor at each level
+of the nested-dict allocation; min implicitly 1. Required when
+workload is `mixed-types`.
+
+### `--workload-seed <u64>`
+
+Optional. RNG seed for reproducible workload generation. When omitted,
+the variant derives a deterministic seed from the spawn name + run id
+so two re-runs with identical config produce identical workload
+sequences.
+
+### Validation behaviour
+
+The variant rejects the spawn at startup (exit non-zero before any
+phase event) when:
+- `--workload block-flood` and `--blob-size` is missing or
+  `values_per_tick % blob_size != 0`.
+- `--workload mixed-types` and any of the five `mixed-*` args is
+  missing.
+- `--workload mixed-types` and `mixed-dict-split-max < 2`.
+
+Existing profiles (`scalar-flood`, `max-throughput`) ignore all new
+args.

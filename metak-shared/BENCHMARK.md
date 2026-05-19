@@ -174,15 +174,53 @@ Each variant binary is a standalone executable that:
 
 ## 6. Workload Profiles
 
-Each operation phase runs a named workload profile. Planned profiles:
+Each operation phase runs a named workload profile.
+
+### `values_per_tick` invariant
+
+Across all workload profiles, `values_per_tick` (`vpt`) is **total
+scalar (leaf) values per tick**. Profiles differ in how those leaves
+are packed into `WriteOp`s; the leaf count remains the analysis tool's
+comparable headline denominator (`leaves_per_sec`). See
+`api-contracts/jsonl-log-schema.md` E19 additions.
+
+### Implemented profiles
+
+| Profile | WriteOps/tick | Per-WriteOp shape | Stresses |
+|---|---|---|---|
+| `scalar-flood` | `vpt` (one per leaf) | scalar (1 leaf, 8 B `f64`) | per-message overhead, fan-out, header bloat |
+| `max-throughput` | `vpt` (one per leaf) | scalar | transport raw ceiling — no tick sleep; relies on `Ok(false)` self-pacing |
+| `block-flood` | `vpt / blob_size` | array (`blob_size` leaves, `blob_size * 8` B) | serialization cost, large-message handling, MTU/fragmentation |
+| `mixed-types` | variable | mix of scalar / array / struct shapes; leaves sum to `vpt` | full serialization path including nested `KeyValue` structures |
+
+### Profile parameters
+
+- **`scalar-flood`** — no parameters beyond `vpt` and `tick_rate_hz`.
+- **`max-throughput`** — no parameters beyond `vpt`. Incompatible with
+  QoS 3/4 (rejected at startup per DESIGN.md § 6.5).
+- **`block-flood`** — `blob_size: u32` (default 100). Validation:
+  `vpt % blob_size == 0`.
+- **`mixed-types`** —
+  `mixed_scalars_min / max`,
+  `mixed_arrays_min / max`,
+  `mixed_dict_split_max`,
+  optional `workload_seed`. See `EPICS.md` E19 "Locked spec" for the
+  allocation algorithm.
+
+### Planned (not yet implemented)
 
 | Profile | Description |
 |---|---|
-| `scalar-flood` | Single writer, 1,000 scalar `Value` updates per tick at 100 Hz. Measures raw throughput and baseline latency. |
 | `multi-writer` | N nodes each own a subtree, all writing concurrently. Measures fan-out and cross-traffic interference. |
-| `mixed-types` | Mix of scalar, array, and nested `KeyValue` updates. Measures serialization cost variance. |
 | `burst-recovery` | Sustained writes followed by a deliberate pause, then a burst. Measures buffering and recovery behavior under load spikes. |
 | `qos-ladder` | Same data written under each QoS level sequentially. Directly compares QoS latency/loss characteristics. |
+
+### Latency unit
+
+Replication latency is reported **per `WriteOp`** across all profiles.
+Block-flood and mixed-types produce one latency sample per published
+block (one `try_publish` call). Scalar-flood preserves per-leaf
+granularity coincidentally (1 leaf = 1 op).
 
 ## 7. Metrics
 

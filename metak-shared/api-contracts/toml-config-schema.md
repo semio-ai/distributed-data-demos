@@ -367,3 +367,48 @@ spawn does NOT appear in the run summary.
 
 Existing configs that omit `threading_modes` continue to behave exactly
 as today: single-threaded spawns only. The new field is purely additive.
+
+---
+
+## E19 additions: workload-shape params in `[variant.common]`
+
+Approved 2026-05-19. Adds optional flat keys to `[variant.common]`
+that parameterize the new `block-flood` and `mixed-types` workload
+profiles. All are forwarded by the runner verbatim as `--kebab-case`
+CLI args — the runner does not interpret them.
+
+### New optional `[variant.common]` keys
+
+| Field | Type | Used by | Description |
+|-------|------|---------|-------------|
+| `blob_size` | integer | `block-flood` | Number of scalar leaves per WriteOp. `values_per_tick` must be divisible by `blob_size`. Default `100`. |
+| `mixed_scalars_min` | integer | `mixed-types` | Lower bound on standalone scalar WriteOps per tick. |
+| `mixed_scalars_max` | integer | `mixed-types` | Upper bound on standalone scalar WriteOps per tick. |
+| `mixed_arrays_min` | integer | `mixed-types` | Lower bound on total leaves allocated to array WriteOps. |
+| `mixed_arrays_max` | integer | `mixed-types` | Upper bound on total leaves allocated to array WriteOps. Also bounds the number of distinct array WriteOps. |
+| `mixed_dict_split_max` | integer | `mixed-types` | Max branching factor at each level of the nested-dict allocation. Min is implicitly 1. |
+| `workload_seed` | integer (u64) | all profiles | RNG seed for reproducible workload generation. When omitted, derived from spawn name + run id. |
+
+### Validation
+
+- `block-flood` requires `blob_size > 0` and `values_per_tick %
+  blob_size == 0`. The variant rejects the spawn at startup if the
+  invariant is violated.
+- `mixed-types` requires all six `mixed_*` keys to be set, with
+  `mixed_scalars_max <= values_per_tick`, `mixed_arrays_max <=
+  values_per_tick - mixed_scalars_min`, and `mixed_dict_split_max >= 2`.
+- Other profiles (`scalar-flood`, `max-throughput`) ignore these keys.
+
+### Forwarding
+
+The runner converts `snake_case` keys to `--kebab-case` args per the
+existing convention. Example: `blob_size = 100` becomes
+`--blob-size 100` on the variant CLI.
+
+### Expansion
+
+The new keys do NOT participate in the existing array-expansion
+mechanism (E9 / E14). They are scalar-only. If a future config needs
+to sweep over `blob_size` values, that's a separate follow-up; for
+now, configs that want multiple shapes write multiple `[[variant]]`
+entries (typically via a shared `[[variant_template]]`).

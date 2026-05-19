@@ -5,13 +5,14 @@ by the analysis tool.
 
 Source: BENCHMARK.md S8, ANALYSIS.md S4-S6.
 
-> **Note (E18, 2026-05-18)**: starting with the E18 rollout, variants
-> default to the **compact post-run digest format** documented in
-> [`compact-log-schema.md`](compact-log-schema.md) and write a single
-> Parquet file per spawn instead of one JSONL line per event. The JSONL
-> schema below remains authoritative for legacy datasets and for the
-> opt-in `--legacy-jsonl-events` debug mode. The analyzer's format
-> detector picks whichever is present per spawn.
+> **Scope (post-E19 cleanup, 2026-05-19)**: this JSONL stream carries
+> **lifecycle events only** — `phase`, `connected`, `eot_*`, `resource`,
+> `clock_sync`. Per-event observations (`write`, `receive`,
+> `backpressure_skipped`, `gap_detected`, `gap_filled`) are written to a
+> compact Parquet digest at the end of each spawn — see
+> [`compact-log-schema.md`](compact-log-schema.md). The E18 dual-emission
+> opt-in (`--legacy-jsonl-events`) was removed in the E19 follow-up
+> cleanup; there is no path that emits per-event data to JSONL any more.
 
 ## General Rules
 
@@ -59,87 +60,6 @@ Logged at the start of each test protocol phase.
 
 The `eot` phase is the bounded end-of-test handshake between `operate`
 and `silent`. See `eot-protocol.md` for the full contract.
-
-### `write`
-
-Logged by the writer each time a value is written during the operate phase.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `seq` | integer | Monotonic sequence number for this writer |
-| `path` | string | Key path (e.g. `/sensors/lidar`) |
-| `qos` | integer | QoS level (1-4) |
-| `bytes` | integer | Serialized size of the value in bytes |
-
-The `ts` common field on `write` events is the wall-clock timestamp
-captured by the driver **immediately before** calling the variant's
-`try_publish()`. This is intentionally taken before the send so that on
-same-host benchmarks the writer's `ts` is monotonically before any
-peer's reader thread can observe the bytes -- without this ordering,
-multi-mode reader threads on the same machine (which share a
-QPC-backed `Utc::now()` source) can log a `receive` event whose `ts`
-precedes the corresponding `write.ts`, violating the contract that
-`receive_ts >= write_ts`. Changes the previous semantic (captured
-after `try_publish` returned) introduced under T16.2 (2026-05-14).
-
-### `backpressure_skipped`
-
-**Valid only at QoS 1 and QoS 2.** Per `DESIGN.md` § 6.5 (Strict No-Skip
-Contract for QoS 3/4), the variant MUST block the publish call at
-QoS 3/4 rather than skip. The driver enforces this (loops on
-`Ok(false)` at QoS 3/4) and the analyzer flags any
-`backpressure_skipped` row with `qos in (3, 4)` as a contract violation.
-
-Logged by the writer when the driver's per-tick value loop calls
-`Variant::try_publish` and the transport reports `Ok(false)`
-(backpressured -- not delivered, not retried within this tick). No
-matching `write` event is emitted for the skipped value, and no
-receiver will see a `receive` for it. Diagnostic counter used by
-analysis to distinguish "writer held back" from "writer sent and
-downstream dropped it".
-
-Under the `max-throughput` workload profile (T-impl.8), emitting this
-event ALSO triggers the driver's two-tier self-pacing back-off:
-`std::thread::yield_now()` on the first consecutive skip since the
-last successful publish, then `std::thread::sleep(Duration::from_millis(1))`
-on the second and later consecutive skips. The counter resets on every
-`Ok(true)`. Under `scalar-flood` the inter-tick sleep is the sole
-pacing and no extra back-off is applied.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `path` | string | Key path that would have been written |
-| `qos` | integer | QoS level (1-4) |
-
-### `receive`
-
-Logged by a reader each time a replicated value is received.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `writer` | string | Runner name of the node that wrote the value |
-| `seq` | integer | The writer's sequence number for this update |
-| `path` | string | Key path |
-| `qos` | integer | QoS level |
-| `bytes` | integer | Serialized size |
-
-### `gap_detected`
-
-Logged by a reader when a sequence gap is detected (QoS 3).
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `writer` | string | Runner name of the writer |
-| `missing_seq` | integer | The missing sequence number |
-
-### `gap_filled`
-
-Logged by a reader when a previously detected gap is recovered (QoS 3).
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `writer` | string | Runner name of the writer |
-| `recovered_seq` | integer | The recovered sequence number |
 
 ### `eot_sent`
 
@@ -211,17 +131,6 @@ this file entirely.
 
 Note: in clock-sync events, the `variant` common field carries the variant
 about to start (or `""` for the initial sync that runs before any variant).
-
-## Correlation Key
-
-The analysis tool correlates writes and receives using:
-
-```
-(variant, run, writer, seq, path)
-```
-
-where `writer` on the receive side comes from the `receive` event's `writer`
-field, and on the write side from the `write` event's `runner` field.
 
 ## Known Deviations
 

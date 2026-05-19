@@ -14,9 +14,11 @@ written after the operate + silent phases complete. Target reduction:
 30-50× smaller files via columnar layout, dict-encoding, and
 path-interning.
 
-Legacy per-message JSONL remains supported (read-side by the analyzer,
-write-side by the variant under an opt-in `--legacy-jsonl-events` flag)
-for live debugging and for replay of older datasets.
+Per-event JSONL emission was removed in the E19 follow-up cleanup
+(2026-05-19). The `--legacy-jsonl-events` opt-in is gone; per-event
+observations are compact-Parquet only. Lifecycle events (`phase`,
+`connected`, `eot_*`, `resource`, `clock_sync`) continue to be written
+as JSONL — see [`jsonl-log-schema.md`](jsonl-log-schema.md).
 
 ## File format
 
@@ -195,16 +197,18 @@ needs ~72 MB before serialization.
 Defaults sized for 100 K msg/s × 30 s × 1000-path workloads with
 generous headroom. Long-running soak tests may need to bump.
 
-## Coexistence with legacy JSONL
+## Per-spawn file pair
 
-- The analyzer's format detector picks compact-parquet if present,
-  otherwise legacy JSONL.
-- The variant defaults to writing compact-parquet from T18.2 onward.
-- A new variant CLI flag `--legacy-jsonl-events` (default OFF) makes
-  the variant ALSO stream legacy per-message JSONL alongside the
-  compact file — useful for live debugging where you want to `tail -f`
-  events as they happen. When the flag is set, the same data is
-  written to both formats; analysis prefers compact.
+Each spawn produces TWO files in `<log_dir>/<run>-<launch_ts>/`:
+
+- `<variant>-<runner>-<run>.jsonl` — lifecycle events only (phase,
+  connected, eot_*, resource, clock_sync). See
+  [`jsonl-log-schema.md`](jsonl-log-schema.md).
+- `<variant>-<runner>-<run>.compact.parquet` — per-event observations
+  (this schema).
+
+The analyzer reads both and joins them by `(variant, runner, run)`
+provenance.
 
 ## Out of scope (for E18)
 
@@ -236,3 +240,60 @@ do NOT require a bump if older readers can simply ignore them.
 The analyzer's per-shard parquet cache (`analysis/cache.py`) treats
 this `metainfo.schema_version` as the rebuild trigger, parallel to
 its own `SCHEMA_VERSION` constant for the internal cache shards.
+
+---
+
+## E19 additions: `leaf_count` and `shape` on write rows
+
+Approved 2026-05-19. Mirrors the `jsonl-log-schema.md` E19 additions
+for the columnar event table. Backward-compatible: legacy compact
+files default to `leaf_count = 1` and `shape = "scalar"`.
+
+### Event table additions
+
+Two new columns on `compact_events`:
+
+| Column | Type | Description |
+|---|---|---|
+| `leaf_count` | u32 nullable | Number of scalar leaves carried by the WriteOp. Null on non-write rows. Defaults to `1` for legacy files (pre-E19). |
+| `shape_idx` | u8 nullable | Index into the `shape_intern` dictionary. Null on non-write rows. |
+
+A new intern dictionary `shape_intern` in the KV file metadata maps
+`shape_idx` → one of `"scalar"`, `"array"`, `"struct"`. Defaults to
+`["scalar"]` so legacy files (without the column) read back as
+`shape = "scalar"` consistently.
+
+Receive rows (`kind = 1`) leave both columns null. The analyzer
+correlates receives with their matching write rows by
+`(writer, seq, path_idx)` and inherits `leaf_count` / `shape` from the
+write side. This keeps the wire opaque and the receive row's storage
+minimal.
+
+### Aggregate throughput numbers
+
+The analysis tool reports three distinct throughput metrics per spawn,
+all derived from the compact-Parquet write rows:
+
+- `ops_per_sec` = `count(write rows) / operate_secs` — number of
+  publish calls per second.
+- `leaves_per_sec` = `sum(leaf_count) / operate_secs` — the canonical
+  cross-workload comparable metric.
+- `bytes_per_sec` = `sum(bytes) / operate_secs`.
+
+For `scalar-flood` runs, `leaves_per_sec == ops_per_sec` because every
+WriteOp carries one leaf.
+
+### Latency unit
+
+Replication latency is reported **per WriteOp** across all workload
+profiles. Block-flood and mixed-types produce one latency sample per
+published block, which is what the transport actually measures
+end-to-end. Scalar-flood happens to coincide (1 leaf = 1 op) so
+existing scalar-flood latency results are unchanged.
+
+### Schema-version
+
+This is an **additive** change — no `metainfo.schema_version` bump
+required per the existing rule (additive new columns can be ignored by
+older readers). New compact-writer code emits the column; older files
+read back as default `1` / `"scalar"`.

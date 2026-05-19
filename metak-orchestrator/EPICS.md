@@ -1321,3 +1321,137 @@ E17 completion (T17.10 acceptance) is required before T18.7 can produce
 a meaningful baseline. T18.1-T18.6 implementation can start once
 T17.9-T17.10 land.
 
+---
+
+## E19: Workload-Shape Dimension
+
+**Repos**: `variant-base/`, `runner/`, `analysis/`, `metak-shared/`.
+
+**Status**: filed 2026-05-19 at user request. Implementation starts
+immediately — additive on top of E17 / E18 work, no blocking
+dependency.
+
+### Motivation
+
+The existing benchmark exclusively exercises the **per-message-overhead
+extreme**: `scalar-flood` with `vpt = 1000` produces 1000 distinct
+WriteOps per tick, each carrying a single 8-byte f64. This is one end
+of the spectrum.
+
+Realistic robotics / sensor-control workloads sit in the middle: a
+handful of WriteOps per tick (5-50), each carrying a structured block
+of values (a joint-state array, a trajectory waypoint set, a camera
+buffer). Total scalar count per tick is still ~1000, but the
+wire/serialization shape is radically different from `scalar-flood`.
+Today nothing in the benchmark surfaces this.
+
+E19 adds two workload profiles to cover this gap:
+
+- **`block-flood`** — fixed-size blocks. `vpt / blob_size` WriteOps per
+  tick, each carrying a `blob_size`-element block of scalars. Stresses
+  serialization cost and large-message transport handling.
+- **`mixed-types`** — heterogeneous tree per tick composed of scalars
+  + arrays + nested dicts, with exactly `vpt` total leaves distributed
+  across all three shapes. Stresses the full serialization path
+  including nested `KeyValue` structures.
+
+### Locked spec (user-approved 2026-05-19)
+
+- **`vpt` invariant**: across all workload profiles, `values_per_tick`
+  = total scalar (leaf) values per tick. Profiles differ in *how*
+  those leaves are packed into WriteOps; the leaf count remains the
+  analysis tool's comparable headline denominator.
+- **`block-flood` params**: `blob_size: u32` (default 100). Derives
+  `writes_per_tick = vpt / blob_size`. Validation: `vpt % blob_size ==
+  0`.
+- **`mixed-types` params**:
+  - `mixed_scalars_min`, `mixed_scalars_max` — count of standalone
+    scalar WriteOps per tick. Drawn as `nS = rand(min, max)`.
+  - `mixed_arrays_min`, `mixed_arrays_max` — total leaves to allocate
+    to arrays. Drawn as `nA = rand(min, min(max, (vpt - nS) / 2))`,
+    distributed across `rand(1, mixed_arrays_max)` array WriteOps.
+  - `mixed_dict_split_max` — max branching factor at each level of
+    the nested-dict allocation (min implicitly 1). Dicts absorb the
+    remainder `vpt - nS - nA`, splitting recursively using
+    `rand(1, mixed_dict_split_max)` at each level until each leaf
+    bucket holds one scalar.
+  - **Allocation order**: scalars → arrays → dicts. Biases the
+    generated tree toward nested structure.
+- **Latency canonical unit**: per-WriteOp everywhere. Scalar-flood
+  per-leaf latency is preserved as a coincidence (1 leaf = 1 op).
+  Block-flood / mixed-types report one latency sample per published
+  block — honest across all profiles. Cross-profile latency charts
+  need no footnote.
+- **Wire encoding**: opaque blob per WriteOp. The variant trait
+  signature `publish(path, &[u8], qos, seq)` is unchanged. Variants
+  treat the blob as one logical unit; transport-level
+  batching/coalescing remains variant-implementation-defined.
+  Receiver does NOT introspect payload bytes.
+- **Receive-side `leaf_count`**: not on the wire, not on the `receive`
+  event. The analysis tool correlates receives with their matching
+  write by `(writer, seq, path)` and inherits `leaf_count` / `shape`
+  from the write side.
+
+### Sub-tasks
+
+- **T19.1** Contract updates (jsonl-log-schema, compact-log-schema,
+  toml-config-schema, variant-cli, glossary) — **orchestrator-self**.
+- **T19.2** variant-base: workload structs (`BlockFlood`,
+  `MixedTypes`), `WriteOp` extension (`leaf_count`, `shape`), logger
+  emission of new fields.
+- **T19.3** variant-base: CLI plumbing for new workload params +
+  validation. Depends on T19.2.
+- **T19.4** runner: TOML schema for new `[variant.common]` keys, CLI
+  forwarding (verbatim — runner does not interpret). Depends on T19.3.
+- **T19.5** analysis: parse new fields, correlate receives to inherit
+  `leaf_count` / `shape`, report leaves/sec, ops/sec, bytes/sec
+  separately. Backfill defaults for legacy logs.
+- **T19.6** analysis: plots — restructure comparison-qos chart
+  (vertical stack + per-variant grouping with workload fill patterns
+  + threading distinction), add per-variant throughput-vs-shape chart.
+- **T19.7** docs: glossary terms, `BENCHMARK.md` § 6 updated with
+  locked spec.
+- **T19.8** E2E validation — two-runner config with scalar-flood +
+  block-flood + mixed-types back-to-back on at least one variant.
+
+### Post-validation follow-ups (filed 2026-05-19 after T19.8 report)
+
+- **T19.9** analysis: post-validation UX fixes (pivot regex for
+  unsuffixed variant names; throughput chart x-axis = workload name
+  not shape; canonical sort order for shape and workload axes).
+- **T19.10** legacy JSONL cleanup: remove `--legacy-jsonl-events`
+  opt-in and the per-event JSONL emission/parse paths. JSONL becomes
+  lifecycle-only (`phase`, `connected`, `eot_*`, `resource`,
+  `clock_sync`). Per-event observations are compact-Parquet only.
+  User-directed at T19.8 acceptance: "we don't have or want to ever
+  keep any legacy behaviour, clear it out please." Split into
+  T19.10a (variant-base), T19.10b (runner), T19.10c (analysis).
+
+### Sequencing
+
+```
+T19.1 (orchestrator) --> T19.2 --> T19.3 --> T19.4 --|
+                         T19.5 --> T19.6 -----------|--> T19.8
+                         T19.7 ----------------------|
+```
+
+Wave 1 (after T19.1): T19.2, T19.5, T19.7 in parallel — only need the
+contracts. Wave 2: T19.3, T19.6. Wave 3: T19.4. Wave 4: T19.8.
+
+### Backward compatibility
+
+Schema changes are additive. Legacy logs (pre-E19) backfill to
+`leaf_count = 1`, `shape = "scalar"`. Existing scalar-flood results
+stay valid and remain on the same axis as new block-flood /
+mixed-types results. No re-run needed.
+
+### Existing variant binaries
+
+No code changes expected in any of the concrete variants (zenoh,
+custom-udp, quic, hybrid, websocket, webrtc, aeron). They accept
+opaque `&[u8]` payloads and ship them; payload size grows but the
+trait interface is unchanged. T19.3 includes a smoke test against
+variant-dummy + custom-udp at `block-flood blob_size = 100`. Variants
+with fixed buffer-size hints (e.g. custom-udp's `buffer_size = 65536`)
+get a startup validation warning if `blob_size * 8 > buffer_size`.
+

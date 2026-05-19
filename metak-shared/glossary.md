@@ -31,3 +31,10 @@
 | launch_ts | RFC 3339 timestamp passed by the runner to the variant via `--launch-ts` at spawn time. Used to compute connection time without IPC. |
 | Pickle cache | The analysis tool caches parsed JSONL data in a `.analysis_cache.pkl` file to avoid re-parsing on repeated analysis runs. |
 | PTP | Precision Time Protocol. Sub-microsecond clock sync on a LAN. Preferred method for cross-node latency measurement. |
+| WriteOp | One logical unit produced by a workload profile per `Variant::try_publish` call: a `(path, payload, leaf_count, shape)` tuple. The transport ships the payload as one logical message even if the underlying socket coalesces multiple WriteOps. |
+| Leaf | One scalar value (typically 8 bytes for an `f64`) within a WriteOp's payload. A scalar WriteOp has one leaf; an array WriteOp has N leaves; a nested struct WriteOp has the sum of its branch leaves. |
+| Blob | Synonym for a multi-leaf WriteOp payload — used to emphasise that the wire encoding is opaque to variants and that internal leaf framing is invisible at the transport layer. |
+| leaf_count | Field on the JSONL `write` event and the compact-Parquet write row recording the number of leaves carried by that WriteOp. Defaults to `1` for backward compatibility. The analysis tool's `leaves_per_sec` headline number is the sum of this field divided by operate seconds. |
+| shape | Field on the JSONL `write` event and the compact-Parquet write row identifying the WriteOp shape: `scalar`, `array`, or `struct`. Used by the analysis tool to slice throughput / latency by workload shape. |
+| block-flood | E19 workload profile that emits `values_per_tick / blob_size` WriteOps per tick, each carrying a `blob_size`-element block of scalars. Stresses serialization cost and large-message transport handling. |
+| mixed-types | E19 workload profile that emits a heterogeneous mix of scalar / array / nested-struct WriteOps per tick, summing to exactly `values_per_tick` total leaves. Bounded by `mixed_scalars_min/max`, `mixed_arrays_min/max`, `mixed_dict_split_max`. Stresses the full serialization path including nested `KeyValue` structures. |

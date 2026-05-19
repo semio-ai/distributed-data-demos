@@ -615,3 +615,64 @@ least 10x smaller than the JSONL (10x is conservative slack on the
 parquet ~930 KB -- 16.3x. Release mode is expected to push this
 toward the upper end of the 10-30x range as the JSONL serialisation
 becomes the bottleneck rather than the Parquet writer.
+
+### Workload-shape dimension (T19.2 + T19.3 / E19)
+
+E19 introduces two new workload profiles alongside `scalar-flood` and
+`max-throughput`:
+
+- `block-flood` — emits `vpt / blob_size` WriteOps per tick, each
+  carrying a `blob_size`-element block of scalars. Stresses the
+  serialization path and large-message transport handling.
+- `mixed-types` — emits a heterogeneous mix of scalar / array /
+  nested-struct WriteOps per tick, summing to exactly `vpt` total
+  leaves. Stresses the full serialization path including nested
+  `KeyValue` structures.
+
+**`WriteOp` extension** (`workload.rs`): the existing
+`{ path, payload }` tuple gains:
+
+- `leaf_count: u32` — number of scalar leaves in `payload`. Scalar =
+  1; array = N; struct = total leaves in the tree.
+- `shape: WriteShape` — enum `{ Scalar, Array, Struct }`.
+
+**Logger emission**: every `write` event (JSONL + compact Parquet)
+carries `leaf_count` and `shape`. Defaults `leaf_count = 1, shape =
+Scalar` for backward compat with `scalar-flood` and `max-throughput`.
+
+**No trait-surface change**: the `Variant` trait's
+`publish(path, &[u8], qos, seq)` signature is unchanged. Payloads
+remain opaque bytes; the wire layer doesn't know or care about leaf
+structure. The `leaf_count` / `shape` metadata lives only on the log
+events.
+
+**Receive side**: receivers do NOT log `leaf_count` / `shape`. The
+analyzer correlates receives with their matching write event by
+`(writer, seq, path)` and inherits the metadata from the write side.
+This keeps receive-side handling minimal and consistent with the
+opaque-blob wire model.
+
+**Latency canonical unit**: per-WriteOp everywhere. Block-flood /
+mixed-types report one latency sample per published block (one
+timestamp pair per `try_publish` call). Scalar-flood preserves its
+per-leaf granularity as a coincidence — its WriteOps each carry one
+leaf, so 1 op = 1 leaf.
+
+**Mixed-types RNG determinism**: the new `--workload-seed` arg
+(optional) seeds the generator deterministically. When omitted, the
+seed is derived from `--variant + --run` so re-runs with identical
+config produce identical workload sequences. Use the `rand` crate's
+`StdRng`.
+
+**Mixed-types termination guarantee**: recursion depth is bounded at
+`log_2(vpt) + 4`; if the bound is reached during dict-tree expansion,
+the remaining leaves are emitted as a flat dict at that level. This
+prevents pathological infinite recursion when the random branching
+factor repeatedly picks 1.
+
+**Validation at startup** (in `run_protocol`): the driver checks
+workload-param constraints (see
+`metak-shared/api-contracts/variant-cli.md` E19 additions) and returns
+Err with a descriptive message BEFORE any phase event if the
+constraints are violated. The `max-throughput + qos 3/4` rejection
+pattern (T17.2) is the template.

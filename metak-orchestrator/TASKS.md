@@ -7806,3 +7806,573 @@ tables, drop-rate heatmaps).
      JSONL run on the same workloads.
 
 **Acceptance**: user signs off on the new pipeline.
+
+---
+
+## E19 — Workload-Shape Dimension
+
+See `EPICS.md` E19 for the locked spec, motivation, and sequencing.
+Wave structure: Wave 1 = T19.2 + T19.5 + T19.7 (parallel, need only
+contracts). Wave 2 = T19.3 + T19.6. Wave 3 = T19.4. Wave 4 = T19.8.
+
+### T19.1 — Contract updates [orchestrator-self, DONE]
+
+**Repo**: `metak-shared/api-contracts/` + `metak-shared/glossary.md`.
+**Owner**: orchestrator (no worker spawned).
+**Status**: landed with E19 filing 2026-05-19 — see "E19 additions"
+sections at the bottom of:
+
+- `jsonl-log-schema.md` — `leaf_count` + `shape` on `write` events.
+- `compact-log-schema.md` — `leaf_count` column + `shape_intern` dict
+  on the columnar event table.
+- `toml-config-schema.md` — new flat `[variant.common]` keys
+  (`blob_size`, `mixed_scalars_*`, `mixed_arrays_*`,
+  `mixed_dict_split_max`, `workload_seed`).
+- `variant-cli.md` — corresponding `--kebab-case` CLI args +
+  validation rules.
+- `glossary.md` — WriteOp, Leaf, Blob, leaf_count, shape,
+  block-flood, mixed-types.
+
+### T19.2 — variant-base: workload structs + WriteOp + logger [large]
+
+**Repo**: `variant-base/`.
+**Owner**: orchestrator → spawn worker (Wave 1).
+**Goal**: Add the two new workload profiles and extend the
+log-emission path to record the new shape metadata. Existing
+`scalar-flood` and `max-throughput` paths remain unchanged.
+
+**Files**:
+
+- `variant-base/src/workload.rs` — extend `WriteOp` with `leaf_count:
+  u32` and `shape: WriteShape` (enum `{ Scalar, Array, Struct }`).
+  `ScalarFlood::generate` emits `leaf_count = 1, shape = Scalar`.
+  New `BlockFlood` struct parameterized by `blob_size`, emits
+  `leaf_count = blob_size, shape = Array` per WriteOp. New
+  `MixedTypes` struct parameterized by
+  `(mixed_scalars_min, mixed_scalars_max, mixed_arrays_min,
+  mixed_arrays_max, mixed_dict_split_max, workload_seed)`, generates
+  a per-tick mix per the EPICS.md E19 locked-spec algorithm.
+- `variant-base/src/logger.rs` (and the compact emission path) —
+  emit `leaf_count` and `shape` on every `write` event. Both JSONL
+  and compact-Parquet writers updated. Pull `shape_intern` from
+  `compact-log-schema.md` E19 additions.
+- `variant-base/src/workload.rs::create_workload` — add the two new
+  names. Both new profiles need a configurable random seed
+  (`--workload-seed`).
+
+**Mixed-types allocation algorithm** (T19.2 owns the termination
+strategy; below is the locked-spec template):
+
+1. Draw `nS = rand(mixed_scalars_min, mixed_scalars_max)`. Emit `nS`
+   scalar WriteOps with random `f64` payloads.
+2. `remaining = vpt - nS`. Draw
+   `nA = rand(mixed_arrays_min, min(mixed_arrays_max,
+   remaining / 2))`. Distribute `nA` total leaves across
+   `k = rand(1, mixed_arrays_max)` array WriteOps using a uniform
+   random partition; each array WriteOp has `shape = Array`.
+3. `remaining = vpt - nS - nA`. Recursively allocate `remaining`
+   leaves to nested-dict WriteOps:
+   - If `remaining == 1`: emit one scalar WriteOp.
+   - Else if `remaining <= mixed_dict_split_max`: emit one Struct
+     WriteOp with `remaining` leaves (flat dict, terminates
+     recursion).
+   - Else: draw `k = rand(1, mixed_dict_split_max)`. Partition
+     `remaining` into `k` positive integers; recurse for each
+     child. Termination guarantee: depth bound =
+     `log_2(vpt) + 4`; if reached, force a flat dict at that
+     level.
+
+Use the `rand` crate's `StdRng` seeded from `--workload-seed`. When
+the seed is unset, derive deterministically from `--variant +
+--run`.
+
+**Tests** (in `variant-base/`):
+
+- Unit: `BlockFlood::generate(1000)` with `blob_size = 100` emits 10
+  WriteOps each with `leaf_count = 100, shape = Array,
+  payload.len() == 800`.
+- Unit: `BlockFlood::generate(vpt)` returns Err when
+  `vpt % blob_size != 0`.
+- Unit: `MixedTypes::generate(1000)` with a fixed seed produces
+  WriteOps whose `leaf_count` values sum to exactly 1000.
+- Unit: `MixedTypes::generate` with the same seed twice produces
+  identical output (determinism).
+- Unit: `MixedTypes::generate(N)` for N in {1, 10, 100, 1000}
+  always sums leaves to N.
+- Integration: VariantDummy spawn with `--workload block-flood
+  --blob-size 100 --values-per-tick 1000`, JSONL contains writes
+  with `leaf_count = 100, shape = "array"`.
+- Integration: same with `--workload mixed-types` — JSONL contains
+  a mix of scalar / array / struct shapes summing to `vpt` per
+  tick.
+
+**Acceptance**:
+
+- All new unit + integration tests pass.
+- Existing `scalar-flood` and `max-throughput` tests pass unchanged
+  (no regression).
+- `cargo clippy --release -p variant-base -- -D warnings` clean.
+- `cargo fmt -p variant-base -- --check` clean.
+- A `variant-dummy` smoke run at `mixed-types vpt=1000` produces a
+  valid JSONL file (parsing verified after T19.5 lands).
+
+### T19.3 — variant-base: CLI plumbing + validation [medium]
+
+**Repo**: `variant-base/`.
+**Owner**: orchestrator → spawn worker (Wave 2 — after T19.2).
+**Goal**: Expose the new workload params on the variant CLI and
+validate them at startup.
+
+**Files**:
+
+- `variant-base/src/cli.rs` — add fields:
+  - `blob_size: Option<u32>` (`--blob-size`, default `100` when
+    `--workload block-flood`)
+  - `mixed_scalars_min: Option<u32>` (`--mixed-scalars-min`)
+  - `mixed_scalars_max: Option<u32>` (`--mixed-scalars-max`)
+  - `mixed_arrays_min: Option<u32>` (`--mixed-arrays-min`)
+  - `mixed_arrays_max: Option<u32>` (`--mixed-arrays-max`)
+  - `mixed_dict_split_max: Option<u32>` (`--mixed-dict-split-max`)
+  - `workload_seed: Option<u64>` (`--workload-seed`)
+- `variant-base/src/driver.rs::run_protocol` — pass these into the
+  workload factory at the same point where `create_workload(name)`
+  is called today. Existing workload selection unchanged for
+  `scalar-flood` and `max-throughput`.
+
+**Validation** (`driver::run_protocol` early-return with descriptive
+Err, BEFORE any phase emission):
+
+- `workload == "block-flood"` requires `blob_size > 0` and
+  `values_per_tick % blob_size == 0`.
+- `workload == "mixed-types"` requires all five `mixed_*` params to
+  be set, with `mixed_scalars_max <= values_per_tick`,
+  `mixed_arrays_max <= values_per_tick - mixed_scalars_min`, and
+  `mixed_dict_split_max >= 2`.
+- Block-size sanity warning (stderr, not Err): if `blob_size * 8 >
+  65536`, emit a one-shot warning recommending the operator check
+  variant-specific buffer hints.
+
+**Smoke test against existing variants**: run each concrete variant
+binary (variant-dummy, custom-udp; others optional in this task) at
+`block-flood vpt=1000 blob_size=100`. Confirm no startup errors and
+a non-empty JSONL. Validates the "no code changes needed in
+variants" assumption; if any variant breaks, escalate to the
+orchestrator before patching.
+
+**Tests**:
+
+- Unit: CLI parse with all new fields populated.
+- Unit: validation rejects `vpt=1000 blob_size=300` (not divisible).
+- Unit: validation rejects `mixed-types` with missing params.
+- Integration: variant-dummy spawn at `block-flood vpt=1000
+  blob_size=100` completes successfully.
+
+**Acceptance**:
+
+- All tests pass.
+- Smoke test against existing variants passes for at least
+  variant-dummy + custom-udp.
+- `cargo clippy --release -p variant-base -- -D warnings` clean.
+
+### T19.4 — runner: TOML schema + CLI forwarding [small]
+
+**Repo**: `runner/`.
+**Owner**: orchestrator → spawn worker (Wave 3 — after T19.3).
+**Goal**: Recognize the new keys in `[variant.common]` and forward
+them as `--kebab-case` CLI args. The runner does not interpret the
+new params — it only forwards them.
+
+**Files**:
+
+- `runner/src/config.rs` (or wherever TOML is parsed) — add the new
+  optional keys.
+- `runner/src/spawn.rs` (or wherever variant CLI args are
+  constructed) — forward the new keys as `--blob-size N`, etc.
+  Follow the existing `snake_case` → `--kebab-case` convention.
+
+**Tests**:
+
+- Unit: TOML with `blob_size = 100` parses; spawned CLI line
+  contains `--blob-size 100`.
+- Unit: TOML missing the new keys still parses (backward compat).
+- Integration: a two-runner config using `workload = "block-flood"`
+  runs to completion using `variant-dummy` for speed.
+
+**Acceptance**:
+
+- Tests pass.
+- `cargo clippy --release -p runner -- -D warnings` clean.
+
+### T19.5 — analysis: parse + correlate + per-shape metrics [medium]
+
+**Repo**: `analysis/`.
+**Owner**: orchestrator → spawn worker (Wave 1 — parallel with T19.2
+and T19.7; only needs the contract).
+**Goal**: Read the new `leaf_count` / `shape` fields, propagate them
+onto correlated receives, surface leaves-vs-ops separately in the
+headline metrics.
+
+**Files**:
+
+- `analysis/schema.py` + `analysis/parse.py` — read `leaf_count`
+  (default `1`) and `shape` (default `"scalar"`) from JSONL `write`
+  events and from compact-Parquet rows. The compact schema needs a
+  column for `shape_idx` + a `shape_intern` dictionary in KV
+  metadata — coordinate with the writer-side once T19.2 lands.
+- `analysis/correlate.py` — when joining receives to writes by
+  `(writer, seq, path)`, copy `leaf_count` and `shape` onto the
+  receive row.
+- `analysis/performance.py` — separate three throughput numbers:
+  - `ops_per_sec` = receives / operate_secs.
+  - `leaves_per_sec` = sum(leaf_count) / operate_secs.
+  - `bytes_per_sec` = sum(bytes) / operate_secs.
+- `analysis/tables.py` — add `shape` and `leaves_per_sec` to the
+  pivot tables. Existing scalar-flood rows show `leaves_per_sec ==
+  ops_per_sec`.
+- `analysis/integrity.py` — leaves-lost rate: when seq gaps imply
+  lost ops, multiply by `leaf_count` for total lost leaves.
+- Cache version bump in `analysis/cache.py` if the SHARD_SCHEMA
+  changes shape.
+
+**Backfill**: legacy JSONL events without `leaf_count` / `shape`
+default to `1` / `"scalar"`. Compact-Parquet files predating E19
+default the same way.
+
+**Tests**:
+
+- Unit: parse a JSONL fixture with mixed `leaf_count` values;
+  confirm correct propagation through correlate → performance.
+- Unit: legacy JSONL (no `leaf_count` / `shape`) parses with
+  defaults.
+- Unit: a block-flood JSONL fixture produces `ops_per_sec ==
+  leaves_per_sec / blob_size`.
+
+**Acceptance**:
+
+- All tests pass.
+- Re-running `analyze.py` on an existing pre-E19 directory produces
+  the same numbers as before plus new columns defaulting to `1` /
+  `"scalar"`.
+
+### T19.6 — analysis: plots [small-medium]
+
+**Repo**: `analysis/`.
+**Owner**: orchestrator → spawn worker (Wave 2 — after T19.5).
+**Goal**: Restructure the existing `comparison-qos` chart and add a
+per-variant throughput-vs-shape chart, per the locked layout
+2026-05-19.
+
+**Files**:
+
+- `analysis/plots.py` — chart updates:
+
+  **(a) Existing `comparison-qos` chart restructure**:
+
+  - Stack the two subplots **vertically** (matplotlib `nrows=2,
+    ncols=1`), not side-by-side.
+  - Preserve per-variant grouping on the x-axis.
+  - Each per-variant group's bars subdivide by
+    `(workload × threading_mode)`:
+    - **Workload distinguished by fill pattern (matplotlib `hatch`)**:
+      - `scalar-flood` — solid fill (no hatch, `hatch=""`).
+      - `block-flood` — horizontal-line hatch (`hatch="-"` or
+        `"---"` for density).
+      - `mixed-types` — checkered hatch (`hatch="+"` or `"x"` —
+        worker picks the most readable; document choice).
+    - **Threading_mode distinguished by color** (preserve the
+      existing `single` vs `multi` palette).
+    - Variants that don't support multi threading_mode simply emit
+      fewer bars in their group — no placeholder bars.
+  - Legend lists workload × threading_mode combinations cleanly
+    (use a 2-row legend or two separate legends — one for fill
+    pattern, one for color).
+
+  **(b) New chart `throughput_vs_workload_shape`**:
+
+  - Per-variant subplot grid (one subplot per variant in the
+    dataset).
+  - X-axis: workload profile (sorted scalar-flood → block-flood-* →
+    mixed-types).
+  - Y-axis: `leaves_per_sec`.
+  - One bar group per QoS within each subplot (or a sibling chart
+    per QoS — worker picks based on what fits visually).
+  - Same fill-pattern / color convention as (a) for cross-chart
+    consistency.
+
+- `analysis/pivot_tables.py` — add `workload` and `shape` as
+  optional pivot dimensions; existing default behaviour unchanged.
+
+**Tests**:
+
+- Smoke test: fixture with three workload rows produces a valid PNG
+  for both charts.
+- Visual regression: verify both new fill patterns render
+  distinctly (compare per-bar hatch attributes).
+
+**Acceptance**:
+
+- Tests pass.
+- Generated charts render cleanly without overlap on the
+  three-workload fixture.
+- Manual inspection confirms the vertical stack and per-variant
+  grouping in the restructured `comparison-qos`.
+
+### T19.7 — docs: glossary + BENCHMARK.md § 6 [small]
+
+**Repo**: `metak-shared/`.
+**Owner**: orchestrator → spawn worker (Wave 1 — parallel with T19.2
+and T19.5).
+**Goal**: Bring the user-facing documentation in line with the
+locked spec.
+
+**Files**:
+
+- `metak-shared/glossary.md` — already updated by T19.1 (verify the
+  new terms render correctly; add any missing nuance).
+- `metak-shared/BENCHMARK.md` § 6 — replace the workload-profile
+  table with one that documents all four profiles (`scalar-flood`,
+  `max-throughput`, `block-flood`, `mixed-types`) and their
+  parameters per the locked E19 spec. Cross-reference EPICS.md E19
+  for the locked algorithm.
+
+**Acceptance**:
+
+- New terms render cleanly.
+- BENCHMARK.md § 6 matches the EPICS.md E19 locked-spec text.
+
+### T19.8 — E2E validation [medium]
+
+**Repo**: operational (no code unless a config tweak is needed).
+**Owner**: orchestrator → spawn worker (Wave 4 — last, after
+T19.2-T19.7 land).
+**Goal**: Run a two-runner config with the three workload shapes
+back-to-back and confirm the analysis produces a coherent
+three-workload comparison.
+
+**Procedure**:
+
+1. Create or extend `configs/two-runner-workload-shapes.toml` with
+   three `[[variant]]` entries:
+   - `scalar-flood` (existing default).
+   - `block-flood blob_size=100`.
+   - `mixed-types` with reasonable defaults (e.g.
+     `mixed_scalars_min=5, mixed_scalars_max=20, mixed_arrays_min=
+     200, mixed_arrays_max=600, mixed_dict_split_max=4`).
+   Use `variant-dummy` or `custom-udp` as the single variant —
+   workload-shape sensitivity is the dimension under test, not
+   transport diversity.
+2. Run two runners on localhost. Capture the JSONL + compact-Parquet
+   output.
+3. Run `python analysis/analyze.py <log-dir> --summary --diagrams`.
+4. Confirm:
+   - Three rows in the pivot table, one per workload, with
+     distinct `ops_per_sec` and identical (or very close)
+     `leaves_per_sec` if the transport keeps up.
+   - The new "throughput vs workload shape" chart renders.
+   - The restructured `comparison-qos` chart renders with vertical
+     stack + per-variant grouping + fill-pattern workload
+     distinction.
+   - No `backpressure_skipped` events at QoS 3/4 (would indicate
+     regression in the E17 contract).
+
+**Acceptance**:
+
+- All three workload spawns complete cleanly.
+- Analysis output is coherent and matches manual sanity checks
+  (e.g. block-flood has fewer ops than scalar-flood at the same
+  vpt).
+- New charts pass visual inspection.
+
+### T19.9 — analysis: post-validation UX fixes [small]
+
+**Repo**: `analysis/`.
+**Owner**: orchestrator → spawn worker (Wave 5 — post-T19.8 acceptance).
+**Goal**: Fix four analyzer presentation bugs surfaced by T19.8 E2E
+validation. See T19.8's STATUS.md completion report for the exact
+issue numbering.
+
+**Scope**:
+
+1. **Issue #2 + #4 (`pivot_tables.py` regex)** — the regex that
+   extracts dimensions from variant names falls back to `n/a` when
+   the name lacks the standard `-<vpt>x<hz>hz-qos<N>` suffix. Fix:
+   prefer the actual data columns (`qos` is on every event row,
+   `threading_mode` is on `connected` events) over name-parsing.
+   The "family" / "base" name extraction should fall back to the
+   full variant name when no suffix is detectable, not to `n/a`.
+2. **Issue #3 (`throughput_vs_workload_shape` x-axis)** — change
+   the chart x-axis labels to **workload name** (`scalar-flood`,
+   `block-flood`, `mixed-types`), NOT shape. Mixed-types' dominant
+   shape is `array`, which currently makes its bar land on the
+   "array" tick — wrong intent.
+3. **Issue #5 (sort order)** — canonical order:
+   - Shape: `scalar` → `array` → `struct`.
+   - Workload: `scalar-flood` → `block-flood` → `mixed-types` →
+     `max-throughput`. Append unknown profiles alphabetically.
+   - Make these `CANONICAL_SHAPE_ORDER` / `CANONICAL_WORKLOAD_ORDER`
+     module-level constants.
+
+**Verification**: re-run `analyze.py` on the T19.8 fixture session
+(`logs/wlshapes-single-20260519_165233`). Confirm pivot cells
+populate (no `n/a` columns) and chart labels match canonical order.
+
+**Tests**:
+- Unit: pivot_tables.py parses unsuffixed variant names without
+  `n/a` fallback.
+- Unit: canonical sort order applied.
+- Visual regression: chart x-axis labels are
+  `["scalar-flood", "block-flood", "mixed-types"]` when those three
+  workloads are present.
+
+**Acceptance**: re-running the T19.8 fixture produces a clean pivot
+table and correctly-labeled charts.
+
+### T19.10 — Legacy JSONL cleanup
+
+User directive 2026-05-19 (post-T19.8 acceptance): "we don't have
+or want to ever keep any legacy behaviour, clear it out please." The
+target is the E18 dual-emission opt-in (`--legacy-jsonl-events`)
+that flagged a bool-forwarding bug during T19.4. After this cleanup:
+
+- **JSONL holds lifecycle events only** (`phase`, `connected`,
+  `eot_*`, `resource`, `clock_sync`).
+- **Per-event observations** (`write`, `receive`,
+  `backpressure_skipped`, `gap_detected`, `gap_filled`) are
+  **compact-Parquet only**.
+- **Contracts already updated** (orchestrator-self, landed
+  2026-05-19): jsonl-log-schema.md strips per-event sections;
+  compact-log-schema.md replaces "Coexistence with legacy JSONL"
+  with "Per-spawn file pair"; the aggregate-throughput +
+  latency-unit narrative moved into compact-log-schema.md's E19
+  additions.
+
+Split into per-repo sub-tasks.
+
+### T19.10a — variant-base: drop --legacy-jsonl-events + dual emission [medium]
+
+**Repo**: `variant-base/`.
+**Owner**: orchestrator → spawn worker (Wave 5 — can run in parallel
+with T19.10b; both independent of T19.9).
+**Goal**: Remove the variant-side opt-in path entirely. Per-event
+data flows only to compact buffers / Parquet.
+
+**Files**:
+- `variant-base/src/cli.rs` — remove the `legacy_jsonl_events` field
+  and its clap derive entry.
+- `variant-base/src/driver.rs` — remove the dual-emission gate /
+  branching on the flag.
+- `variant-base/src/logger.rs` — drop the JSONL emission paths for
+  `write`, `receive`, `backpressure_skipped`, `gap_detected`,
+  `gap_filled`. **Keep** the JSONL paths for `phase`, `connected`,
+  `eot_sent`, `eot_received`, `eot_timeout`, `resource` — those
+  remain unchanged.
+- `variant-base/tests/integration.rs` — remove tests that exercise
+  the opt-in path; remove any fixtures that inspect per-event JSONL.
+  Lifecycle JSONL inspection stays.
+- `variant-base/STRUCT.md` — drop references to the flag.
+- `variant-base/CUSTOM.md` — update the "Workload-shape dimension
+  (T19.2 + T19.3 / E19)" section: "every `write` row (compact
+  Parquet) carries `leaf_count` and `shape`" — not "JSONL + compact
+  Parquet". Also drop any other `--legacy-jsonl-events` mentions.
+
+**Validation**:
+```
+cargo test --release -p variant-base
+cargo clippy --release -p variant-base -- -D warnings
+cargo fmt -p variant-base -- --check
+cargo build --release   # confirm all variants still compile
+```
+
+**Smoke test**: spawn variant-dummy at scalar-flood + block-flood,
+inspect the produced files — JSONL should contain ONLY lifecycle
+events, compact-Parquet should contain the per-event rows.
+
+**Acceptance**: variant-base no longer accepts or recognizes
+`--legacy-jsonl-events`. Per-event data appears exclusively in
+compact-Parquet. Lifecycle events appear exclusively in JSONL.
+All existing variant binaries continue to spawn and complete
+cleanly (no source-code changes expected outside variant-base).
+
+### T19.10b — runner: drop legacy_jsonl_events forwarding [small]
+
+**Repo**: `runner/`.
+**Owner**: orchestrator → spawn worker (Wave 5 — can run in parallel
+with T19.10a; both independent of T19.9).
+**Goal**: Remove forwarding of the `legacy_jsonl_events` TOML key.
+Sidesteps the bool-forwarding bug that T19.4 surfaced.
+
+**Files**:
+- `runner/src/config.rs` (or wherever) — remove parsing of
+  `legacy_jsonl_events`.
+- `runner/src/cli_args.rs` (or wherever) — remove forwarding of the
+  key. If the forwarding is via a generic key-skip list, ensure
+  the runner does NOT forward this key (it's gone from variant-base
+  CLI).
+- `runner/CUSTOM.md` — remove any reference to the flag.
+
+**Validation**:
+```
+cargo test --release -p runner
+cargo clippy --release -p runner -- -D warnings
+cargo fmt -p runner -- --check
+```
+
+**Acceptance**: a TOML config that sets `legacy_jsonl_events = true`
+in `[variant.common]` either is rejected at parse time OR is silently
+ignored — worker's call, but be explicit in the completion report.
+Variant-base spawning works unchanged.
+
+### T19.10c — analysis: drop per-event JSONL parser path [medium]
+
+**Repo**: `analysis/`.
+**Owner**: orchestrator → spawn worker (Wave 6 — AFTER T19.9 lands;
+both modify analysis/parse.py and cache.py).
+**Goal**: Remove the analyzer's ability to parse per-event JSONL.
+JSONL handling is now lifecycle-events-only. Per-event data comes
+exclusively from compact-Parquet via `parse_compact.py`.
+
+**User directive context**: "We won't ever need to load historic
+data in jsonl, just use it for the lifecycle event log." So old
+pre-T18.2 JSONL datasets that contain per-event rows are NO LONGER
+supported. The analyzer may emit a warning if it encounters such
+data, but should not attempt to load it.
+
+**Files**:
+- `analysis/parse.py` — strip the per-event JSONL branches (`write`,
+  `receive`, `backpressure_skipped`, `gap_detected`, `gap_filled`).
+  JSONL parsing keeps `phase`, `connected`, `eot_sent`,
+  `eot_received`, `eot_timeout`, `resource`, `clock_sync`. If
+  per-event types are encountered in a JSONL file, log a one-shot
+  warning per spawn (`"<file>: ignoring N pre-T18.2 per-event
+  JSONL rows; compact-Parquet is now the only path"`) and skip
+  them.
+- `analysis/schema.py` — `SHARD_SCHEMA` adjustments if the JSONL
+  vs Parquet schemas diverged.
+- `analysis/cache.py` — bump `SCHEMA_VERSION` (this is structural).
+- `analysis/correlate.py` — if it had any logic to dedup
+  JSONL-sourced rows against Parquet-sourced rows for the same
+  spawn, remove it.
+- `analysis/tests/` — remove fixtures that simulate per-event JSONL
+  data. Keep lifecycle JSONL fixtures.
+- `analysis/CUSTOM.md` — update the "Workload-shape dimension
+  (T19.5 + T19.6 / E19)" section to drop the "legacy JSONL"
+  reference: per-event data comes only from compact-Parquet.
+
+**Validation**:
+```
+cd analysis && python -m pytest -v
+```
+
+**Acceptance**:
+- All tests pass.
+- Running `analyze.py` on a directory containing both lifecycle
+  JSONL + compact-Parquet (the new post-cleanup norm) produces a
+  coherent report.
+- Running `analyze.py` on an old pre-T18.2 directory (per-event
+  JSONL only, no compact-Parquet) produces a clear warning and
+  empty per-event tables — no crash.
+- T19.9's fixture re-run still passes.
+
+**Sequencing**: must spawn AFTER T19.9 lands because both edit
+`analysis/parse.py` and `analysis/cache.py`. T19.10c picks up T19.9's
+schema version (whatever it ended at) and bumps from there.
