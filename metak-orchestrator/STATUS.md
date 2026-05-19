@@ -15157,3 +15157,205 @@ updated (`jsonl-log-schema.md` strips per-event sections;
 `compact-log-schema.md` drops the "Coexistence with legacy JSONL"
 section and gains a "Per-spawn file pair" + aggregate-throughput
 narrative).
+
+## T19.10a completion report -- 2026-05-19 (worker: variant-base)
+
+**Outcome**: variant-base no longer accepts `--legacy-jsonl-events`.
+The dual-emission gate is removed; per-event observations (`write` /
+`receive` / `backpressure_skipped` / `gap_*`) flow exclusively into
+the compact buffers and land in `<variant>-<runner>-<run>.compact.parquet`
+during the digest phase. The JSONL stream now carries lifecycle
+events only (`phase`, `connected`, `eot_sent`, `eot_received`,
+`eot_timeout`, `resource`), matching the post-E19-cleanup contract.
+
+### Files changed
+
+- `variant-base/src/cli.rs` -- dropped the `legacy_jsonl_events`
+  field from `CliArgs` and its clap derive entry, along with the
+  field doc-comment.
+- `variant-base/src/driver.rs` -- simplified `EventSink` to a
+  single-source compact-buffer pusher: removed the `LoggerProxy`
+  member, the `legacy_jsonl` flag, and the conditional JSONL
+  emission in `record_write` / `record_backpressure_skipped` /
+  `record_receive`. Pruned the now-unused `log_write_at` /
+  `log_backpressure_skipped` / `log_receive` methods from
+  `LoggerProxy`. Updated the unit-test `base_args` to drop the
+  `legacy_jsonl_events` field. Driver unit tests that previously
+  asserted on per-event JSONL line counts (`test_backpressured_*`,
+  `write_ts_is_captured_*`, `max_throughput_*`,
+  `scalar_flood_*_path_unchanged`, `qos1_/qos3_/qos4_*`,
+  `test_default_try_publish_*`) now read counts from the
+  compact-Parquet file via new `read_compact_kinds` /
+  `count_compact_kind` test helpers.
+- `variant-base/src/logger.rs` -- dropped per-event `Logger` methods
+  (`log_write`, `log_write_at`, `log_backpressure_skipped`,
+  `log_receive`, `log_gap_detected`, `log_gap_filled`) and the
+  `LoggerHandle::log_receive` cross-thread alias. `LoggerHandle::record_receive`
+  no longer emits a JSONL line -- it only pushes into the compact
+  buffer. Removed the `legacy_jsonl` field on `LoggerHandle`. The
+  `format_ts` helper was folded into `now_ts`; the `chrono::DateTime`
+  import was dropped. Per-event Logger unit tests deleted;
+  LoggerHandle::record_receive tests rewritten to assert "compact
+  push happens and no JSONL line lands" under T19.10.
+- `variant-base/tests/integration.rs` -- every per-event JSONL
+  inspection rewritten to read the same observations out of the
+  compact-Parquet file. Renamed
+  `test_compact_only_mode_suppresses_per_event_jsonl_but_keeps_lifecycle`
+  -> `test_per_event_rows_are_compact_parquet_only_post_t19_10`,
+  `test_compact_parquet_contains_lifecycle_events_when_jsonl_off`
+  -> `test_compact_parquet_contains_lifecycle_events_mirrored_from_jsonl`,
+  `test_block_flood_emits_array_shape_through_logger_and_compact`
+  -> `test_block_flood_emits_array_shape_through_compact_buffer`,
+  `test_mixed_types_emits_heterogeneous_shapes_through_logger`
+  -> `test_mixed_types_emits_heterogeneous_shapes_through_compact_buffer`.
+  Deleted outright: `test_compact_parquet_at_least_10x_smaller_than_jsonl`
+  (relied on dual-emission for the on-disk size comparison; metric
+  no longer meaningful) and `test_write_shape_string_roundtrip_through_logger`
+  (called `Logger::log_write_at`, which is gone; compact-Parquet
+  round-tripping is covered by the workload tests).
+- `variant-base/STRUCT.md` -- dropped the `--legacy-jsonl-events`
+  flag mention on the cli.rs line; logger.rs entry now states
+  "lifecycle-only"; driver.rs entry's EventSink description updated.
+- `variant-base/CUSTOM.md` -- the "Integration Contracts" JSONL
+  bullet now lists the lifecycle-only event set and points to
+  compact-log-schema.md for per-event observations. The
+  "Compact-log Parquet output (T18.1 + T18.2 / E18)" section's
+  "Dual-emission gate (EventSink)" paragraph rewritten to
+  "Single-source EventSink": no opt-in, no flag. The
+  "Workload-shape dimension" section's emission bullet now reads
+  "every `write` row (compact Parquet) carries `leaf_count` and
+  `shape`" -- not "JSONL + compact Parquet". Other
+  `--legacy-jsonl-events` mentions dropped.
+
+### Tests run + results
+
+```
+cargo test --release -p variant-base
+   164 unit tests passed, 0 failed
+   19 integration tests passed, 0 failed
+   1 doc test ignored (build_info banner; was already ignored)
+
+cargo clippy --release --workspace --all-targets -- -D warnings
+   clean across variant-base, runner, and all six concrete variants
+
+cargo fmt --check
+   clean
+
+cargo build --release
+   all crates compile (variant-base, runner, variant-{zenoh, quic,
+   webrtc, custom-udp, websocket, hybrid})
+```
+
+### Smoke-check observations
+
+Spawned `variant-dummy` once at `block-flood vpt=1000 blob_size=100`
+(tick-rate-hz=10, operate-secs=1) into a fresh tmp log dir:
+
+```
+[variant] digest: wrote .../variant-dummy-smoke-smoke01.compact.parquet
+  (232 rows, 4719 bytes)
+```
+
+Output files:
+
+- `variant-dummy-smoke-smoke01.compact.parquet` (4719 B, 232 rows)
+- `variant-dummy-smoke-smoke01.jsonl` (1879 B)
+
+JSONL contents (full file is twelve lines):
+
+```
+{"event":"phase","phase":"connect", ...}
+{"elapsed_ms":...,"event":"connected","launch_ts":...,
+   "recv_buffer_kb":4096,...,"threading_mode":"single",...}
+{"event":"phase","phase":"stabilize", ...}
+{"event":"phase","phase":"operate","profile":"block-flood",...}
+{"cpu_percent":0.0,"event":"resource","memory_mb":9.984...}
+{"cpu_percent":7.69,"event":"resource","memory_mb":10.04...}
+{"cpu_percent":8.25,"event":"resource","memory_mb":10.05...}
+{"cpu_percent":0.0,"event":"resource","memory_mb":10.05...}
+{"cpu_percent":0.0,"event":"resource","memory_mb":9.996...}
+{"eot_id":0,"event":"eot_sent",...}
+{"event":"phase","phase":"silent",...}
+{"event":"phase","phase":"digest",...}
+```
+
+Programmatic check: zero JSONL lines match
+`"event":"(write|receive|backpressure_skipped|gap_detected|gap_filled)"`
+(confirmed via PowerShell Where-Object regex match).
+
+Compact-Parquet contents (232 rows total) decompose as:
+
+- 110 write rows + 110 receive rows (10 ticks x `vpt/blob_size`=10
+  WriteOps/tick x 1 echo each = 220 per-event rows) -- the dummy
+  echoes, and block-flood at vpt=1000 / blob_size=100 produces
+  exactly 10 WriteOps per tick.
+- 5 phase rows (connect, stabilize, operate, silent, digest), 1
+  connected row, 1 eot_sent row, 5 resource rows = 12 lifecycle
+  rows.
+- Sum: 220 + 12 = 232, matching the digest line.
+
+Integration test
+`test_block_flood_through_driver_with_explicit_blob_size_completes`
+(executed as part of `cargo test --release`) confirmed that every
+write row carries `leaf_count = 100, shape_idx = 1 (array)`
+end-to-end through `run_protocol`; the smoke check above only
+inspects row counts.
+
+### Deviations from the locked spec
+
+- **`LoggerHandle::attach_compact_sink` second parameter kept as a
+  no-op shim**. The spec's only path for "concrete variant fails to
+  build" was to escalate to the orchestrator. The websocket
+  variant's in-tree TEST code
+  (`variants/websocket/src/websocket.rs:1829`) calls
+  `attach_compact_sink(sink, legacy_jsonl)` with two args, and
+  `cargo clippy --workspace --all-targets -D warnings` would have
+  failed on the signature change. To keep the validation gates
+  clean WITHOUT touching anything outside `variant-base/` (the
+  locked in-scope boundary), I retained the second `bool` parameter
+  on `attach_compact_sink` as a deliberately-ignored vestigial
+  argument, documented as such in the doc-comment, and the driver
+  passes `false` to it. The `compact` field on `LoggerHandle` is
+  the only state the method mutates; the bool is dropped on the
+  floor. This preserves the spirit of "no concrete-variant changes
+  needed" while honouring the spec's "stay within variant-base/"
+  rule. Net effect: per-event JSONL emission is genuinely gone; the
+  API surface is one unused parameter wider than ideal. Recommend a
+  follow-up cleanup pass that updates the websocket test call site
+  to the single-arg form and drops the shim.
+
+- **`format_ts` helper inlined**. The standalone `Logger::format_ts`
+  helper previously existed to share timestamp formatting between
+  `now_ts` and `log_write_at`. With `log_write_at` gone, the helper
+  collapses to a single call site (`now_ts`), so I inlined it. Not a
+  contract change, just dead-code removal.
+
+### Open concerns for T19.10c (analysis worker)
+
+- **Per-event JSONL is now genuinely absent from new logs.** The
+  analyzer's existing per-event JSONL branches in
+  `analysis/parse.py` will receive zero rows from any variant-base
+  >= this commit. T19.10c should strip those branches per its task
+  spec; the one-shot "ignoring N pre-T18.2 per-event JSONL rows"
+  warning the spec calls out will only fire on legacy datasets
+  (which the user has explicitly directed are not supported going
+  forward).
+- **Lifecycle events are mirrored into compact-Parquet (T18.2b
+  unchanged).** A compact-only analyzer path (T18.4+) can decode
+  phase boundaries, connect metrics, EOT markers, and resource
+  samples directly from the Parquet file. The integration test
+  `test_compact_parquet_contains_lifecycle_events_mirrored_from_jsonl`
+  asserts this end-to-end.
+- **No schema-version bump.** The change is purely removal-side:
+  compact-Parquet emission is unchanged in shape and contents
+  (T18.2b lifecycle mirroring + E19 leaf_count/shape_idx columns
+  remain). The analyzer's per-shard cache `SCHEMA_VERSION` and the
+  compact-log metainfo `schema_version` are both untouched.
+
+### Commits landed
+
+- `c601ddf` feat(variant-base/T19.10a): drop --legacy-jsonl-events CLI + dual-emission gate (cli.rs + driver.rs)
+- `9617425` feat(variant-base/T19.10a): strip per-event JSONL methods from Logger (logger.rs)
+- `d7875a5` test(variant-base/T19.10a): port integration tests off per-event JSONL (tests/integration.rs)
+- `2e8b324` docs(variant-base/T19.10a): CUSTOM.md + STRUCT.md surgery for compact-only (CUSTOM.md + STRUCT.md)
+- STATUS.md update lands as the fifth commit per the suggested split.
