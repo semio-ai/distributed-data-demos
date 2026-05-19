@@ -9,6 +9,7 @@ use serde_json::json;
 
 use crate::compact::CompactBuffers;
 use crate::types::{Phase, Qos, ThreadingMode};
+use crate::workload::WriteShape;
 
 /// Structured JSONL log writer.
 ///
@@ -126,8 +127,11 @@ impl Logger {
     /// timestamp BEFORE the variant's `try_publish` call (T16.2) and
     /// prevent same-host loopback races where a peer's reader thread
     /// observes the bytes before the writer thread reaches this method.
+    ///
+    /// Back-compat wrapper: defaults `leaf_count = 1, shape = Scalar`
+    /// per the E19 contract for legacy callers.
     pub fn log_write(&mut self, seq: u64, path: &str, qos: Qos, bytes: usize) -> Result<()> {
-        self.log_write_at(Utc::now(), seq, path, qos, bytes)
+        self.log_write_at(Utc::now(), seq, path, qos, bytes, 1, WriteShape::Scalar)
     }
 
     /// Log a `write` event with a caller-supplied timestamp.
@@ -138,6 +142,14 @@ impl Logger {
     /// thread can observe the bytes. See
     /// `metak-shared/api-contracts/jsonl-log-schema.md` for the
     /// contract.
+    ///
+    /// `leaf_count` and `shape` (E19 / T19.2) record the workload-shape
+    /// metadata documented in the JSONL schema's E19 additions. Both
+    /// are emitted on every `write` event (no legacy-omitting branch);
+    /// the analyzer's pre-E19 backfill defaults match the values
+    /// scalar-flood / max-throughput emit (`leaf_count = 1, shape =
+    /// "scalar"`) so old and new logs share the same schema surface.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_write_at(
         &mut self,
         ts: DateTime<Utc>,
@@ -145,6 +157,8 @@ impl Logger {
         path: &str,
         qos: Qos,
         bytes: usize,
+        leaf_count: u32,
+        shape: WriteShape,
     ) -> Result<()> {
         let entry = json!({
             "ts": Self::format_ts(ts),
@@ -156,6 +170,8 @@ impl Logger {
             "path": path,
             "qos": qos.as_int(),
             "bytes": bytes,
+            "leaf_count": leaf_count,
+            "shape": shape.as_str(),
         });
         self.write_line(&entry)
     }
@@ -641,6 +657,48 @@ mod tests {
         assert_eq!(line["path"], "/sensors/lidar");
         assert_eq!(line["qos"], 1);
         assert_eq!(line["bytes"], 256);
+        // E19: legacy `log_write` defaults to scalar shape.
+        assert_eq!(line["leaf_count"], 1);
+        assert_eq!(line["shape"], "scalar");
+    }
+
+    #[test]
+    fn test_write_event_records_e19_leaf_count_and_shape() {
+        // E19: block-flood / mixed-types callers emit non-scalar
+        // shapes. Both fields must round-trip on the JSONL line.
+        let (mut logger, _dir) = create_test_logger();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-05-19T00:00:00.000000000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        logger
+            .log_write_at(
+                ts,
+                1,
+                "/bench/block/0",
+                Qos::BestEffort,
+                800,
+                100,
+                WriteShape::Array,
+            )
+            .unwrap();
+        logger
+            .log_write_at(
+                ts,
+                2,
+                "/bench/mixed/dict/flat",
+                Qos::BestEffort,
+                336,
+                42,
+                WriteShape::Struct,
+            )
+            .unwrap();
+        logger.flush().unwrap();
+
+        let lines = read_lines(&logger);
+        assert_eq!(lines[0]["leaf_count"], 100);
+        assert_eq!(lines[0]["shape"], "array");
+        assert_eq!(lines[1]["leaf_count"], 42);
+        assert_eq!(lines[1]["shape"], "struct");
     }
 
     #[test]
@@ -655,7 +713,15 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         logger
-            .log_write_at(supplied, 99, "/bench/7", Qos::ReliableTcp, 128)
+            .log_write_at(
+                supplied,
+                99,
+                "/bench/7",
+                Qos::ReliableTcp,
+                128,
+                1,
+                WriteShape::Scalar,
+            )
             .unwrap();
         logger.flush().unwrap();
 
