@@ -630,3 +630,128 @@ class TestPivotDataclasses:
         )
         assert table.qos == 4
         assert table.rows[0] == ("custom-udp", "multi")
+
+
+# --- E19 / T19.6: workload + shape pivot dimensions --------------------------
+
+
+def _shape_result(
+    variant: str,
+    *,
+    shape: str = "scalar",
+    receives_per_sec: float = 1000.0,
+    writes_per_sec: float = 1000.0,
+    leaves_per_sec: float = 1000.0,
+    bytes_per_sec: float = 8000.0,
+    latency_mean_ms: float = 1.0,
+    latency_std_ms: float = 0.1,
+) -> PerformanceResult:
+    """Build a PerformanceResult carrying a workload shape (E19 / T19.6)."""
+    return PerformanceResult(
+        variant=variant,
+        run="run01",
+        connect_mean_ms=0.0,
+        connect_max_ms=0.0,
+        latency_p50_ms=latency_mean_ms,
+        latency_p95_ms=latency_mean_ms,
+        latency_p99_ms=latency_mean_ms,
+        latency_max_ms=latency_mean_ms,
+        writes_per_sec=writes_per_sec,
+        receives_per_sec=receives_per_sec,
+        jitter_ms=0.0,
+        jitter_p95_ms=0.0,
+        loss_pct=0.0,
+        threading_mode="multi",
+        latency_mean_ms=latency_mean_ms,
+        latency_std_ms=latency_std_ms,
+        expected_writes_per_sec=writes_per_sec,
+        receives_to_expected_ratio_pct=100.0,
+        shape=shape,
+        ops_per_sec=receives_per_sec,
+        leaves_per_sec=leaves_per_sec,
+        bytes_per_sec=bytes_per_sec,
+    )
+
+
+class TestPivotShapeAware:
+    """Workload + shape optional pivot dimensions (T19.6)."""
+
+    def test_default_mode_keeps_two_tuple_row_key(self) -> None:
+        """Default ``include_shape=False`` preserves pre-E19 (family, mode) rows."""
+        results = [
+            _shape_result("custom-udp-100x100hz-qos1-multi", shape="scalar"),
+            _shape_result("custom-udp-100x100hz-qos1-multi", shape="array"),
+        ]
+        tables = build_pivot_tables(results)
+        assert len(tables) == 1
+        table = tables[0]
+        # Default mode collapses both shapes into one (family, mode) row.
+        assert len(table.rows) == 1
+        assert table.rows[0] == ("custom-udp", "multi")
+
+    def test_shape_aware_mode_expands_rows_per_shape(self) -> None:
+        """``include_shape=True`` -> one row per (family, mode, shape)."""
+        results = [
+            _shape_result("custom-udp-100x100hz-qos1-multi", shape="scalar"),
+            _shape_result("custom-udp-100x100hz-qos1-multi", shape="array"),
+            _shape_result("custom-udp-100x100hz-qos1-multi", shape="struct"),
+        ]
+        tables = build_pivot_tables(results, include_shape=True)
+        assert len(tables) == 1
+        table = tables[0]
+        # Three observed shapes -> three rows on the single
+        # (family, mode) line.
+        assert len(table.rows) == 3
+        # The row key is now a 3-tuple including the shape.
+        for row_key in table.rows:
+            assert len(row_key) == 3
+            assert row_key[0] == "custom-udp"
+            assert row_key[1] == "multi"
+        # Locked shape ordering: scalar -> array -> struct.
+        shapes = [row_key[2] for row_key in table.rows]
+        assert shapes == ["scalar", "array", "struct"]
+
+    def test_shape_aware_renders_without_crash(self) -> None:
+        """The format function handles the 3-tuple row key transparently."""
+        results = [
+            _shape_result("custom-udp-100x100hz-qos1-multi", shape="scalar"),
+            _shape_result("custom-udp-100x100hz-qos1-multi", shape="array"),
+        ]
+        text = format_pivot_section(results, include_shape=True)
+        # Row labels carry the shape token (e.g. "custom-udp-multi/scalar").
+        assert "custom-udp-multi/scalar" in text
+        assert "custom-udp-multi/array" in text
+
+    def test_csv_export_carries_workload_and_shape_columns(self) -> None:
+        """E19 CSV: each row carries ``workload`` + ``shape`` columns."""
+        results = [
+            _shape_result(
+                "custom-udp-100x100hz-qos1-multi",
+                shape="array",
+                leaves_per_sec=50_000.0,
+                bytes_per_sec=400_000.0,
+            ),
+        ]
+        text = export_csv(results)
+        rows = list(csv.DictReader(io.StringIO(text)))
+        assert len(rows) == 1
+        row = rows[0]
+        # ``shape`` is the analyzer-internal token; ``workload`` is the
+        # user-facing profile name from BENCHMARK.md § 6.
+        assert row["shape"] == "array"
+        assert row["workload"] == "block-flood"
+        assert row["leaves_per_sec"] == "50000.0"
+        assert row["bytes_per_sec"] == "400000.0"
+
+    def test_csv_export_legacy_data_defaults_to_scalar_flood(self) -> None:
+        """Pre-E19 results carry default shape='scalar' -> workload='scalar-flood'."""
+        results = [
+            _shape_result(
+                "custom-udp-100x100hz-qos1-multi",
+                shape="scalar",
+            ),
+        ]
+        text = export_csv(results)
+        rows = list(csv.DictReader(io.StringIO(text)))
+        assert rows[0]["shape"] == "scalar"
+        assert rows[0]["workload"] == "scalar-flood"

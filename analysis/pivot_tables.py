@@ -219,12 +219,24 @@ class PivotTable:
     ``rows`` and ``columns`` are the canonical orderings (extended with
     any non-canonical rows / columns observed in the data).
     ``cells[(row_key, column_key)]`` is the per-cell triple.
+
+    Row-key shape:
+
+    - Default mode (``build_pivot_tables(results)``): the row key is
+      the 2-tuple ``(family, threading_mode)``.
+    - Shape-aware mode (``build_pivot_tables(results,
+      include_shape=True)`` -- T19.6): the row key is the 3-tuple
+      ``(family, threading_mode, shape)`` where ``shape`` is
+      ``"scalar"`` / ``"array"`` / ``"struct"``.
+
+    Renderers introspect the tuple length so callers don't need to
+    pick a different format function per mode.
     """
 
     qos: int
-    rows: tuple[tuple[str, str], ...]
+    rows: tuple[tuple, ...]
     columns: tuple[str, ...]
-    cells: dict[tuple[tuple[str, str], str], PivotCell]
+    cells: dict[tuple[tuple, str], PivotCell]
 
 
 def _delivery_pct(result: PerformanceResult) -> float | None:
@@ -238,7 +250,11 @@ def _delivery_pct(result: PerformanceResult) -> float | None:
     return 100.0 * result.receives_per_sec / result.writes_per_sec
 
 
-def build_pivot_tables(results: list[PerformanceResult]) -> list[PivotTable]:
+def build_pivot_tables(
+    results: list[PerformanceResult],
+    *,
+    include_shape: bool = False,
+) -> list[PivotTable]:
     """Build one PivotTable per QoS level present in ``results``.
 
     Spawns whose name does not parse via ``parse_spawn_name`` are
@@ -251,6 +267,20 @@ def build_pivot_tables(results: list[PerformanceResult]) -> list[PivotTable]:
     against partial datasets (e.g. a smoke config that only spawns
     websocket variants) AND when run against future configs that add
     new workload profiles or threading-mode combinations.
+
+    E19 / T19.6: when ``include_shape`` is ``True``, the row key is
+    extended with the workload-shape value (``"scalar"`` /
+    ``"array"`` / ``"struct"``) read from ``PerformanceResult.shape``.
+    A single (family, mode) pair that ran multiple shape profiles
+    therefore produces one row per shape. Default behaviour
+    (``include_shape=False``) is unchanged so existing callers, dumps
+    and tests see the pre-E19 (family, mode) row grouping.
+
+    The row-key tuple shape is the documented coupling point: in the
+    default mode it stays ``(family, mode)``; in shape-aware mode it
+    becomes ``(family, mode, shape)``. Renderers downstream
+    (:func:`format_pivot_table`, :func:`_row_label`) handle both via
+    tuple-length introspection so no caller has to update.
     """
     by_qos: dict[int, list[tuple[SpawnIdentity, PerformanceResult]]] = {}
     for r in results:
@@ -263,12 +293,16 @@ def build_pivot_tables(results: list[PerformanceResult]) -> list[PivotTable]:
     for qos in sorted(by_qos.keys()):
         entries = by_qos[qos]
 
-        observed_rows: list[tuple[str, str]] = []
-        seen_rows: set[tuple[str, str]] = set()
+        observed_rows: list[tuple] = []
+        seen_rows: set[tuple] = set()
         observed_cols: list[str] = []
         seen_cols: set[str] = set()
-        for identity, _r in entries:
-            row_key = identity.row_key
+        for identity, r in entries:
+            if include_shape:
+                shape = r.shape if r.shape else "scalar"
+                row_key: tuple = (identity.family, identity.mode, shape)
+            else:
+                row_key = identity.row_key
             if row_key not in seen_rows:
                 seen_rows.add(row_key)
                 observed_rows.append(row_key)
@@ -277,19 +311,41 @@ def build_pivot_tables(results: list[PerformanceResult]) -> list[PivotTable]:
                 seen_cols.add(col)
                 observed_cols.append(col)
 
-        rows: list[tuple[str, str]] = [r for r in _CANONICAL_ROWS if r in seen_rows]
-        for r in observed_rows:
-            if r not in rows:
-                rows.append(r)
+        if include_shape:
+            # Shape-aware mode: expand each canonical (family, mode)
+            # row into one row per observed shape, preserving the
+            # canonical (family, mode) ordering and putting shapes in
+            # the locked scalar / array / struct order from the
+            # workload-profile glossary.
+            shape_order_local = ("scalar", "array", "struct")
+            rows: list[tuple] = []
+            for fm in _CANONICAL_ROWS:
+                for shape in shape_order_local:
+                    candidate = (fm[0], fm[1], shape)
+                    if candidate in seen_rows:
+                        rows.append(candidate)
+            for r in observed_rows:
+                if r not in rows:
+                    rows.append(r)
+        else:
+            rows = [r for r in _CANONICAL_ROWS if r in seen_rows]
+            for r in observed_rows:
+                if r not in rows:
+                    rows.append(r)
 
         columns: list[str] = [c for c in _CANONICAL_COLUMNS if c in seen_cols]
         for c in observed_cols:
             if c not in columns:
                 columns.append(c)
 
-        cells: dict[tuple[tuple[str, str], str], PivotCell] = {}
+        cells: dict[tuple[tuple, str], PivotCell] = {}
         for identity, r in entries:
-            key = (identity.row_key, identity.workload_profile)
+            if include_shape:
+                shape = r.shape if r.shape else "scalar"
+                row_key = (identity.family, identity.mode, shape)
+            else:
+                row_key = identity.row_key
+            key = (row_key, identity.workload_profile)
             # If two runs land in the same cell (e.g. multiple ``run``
             # values for the same spawn), take the LAST one. In the
             # canonical dataset each (variant, run) pair is unique, so
@@ -365,9 +421,19 @@ def _fmt_latency_cell(mean_ms: float, std_ms: float) -> str:
     return f"{mean_str}+/-{std_str}ms"
 
 
-def _row_label(row_key: tuple[str, str]) -> str:
-    family, mode = row_key
-    return f"{family}-{mode}"
+def _row_label(row_key: tuple) -> str:
+    """Format a row label.
+
+    Accepts either the default 2-tuple ``(family, mode)`` or the
+    shape-aware 3-tuple ``(family, mode, shape)`` (E19 / T19.6). The
+    shape token is appended with a slash so the resulting label reads
+    e.g. ``custom-udp-multi/array``.
+    """
+    if len(row_key) == 2:
+        family, mode = row_key
+        return f"{family}-{mode}"
+    family, mode, shape = row_key
+    return f"{family}-{mode}/{shape}"
 
 
 def format_pivot_table(table: PivotTable) -> str:
@@ -392,14 +458,23 @@ def format_pivot_table(table: PivotTable) -> str:
     when a cell value is empty (``-``).
     """
     n_cols = len(table.columns)
-    total_width = _ROW_LABEL_WIDTH + (_CELL_WIDTH + 3) * n_cols + 1
+    # T19.6: shape-aware row keys (3-tuple) produce wider labels like
+    # ``custom-udp-multi/struct`` (~23 chars). Widen the row-label
+    # column dynamically so those labels still fit; the default 2-tuple
+    # row keys fall comfortably within the original 18-char column.
+    row_label_width = _ROW_LABEL_WIDTH
+    for row_key in table.rows:
+        candidate = len(_row_label(row_key)) + 1
+        if candidate > row_label_width:
+            row_label_width = candidate
+    total_width = row_label_width + (_CELL_WIDTH + 3) * n_cols + 1
 
     lines: list[str] = []
     lines.append(f"QoS {table.qos}")
     lines.append("-" * total_width)
 
     # Header row.
-    header = " " * _ROW_LABEL_WIDTH
+    header = " " * row_label_width
     for col in table.columns:
         header += " | " + col.ljust(_CELL_WIDTH)
     lines.append(header)
@@ -408,9 +483,9 @@ def format_pivot_table(table: PivotTable) -> str:
     for row_key in table.rows:
         # Build the three sub-lines, accumulating each column's cell
         # rendering into the corresponding line.
-        line_a = _row_label(row_key).ljust(_ROW_LABEL_WIDTH)
-        line_b = " " * _ROW_LABEL_WIDTH
-        line_c = " " * _ROW_LABEL_WIDTH
+        line_a = _row_label(row_key).ljust(row_label_width)
+        line_b = " " * row_label_width
+        line_c = " " * row_label_width
         for col in table.columns:
             cell = table.cells.get((row_key, col))
             if cell is None:
@@ -440,7 +515,12 @@ _PIVOT_SECTION_LEGEND: str = (
 )
 
 
-def format_pivot_for_qos(results: list[PerformanceResult], qos: int) -> str:
+def format_pivot_for_qos(
+    results: list[PerformanceResult],
+    qos: int,
+    *,
+    include_shape: bool = False,
+) -> str:
     """Render the pivot block for a single QoS level.
 
     Returns the same header + legend used by :func:`format_pivot_section`
@@ -448,8 +528,13 @@ def format_pivot_for_qos(results: list[PerformanceResult], qos: int) -> str:
     argument. When no spawn in ``results`` matches the requested QoS
     level a placeholder ``(no data)`` block is returned so the caller
     (e.g. the ``--dump`` writer) always produces a well-formed file.
+
+    E19 / T19.6: pass ``include_shape=True`` to expand each
+    (family, mode) row into one row per observed workload shape.
+    Default (``False``) preserves the pre-E19 (family, mode) row
+    grouping.
     """
-    tables = build_pivot_tables(results)
+    tables = build_pivot_tables(results, include_shape=include_shape)
     table = next((t for t in tables if t.qos == qos), None)
 
     lines: list[str] = []
@@ -466,14 +551,21 @@ def format_pivot_for_qos(results: list[PerformanceResult], qos: int) -> str:
     return "\n".join(lines)
 
 
-def format_pivot_section(results: list[PerformanceResult]) -> str:
+def format_pivot_section(
+    results: list[PerformanceResult],
+    *,
+    include_shape: bool = False,
+) -> str:
     """Render the full pivot-tables section: one table per QoS level.
 
     Begins with a section header that documents the 3-sub-cell format
     so the reader does not have to cross-reference the docs while
     scanning the output.
+
+    E19 / T19.6: pass ``include_shape=True`` to expand each
+    (family, mode) row into one row per observed workload shape.
     """
-    tables = build_pivot_tables(results)
+    tables = build_pivot_tables(results, include_shape=include_shape)
     if not tables:
         return "Pivot Tables (variant x workload, one per QoS)\n(no data)\n"
 
@@ -492,6 +584,18 @@ def format_pivot_section(results: list[PerformanceResult]) -> str:
 # Long-form CSV column order. Keeps the pivot-relevant columns first
 # so operators can pivot in Excel/Sheets without re-arranging, then
 # appends the existing PerformanceResult columns for completeness.
+#
+# E19 / T19.6: ``workload`` (the canonical user-facing workload-
+# profile token) and ``shape`` (the analyzer-internal shape value)
+# are surfaced as optional pivot dimensions so an external pivot can
+# slice on the workload-shape axis. Both columns are unconditionally
+# populated -- defaults are ``"scalar-flood"`` / ``"scalar"`` for
+# pre-E19 data per the api-contracts backward-compat rule -- so the
+# CSV stays stable across datasets that mix legacy and E19+ spawns.
+# ``leaves_per_sec`` and ``bytes_per_sec`` are surfaced alongside
+# the existing ``receives_per_sec`` so a spreadsheet pivot can render
+# the canonical cross-workload comparable metric (``leaves_per_sec``)
+# without re-deriving it.
 _CSV_COLUMNS: tuple[str, ...] = (
     "variant",
     "run",
@@ -501,10 +605,14 @@ _CSV_COLUMNS: tuple[str, ...] = (
     "tick_rate_hz",
     "qos",
     "workload_kind",
+    "workload",
+    "shape",
     "delivery_pct",
     "ratio_pct",
     "expected_writes_per_sec",
     "receives_per_sec",
+    "leaves_per_sec",
+    "bytes_per_sec",
     "writes_per_sec",
     "latency_mean_ms",
     "latency_std_ms",
@@ -522,6 +630,17 @@ _CSV_COLUMNS: tuple[str, ...] = (
     "late_receives_tail_pct",
     "has_uncorrected_latency",
 )
+
+# Mapping from the analyzer-internal ``shape`` token to the user-facing
+# workload-profile name used by BENCHMARK.md § 6 and the CLI variant
+# matrix. Kept here -- not duplicated in plots.py -- because the CSV
+# is the cleanest place to surface a stable column name that
+# downstream pivot tooling can rely on.
+_SHAPE_TO_WORKLOAD: dict[str, str] = {
+    "scalar": "scalar-flood",
+    "array": "block-flood",
+    "struct": "mixed-types",
+}
 
 
 def _csv_value(value: object) -> str:
@@ -562,6 +681,15 @@ def _csv_row(result: PerformanceResult) -> dict[str, str]:
 
     delivery_pct = _delivery_pct(result)
 
+    # E19 / T19.6: surface workload + shape as first-class CSV
+    # columns. ``shape`` defaults to ``"scalar"`` for legacy data per
+    # the api-contracts backward-compat rule; the matching workload
+    # name falls back via :data:`_SHAPE_TO_WORKLOAD` so the column
+    # value remains the user-facing profile token from BENCHMARK.md
+    # § 6 rather than the analyzer-internal shape value.
+    shape_value = result.shape if result.shape else "scalar"
+    workload_value = _SHAPE_TO_WORKLOAD.get(shape_value, shape_value)
+
     row = {
         "variant": result.variant,
         "run": result.run,
@@ -571,10 +699,14 @@ def _csv_row(result: PerformanceResult) -> dict[str, str]:
         "tick_rate_hz": hz,
         "qos": qos,
         "workload_kind": workload_kind,
+        "workload": workload_value,
+        "shape": shape_value,
         "delivery_pct": delivery_pct,
         "ratio_pct": result.receives_to_expected_ratio_pct,
         "expected_writes_per_sec": result.expected_writes_per_sec,
         "receives_per_sec": result.receives_per_sec,
+        "leaves_per_sec": result.leaves_per_sec,
+        "bytes_per_sec": result.bytes_per_sec,
         "writes_per_sec": result.writes_per_sec,
         "latency_mean_ms": result.latency_mean_ms,
         "latency_std_ms": result.latency_std_ms,
