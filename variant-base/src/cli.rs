@@ -63,6 +63,23 @@ pub const DEFAULT_WATCHDOG_SECS: u32 = 30;
 /// approximate steady-state footprint plus a 20% margin.
 pub const DEFAULT_DIGEST_MEM_SOFT_MB: u32 = 1024;
 
+/// Default value for `--blob-size` when `--workload block-flood` is
+/// selected and `--blob-size` is omitted. Matches
+/// `metak-shared/api-contracts/variant-cli.md` (E19 additions): "Default
+/// `100`". The default is materialized by `driver::run_protocol`'s
+/// startup validation (T19.3), not by clap's `default_value_t`, so the
+/// CLI field remains a true `Option<u32>` and other workload profiles
+/// (`scalar-flood`, `max-throughput`, `mixed-types`) leave it `None`.
+pub const DEFAULT_BLOB_SIZE: u32 = 100;
+
+/// Block-size sanity threshold used by `driver::run_protocol` (T19.3):
+/// when `blob_size * 8 > BLOCK_SIZE_SANITY_BYTES` the driver emits a
+/// one-shot stderr warning recommending the operator check
+/// variant-specific buffer hints (e.g. UDP MTU, websocket frame caps).
+/// Tuned to the 64 KiB threshold typical of UDP datagram fragmentation
+/// boundaries.
+pub const BLOCK_SIZE_SANITY_BYTES: u32 = 65_536;
+
 /// Default value for `--digest-mem-hard-mb`. When the running
 /// estimate of in-memory compact-buffer footprint exceeds this size,
 /// the variant returns an error from the operate loop with a clear
@@ -278,6 +295,69 @@ pub struct CliArgs {
     /// are gated on it. See T18.2 / E18.
     #[arg(long, default_value_t = false)]
     pub legacy_jsonl_events: bool,
+
+    // -- E19 workload-shape params (T19.3) --
+    //
+    // All optional at the clap layer because they only apply to the
+    // `block-flood` / `mixed-types` profiles. The driver materializes
+    // defaults (e.g. `blob_size = 100` for `block-flood` when the flag
+    // is omitted) and enforces the per-profile required-set during
+    // startup validation -- see `driver::validate_workload_params`.
+    //
+    // The runner forwards these from `[variant.common]` per the TOML
+    // schema (E19 additions), preserving the `snake_case` ->
+    // `--kebab-case` convention. Other workload profiles
+    // (`scalar-flood`, `max-throughput`) ignore these args.
+    /// `--blob-size` (E19 / T19.3): number of scalar leaves per WriteOp
+    /// when `--workload block-flood`. Defaulted to 100 by the driver's
+    /// startup validation when the flag is omitted. Validation requires
+    /// `values_per_tick % blob_size == 0`. See
+    /// `metak-shared/api-contracts/variant-cli.md` (E19 additions).
+    #[arg(long)]
+    pub blob_size: Option<u32>,
+
+    /// `--mixed-scalars-min` (E19 / T19.3): lower bound on standalone
+    /// scalar WriteOps per tick under `--workload mixed-types`. Required
+    /// for `mixed-types`; ignored otherwise.
+    #[arg(long)]
+    pub mixed_scalars_min: Option<u32>,
+
+    /// `--mixed-scalars-max` (E19 / T19.3): upper bound on standalone
+    /// scalar WriteOps per tick under `--workload mixed-types`. Required
+    /// for `mixed-types`; ignored otherwise. Must satisfy
+    /// `mixed_scalars_max <= values_per_tick`.
+    #[arg(long)]
+    pub mixed_scalars_max: Option<u32>,
+
+    /// `--mixed-arrays-min` (E19 / T19.3): lower bound on total leaves
+    /// allocated to array WriteOps under `--workload mixed-types`.
+    /// Required for `mixed-types`; ignored otherwise.
+    #[arg(long)]
+    pub mixed_arrays_min: Option<u32>,
+
+    /// `--mixed-arrays-max` (E19 / T19.3): upper bound on total leaves
+    /// allocated to array WriteOps under `--workload mixed-types`. Also
+    /// bounds the number of distinct array WriteOps. Required for
+    /// `mixed-types`; ignored otherwise. Must satisfy
+    /// `mixed_arrays_max <= values_per_tick - mixed_scalars_min`.
+    #[arg(long)]
+    pub mixed_arrays_max: Option<u32>,
+
+    /// `--mixed-dict-split-max` (E19 / T19.3): max branching factor at
+    /// each level of the nested-dict allocation under `--workload
+    /// mixed-types`. Min branching is implicitly 1. Required for
+    /// `mixed-types`; ignored otherwise. Must satisfy
+    /// `mixed_dict_split_max >= 2`.
+    #[arg(long)]
+    pub mixed_dict_split_max: Option<u32>,
+
+    /// `--workload-seed` (E19 / T19.3): RNG seed for reproducible
+    /// workload generation. Currently consumed only by `mixed-types`;
+    /// optional in all cases. When omitted, the variant derives a
+    /// deterministic seed from `--variant + --run` so re-runs with
+    /// identical config produce identical workload sequences.
+    #[arg(long)]
+    pub workload_seed: Option<u64>,
 
     // -- Variant-specific pass-through arguments --
     /// Additional variant-specific arguments (collected as trailing args).
@@ -577,6 +657,104 @@ mod tests {
         ];
         let names = parse_peer_names_from_extra(&extra);
         assert_eq!(names, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn workload_shape_args_default_to_none() {
+        // T19.3: when none of the new E19 args are passed, every
+        // workload-shape field on `CliArgs` is `None`. `scalar-flood`
+        // and `max-throughput` are agnostic to the new args and must
+        // continue to parse without them.
+        let args = CliArgs::parse_from([
+            "variant-dummy",
+            "--tick-rate-hz",
+            "100",
+            "--stabilize-secs",
+            "0",
+            "--operate-secs",
+            "1",
+            "--silent-secs",
+            "0",
+            "--workload",
+            "scalar-flood",
+            "--values-per-tick",
+            "10",
+            "--qos",
+            "1",
+            "--log-dir",
+            "/tmp/logs",
+            "--launch-ts",
+            "2026-05-19T14:00:00.000000000Z",
+            "--variant",
+            "dummy",
+            "--runner",
+            "a",
+            "--run",
+            "run01",
+        ]);
+        assert_eq!(args.blob_size, None);
+        assert_eq!(args.mixed_scalars_min, None);
+        assert_eq!(args.mixed_scalars_max, None);
+        assert_eq!(args.mixed_arrays_min, None);
+        assert_eq!(args.mixed_arrays_max, None);
+        assert_eq!(args.mixed_dict_split_max, None);
+        assert_eq!(args.workload_seed, None);
+    }
+
+    #[test]
+    fn parse_all_e19_workload_args() {
+        // T19.3 acceptance: every new E19 CLI arg parses and round-trips
+        // into the matching `Option<...>` field on `CliArgs`. The
+        // `--workload-seed` value is large enough to exercise the
+        // `u64` width (would overflow `i32` and `u32`).
+        let args = CliArgs::parse_from([
+            "variant-dummy",
+            "--tick-rate-hz",
+            "100",
+            "--stabilize-secs",
+            "0",
+            "--operate-secs",
+            "1",
+            "--silent-secs",
+            "0",
+            "--workload",
+            "mixed-types",
+            "--values-per-tick",
+            "1000",
+            "--qos",
+            "1",
+            "--log-dir",
+            "/tmp/logs",
+            "--launch-ts",
+            "2026-05-19T14:00:00.000000000Z",
+            "--variant",
+            "dummy",
+            "--runner",
+            "a",
+            "--run",
+            "run01",
+            "--blob-size",
+            "100",
+            "--mixed-scalars-min",
+            "10",
+            "--mixed-scalars-max",
+            "100",
+            "--mixed-arrays-min",
+            "20",
+            "--mixed-arrays-max",
+            "400",
+            "--mixed-dict-split-max",
+            "4",
+            "--workload-seed",
+            "12345678901234567890",
+        ]);
+        assert_eq!(args.blob_size, Some(100));
+        assert_eq!(args.mixed_scalars_min, Some(10));
+        assert_eq!(args.mixed_scalars_max, Some(100));
+        assert_eq!(args.mixed_arrays_min, Some(20));
+        assert_eq!(args.mixed_arrays_max, Some(400));
+        assert_eq!(args.mixed_dict_split_max, Some(4));
+        assert_eq!(args.workload_seed, Some(12_345_678_901_234_567_890));
     }
 
     #[test]
