@@ -15158,6 +15158,159 @@ updated (`jsonl-log-schema.md` strips per-event sections;
 section and gains a "Per-spawn file pair" + aggregate-throughput
 narrative).
 
+## T19.10b -- runner: drop legacy_jsonl_events forwarding -- LANDED
+
+**Scope confirmation**: `runner/` only. No edits outside this subtree.
+The parallel T19.10a worker owns the variant-base side and was still
+in-flight in the working tree while this worker ran; tests for the
+pre-existing protocol-network suite reproduce as documented (see
+"Tests run + results" below). T19.10c is sequenced after.
+
+### Files changed
+
+- `runner/src/config.rs` (+154 lines):
+  - New `VariantConfig::validate_no_removed_keys` method (lines
+    ~500-520). Rejects `legacy_jsonl_events` when present in
+    `[variant.common]`. Designed for low-friction extension if
+    additional removed keys land later -- the doc-comment lists
+    "currently rejected" so each new entry adds one block + one
+    table row.
+  - `BenchConfig::validate` calls the new method inside the existing
+    per-variant validation loop, right after `validate_workload_shape_keys`
+    so the diagnostic ordering matches the existing T19.4 patterns.
+  - Tests module (lines ~2316-2440): four new unit tests pinning the
+    rejection behavior and a positive sanity check. Exact wording of
+    the operator-facing message is asserted so it does not drift.
+- `runner/CUSTOM.md` (+24 lines): new "Removed `[variant.common]`
+  keys (T19.10b)" section. Table format leaves room for future
+  removed keys.
+
+No `cli_args.rs` edits were required. The runner-side "forwarding"
+was always purely generic (`snake_case` -> `--kebab-case` loop over
+the `[variant.common]` table). Rejecting at parse time means the
+key never reaches `build_variant_args`, so the forwarding path is
+naturally pruned without an explicit skip-list change. This matches
+the spec note in the brief: "If parsing of TOML is generic ... make
+sure the generic forwarding does NOT include `legacy_jsonl_events`".
+
+### Decision: parse-time rejection (chosen) vs silent skip
+
+**Picked parse-time rejection**, matching the brief's preference and
+the user directive ("clear it out please"). The diagnostic reads:
+
+```
+config: variant '<v>' has a removed [variant.common] key
+
+Caused by:
+    `legacy_jsonl_events` was removed in the E19 follow-up cleanup;
+    per-event observations are written to compact Parquet only.
+    Delete `legacy_jsonl_events` from [variant.common] in this config.
+```
+
+Rationale (recorded inline in `runner/CUSTOM.md` and the doc-comment
+on `validate_no_removed_keys`):
+
+- An operator with a stale config that silently skips the key would
+  see no `legacy-jsonl-events`-bearing variant arg AND no
+  per-event JSONL in the spawn output; they would assume their
+  `tail -f` is broken, not their config. Parse-time failure
+  unambiguously points at the offending file and key.
+- The variant-base side (T19.10a) removed the CLI flag outright,
+  so even if the runner DID still forward `--legacy-jsonl-events true`
+  the spawn would fail at clap parse with "unknown argument" -- and
+  the original bool-with-value bug T19.4 surfaced would re-trigger
+  in the process. Failing at the runner is strictly clearer than
+  failing inside the variant child.
+- The variant-base T19.10a stripped the CLI arg without leaving a
+  deprecation alias. Mirroring that policy on the runner side --
+  hard removal with a clear failure -- keeps the two halves of the
+  removal symmetric.
+
+### Tests run + results
+
+```
+cargo build --release -p runner            # ok
+cargo build --release                       # ok (full workspace)
+cargo fmt -p runner -- --check              # ok (after one indent fix)
+cargo clippy --release -p runner -- -D warnings  # ok
+cargo test --release -p runner --bin runner config::   # 63/63 passed
+cargo test --release -p runner --bin runner cli_args:: # 18/18 passed
+cargo test --release -p runner --bin runner validation_rejects_legacy  # 3/3 passed
+cargo test --release -p runner --test integration single_runner_lifecycle  # passed
+cargo test --release -p runner --test integration t19_4  # 2/2 passed
+```
+
+Full `cargo test --release -p runner` reproduces the pre-existing
+flaky protocol-network suite documented for T-coord.* (Windows
+`os error 10065 WSAEHOSTUNREACH` from
+`protocol.rs:1896`). Confirmed pre-existing by stashing the worker's
+changes and reproducing on clean `HEAD`: same panic, same line, same
+OS error. The brief explicitly called out
+`barrier_coord::tests::two_runner_barrier_exchange_round_trips` as
+the known-flaky case; the wider set of failures here is the same
+host-multicast configuration issue (already exercised in T19.8 when
+two-runner E2E delivery was reported BLOCKED for the same reason).
+Not in scope for T19.10b.
+
+### Smoke checks
+
+Two synthetic configs (under `c:/tmp/t1910b/`, not committed):
+
+**Stale config with `legacy_jsonl_events = true`** -- runner output:
+
+```
+[runner:alice] build: 79171d5+dirty (rustc 1.94.1)
+[runner:alice] barrier timeout: 120s
+Error: config: variant 'v' has a removed [variant.common] key
+
+Caused by:
+    `legacy_jsonl_events` was removed in the E19 follow-up cleanup;
+    per-event observations are written to compact Parquet only.
+    Delete `legacy_jsonl_events` from [variant.common] in this config.
+```
+
+Exits before any spawn. No log file created. Exact wording matches
+the unit-test assertion.
+
+**Clean config (single-runner, variant-dummy, scalar-flood)** --
+runner output (truncated):
+
+```
+[runner:alice] starting discovery...
+[runner:alice] discovery complete
+[runner:alice] log subfolder: clean-test-20260519_205529
+[runner:alice] peer_hosts: {"alice": "127.0.0.1"}
+[runner:alice] note: variant 'v' has no supported_modes declared; ...
+[runner:alice] ready barrier for spawn 'v' ...
+[runner:alice] spawning 'v' ...
+[runner:alice] 'v' final progress: phase=done sent=20100 received=20100
+[runner:alice] 'v' finished: status=success, exit_code=0
+Benchmark run: clean-test
+Variant                  Runner   Status    Exit
+v                        alice    success   0
+```
+
+`variant-dummy.exe` was spawned with no `--legacy-jsonl-events` in
+its argv (no key in the source TOML -> never reaches
+`build_variant_args`'s generic loop).
+
+### Commits
+
+Four split commits on `main` (no remote push per brief):
+
+- `feat(runner/T19.10b): reject legacy_jsonl_events at parse time`
+- `test(runner/T19.10b): cover legacy_jsonl_events parse-time rejection`
+- `docs(runner/T19.10b): document removed-keys rejection in CUSTOM.md`
+- `status(T19.10b): worker completion report` (this entry)
+
+### Deviations from the locked spec
+
+None. The brief's "either parse-time rejection OR silent skip" choice
+was made (rejection) and documented as instructed. No edits outside
+`runner/`. No fix attempted for the T19.4-surfaced bool-forwarding
+bug -- the only key that triggered it is gone, making the bug moot
+as the brief permits.
+
 ## T19.10a completion report -- 2026-05-19 (worker: variant-base)
 
 **Outcome**: variant-base no longer accepts `--legacy-jsonl-events`.
