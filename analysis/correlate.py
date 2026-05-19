@@ -62,9 +62,24 @@ class DeliveryRecord:
     latency_ms: float
     offset_ms: float | None
     offset_applied: bool
+    # E19 / T19.5: workload-shape dimension. Inherited from the
+    # matching ``write`` row via the (writer, seq, path) join key.
+    # Defaults to ``1`` / ``"scalar"`` for legacy data per the
+    # api-contracts backward-compat rule. ``bytes`` is the serialized
+    # payload size recorded by the writer (null on legacy data that
+    # predates the column).
+    leaf_count: int = 1
+    shape: str = "scalar"
+    bytes: int | None = None
 
 
 # Output column order on the delivery DataFrame.
+#
+# ``leaf_count`` / ``shape`` / ``bytes`` (E19 / T19.5) are inherited
+# from the matching ``write`` row -- the wire is opaque so receive
+# events never carry them directly. ``leaf_count`` defaults to ``1``
+# and ``shape`` to ``"scalar"`` on legacy data per the api-contracts
+# backward-compat rule.
 DELIVERY_COLUMNS: tuple[str, ...] = (
     "variant",
     "run",
@@ -78,6 +93,9 @@ DELIVERY_COLUMNS: tuple[str, ...] = (
     "latency_ms",
     "offset_ms",
     "offset_applied",
+    "leaf_count",
+    "shape",
+    "bytes",
 )
 
 
@@ -223,6 +241,28 @@ def correlate_lazy(group: pl.LazyFrame) -> pl.LazyFrame:
     sorted right-hand side. The result is then re-wrapped as lazy so
     callers (``analyze.run_analysis``) can continue to compose with it.
     """
+    # E19 / T19.5: ``leaf_count`` / ``shape`` / ``bytes`` are sourced from
+    # the write side and inherited by the matching receive row via the
+    # ``(variant, run, writer, seq, path)`` join. Schema columns may be
+    # absent on caches built before SCHEMA_VERSION 5 -- guard with the
+    # lazy frame's collected schema and synthesize default-value
+    # expressions so the projection always emits the same column set.
+    available = set(group.collect_schema().names())
+    if "leaf_count" in available:
+        leaf_count_expr = (
+            pl.col("leaf_count").cast(pl.UInt32, strict=False).fill_null(1)
+        )
+    else:
+        leaf_count_expr = pl.lit(1, dtype=pl.UInt32)
+    if "shape" in available:
+        shape_expr = pl.col("shape").fill_null(pl.lit("scalar"))
+    else:
+        shape_expr = pl.lit("scalar", dtype=pl.Utf8)
+    if "bytes" in available:
+        bytes_expr = pl.col("bytes").cast(pl.Int64, strict=False)
+    else:
+        bytes_expr = pl.lit(None, dtype=pl.Int64)
+
     writes = (
         group.filter(pl.col("event") == "write")
         .filter(pl.col("seq").is_not_null() & pl.col("path").is_not_null())
@@ -234,6 +274,9 @@ def correlate_lazy(group: pl.LazyFrame) -> pl.LazyFrame:
             pl.col("path"),
             pl.col("ts").alias("write_ts"),
             pl.col("qos").alias("write_qos"),
+            leaf_count_expr.alias("leaf_count"),
+            shape_expr.alias("shape"),
+            bytes_expr.alias("bytes"),
         )
     )
     receives = (
@@ -281,6 +324,9 @@ def correlate_lazy(group: pl.LazyFrame) -> pl.LazyFrame:
         pl.col("write_ts"),
         pl.col("receive_ts"),
         pl.col("latency_ms"),
+        pl.col("leaf_count"),
+        pl.col("shape"),
+        pl.col("bytes"),
     )
 
     # Materialize the deliveries here so we can run the asof-join against
@@ -305,6 +351,17 @@ def deliveries_to_records(deliveries: pl.DataFrame) -> list[DeliveryRecord]:
     for row in deliveries.iter_rows(named=True):
         offset_raw = row.get("offset_ms")
         offset_ms: float | None = float(offset_raw) if offset_raw is not None else None
+        # E19 / T19.5: populate ``leaf_count`` / ``shape`` / ``bytes``.
+        # Older delivery DataFrames (pre-T19.5 callers) won't have the
+        # columns; we fall back to the dataclass defaults so this helper
+        # stays back-compatible for any consumer that did its own
+        # correlation outside ``correlate_lazy``.
+        leaf_count_raw = row.get("leaf_count")
+        leaf_count = int(leaf_count_raw) if leaf_count_raw is not None else 1
+        shape_raw = row.get("shape")
+        shape = str(shape_raw) if shape_raw is not None else "scalar"
+        bytes_raw = row.get("bytes")
+        bytes_val = int(bytes_raw) if bytes_raw is not None else None
         records.append(
             DeliveryRecord(
                 variant=row["variant"],
@@ -319,6 +376,9 @@ def deliveries_to_records(deliveries: pl.DataFrame) -> list[DeliveryRecord]:
                 latency_ms=float(row["latency_ms"]),
                 offset_ms=offset_ms,
                 offset_applied=bool(row.get("offset_applied", False)),
+                leaf_count=leaf_count,
+                shape=shape,
+                bytes=bytes_val,
             )
         )
     return records

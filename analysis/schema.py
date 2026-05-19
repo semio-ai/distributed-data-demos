@@ -32,7 +32,20 @@ import polars as pl
 # ``extra_i64`` slot, with an unsigned cast). Bumping forces a
 # rebuild so caches built from JSONL on a v3 run get re-projected
 # through the unified v4 pipeline when a compact file appears.
-SCHEMA_VERSION: str = "4"
+#
+# Bumped to "5" by T19.5 (E19): the ``write`` event gained
+# ``leaf_count`` / ``shape`` fields and the analysis pipeline now also
+# captures the ``bytes`` payload size. Three new columns join
+# ``SHARD_SCHEMA``: ``leaf_count`` (UInt32, default 1 on write rows
+# from pre-E19 logs), ``shape`` (Utf8, default ``"scalar"`` on write
+# rows from pre-E19 logs), and ``bytes`` (Int64, optional). These are
+# additive in the strict Parquet sense (older shards would simply
+# lack the columns) but the downstream lazy pipeline references them
+# unconditionally -- correlate.py copies ``leaf_count`` / ``shape`` /
+# ``bytes`` from writes onto correlated receives, and performance.py
+# derives ``leaves_per_sec`` / ``bytes_per_sec``. Bumping forces a
+# rebuild so existing caches get the new columns.
+SCHEMA_VERSION: str = "5"
 
 # Flat columnar event schema. One row per JSONL line. Event-specific
 # fields share the same row; columns that don't apply to a given event
@@ -86,6 +99,23 @@ SHARD_SCHEMA: dict[str, pl.DataType] = {
     # the analysis pipeline but kept in-schema so future grouping or
     # plotting work can reach it without a rebuild.
     "recv_buffer_kb": pl.UInt32,
+    # Workload-shape dimension (E19 / T19.5). ``leaf_count`` is the
+    # number of scalar leaves carried by a WriteOp (1 for scalar-flood;
+    # > 1 for block-flood / mixed-types). ``shape`` is one of
+    # ``"scalar"`` / ``"array"`` / ``"struct"``. Both are populated only
+    # on ``write`` rows; correlate.py propagates them onto matching
+    # ``receive`` rows by the (writer, seq, path) key. Legacy JSONL /
+    # compact-Parquet pre-E19 default to ``leaf_count = 1`` and
+    # ``shape = "scalar"`` per the api-contracts.
+    "leaf_count": pl.UInt32,
+    "shape": pl.Utf8,
+    # Serialized payload size for ``write`` / ``receive`` events. The
+    # JSONL contract has always recorded this on the per-event line, but
+    # the analysis pipeline previously dropped it. E19 introduces
+    # ``bytes_per_sec`` as a headline throughput metric so we now keep
+    # the value in-schema. Null on event types that have no payload
+    # (phase / connected / resource / etc.).
+    "bytes": pl.Int64,
 }
 
 

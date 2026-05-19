@@ -291,6 +291,52 @@ def project_line(line: str) -> dict | None:
         except (TypeError, ValueError):
             recv_buffer_kb = None
 
+    # Workload-shape dimension (E19 / T19.5). ``leaf_count`` defaults
+    # to ``1`` and ``shape`` to ``"scalar"`` on ``write`` events when
+    # the fields are absent (pre-E19 logs). On non-``write`` rows we
+    # leave both null so the column semantics ("populated only on write
+    # rows") remain unambiguous -- correlate.py propagates them onto
+    # receives by the (writer, seq, path) key. The wire is opaque, so
+    # receive events do not carry these fields directly.
+    leaf_count: int | None
+    shape: str | None
+    if event_type == "write":
+        leaf_count_raw = obj.get("leaf_count")
+        if leaf_count_raw is None:
+            leaf_count = 1
+        else:
+            try:
+                leaf_count = int(leaf_count_raw)
+                if leaf_count < 0:
+                    leaf_count = 1
+            except (TypeError, ValueError):
+                leaf_count = 1
+        shape_raw = obj.get("shape")
+        if shape_raw is None:
+            shape = "scalar"
+        else:
+            shape = str(shape_raw)
+    else:
+        leaf_count = None
+        shape = None
+
+    # Serialized payload size (``bytes``). The contract records it on
+    # both ``write`` and ``receive`` events; we keep both populated so
+    # the analyzer can derive ``bytes_per_sec`` from the write side and
+    # cross-check at the receive side if needed. Null on event types
+    # without a payload.
+    bytes_raw = obj.get("bytes")
+    bytes_val: int | None
+    if bytes_raw is None:
+        bytes_val = None
+    else:
+        try:
+            bytes_val = int(bytes_raw)
+            if bytes_val < 0:
+                bytes_val = None
+        except (TypeError, ValueError):
+            bytes_val = None
+
     return {
         "ts": ts_ns,
         "variant": obj["variant"],
@@ -315,6 +361,9 @@ def project_line(line: str) -> dict | None:
         "wait_ms": wait_ms,
         "threading_mode": threading_mode,
         "recv_buffer_kb": recv_buffer_kb,
+        "leaf_count": leaf_count,
+        "shape": shape,
+        "bytes": bytes_val,
     }
 
 

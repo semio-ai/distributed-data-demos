@@ -662,14 +662,25 @@ class TestRunAnalysisParity:
 
 
 class TestSchemaVersionBump:
-    def test_schema_version_bumped_to_4(self) -> None:
-        """T18.4 bumped the cache schema version to 4."""
+    def test_schema_version_bumped_to_5(self) -> None:
+        """T19.5 bumped the cache schema version to 5 (E19 additions).
+
+        T18.4 had bumped it to 4 for the compact-parquet ingest. T19.5
+        bumps again because ``SHARD_SCHEMA`` gained ``leaf_count``,
+        ``shape``, and ``bytes`` columns that the downstream lazy
+        pipeline references unconditionally.
+        """
         from schema import SCHEMA_VERSION as v
 
-        assert v == "4"
+        assert v == "5"
 
     def test_legacy_v3_cache_is_invalidated(self, tmp_path: Path) -> None:
-        """A cache with the previous schema version triggers a wipe."""
+        """A cache with an older schema version triggers a wipe.
+
+        The previous test name pinned v3 -> bumped-version invalidation;
+        the same behaviour applies to v4 (the post-T18.4 version) being
+        invalidated by the T19.5 bump to v5.
+        """
         # Drop a fake legacy cache with the v3 sentinel and an orphan
         # shard. The next update_cache call should wipe it because the
         # version no longer matches.

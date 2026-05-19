@@ -150,6 +150,30 @@ class PerformanceResult:
     latency_std_ms: float = float("nan")
     expected_writes_per_sec: float | None = None
     receives_to_expected_ratio_pct: float | None = None
+    # E19 / T19.5: workload-shape headline metrics. All three are
+    # derived from correlated deliveries (receive side) so they reflect
+    # what the wire actually delivered, not just what was requested.
+    #
+    # - ``ops_per_sec`` is the count of received WriteOps per operate
+    #   second. Equal to ``receives_per_sec`` (kept as a separate field
+    #   for the workload-shape vocabulary).
+    # - ``leaves_per_sec`` is the sum of ``leaf_count`` across all
+    #   correlated deliveries divided by ``operate_secs`` -- the
+    #   canonical cross-workload comparable metric. For ``scalar-flood``
+    #   data ``leaves_per_sec == ops_per_sec`` because every WriteOp
+    #   carries one leaf.
+    # - ``bytes_per_sec`` is the sum of ``bytes`` across all correlated
+    #   deliveries divided by ``operate_secs``. Falls back to ``0.0`` on
+    #   legacy data where the ``bytes`` column is null.
+    # - ``shape`` is the dominant ``shape`` value across this group's
+    #   delivered writes (the writer is supposed to emit a single
+    #   profile per spawn so this is a near-degenerate aggregation in
+    #   practice; we pick the lexicographically-first non-null value
+    #   for determinism when a group happens to mix shapes).
+    ops_per_sec: float = 0.0
+    leaves_per_sec: float = 0.0
+    bytes_per_sec: float = 0.0
+    shape: str = "scalar"
 
 
 def _percentile(data: list[float], p: float) -> float:
@@ -712,6 +736,125 @@ def _late_receives_count(group: pl.LazyFrame, windows: _OperateWindows) -> int |
     return int(late)
 
 
+def _shape_aggregates(
+    deliveries: pl.DataFrame, windows: _OperateWindows
+) -> tuple[int, int, str]:
+    """E19 / T19.5: per-group leaf/byte totals + dominant shape.
+
+    Returns ``(leaves_total, bytes_total, shape)`` for the deliveries
+    that fall in each writer's operate window. The window scoping
+    matches ``_write_receive_counts``: a delivery counts when its
+    ``write_ts`` (writer clock) is in ``[operate_start, end_ts]`` per
+    writer, where ``end_ts`` is the writer's ``eot_sent_ts`` if
+    available else the group's ``silent_start``. This keeps the leaf /
+    bytes accounting consistent with the existing throughput numbers.
+
+    ``leaf_count`` / ``bytes`` are inherited from the matching write
+    row via ``correlate_lazy``; legacy data defaults to
+    ``leaf_count = 1`` and a null ``bytes``. Null ``bytes`` contribute
+    ``0`` to the byte total.
+
+    ``shape`` picks the lexicographically-first non-null shape across
+    the in-window deliveries. The E19 contract specifies that a single
+    spawn emits exactly one workload profile, so this is normally
+    degenerate (every row carries the same shape); the deterministic
+    tie-break is for stability when a synthetic / mixed fixture
+    deliberately violates the per-spawn-single-shape assumption.
+    Falls back to ``"scalar"`` when no deliveries are present.
+    """
+    if deliveries.is_empty():
+        return 0, 0, "scalar"
+
+    # Build the per-writer end-boundary table -- same shape as the one
+    # ``_write_receive_counts`` constructs, but we don't share it
+    # because the caller controls the lifecycle of those temporaries.
+    fallback_end = windows.silent_start
+    if windows.operate_start is None:
+        # No operate phase -- the existing throughput numbers also fall
+        # back to "count every delivery"; mirror that here so the leaf
+        # / byte totals stay in lockstep with ``receive_count``.
+        df = deliveries.select(
+            pl.col("leaf_count").cast(pl.Int64, strict=False).sum().alias("leaves"),
+            pl.col("bytes").cast(pl.Int64, strict=False).sum().alias("bytes"),
+        ).row(0)
+        leaves = int(df[0] or 0)
+        bytes_total = int(df[1] or 0)
+        shape = _dominant_shape(deliveries)
+        return leaves, bytes_total, shape
+
+    operate_start = windows.operate_start
+
+    candidate_writers: set[str] = set(windows.per_writer_eot_ts.keys())
+    if "writer" in deliveries.columns:
+        for w in deliveries.get_column("writer").unique().to_list():
+            if w is not None:
+                candidate_writers.add(str(w))
+
+    end_rows: list[dict] = []
+    for writer in candidate_writers:
+        end = windows.per_writer_eot_ts.get(writer, fallback_end)
+        if end is None:
+            continue
+        end_rows.append({"writer": writer, "end_ts": end})
+
+    if not end_rows:
+        return 0, 0, "scalar"
+
+    end_df = pl.DataFrame(
+        end_rows,
+        schema={"writer": pl.Utf8, "end_ts": pl.Datetime("ns", "UTC")},
+        orient="row",
+    )
+
+    scoped = (
+        deliveries.select(
+            pl.col("writer").cast(pl.Utf8),
+            pl.col("write_ts"),
+            pl.col("leaf_count").cast(pl.Int64, strict=False),
+            pl.col("bytes").cast(pl.Int64, strict=False),
+            pl.col("shape"),
+        )
+        .join(end_df, on="writer", how="inner")
+        .filter(pl.col("write_ts") >= operate_start)
+        .filter(pl.col("write_ts") <= pl.col("end_ts"))
+    )
+
+    if scoped.is_empty():
+        return 0, 0, "scalar"
+
+    totals = scoped.select(
+        pl.col("leaf_count").sum().alias("leaves"),
+        pl.col("bytes").sum().alias("bytes"),
+    ).row(0)
+    leaves = int(totals[0] or 0)
+    bytes_total = int(totals[1] or 0)
+    shape = _dominant_shape(scoped)
+    return leaves, bytes_total, shape
+
+
+def _dominant_shape(deliveries: pl.DataFrame) -> str:
+    """Pick a stable single shape value across a delivery DataFrame.
+
+    Returns the lexicographically-first non-null shape; falls back to
+    ``"scalar"`` when no value is present. See ``_shape_aggregates``
+    for rationale.
+    """
+    if deliveries.is_empty() or "shape" not in deliveries.columns:
+        return "scalar"
+    distinct = (
+        deliveries.select(pl.col("shape"))
+        .filter(pl.col("shape").is_not_null())
+        .unique()
+        .sort("shape")
+    )
+    if distinct.is_empty():
+        return "scalar"
+    value = distinct.item(0, "shape")
+    if value is None or value == "":
+        return "scalar"
+    return str(value)
+
+
 def _any_uncorrected(deliveries: pl.DataFrame) -> bool:
     """Return True if any delivery row has ``offset_applied == False``.
 
@@ -760,6 +903,18 @@ def performance_for_group(
     duration = _operate_duration_seconds(windows)
     writes_per_sec = write_count / duration if duration > 0 else 0.0
     receives_per_sec = receive_count / duration if duration > 0 else 0.0
+    # E19 / T19.5: leaves + bytes throughput. Derived from correlated
+    # deliveries scoped to each writer's operate window so the
+    # accounting matches the writer-clock semantics of ``receives_per_sec``
+    # (T16.16). When ``deliveries`` is empty (no correlated rows) the
+    # totals are zero and the three throughput fields collapse to
+    # ``0.0``. ``shape`` picks the lexicographically-first non-null
+    # value; per the E19 contract a single spawn emits exactly one
+    # workload profile so this is normally degenerate.
+    leaves_sum, bytes_sum, group_shape = _shape_aggregates(deliveries, windows)
+    ops_per_sec = receives_per_sec
+    leaves_per_sec = leaves_sum / duration if duration > 0 else 0.0
+    bytes_per_sec = bytes_sum / duration if duration > 0 else 0.0
     jitter, jitter_p95 = _jitter(deliveries)
     if write_count > 0:
         loss_pct = max(0.0, (1.0 - receive_count / write_count) * 100.0)
@@ -818,4 +973,8 @@ def performance_for_group(
         latency_std_ms=latency_std,
         expected_writes_per_sec=expected_wps,
         receives_to_expected_ratio_pct=ratio_pct,
+        ops_per_sec=ops_per_sec,
+        leaves_per_sec=leaves_per_sec,
+        bytes_per_sec=bytes_per_sec,
+        shape=group_shape,
     )

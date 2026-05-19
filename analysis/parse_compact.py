@@ -76,6 +76,12 @@ class CompactMeta:
     stores spawn identity + intern dictionaries here. We surface only
     the fields the analyzer consumes; missing fields default to ``None``
     or an empty list so older / partial files still load.
+
+    ``shapes`` (E19) is the ``shape_intern`` dictionary the writer
+    persists alongside ``paths`` / ``peers``; index = ``shape_idx``.
+    Defaults to ``["scalar"]`` so legacy compact files (pre-E19) that
+    omit the dictionary read back with the scalar shape -- this matches
+    the api-contracts ``compact-log-schema.md`` § E19 additions.
     """
 
     schema_version: int | None
@@ -86,6 +92,7 @@ class CompactMeta:
     recv_buffer_kb: int | None
     paths: list[str]
     peers: list[str]
+    shapes: list[str]
 
 
 class CompactLoadError(Exception):
@@ -174,6 +181,26 @@ def read_compact_metadata(path: Path) -> CompactMeta:
         val = raw.get(key)
         return str(val) if val is not None else None
 
+    # E19 ``shape_intern`` dictionary. Defaults to ``["scalar"]`` when
+    # the key is absent (pre-E19 files) so any later ``shape_idx`` lookup
+    # against index ``0`` recovers the scalar default consistently. We
+    # tolerate either the canonical key name (``shape_intern``) or a
+    # shorter alias (``shapes``) since the contract is freshly minted
+    # and the writer's exact key name lands in T19.2 -- absence of either
+    # collapses to the legacy default.
+    shapes: list[str]
+    if raw.get("shape_intern") is not None:
+        shapes = _decode_list("shape_intern")
+    elif raw.get("shapes") is not None:
+        shapes = _decode_list("shapes")
+    else:
+        shapes = ["scalar"]
+    # Defensive empty-list fallback: a writer that emits an empty
+    # dictionary still needs index ``0`` to resolve to ``"scalar"`` for
+    # the legacy / unset case.
+    if not shapes:
+        shapes = ["scalar"]
+
     return CompactMeta(
         schema_version=_decode_int("schema_version"),
         variant=_decode_str("variant"),
@@ -183,6 +210,7 @@ def read_compact_metadata(path: Path) -> CompactMeta:
         recv_buffer_kb=_decode_int("recv_buffer_kb"),
         paths=_decode_list("paths"),
         peers=_decode_list("peers"),
+        shapes=shapes,
     )
 
 
@@ -227,15 +255,38 @@ def _common_cols(
 def _project_write(
     frame: pl.DataFrame, *, variant: str, runner: str, run: str
 ) -> pl.DataFrame:
-    """``Write (0)``: ts / seq / path / qos / bytes. ``writer`` left null.
+    """``Write (0)``: ts / seq / path / qos / bytes / leaf_count / shape.
 
-    The ``bytes`` column is not in ``SHARD_SCHEMA`` -- the legacy JSONL
-    parser drops it too -- so we don't propagate it.
+    ``writer`` is left null on write rows -- the row's runner already
+    identifies the source. ``bytes`` was historically dropped by the
+    legacy projection; E19 (T19.5) keeps it because it feeds the new
+    ``bytes_per_sec`` headline metric. ``leaf_count`` and ``shape`` are
+    resolved from the compact ``leaf_count`` column and the
+    ``shape_idx`` -> ``shape_intern`` lookup (already attached to the
+    frame as ``shape_str``). Both default to ``1`` / ``"scalar"`` for
+    legacy / pre-E19 rows.
     """
     sub = frame.filter(pl.col("kind") == KIND_WRITE)
     if sub.is_empty():
         return _empty_shard_frame()
     sub = _common_cols(sub, variant=variant, runner=runner, run=run)
+    # ``leaf_count`` column is optional in the compact format; older
+    # files don't have it. ``with_columns`` + ``fill_null`` would only
+    # work if the column exists, so we branch on column-presence.
+    if "leaf_count" in sub.columns:
+        leaf_count_expr = (
+            pl.col("leaf_count").cast(pl.UInt32, strict=False).fill_null(1)
+        )
+    else:
+        leaf_count_expr = pl.lit(1, dtype=pl.UInt32)
+    if "shape_str" in sub.columns:
+        shape_expr = pl.col("shape_str").fill_null(pl.lit("scalar"))
+    else:
+        shape_expr = pl.lit("scalar", dtype=pl.Utf8)
+    if "bytes" in sub.columns:
+        bytes_expr = pl.col("bytes").cast(pl.Int64, strict=False)
+    else:
+        bytes_expr = pl.lit(None, dtype=pl.Int64)
     return sub.select(
         pl.col("ts"),
         pl.col("variant"),
@@ -245,17 +296,29 @@ def _project_write(
         pl.col("seq").cast(pl.Int64),
         pl.col("path_str").alias("path"),
         pl.col("qos").cast(pl.Int8),
+        bytes_expr.alias("bytes"),
+        leaf_count_expr.alias("leaf_count"),
+        shape_expr.alias("shape"),
     )
 
 
 def _project_receive(
     frame: pl.DataFrame, *, variant: str, runner: str, run: str
 ) -> pl.DataFrame:
-    """``Receive (1)``: ts / seq / path / writer / qos."""
+    """``Receive (1)``: ts / seq / path / writer / qos / bytes.
+
+    ``leaf_count`` / ``shape`` are NOT carried on receive rows by the
+    compact format -- the wire is opaque. The analyzer propagates them
+    from the matching write row in ``correlate.py``.
+    """
     sub = frame.filter(pl.col("kind") == KIND_RECEIVE)
     if sub.is_empty():
         return _empty_shard_frame()
     sub = _common_cols(sub, variant=variant, runner=runner, run=run)
+    if "bytes" in sub.columns:
+        bytes_expr = pl.col("bytes").cast(pl.Int64, strict=False)
+    else:
+        bytes_expr = pl.lit(None, dtype=pl.Int64)
     return sub.select(
         pl.col("ts"),
         pl.col("variant"),
@@ -266,6 +329,7 @@ def _project_receive(
         pl.col("path_str").alias("path"),
         pl.col("peer_str").alias("writer"),
         pl.col("qos").cast(pl.Int8),
+        bytes_expr.alias("bytes"),
     )
 
 
@@ -605,6 +669,28 @@ def read_compact_parquet(path: Path) -> pl.DataFrame:
         frame = frame.join(peers_df, on="peer_idx", how="left")
     else:
         frame = frame.with_columns(pl.lit(None, dtype=pl.Utf8).alias("peer_str"))
+
+    # E19: resolve ``shape_idx`` -> interned shape string via the
+    # ``shape_intern`` dictionary from KV metadata. When the source file
+    # predates E19 the ``shape_idx`` column is absent (older compact
+    # writers never emit it); we synthesize a null column so the
+    # downstream ``shape_str`` lookup still has something to read from.
+    # The ``meta.shapes`` list defaults to ``["scalar"]`` when the KV
+    # metadata key is missing -- see ``read_compact_metadata`` -- so the
+    # join below resolves any present index-0 row to ``"scalar"`` in
+    # the legacy case too.
+    if "shape_idx" not in frame.columns:
+        frame = frame.with_columns(pl.lit(None, dtype=pl.UInt32).alias("shape_idx"))
+    else:
+        frame = frame.with_columns(pl.col("shape_idx").cast(pl.UInt32, strict=False))
+    shapes_df = pl.DataFrame(
+        {
+            "shape_idx": list(range(len(meta.shapes))),
+            "shape_str": meta.shapes,
+        },
+        schema={"shape_idx": pl.UInt32, "shape_str": pl.Utf8},
+    )
+    frame = frame.join(shapes_df, on="shape_idx", how="left")
 
     variant = meta.variant
     runner = meta.runner
