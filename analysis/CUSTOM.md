@@ -2,14 +2,36 @@
 
 ## Overview
 
-Python script that ingests JSONL log files from benchmark runs, verifies
-data integrity, computes performance metrics, and produces CLI summary
-tables and diagrams. Phase 1 (E4) is shipped. **Phase 1.5 (E11) reworks
-the storage and execution model to scale to multi-tens-of-GB datasets;
-Phase 2/3 (E5/E6) add diagrams on top of the Phase 1.5 lazy pipeline.**
+Python script that ingests per-spawn log files from benchmark runs,
+verifies data integrity, computes performance metrics, and produces
+CLI summary tables and diagrams. Phase 1 (E4) is shipped. **Phase 1.5
+(E11) reworks the storage and execution model to scale to multi-tens-
+of-GB datasets; Phase 2/3 (E5/E6) add diagrams on top of the Phase 1.5
+lazy pipeline.**
 
 The full spec is in `metak-shared/ANALYSIS.md`. Sections 3-4 describe
 the post-rework caching and data model. Section 8 lists the phases.
+
+## Post-E19-cleanup invariant (T19.10c)
+
+Since the E19 follow-up cleanup landed (2026-05-19), each spawn
+contributes a **per-spawn file pair** to its log directory:
+
+- `<variant>-<runner>-<run>.jsonl` — **lifecycle events only**:
+  `phase`, `connected`, `eot_sent`, `eot_received`, `eot_timeout`,
+  `resource`, `clock_sync`. No `write` / `receive` /
+  `backpressure_skipped` / `gap_detected` / `gap_filled` rows.
+- `<variant>-<runner>-<run>.compact.parquet` — **per-event
+  observations** plus mirrored lifecycle rows (T18.2b). The compact
+  file is the canonical source for the analyzer; when both files are
+  present for a stem, the cache picks the compact one.
+
+`parse.iter_rows` (used by the cache pipeline when ingesting JSONL)
+warns once per file and skips any pre-T18.2 per-event JSONL rows it
+encounters on disk. Pre-T18.2 datasets with per-event JSONL rows are
+**no longer supported** -- they parse without crashing but produce
+empty per-event tables. The user directive backing this rule is
+recorded in `metak-orchestrator/STATUS.md` (T19.10).
 
 ## Tech Stack
 
@@ -47,11 +69,20 @@ No build step — it's a Python script.
 
 ## Integration Contracts
 
-Consumes JSONL log files per `metak-shared/api-contracts/jsonl-log-schema.md`.
+Consumes two per-spawn file formats:
 
-Key fields on every line: `ts`, `variant`, `runner`, `run`, `event`.
-Event types: `connected`, `phase`, `write`, `receive`, `gap_detected`,
-`gap_filled`, `resource`.
+- Lifecycle JSONL per `metak-shared/api-contracts/jsonl-log-schema.md`
+  -- post-E19 cleanup this is **lifecycle-only**: `connected`,
+  `phase`, `eot_sent`, `eot_received`, `eot_timeout`, `resource`,
+  `clock_sync`.
+- Compact-Parquet per
+  `metak-shared/api-contracts/compact-log-schema.md` -- carries
+  per-event observations (`write`, `receive`, `backpressure_skipped`,
+  `gap_detected`, `gap_filled`) plus mirrored lifecycle rows (T18.2b).
+
+Key fields on every JSONL line: `ts`, `variant`, `runner`, `run`,
+`event`. The same five identify a row in the compact-Parquet tagged
+union.
 
 ## Test Data
 
@@ -205,8 +236,11 @@ dummy                local-test   0.1          0.01ms       0.02ms  0.03ms  50  
 
 E19 adds the workload axis to the analysis pipeline. Two new fields
 appear on `write` events: `leaf_count: u32` (default `1`) and
-`shape: string` (default `"scalar"`). Backward-compatible: legacy
-JSONL / compact-Parquet files default both fields when parsing.
+`shape: string` (default `"scalar"`). Backward-compatible:
+pre-E19 compact-Parquet files default both fields when parsing.
+Per-event observations (including `write`) come exclusively from the
+compact-Parquet sibling file -- see the
+"Post-E19-cleanup invariant (T19.10c)" section above.
 
 **Parse + correlate** (T19.5):
 
