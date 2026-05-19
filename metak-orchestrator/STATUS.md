@@ -13447,3 +13447,159 @@ config's `runners` array is not required to be sorted.
 **Commits**: implementation is split into three logical commits per
 the worker brief (T18.5 -> T18.6 -> contract). See `git log` for the
 final SHAs at the end of the worker run.
+
+## T18.4 — analysis: load both compact and legacy formats
+
+**Status**: implementation complete, tests pass. **E18 implementation
+complete pending T18.7 user-owned re-run** (T18.2b + T18.5 + T18.6
+landed earlier; T18.4 closes out the analysis-side coverage).
+
+**Implementation summary**:
+
+- `analysis/parse_compact.py` (new, ~420 lines) -- the compact-parquet
+  loader. `read_compact_parquet(path)` reads the Parquet KV metadata
+  (schema version, spawn identity `variant`/`runner`/`run`/
+  `threading_mode`/`recv_buffer_kb`, intern dicts `paths` / `peers`),
+  reads the `compact_events` columnar table, resolves
+  `path_idx` / `peer_idx` via in-memory joins against small intern
+  DataFrames, then dispatches per `kind` to materialize the matching
+  `SHARD_SCHEMA` slot. All 12 event kinds covered (0..=11) including
+  the reserved E8 `clock_sync` kind. `offset_ns` is converted to
+  `offset_ms` for the `SHARD_SCHEMA` column. JSON-encoded `missing`
+  list on `eot_timeout` is propagated verbatim into `eot_missing`.
+  `read_compact_metadata(path)` is also exposed for callers that need
+  only the spawn identity.
+- `analysis/parse.py` -- added `SourceFormat` enum +
+  `detect_source_format(path) -> SourceFormat | None` +
+  `source_stem(path) -> str`. The detector is name-based so it stays
+  fast on the multi-thousand-file two-machine scenario. The
+  `.compact.parquet` suffix is checked before `.jsonl` so the
+  precedence is unambiguous.
+- `analysis/cache.py` -- new `discover_sources(logs_dir)` returns a
+  stem-keyed `{stem: (source_path, source_format)}` dict. Two-pass
+  scan: JSONL first, compact second; the second pass naturally
+  implements the "compact wins when both formats present" rule. Kept
+  a legacy `discover_jsonl(logs_dir) -> list[Path]` back-compat alias
+  pointing at the modern implementation (returns JSONL-only view).
+  `_build_shard` dispatches by `SourceFormat`: JSONL keeps the
+  streaming batch path; COMPACT calls `read_compact_parquet` in one
+  shot (the compact format is itself the streaming-compression step
+  the JSONL batch loop was trying to bound). `_build_shard_worker`
+  carries the format value across the `ProcessPoolExecutor` boundary
+  as the enum's string `value` for pickle hygiene.
+- `analysis/schema.py` -- `SCHEMA_VERSION` bumped from `"3"` to
+  `"4"`. The bump is conservative: any cache built from JSONL on v3
+  gets wiped and re-projected through the unified v4 pipeline, which
+  guarantees the offset_ns/offset_ms semantics and EOT-field handling
+  stay consistent across formats.
+- `analysis/analyze.py::resolve_logs_dir` -- now matches
+  `.compact.parquet` in addition to `.jsonl` when auto-selecting the
+  latest sub-run. Previously a compact-only run directory would have
+  been invisible to the CLI's auto-resolve.
+
+**Tests added** (all green):
+
+- `tests/compact_fixture.py` -- a Python-side fixture builder that
+  mirrors `variant-base::compact::CompactBuffers::push_*` and writes
+  a one-row-group Parquet file via `polars.DataFrame.write_parquet`
+  with the same KV metadata block the Rust writer produces. Used by
+  the per-kind round-trip + parity tests.
+- `tests/test_parse_compact.py` (33 cases, all green) --
+  - Format detector: `detect_source_format` distinguishes
+    `.compact.parquet` / `.jsonl` / other; plain `.parquet` returns
+    `None` so the analyzer's own cache shards (under `.cache/`) are
+    not confused with source files.
+  - `source_stem` + `compact_stem` strip the right suffix so the
+    stems align with the legacy JSONL convention.
+  - Per-kind round-trip: build a fixture exercising every one of the
+    12 `EventKind` values, run it through `read_compact_parquet`,
+    assert the projected `SHARD_SCHEMA` rows carry the expected
+    `event` / `path` / `writer` / `qos` / `phase` / `cpu_percent` /
+    `memory_mb` / `missing_seq` / `recovered_seq` / `eot_id` /
+    `wait_ms` / `eot_missing` / `peer` / `offset_ms` / `rtt_ms`
+    columns.
+  - Byte-equivalence: build the same workload as both JSONL and
+    compact, run both through their respective loaders, assert
+    `pl.DataFrame.equals` on per-event projections (write / receive /
+    gap / resource / connected / phase / ts).
+  - Empty buffers round-trip cleanly (no events emitted, schema
+    intact).
+  - A compact file missing variant/runner/run KV metadata raises
+    `CompactLoadError` so the cache layer can attribute the failure
+    cleanly.
+- `tests/test_cache_compact.py` (17 cases, all green) --
+  - `discover_sources` returns JSONL-only / compact-only / both
+    correctly; compact wins on collision.
+  - `discover_jsonl` back-compat alias still returns JSONL-only.
+  - `update_cache` on a compact-only directory builds shards with
+    the expected `SHARD_SCHEMA` columns, populates the global
+    sentinel index with variant/run, and rebuilds when the compact
+    file's mtime drifts.
+  - Mixed directory (distinct stems in different formats) keeps both
+    shards; same-stem collision uses the compact source contents.
+  - End-to-end analyzer parity: `run_analysis` on JSONL-only vs
+    compact-only of the same logical workload produces identical
+    IntegrityResult and PerformanceResult dataclasses (write_count,
+    receive_count, delivery_pct, out_of_order, duplicates all
+    match). **This is the T18.4 acceptance gate**.
+  - Schema-version bump triggers a wipe of pre-existing v3 caches.
+
+**Byte-equivalence verification**: the parity tests in
+`tests/test_cache_compact.py::TestRunAnalysisParity` and
+`tests/test_parse_compact.py::TestJsonlCompactByteEquivalence` cover
+both the projection layer (cache-shard equality) and the analyzer
+layer (IntegrityResult / PerformanceResult equality). Both pass
+exactly -- the two formats encode the same wall-clock timestamps so
+latency math agrees to the nanosecond.
+
+**Deviations from the task spec**: none material. Couple of small
+choices the spec did not constrain:
+
+- `clock_sync` rows expose `offset_ms` (float-ms) rather than
+  `offset_ns` to match the existing `SHARD_SCHEMA` column name; the
+  loader does the ns -> ms conversion. The contract reserves the
+  `extra_i64` slot for `offset_ns` so the on-disk format is unchanged.
+- `recv_buffer_kb` on `connected` rows is sourced from the
+  spawn-level Parquet KV metadata (where the compact writer stamps
+  it once per spawn) rather than from a per-row column. The legacy
+  JSONL parser reads it from the per-row JSON; both end up populating
+  the same `SHARD_SCHEMA.recv_buffer_kb` column with the same value.
+- The compact loader does NOT stream -- it reads the whole file in
+  one shot. The compact format is the streaming-compression step,
+  not the streaming-read step; a 30s/100K msg/s spawn fits
+  comfortably under the analyzer's per-shard memory budget after
+  compaction.
+
+**Lint / test state at handoff**:
+
+- `cd analysis && python -m pytest tests/` -- 380 passed, 6 skipped
+  (the same 6 integration skips that pre-date T18.4; they require
+  the multi-GB real-log fixtures).
+- `cd analysis && ruff format --check .` -- clean.
+- `cd analysis && ruff check .` -- clean.
+
+**Files changed**:
+
+- `analysis/parse_compact.py` (new).
+- `analysis/parse.py` -- format detector + `source_stem` added; legacy
+  JSONL projection untouched.
+- `analysis/cache.py` -- `discover_sources` / `discover_jsonl` /
+  per-format dispatch.
+- `analysis/schema.py` -- `SCHEMA_VERSION` 3 -> 4.
+- `analysis/analyze.py::resolve_logs_dir` -- accepts compact files
+  when auto-selecting a sub-run.
+- `analysis/tests/compact_fixture.py` (new).
+- `analysis/tests/test_parse_compact.py` (new).
+- `analysis/tests/test_cache_compact.py` (new).
+
+**Commits**: implementation split into three logical commits per the
+worker brief --
+
+  1. `feat(analysis): T18.4 compact-parquet loader + format detector`
+  2. `feat(analysis): T18.4 cache reads both compact + legacy source formats`
+  3. `test(analysis): T18.4 round-trip + analyzer parity across compact / JSONL`
+
+Files outside `analysis/` (`variant-base/` + `variants/websocket/`
+edits visible in working tree on entry to this task) were the
+concurrent T18.5+T18.6 worker's territory and were NOT touched by
+this worker.
