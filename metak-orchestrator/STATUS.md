@@ -15512,3 +15512,329 @@ inspects row counts.
 - `d7875a5` test(variant-base/T19.10a): port integration tests off per-event JSONL (tests/integration.rs)
 - `2e8b324` docs(variant-base/T19.10a): CUSTOM.md + STRUCT.md surgery for compact-only (CUSTOM.md + STRUCT.md)
 - STATUS.md update lands as the fifth commit per the suggested split.
+
+---
+
+## configs/two-runner-smoke.toml -- E19 workload cross-product update (2026-05-19)
+
+### Summary
+
+`configs/two-runner-smoke.toml` updated to cross-product the existing
+5 variant families x 5 sweep points with the three E19 workload
+profiles (`scalar-flood`, `block-flood`, `mixed-types`). Family lineup
+unchanged (zenoh multi, hybrid single, quic multi, websocket single
+qos[3,4], webrtc multi); template layout preserved; default
+`workload = "scalar-flood"` removed from every `[[variant_template]]`
+so each `[[variant]]` declares its own workload + profile params.
+
+### Spawn count math (per runner)
+
+- `[[variant]]` entries: 5 families x 5 sweeps x 3 workloads = **75**
+- After QoS expansion:
+  - zenoh / quic / webrtc (multi):   15 x 4 qos = 60 each -> 180
+  - hybrid (single):                 15 x 4 qos =          60
+  - websocket (single, qos [3,4]):   15 x 2 qos =          30
+- **Grand total: 270 spawns per runner** (vs. 90 before the workload
+  cross-product).
+
+### Per-sweep parameter choices
+
+`workload_seed = 12345` everywhere for reproducibility (matches the
+existing two-runner-workload-shapes.toml reference).
+
+`block-flood` blob sizes (target ~10 ops/tick where vpt allows):
+
+| vpt   | blob_size | ops/tick | leaves/op | Notes |
+|-------|-----------|----------|-----------|-------|
+| 10    | 10        | 1        | 10        | Degenerate (any other divisor either fails vpt%blob==0 or collapses toward scalar); single op of 10 leaves still distinguishes from scalar-flood's 10 ops of 1 leaf. |
+| 100   | 10        | 10       | 10        | ~10 ops/tick target. |
+| 1000  | 100       | 10       | 100       | ~10 ops/tick target. |
+
+`mixed-types` ranges (scaled with vpt; satisfy
+`scalars_max <= vpt`, `arrays_max <= vpt - scalars_min`,
+`dict_split_max >= 2`):
+
+| vpt   | scalars_min | scalars_max | arrays_min | arrays_max | dict_split_max |
+|-------|-------------|-------------|------------|------------|----------------|
+| 10    | 1           | 3           | 2          | 6          | 2              |
+| 100   | 2           | 10          | 20         | 60         | 3              |
+| 1000  | 5           | 20          | 200        | 600        | 4              |
+
+The vpt=1000 row matches `two-runner-workload-shapes.toml`'s
+parameters one-for-one. The vpt=100 row scales linearly (1/10). The
+vpt=10 row uses tighter ranges so the random allocation always has
+room for at least one of each shape.
+
+### Validation steps run
+
+1. **Python tomllib parse + constraint check** of the file (75 entries
+   each verified against the appropriate validation rules from
+   `metak-shared/api-contracts/toml-config-schema.md` lines 393-399):
+   25 scalar OK, 25 block OK (every block-flood passes
+   `vpt % blob_size == 0`), 25 mixed OK (every mixed-types passes the
+   three inequalities). **0 errors.**
+2. **`cargo check -p runner`**: clean compile, no warnings new to this
+   change.
+3. **`cargo build -p runner --release`**: success, 6.80s.
+4. **End-to-end parse via the real runner binary**:
+   `target/release/runner.exe --name nonexistent-runner --config
+   configs/two-runner-smoke.toml` reaches the post-template-resolve,
+   post-validate "runner name not in runners list" error path,
+   confirming `BenchConfig::from_file` (parse + `resolve_templates` +
+   `validate`) accepts the file. Error printed:
+   `runner name 'nonexistent-runner' is not in the config runners
+   list: ["alice", "bob"]`.
+
+### Spot-checks (hand-computed)
+
+- `zenoh-100x100hz-block`: vpt=100, blob_size=10 -> 100 % 10 = 0. OK.
+  Ops/tick = 10, leaves/op = 10.
+- `quic-1000x10hz-block`: vpt=1000, blob_size=100 -> 1000 % 100 = 0.
+  OK. Ops/tick = 10, leaves/op = 100.
+- `hybrid-10x1000hz-mixed`: vpt=10, scalars_max=3 (<= 10), arrays_max=6
+  (<= 10 - 1 = 9), dict_split_max=2 (>= 2). All constraints hold.
+- `webrtc-1000x100hz-mixed`: vpt=1000, scalars_max=20 (<= 1000),
+  arrays_max=600 (<= 1000 - 5 = 995), dict_split_max=4 (>= 2). OK.
+
+### Scope
+
+Only `configs/two-runner-smoke.toml` was modified. No source files,
+contracts, or other configs touched. No commit created (orchestrator
+handles commits).
+## T19.10c -- analysis: drop per-event JSONL parser path -- LANDED
+
+**Scope confirmation**: `analysis/` subtree only. T19.10a (variant-base) and
+T19.10b (runner) had already landed; this completes the E19 follow-up cleanup
+on the analyzer side.
+
+### Files changed
+
+- `analysis/parse.py` (+ ~50 lines, ~5 removed)
+  - New `_REMOVED_JSONL_EVENTS` constant covering `write` / `receive` /
+    `backpressure_skipped` / `gap_detected` / `gap_filled`.
+  - `iter_rows` now skips any row whose `event` is in that set and emits
+    a one-shot stderr warning per file (counting the total skipped rows
+    and naming the source path, when supplied).
+  - `project_line` is unchanged -- in-memory consumers (the
+    `helpers.events_to_lazy` test helper that synthesises post-cache
+    lazy frames) keep working without seeing the warn-and-skip.
+  - Module docstring updated to spell out the lifecycle-only invariant.
+- `analysis/schema.py` (+ ~13 lines)
+  - `SCHEMA_VERSION` bumped `5` -> `6`. Comment block extends the
+    version history with the rationale (any v5 cache built from a
+    pre-T18.2 JSONL contains rows that the post-cleanup analyzer
+    would drop -- rebuild forces alignment under the new rule).
+  - Tidied the `leaf_count` / `shape` / `bytes` column comments to
+    drop the "legacy JSONL" framing.
+- `analysis/cache.py` (+ ~20 lines, ~5 removed)
+  - `_build_shard` passes `source_path` into `iter_rows` so the
+    warning identifies the file.
+  - Module docstring rewritten around the post-E19 per-spawn file
+    pair contract; the `discover_sources` docstring rewritten to
+    drop the `--legacy-jsonl-events` reference and explain why
+    compact wins (T18.2b lifecycle mirroring on the variant-base
+    side).
+- `analysis/CUSTOM.md` (+ ~45 lines, ~11 removed)
+  - New "Post-E19-cleanup invariant (T19.10c)" section near the top.
+  - "Integration Contracts" rewritten to cite both api-contracts
+    (JSONL is lifecycle-only; compact-Parquet carries per-event +
+    mirrored lifecycle).
+  - "Workload-shape dimension" section updated per the brief: drops
+    the "legacy JSONL" framing on the backward-compat default rule
+    and points readers at the new invariant section.
+- `analysis/tests/helpers.py` (+ ~200 lines, 0 removed)
+  - New `write_spawn_pair(logs_dir, *, variant, runner, run, events,
+    ...)` helper: takes a unified JSONL-shaped event list and emits
+    the canonical per-spawn pair (`<stem>.jsonl` lifecycle-only +
+    `<stem>.compact.parquet` per-event + mirrored lifecycle).
+    Lifecycle mirroring on the compact side is the load-bearing
+    piece -- the cache prefers compact for shard derivation, so the
+    compact file must carry phase boundaries / connected metrics /
+    etc. for the analyzer to find anything.
+  - The compact file also carries `leaf_count` / `shape_idx` columns
+    + `shape_intern` KV metadata when any write row supplied
+    `leaf_count`, mirroring the variant-base T19.2 encoding.
+- `analysis/tests/conftest.py` (+ ~15 lines, ~2 removed)
+  - `tmp_logs` switches to `write_spawn_pair`.
+- `analysis/tests/test_cache.py` (+ ~25 lines, ~12 removed)
+  - `_write_clocksync_run` switches to `write_spawn_pair` for the
+    variant logs (clock-sync sibling stays JSONL-only).
+  - `test_rebuild_on_jsonl_mtime_drift` renamed to
+    `test_rebuild_on_source_mtime_drift` and retargets the
+    compact-Parquet source (compact wins, so its mtime is what the
+    cache tracks).
+- `analysis/tests/test_cache_compact.py` (~370 lines removed, ~20
+  added)
+  - `TestDiscoverSources.test_jsonl_only` renamed to
+    `test_canonical_pair_surfaces_compact` (asserts compact wins
+    rather than JSONL-only).
+  - `TestNumericParityAcrossFormats` and `TestRunAnalysisParity`
+    deleted -- the JSONL-only-with-per-event-rows shape they tested
+    is no longer a supported source. A standing comment block at the
+    deletion site explains the removal and points at the surviving
+    compact-Parquet exercising path.
+  - `TestSchemaVersionBump.test_schema_version_bumped_to_5` renamed
+    to `_to_6` with the version-history docstring extended.
+- `analysis/tests/test_integration.py` (+ ~25 lines, ~5 removed)
+  - `_build_skew_fixture` switches to `write_spawn_pair` for the
+    alice/bob spawn pair (clock-sync sibling stays JSONL).
+  - `TestPersistentSkewFixture.test_corrected_latency` copies the
+    `.compact.parquet` siblings alongside the JSONL.
+- `analysis/tests/test_parse.py` (+ ~170 lines, ~15 removed)
+  - `TestIterRows.test_real_file` rewritten as a lifecycle-only happy
+    path (its prior `write` event would now be skipped).
+  - New `TestIterRowsSkipsPreT182PerEventRows` class:
+    parametrised over each removed event type asserting it drops out
+    of the row stream; one-shot-per-file warning aggregation;
+    `source_path` appears in the warning when supplied; end-to-end
+    `update_cache` + `scan_shards` round-trip showing the analyzer
+    emits empty per-event tables (no crash) when a pre-T18.2 JSONL
+    is the only source on disk.
+
+### Fixture rebuild
+
+`analysis/tests/fixtures/two-runner-skew50ms/` was rebuilt locally
+via a one-shot script (deleted post-migration) to add
+`.compact.parquet` siblings and shrink the JSONLs to lifecycle-only.
+The fixture is `.gitignored` (`*.jsonl` / `*.parquet` rules apply to
+the whole repo), so the persistent fixture test is `skipif`-gated
+on a fresh checkout; locally it runs and passes.
+
+### Tests run + results
+
+```
+cd analysis && python -m pytest --no-header
+   433 passed, 6 skipped in 34.84s
+
+cd analysis && ruff format --check .
+   clean
+
+cd analysis && ruff check .
+   All checks passed!
+```
+
+**Baseline delta**: T19.9 reported 428 passed / 6 skipped; this PR
+lands 433 / 6 (net +5). The added tests are the parametrised
+`TestIterRowsSkipsPreT182PerEventRows` cases (5 parametrise values
+on `test_each_removed_event_type_is_skipped` + three new sibling
+methods + one end-to-end test = 9 new tests). The
+parity-test removal in `test_cache_compact.py` cancels some of those
+out (`TestNumericParityAcrossFormats` had three methods,
+`TestRunAnalysisParity` had one;
+`TestSchemaVersionBump.test_schema_version_bumped_to_5` was renamed
+not removed). Net of 9 added - 4 removed = +5. Matches.
+
+### Smoke-check observations
+
+**Wlshapes-single fixture re-run** (the T19.9 baseline; per the brief):
+
+```
+python analyze.py logs/wlshapes-single-20260519_165233 --summary
+```
+
+Produced the same shape as T19.9:
+
+- Integrity Report: three rows (block-flood / mixed-types /
+  scalar-flood). All 100% delivery, zero out-of-order, zero dupes,
+  `runner_idle_terminated` for each.
+- Performance Report: `leaves_per_sec ~= 100,200` across all three
+  (the expected per-workload identity per the api-contracts), with
+  `ops_per_sec` ranging `1,002` (block-flood, vpt=100) ->
+  `100,184` (scalar-flood, vpt=1).
+- Pivot Tables: scalar-flood column lit for scalar-flood variant
+  only, block-flood for block-flood variant only, mixed-types for
+  mixed-types variant only -- matches the canonical sort order
+  T19.9's last-mile fixes pinned.
+- Two `late_tail_present` warnings exactly as T19.9 reported; no
+  pre-T18.2 warnings (the wlshapes fixture is canonical
+  post-cleanup shape).
+
+**Synthetic pre-T18.2 smoke**: hand-crafted a JSONL containing two
+`write` rows + one `receive` row + lifecycle rows, ran
+`analyze.py`. Output:
+
+```
+<tmp>/v-alice-r1.jsonl: ignoring 3 pre-T18.2 per-event JSONL rows
+(event in {write, receive, backpressure_skipped, gap_detected,
+gap_filled}); compact-Parquet is the only source for per-event
+data since the E19 cleanup
+```
+
+Followed by `Integrity Report (no data)`, the performance row with
+all-zero throughput/latency, and `Pivot Tables (no data)`. No crash,
+single warning, empty per-event tables -- exactly the contract the
+T19.10c spec calls out.
+
+### Deviations from the locked spec
+
+- **Stripping placement**: the spec wording suggested removing
+  per-event branches from a "JSONL row-projection logic that
+  dispatches on `event` value" inside `parse.py`. The actual
+  implementation has no such dispatch -- `project_line` is a
+  shared projector used by both file ingestion (`iter_rows`) and
+  in-memory test helpers (`events_to_lazy`). I left `project_line`
+  unchanged and put the skip-and-warn in `iter_rows` instead, so
+  the contract is enforced at the file-ingestion boundary where it
+  belongs and the in-memory helper (which models the post-cache
+  lazy frame, not the JSONL file) keeps working without changes.
+  This is the same end-user behaviour the spec asks for; the
+  layering just lives at a different seam.
+
+- **JSONL parity tests deleted, not migrated**:
+  `TestNumericParityAcrossFormats` / `TestRunAnalysisParity` in
+  `test_cache_compact.py` were two test classes specifically
+  asserting that JSONL-only and compact-only sources of the same
+  workload produced identical cached rows / analyzer output. With
+  the JSONL stream no longer carrying per-event rows, the JSONL
+  side of the parity is trivially empty -- the tests have no
+  remaining meaning. I deleted them outright (instead of
+  migrating to the per-spawn pair shape, which would just be
+  testing the compact-only path twice). The deletion site carries
+  an explanatory comment block pointing at the surviving
+  compact-only exercise and at the per-spawn-pair pivot parity
+  covered by the `tmp_logs` fixture in `test_cache` / `test_analyze`.
+
+- **`correlate.py` not touched**: the spec called out optional
+  cleanup of `pl.lit` defaults that were there for legacy
+  compatibility. The defaults are cheap and defensive (they fire
+  only when the schema doesn't carry the column, which only
+  happens on a downlevel cache that's about to get rebuilt by the
+  v6 bump anyway). I left them in place -- removing them would
+  add risk for no observable benefit, and the brief explicitly
+  permits the "stay" choice.
+
+### Open concerns
+
+- **Pre-T18.2 datasets on disk**: users still holding pre-T18.2
+  JSONL logs that contain per-event rows will see the new warning
+  on every cache rebuild and empty per-event tables in the
+  analyzer's output. This is the documented, user-directive-backed
+  behaviour ("we won't ever need to load historic data in jsonl");
+  no migration path is provided. If anyone has such a dataset they
+  still want to analyse, the only path is to re-run the variants
+  to produce fresh compact-Parquet output.
+
+- **Persistent skew fixture is gitignored**: the
+  `analysis/tests/fixtures/two-runner-skew50ms/` files are
+  excluded by the repo-wide `*.jsonl` / `*.parquet` gitignore
+  rules, so they live only in working trees. The
+  `TestPersistentSkewFixture` test is `skipif`-gated on the
+  fixture being present, so it's a no-op on a fresh checkout.
+  Locally it runs and passes against the migrated fixture. Not a
+  regression -- the same gating applied before T19.10c. Surfaces
+  here for completeness so any later worker who runs `--clear`
+  on the worktree knows to regenerate via the in-test
+  `_build_skew_fixture` shape if they want the persistent test to
+  cover them.
+
+### Commits landed
+
+Four split commits on `main` (no remote push per brief), in
+the suggested order:
+
+- `eff5bc1` feat(analysis/T19.10c): strip per-event JSONL parser branches + warn-and-skip
+- `874be51` feat(analysis/T19.10c): bump SCHEMA_VERSION to 6 + drop JSONL parity tests
+- `26cbcf8` test(analysis/T19.10c): migrate synthetic fixtures to per-spawn file pair
+- `89d8f53` docs(analysis/T19.10c): document post-E19-cleanup per-spawn pair invariant
+
+STATUS.md update lands as the fifth commit per the suggested split.
