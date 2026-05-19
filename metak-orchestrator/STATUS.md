@@ -13032,3 +13032,93 @@ orchestrator can sequence the reconciliation as needed.
 **Worktree cleanup**: after the merge landed (commit `b992699`),
 the branch `worktree-agent-ac5cc63f3372fa849` and the worktree
 directory `.claude/worktrees/agent-ac5cc63f3372fa849` were removed.
+
+## T18.3 — Variant audit: any variant bypassing variant-base logger — done
+
+**Date**: 2026-05-19.
+**Branch**: `main` (audit-only, no source changes).
+**Worker scope**: `variants/*/src/` (read-only audit), one new data
+file `variants/T18.3-AUDIT.md` created.
+
+**Method**: per-variant greps for direct JSONL writers
+(`serde_json::to_writer`, `writeln!`, `.write_all`, `File::create`,
+`OpenOptions`, `BufWriter`), manual log-file naming (`.jsonl`,
+`.parquet`), and direct variant-base logger method names
+(`log_write`, `log_receive`, `log_phase`, `log_connected`, `log_eot_*`,
+`log_backpressure_skipped`, `log_resource`, `log_gap_*`,
+`log_clock_sync`). Every match was inspected in context to determine
+whether the call routes through `variant-base`'s public surface or
+bypasses it. The `Variant`-trait surface (`publish` / `try_publish` /
+`poll_receive`) was inspected for each variant to confirm receive
+events surface to the driver's `EventSink::record_receive` rather
+than to a side channel.
+
+**Per-variant verdict**:
+
+| Variant | Verdict |
+|---|---|
+| custom-udp | OK |
+| hybrid | OK |
+| quic | OK |
+| webrtc | OK |
+| websocket | **GAP** — `LoggerHandle::log_receive` side channel bypasses compact `EventBuffer` |
+| zenoh | OK |
+
+**High-level counts**: 5 OK, 1 GAP. No variant constructs JSONL
+manually, opens a log file directly, writes event-shape lines to
+stdout, or uses `serde_json::to_writer` against a log path.
+
+**Gap detail (websocket)**: the T14.10 pattern attaches a
+`LoggerHandle` (a clone of the driver's `Arc<Mutex<Logger>>`) and
+calls `Logger::log_receive` directly from (a) the Multi-mode
+per-peer reader thread and (b) the Single-mode T17.5 publish-side
+back-pressure retry helper `drain_current_peer_into_logger`.
+`Logger::log_receive` writes only the legacy JSONL line; it does
+NOT push into the driver's compact `EventBuffer`. Under T18.2's
+compact-default writer, these receives would therefore be missing
+from `<spawn>.compact.parquet`. The variant is still using the
+public `variant-base` surface (no hand-rolled JSONL), so the
+literal acceptance "no variant writes JSONL or custom files
+directly" is met -- but the intent of E18 is not.
+
+The strict-Single-mode normal flow is unaffected: receives flow
+back to the driver via `poll_receive` and land in the compact
+buffer via `EventSink::record_receive`. Only the T17.5 retry
+side-channel and the entire Multi-mode receive path bypass the
+buffer.
+
+**Recommended follow-up task (filing left to orchestrator)**:
+
+- `T18.3a — close websocket compact-buffer gap`. Either (i) extend
+  `Logger::log_receive` to also push into a shared compact
+  `EventBuffer` reachable from `LoggerHandle`, or (ii) extend the
+  `LoggerHandle` API with a `record_receive` method that wraps both
+  the JSONL line and the compact-buffer push under one mutex
+  acquisition, and switch the websocket reader thread + the
+  T17.5 drain helper to call it. Option (ii) preserves the
+  one-mutex-acquisition cost the T14.10 design was optimised for.
+
+**Aux-event note (informational, not a variant-level gap)**: the
+driver's own lifecycle/aux events (`log_phase`, `log_connected`,
+`log_resource`, `log_eot_sent`) go through `LoggerProxy` ->
+`Logger::log_*` and are NOT pushed into the compact buffer either.
+This is a variant-base concern (`variant-base/src/driver.rs::run_protocol`
+around lines 475, 491, 499, 504, 760, 802, 807, 852) and out of
+scope for T18.3 -- the audit's mandate is variant-level bypasses.
+Flagged here in case the orchestrator wants to bundle the fix with
+T18.3a.
+
+**Lint state**: `cargo clippy --release -p variant-custom-udp -p
+variant-hybrid -p variant-quic -p variant-webrtc -p
+variant-websocket -p variant-zenoh --all-targets -- -D warnings`
+runs clean. `cargo fmt --check` runs clean across the workspace.
+A workspace-wide clippy on the runner crate currently surfaces
+dead-code warnings inside `runner/src/config.rs` (T18.5+T18.6
+worker territory); not touched -- those changes are uncommitted
+on `main` and are the concurrent worker's to land.
+
+**Commit**: `audit(variants): T18.3 audit report` -- single commit
+adding `variants/T18.3-AUDIT.md`.
+
+**Artifacts**: `variants/T18.3-AUDIT.md` (the audit document
+itself, with one section per variant and the gap analysis above).

@@ -7627,7 +7627,7 @@ schema extension + unit tests, (2) driver wiring + integration test.
   events in the parquet, the analyzer can't operate on compact-only
   data.
 
-### T18.3 — Variant audit: any variant bypassing variant-base logger [low]
+### T18.3 — Variant audit: any variant bypassing variant-base logger [low] — done 2026-05-19
 
 **Repo**: every `variants/*/`.
 **Owner**: orchestrator → spawn worker(s) (Wave 2, after T18.2).
@@ -7640,6 +7640,18 @@ paths use the `variant-base` logger; no variant writes JSONL or
 custom files directly. Variants that need to skip the compact write
 path for any structural reason (e.g. zenoh sidecar mode) are
 documented in their CUSTOM.md.
+
+**Outcome (2026-05-19)**: audit complete; 5 OK / 1 GAP. No variant
+writes JSONL or opens custom log files directly. Websocket uses the
+public `LoggerHandle::log_receive` from its Multi-mode reader thread
+and Single-mode T17.5 retry helper -- legal under the literal
+acceptance criterion, but those calls bypass the compact `EventBuffer`
+introduced by T18.2 and would surface as missing receives in
+`*.compact.parquet`. See `variants/T18.3-AUDIT.md` for the full
+report and `metak-orchestrator/STATUS.md` § T18.3 for the per-variant
+verdict and the recommended follow-up `T18.3a` (close the websocket
+compact-buffer gap; option-set documented). The audit is closed; the
+follow-up is orchestrator-filed.
 
 ### T18.4 — analysis: load both compact and legacy formats [medium]
 
