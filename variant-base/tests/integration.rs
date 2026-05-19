@@ -1277,41 +1277,52 @@ fn test_mixed_types_emits_heterogeneous_shapes_through_logger() {
     );
 }
 
-/// E19 / T19.2 acceptance: the dummy binary integration test the spec
-/// names runs `block-flood vpt=1000 blob_size=100` through the variant
-/// CLI. Since the CLI plumbing for `--blob-size` is owned by T19.3,
-/// this test instead drives `run_protocol` directly against
-/// `VariantDummy` with a workload name that the T19.2 driver
-/// recognises but cannot construct (no `blob_size` plumbing yet) --
-/// and verifies the driver returns a descriptive Err that names the
-/// missing argument. This is the load-bearing acceptance check that
-/// T19.2 wired the workload factory through the driver correctly;
-/// T19.3 will replace this with a positive-path acceptance test once
-/// the CLI arg lands.
+/// E19 / T19.3: a `block-flood` spawn that omits `--blob-size`
+/// transparently defaults to `--blob-size 100` (per the locked spec),
+/// so a `values_per_tick` divisible by 100 must complete successfully
+/// without an explicit `--blob-size`. The previous T19.2-era test
+/// (`*_through_driver_errors_until_t19_3_lands`) asserted that omitting
+/// `--blob-size` produces an Err; T19.3's blob-size default flipped
+/// that contract, so this test now asserts the positive path.
 #[test]
-fn test_block_flood_through_driver_errors_until_t19_3_lands() {
+fn test_block_flood_through_driver_defaults_blob_size_to_100() {
     let dir = TempDir::new().unwrap();
     let log_dir = dir.path().to_str().unwrap();
     let mut args = test_args(log_dir);
     args.workload = "block-flood".to_string();
+    // vpt=100 with the default blob_size=100 produces exactly one
+    // block-shaped WriteOp per tick, the smallest valid block-flood
+    // workload that exercises the default.
+    args.values_per_tick = 100;
+    // Leave args.blob_size = None to exercise the default.
     let mut dummy = VariantDummy::new(&args.runner);
-    let result = run_protocol(&mut dummy, &args);
-    let err = match result {
-        Err(e) => e,
-        Ok(()) => panic!("expected block-flood without --blob-size to Err"),
-    };
-    let msg = format!("{err}");
+    run_protocol(&mut dummy, &args).expect("block-flood with default blob_size must complete");
+
+    let log_path = dir.path().join("dummy-test-runner-run01.jsonl");
+    let file = std::fs::File::open(&log_path).unwrap();
+    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    let writes: Vec<&serde_json::Value> = lines.iter().filter(|l| l["event"] == "write").collect();
     assert!(
-        msg.contains("blob-size") || msg.contains("blob_size"),
-        "error must name the missing arg; got: {msg}"
+        !writes.is_empty(),
+        "block-flood produces write events under the default blob_size"
     );
+    for (i, w) in writes.iter().enumerate() {
+        assert_eq!(w["leaf_count"], 100, "block-flood write {i} leaf_count");
+        assert_eq!(w["shape"], "array", "block-flood write {i} shape");
+    }
 }
 
-/// Same for mixed-types: until T19.3 wires the CLI args, the driver
-/// must Err with a descriptive message naming the first missing
-/// mixed-* parameter.
+/// E19 / T19.3: a `mixed-types` spawn that omits any of the five
+/// required `--mixed-*` args is rejected at startup with a descriptive
+/// Err naming the missing argument. Inversion of the T19.2-era
+/// `*_through_driver_errors_until_t19_3_lands` test; the error
+/// message is now owned by the driver's `validate_and_build_workload_params`
+/// rather than the workload factory.
 #[test]
-fn test_mixed_types_through_driver_errors_until_t19_3_lands() {
+fn test_mixed_types_without_required_args_is_rejected_at_startup() {
     let dir = TempDir::new().unwrap();
     let log_dir = dir.path().to_str().unwrap();
     let mut args = test_args(log_dir);
@@ -1324,10 +1335,126 @@ fn test_mixed_types_through_driver_errors_until_t19_3_lands() {
     };
     let msg = format!("{err}");
     assert!(
-        msg.contains("mixed-scalars-min")
-            || msg.contains("mixed_scalars_min")
-            || msg.contains("mixed-types requires"),
+        msg.contains("mixed-types requires") && msg.contains("--mixed-scalars-min"),
         "error must mention the missing mixed-types arg; got: {msg}"
+    );
+    // Rejection happens before any phase event lands.
+    let log_path = dir.path().join("dummy-test-runner-run01.jsonl");
+    assert!(
+        !log_path.exists(),
+        "rejection must happen before logger creates the JSONL file"
+    );
+}
+
+/// E19 / T19.3 acceptance: a full `block-flood vpt=1000 blob_size=100`
+/// spawn completes through `run_protocol` and emits JSONL `write`
+/// events carrying `leaf_count = 100, shape = "array"`. Pairs the
+/// "block-flood validation passes" assertion with the smoke-test
+/// requirement from the task spec.
+#[test]
+fn test_block_flood_through_driver_with_explicit_blob_size_completes() {
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let mut args = test_args(log_dir);
+    args.workload = "block-flood".to_string();
+    args.values_per_tick = 1000;
+    args.blob_size = Some(100);
+    let mut dummy = VariantDummy::new(&args.runner);
+    run_protocol(&mut dummy, &args).expect("block-flood vpt=1000 blob_size=100 must complete");
+
+    let log_path = dir.path().join("dummy-test-runner-run01.jsonl");
+    let file = std::fs::File::open(&log_path).unwrap();
+    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    let writes: Vec<&serde_json::Value> = lines.iter().filter(|l| l["event"] == "write").collect();
+    assert!(!writes.is_empty(), "block-flood produces write events");
+    for (i, w) in writes.iter().enumerate() {
+        assert_eq!(w["leaf_count"], 100, "block-flood write {i} leaf_count");
+        assert_eq!(w["shape"], "array", "block-flood write {i} shape");
+    }
+}
+
+/// E19 / T19.3 acceptance: a full `mixed-types` spawn with sensible
+/// defaults completes through `run_protocol` and emits JSONL `write`
+/// events whose leaf_count values sum to `values_per_tick` per tick
+/// and whose shapes include at least two of the three categories.
+#[test]
+fn test_mixed_types_through_driver_with_sensible_defaults_completes() {
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let mut args = test_args(log_dir);
+    args.workload = "mixed-types".to_string();
+    args.values_per_tick = 100;
+    args.mixed_scalars_min = Some(5);
+    args.mixed_scalars_max = Some(20);
+    args.mixed_arrays_min = Some(5);
+    args.mixed_arrays_max = Some(40);
+    args.mixed_dict_split_max = Some(4);
+    args.workload_seed = Some(0xCAFE_BABE);
+
+    let mut dummy = VariantDummy::new(&args.runner);
+    run_protocol(&mut dummy, &args).expect("mixed-types with sensible defaults must complete");
+
+    let log_path = dir.path().join("dummy-test-runner-run01.jsonl");
+    let file = std::fs::File::open(&log_path).unwrap();
+    let lines: Vec<serde_json::Value> = std::io::BufReader::new(file)
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    let writes: Vec<&serde_json::Value> = lines.iter().filter(|l| l["event"] == "write").collect();
+    assert!(!writes.is_empty(), "mixed-types produces write events");
+
+    // Sum of leaf_count must equal vpt * tick_count. tick_count is hard
+    // to pin precisely (operate_secs=1, tick_rate_hz=10 produces ~10
+    // ticks), so we instead assert the per-tick invariant: leaf_count
+    // is divisible by vpt across all writes belonging to whole ticks.
+    let total_leaves: u64 = writes
+        .iter()
+        .map(|w| w["leaf_count"].as_u64().unwrap())
+        .sum();
+    assert!(
+        total_leaves > 0 && total_leaves.is_multiple_of(args.values_per_tick as u64),
+        "total leaves ({total_leaves}) must be a positive multiple of vpt ({})",
+        args.values_per_tick
+    );
+
+    // Shapes diversity: at least two distinct shape strings appear.
+    let shapes: std::collections::HashSet<&str> = writes
+        .iter()
+        .map(|w| w["shape"].as_str().unwrap())
+        .collect();
+    assert!(
+        shapes.len() >= 2,
+        "mixed-types must produce more than one shape; got {shapes:?}"
+    );
+}
+
+/// E19 / T19.3: block-flood with `vpt % blob_size != 0` is rejected at
+/// startup. The error must name both numbers and the divisibility
+/// constraint so operators can fix their config without consulting the
+/// contract doc.
+#[test]
+fn test_block_flood_indivisible_blob_size_is_rejected_at_startup() {
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let mut args = test_args(log_dir);
+    args.workload = "block-flood".to_string();
+    args.values_per_tick = 1000;
+    args.blob_size = Some(300);
+    let mut dummy = VariantDummy::new(&args.runner);
+    let err = run_protocol(&mut dummy, &args)
+        .expect_err("block-flood vpt=1000 blob_size=300 must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("divisible"),
+        "error must explain divisibility; got: {msg}"
+    );
+    let log_path = dir.path().join("dummy-test-runner-run01.jsonl");
+    assert!(
+        !log_path.exists(),
+        "rejection must happen before logger creates the JSONL file"
     );
 }
 
