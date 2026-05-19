@@ -13978,3 +13978,233 @@ correlated receives, and surface three distinct throughput numbers
   under either `shape_intern` (canonical) or `shapes` (alias).
   When T19.2 lands on the writer side, the loader will need to
   drop the alias if the contract pins one canonical key name.
+
+## T19.2 — variant-base: workload structs + WriteOp + logger [DONE 2026-05-19]
+
+Worker spawn for E19 Wave 1. Adds the two new workload profiles
+(`block-flood`, `mixed-types`), extends `WriteOp` with `leaf_count`
+and `shape`, and threads the metadata through both the JSONL logger
+and the compact-Parquet writer. Existing `scalar-flood` and
+`max-throughput` paths remain unchanged (no behaviour regression).
+
+### What was implemented
+
+**`variant-base/Cargo.toml`** — added `rand = "0.8"` dependency. The
+crate is now consistent with the variants that already pull in
+`rand`; we only use `StdRng` + `Uniform` from the basic API.
+
+**`variant-base/src/workload.rs`** — major rewrite.
+
+- New `WriteShape` enum (`Scalar`, `Array`, `Struct`) with stable
+  `as_str()` / `as_u8()` mappings; matches the JSONL `shape` strings
+  and the canonical `SHAPE_INTERN = ["scalar","array","struct"]`
+  dictionary.
+- `WriteOp` extended with `leaf_count: u32` and `shape: WriteShape`.
+  `ScalarFlood` emits `leaf_count=1, shape=Scalar` per WriteOp
+  (back-compat default).
+- `WorkloadParams` struct carrying the per-spawn workload knobs the
+  driver will pass to the factory. All E19-new fields are optional;
+  T19.3 plumbs them from the CLI. The driver currently builds a
+  `WorkloadParams { variant, run, ..default() }` (only the spawn
+  identifiers are populated) which means `scalar-flood` and
+  `max-throughput` keep working and `block-flood` / `mixed-types`
+  return descriptive Errs naming the missing arg.
+- `BlockFlood` workload: emits `vpt / blob_size` WriteOps per tick,
+  each carrying a `blob_size`-element block of f64s with
+  `leaf_count = blob_size, shape = Array`. Rejects `blob_size == 0`
+  at construction; on a runtime `vpt % blob_size != 0` returns an
+  empty Vec (the driver validates this at startup in T19.3, so the
+  empty-Vec fallback is a defensive belt-and-braces on a path
+  T19.3 will already have closed).
+- `MixedTypes` workload: implements the locked-spec allocation
+  algorithm (scalars -> arrays -> nested dicts), with a uniform
+  random `stars-and-bars` partition for the leaf distribution
+  inside arrays / dict children. RNG is `StdRng`. Depth bound is
+  `log_2(vpt) + 4` per the locked spec; if reached, the remaining
+  leaves are emitted as one flat struct WriteOp at that level. The
+  depth-bound `max_depth` helper is unit-tested directly so the
+  formula does not drift silently.
+- Seed sourcing: `WorkloadParams::workload_seed.unwrap_or_else(||
+  MixedTypes::derive_seed_from_spawn(variant, run))`. The fallback
+  hashes `(variant, run)` via `DefaultHasher` (per-toolchain stable
+  is what we need, not cryptographic strength).
+- Factory: new `create_workload_with_params(name, &params)`. The
+  legacy `create_workload(name)` is a thin wrapper for back-compat
+  with existing call sites; it returns Err for `block-flood` /
+  `mixed-types` since those need params.
+- Helper: `uniform_partition(rng, total, parts)` is a private
+  utility used by both array distribution and dict recursion. Three
+  dedicated unit tests cover sum invariants, minimum-one-per-bucket
+  property, and the `parts == 1` edge case.
+
+**`variant-base/src/logger.rs`** — extends `log_write_at` to take
+`leaf_count: u32` and `shape: WriteShape`. The two new fields are
+emitted unconditionally on every `write` JSONL line (the pre-E19
+backfill default at the analyzer side matches `1, "scalar"`). The
+legacy zero-arg `log_write` is a thin wrapper that supplies the
+scalar defaults so non-driver callers (and existing tests) keep
+working unchanged.
+
+**`variant-base/src/compact.rs`** — adds two new nullable columns:
+`leaf_count: Vec<Option<u32>>` and `shape_idx: Vec<Option<u8>>`. Only
+`push_write` populates them (`Some(_)` on every write row); every
+other `push_*` leaves them `None`. The `RowBuilder` gained matching
+`with_leaf_count` / `with_shape_idx` helpers so the push methods
+stay short. New per-column lockstep assertions cover both new
+columns.
+
+**`variant-base/src/compact_writer.rs`** — Parquet schema gains two
+new OPTIONAL `INT32` columns (`leaf_count`, `shape_idx`); the writer
+emits them via the existing `collect_optional_*` def-level helpers
+(two new ones for `Option<u32>` and `Option<u8>`). The
+`shape_intern = ["scalar","array","struct"]` dictionary is now
+stored in the file's KV metadata under the **canonical
+`shape_intern` key**. The schema-version constant
+(`COMPACT_SCHEMA_VERSION = 1`) is unchanged — the columns are
+additive (nullable), so older readers fall back to None/default and
+the contract docs explicitly permit additive changes without a
+bump.
+
+**`variant-base/src/driver.rs`** — `EventSink::record_write` and the
+`LoggerProxy::log_write_at` shim both take `leaf_count` and `shape`;
+the two `record_write` call sites in the operate loop (strict-QoS
+branch and non-strict branch) forward `op.leaf_count` and `op.shape`
+directly from the WriteOp. The driver uses
+`create_workload_with_params` and passes `variant` + `run` so the
+mixed-types fallback seed is available even before T19.3 wires the
+CLI. **No runtime behaviour change for scalar-flood / max-throughput.**
+
+**Tests**:
+
+- New unit tests in `workload.rs`: 22 tests covering both new
+  profiles (count + metadata, leaf-sum invariant for vpt in {1, 10,
+  100, 1000}, determinism with fixed seed, fallback-seed derivation,
+  termination under pathological dict-split=2, depth-bound formula,
+  validation errors, WriteShape canonical strings, uniform_partition
+  primitive). All 27 workload tests pass.
+- New tests in `compact.rs` for `leaf_count` / `shape_idx` column
+  population on writes vs nullity on non-write rows.
+- New test in `compact_writer.rs` for round-tripping the two new
+  columns through Parquet write/read. The `shape_intern` KV
+  metadata assertion landed in the existing dictionaries test.
+- New tests in `logger.rs` confirming both new fields appear on
+  every `write` JSONL line, including non-scalar shapes.
+- New integration tests in `tests/integration.rs`:
+  - `test_block_flood_emits_array_shape_through_logger_and_compact`
+    — generates BlockFlood ops via the factory, pushes them
+    through Logger + CompactBuffers, asserts JSONL + compact-buffer
+    columns. The spec's "JSONL contains writes with leaf_count=100,
+    shape=array" assertion lives here.
+  - `test_mixed_types_emits_heterogeneous_shapes_through_logger` —
+    same shape, with the leaf-sum=vpt invariant + heterogeneous
+    shape diversity assertion. The spec's "JSONL contains a mix of
+    scalar / array / struct shapes summing to vpt per tick"
+    assertion lives here.
+  - `test_block_flood_through_driver_errors_until_t19_3_lands`,
+    `test_mixed_types_through_driver_errors_until_t19_3_lands` —
+    confirm the factory is wired through `run_protocol` correctly
+    (the new profiles Err out cleanly with a descriptive message
+    naming the missing arg, BEFORE any phase event).
+  - `test_scalar_flood_through_driver_emits_scalar_leaf_count_and_shape`,
+    `test_scalar_flood_through_driver_emits_scalar_columns_in_parquet`
+    — the no-regression assertions: scalar-flood spawns now also
+    carry `leaf_count=1, shape="scalar"` in JSONL and the matching
+    `leaf_count=Some(1), shape_idx=Some(0)` in compact-Parquet.
+  - `test_write_shape_string_roundtrip_through_logger` — sanity
+    check that all three shape strings round-trip through the
+    logger emit path.
+
+### Tests run + results
+
+```
+cargo build --release -p variant-base
+cargo test --release -p variant-base
+cargo clippy --release -p variant-base --all-targets -- -D warnings
+cargo fmt -p variant-base -- --check
+cargo build --release      (full workspace)
+```
+
+All clean. Test counts:
+- 162 unit tests pass (was 135 pre-T19.2; +27 workload tests +
+  several new compact/logger tests).
+- 19 integration tests pass (was 12 pre-T19.2; +7 E19 tests).
+- workspace build OK across all variants (no concrete variant
+  needed code changes — they accept opaque `&[u8]` payloads
+  unchanged, per the E19 invariant).
+
+### Deviations from the locked spec
+
+1. **`BlockFlood::generate` on indivisibility**: the task spec says
+   "BlockFlood::generate(vpt) returns Err when vpt % blob_size != 0".
+   Since `Workload::generate` returns `Vec<WriteOp>` (no Result),
+   this is implemented as "returns empty Vec" instead. The proper
+   defence is at the driver's startup validation (T19.3); the
+   empty-Vec fallback is a belt-and-braces in case T19.3's check is
+   ever bypassed. Constructor `BlockFlood::new(0)` does return Err.
+   If T19.3 (or a future cleanup) wants a stronger contract here,
+   `Workload::generate` would need to become fallible
+   workspace-wide.
+2. **Single-leaf `expand_dict` recursion**: when a recursive call
+   bottoms out at a single-leaf bucket, the implementation emits
+   a `shape = Scalar` WriteOp (rather than `Struct` with
+   leaf_count=1). Rationale: a 1-leaf struct is identical on the
+   wire to a scalar, and emitting it as a scalar keeps the
+   analyzer's per-shape histogram free of misleading single-leaf
+   `struct` rows. The leaf-count contract (sum = vpt) is preserved
+   either way. If the analysis team would rather see strict shape
+   tagging in the dict recursion, this is a single-line change in
+   `MixedTypes::expand_dict`.
+3. **Schema-version**: did NOT bump `COMPACT_SCHEMA_VERSION` (still
+   1). Per the compact-log-schema E19 additions: "This is an
+   **additive** change — no `metainfo.schema_version` bump required
+   per the existing rule (additive new columns can be ignored by
+   older readers)." Existing analyzers read back as null + default,
+   matching the contract.
+
+### Open concerns for T19.3, T19.5, and existing variants
+
+- **T19.3 (CLI plumbing)** — the variant CLI args
+  (`--blob-size`, `--mixed-*`, `--workload-seed`) are NOT yet
+  exposed on `CliArgs`. The driver currently builds a
+  `WorkloadParams` from `variant + run` only; T19.3 needs to add
+  the fields to `CliArgs` and copy them into the params struct.
+  Validation per the locked spec
+  (`values_per_tick % blob_size == 0`, all `mixed-*` required for
+  `mixed-types`, `mixed_dict_split_max >= 2`) lives in the driver
+  before any phase emission (the `max-throughput + qos 3/4`
+  rejection pattern is the template). Smoke test against existing
+  variants: should be straightforward since the trait surface is
+  unchanged. The two new "errors-until-T19.3-lands" integration
+  tests will start failing once the CLI args land; T19.3 should
+  delete or invert them as part of its work.
+- **T19.5 (analysis)** — the analyzer's expected `shape_intern` key
+  name in compact-parquet KV metadata is `shape_intern` (canonical,
+  as the contract specifies). Previous status note flagged a
+  potential `shapes` alias in the analyzer; the writer pins the
+  canonical name, so the alias path on the analyzer side is now
+  safe to drop.
+- **Variant trait surface** — unchanged. Concrete variants ship
+  opaque `&[u8]` blobs and never see `leaf_count` / `shape`. No
+  follow-up needed in the variant binaries for T19.2.
+- **Receive side** — `receive` JSONL events and compact `receive`
+  rows continue to NOT carry `leaf_count` / `shape`. Per the
+  locked-spec wire-opacity invariant, T19.5 correlates receives to
+  their matching write events and inherits the metadata from the
+  write side. The new tests assert that receives leave both new
+  compact-buffer columns as `None`.
+
+### Files changed
+
+- `variant-base/Cargo.toml` — added `rand = "0.8"` dep.
+- `variant-base/src/workload.rs` — rewrite (E19 profiles, params).
+- `variant-base/src/logger.rs` — `log_write_at` takes leaf_count + shape.
+- `variant-base/src/compact.rs` — `leaf_count` + `shape_idx` columns.
+- `variant-base/src/compact_writer.rs` — Parquet schema + KV
+  `shape_intern` dictionary.
+- `variant-base/src/driver.rs` — record_write threads leaf_count +
+  shape; create_workload_with_params + WorkloadParams build site.
+- `variant-base/src/lib.rs` — re-export the new public surface
+  (`BlockFlood`, `MixedTypes`, `WorkloadParams`, `WriteShape`,
+  `SHAPE_INTERN`, `create_workload_with_params`).
+- `variant-base/tests/integration.rs` — 7 new E19 integration tests
+  + updated num_columns assertion (11 -> 13).
