@@ -30,4 +30,7 @@ pub use socket::{tune_udp_buffers, tune_udp_buffers_std};
 pub use types::{Phase, Qos, ReceivedUpdate, ThreadingMode, ThreadingModeParseError};
 pub use variant_trait::Variant;
 pub use watchdog::{Watchdog, WATCHDOG_EXIT_CODE, WATCHDOG_STDERR_PREFIX};
-pub use workload::{create_workload, ScalarFlood, Workload, WriteOp};
+pub use workload::{
+    create_workload, create_workload_with_params, BlockFlood, MixedTypes, ScalarFlood, Workload,
+    WorkloadParams, WriteOp, WriteShape, SHAPE_INTERN,
+};

@@ -34,6 +34,17 @@ thiserror = "2"
 # the variant base crate. Default features (including `snap` for the
 # Snappy codec which is our chosen compression) are sufficient.
 parquet = "53"
+# `rand` (and `rand` 0.8's `StdRng`) is used by the `MixedTypes` workload
+# profile (E19 / T19.2) to generate deterministically-seeded heterogeneous
+# trees of scalars / arrays / nested dicts. The seed is supplied via
+# `--workload-seed` (T19.3) or derived from `--variant + --run` when
+# unset, so re-runs with identical config produce identical workload
+# sequences. We also use `rand` from a workload's perspective to fill
+# block-flood payloads with non-trivial bytes -- the analysis pipeline
+# never inspects the payload contents so the byte values are arbitrary,
+# but using `rand` keeps the serialiser honest under variants that
+# look at the bytes (e.g. compression-aware transports).
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
