@@ -793,8 +793,10 @@ fn test_compact_parquet_is_written_alongside_jsonl() {
     let meta = reader.metadata();
     assert_eq!(
         meta.file_metadata().schema_descr().num_columns(),
-        7,
-        "compact schema must have exactly 7 columns (ts_ns, kind, seq, path_idx, peer_idx, qos, bytes)"
+        11,
+        "compact schema must have exactly 11 columns (T18.2b): 7 base \
+         (ts_ns, kind, seq, path_idx, peer_idx, qos, bytes) + 4 extras \
+         (extra_f32, extra_f32_b, extra_i64, extra_utf8)"
     );
 
     let kv = meta
@@ -811,32 +813,22 @@ fn test_compact_parquet_is_written_alongside_jsonl() {
     assert!(lookup.contains_key("paths"));
     assert!(lookup.contains_key("peers"));
 
-    // Cross-check: the parquet row count must equal the number of
-    // per-event rows in the JSONL stream (write + receive +
-    // backpressure_skipped + gap_*).
+    // Cross-check: T18.2b made the compact buffer cover lifecycle
+    // events too (`phase`, `connected`, `eot_sent`, `resource`).
+    // The compact row count therefore equals the count of EVERY
+    // JSONL event line, not only the per-event subset.
     let jsonl_lines: Vec<serde_json::Value> = std::fs::read_to_string(&jsonl_path)
         .unwrap()
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    let jsonl_event_rows = jsonl_lines
-        .iter()
-        .filter(|l| {
-            matches!(
-                l["event"].as_str(),
-                Some("write")
-                    | Some("receive")
-                    | Some("backpressure_skipped")
-                    | Some("gap_detected")
-                    | Some("gap_filled")
-            )
-        })
-        .count() as i64;
+    let jsonl_event_rows = jsonl_lines.len() as i64;
     assert_eq!(
         meta.file_metadata().num_rows(),
         jsonl_event_rows,
-        "compact row count must equal the number of per-event JSONL rows"
+        "T18.2b: compact row count must equal the number of JSONL event lines \
+         (per-event + lifecycle)"
     );
     // VariantDummy echoes every write -> at least one row per write.
     assert!(meta.file_metadata().num_rows() > 0);
@@ -905,6 +897,102 @@ fn test_compact_only_mode_suppresses_per_event_jsonl_but_keeps_lifecycle() {
     assert!(
         reader.metadata().file_metadata().num_rows() > 0,
         "compact-only mode must STILL accumulate rows in the Parquet file"
+    );
+}
+
+/// T18.2b acceptance: every lifecycle event the JSONL stream emits
+/// MUST also appear as a row in the compact `compact_events` table.
+///
+/// Run VariantDummy with `--legacy-jsonl-events` OFF so the JSONL
+/// stream contains ONLY lifecycle events; cross-check that the
+/// compact parquet contains a row for each lifecycle kind the
+/// analyzer's existing pipeline depends on (`phase`, `connected`,
+/// `eot_sent`, `resource`). After T18.4 lands, the analyzer can
+/// drop the JSONL dependency entirely.
+#[test]
+fn test_compact_parquet_contains_lifecycle_events_when_jsonl_off() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+    use variant_base::compact::EventKind;
+
+    let dir = TempDir::new().unwrap();
+    let log_dir = dir.path().to_str().unwrap();
+    let mut args = test_args(log_dir);
+    args.legacy_jsonl_events = false;
+    // Operate long enough that the resource sampler (every 100 ms)
+    // produces at least a couple of samples -- the existing
+    // test_args sets operate_secs = 1, so at least ~10 samples are
+    // expected.
+
+    let mut dummy = VariantDummy::new(&args.runner);
+    run_protocol(&mut dummy, &args).expect("protocol should complete");
+
+    let parquet_path = dir.path().join("dummy-test-runner-run01.compact.parquet");
+    let reader = SerializedFileReader::new(std::fs::File::open(&parquet_path).unwrap()).unwrap();
+
+    // Collect kind column values across all rows.
+    let kinds: Vec<i32> = reader
+        .get_row_iter(None)
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .filter_map(|r| r.get_int(1).ok())
+        .collect();
+
+    // Count rows per kind so we can assert presence rather than
+    // exact counts (resource sample timing is workload-sensitive).
+    let count_kind = |k: EventKind| kinds.iter().filter(|&&v| v == k as i32).count();
+
+    // Phase events: connect, stabilize, operate, silent, digest = 5
+    // exact rows (matches the JSONL phase-sequence assertion in
+    // `test_full_protocol_with_dummy`).
+    assert_eq!(
+        count_kind(EventKind::Phase),
+        5,
+        "compact parquet must contain one row per phase transition \
+         (connect, stabilize, operate, silent, digest)"
+    );
+
+    // Connected event: exactly one row per spawn.
+    assert_eq!(
+        count_kind(EventKind::Connected),
+        1,
+        "compact parquet must contain one row per connect"
+    );
+
+    // EotSent: exactly one row.
+    assert_eq!(
+        count_kind(EventKind::EotSent),
+        1,
+        "compact parquet must contain one eot_sent row"
+    );
+
+    // Resource: variable count, but at least one (operate runs for
+    // 1 s, sampler fires every 100 ms).
+    assert!(
+        count_kind(EventKind::Resource) >= 1,
+        "compact parquet must contain at least one resource row, got {}",
+        count_kind(EventKind::Resource)
+    );
+
+    // EotReceived / EotTimeout: VariantDummy in single-runner
+    // self-loopback never emits these. Their absence is the
+    // contract.
+    assert_eq!(
+        count_kind(EventKind::EotReceived),
+        0,
+        "VariantDummy self-loopback should not produce eot_received"
+    );
+    assert_eq!(
+        count_kind(EventKind::EotTimeout),
+        0,
+        "VariantDummy self-loopback should not produce eot_timeout"
+    );
+
+    // ClockSync: reserved for E8; the driver does not yet emit it.
+    assert_eq!(
+        count_kind(EventKind::ClockSync),
+        0,
+        "clock_sync is reserved for E8; should be absent until then"
     );
 }
 

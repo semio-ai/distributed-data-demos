@@ -124,21 +124,28 @@ pub enum MemCheckOutcome {
     HardCrossed { current_mb: u64, threshold_mb: u32 },
 }
 
-/// Dual-emission sink for high-volume per-event rows.
+/// Dual-emission sink for per-event AND lifecycle event rows.
 ///
 /// During operate + silent, every event the driver would historically
 /// have logged as a JSONL line is also pushed into the compact
 /// columnar buffers ([`CompactBuffers`]). At digest time the buffers
 /// are serialised to a single Parquet file.
 ///
-/// JSONL emission of the same rows is **opt-in** via
+/// JSONL emission of high-volume per-event rows (`write`, `receive`,
+/// `backpressure_skipped`, `gap_*`) is **opt-in** via
 /// `legacy_jsonl_events`. When off (the T18.2 default), each
 /// `record_*` call writes to the compact buffers only -- saving the
 /// ~200 byte JSONL line that the analysis pipeline does not need
-/// once T18.3-T18.6 land. Lifecycle events (`phase`, `connected`,
-/// `eot_sent`, `resource`, etc.) are NOT routed through this sink;
-/// they always go to JSONL because they are low-volume and the
-/// runner reads them out-of-band.
+/// once T18.3-T18.6 land.
+///
+/// **T18.2b**: Lifecycle events (`phase`, `connected`, `eot_sent`,
+/// `eot_received`, `eot_timeout`, `resource`, `clock_sync`) are now
+/// ALSO captured by this sink. They are unconditionally emitted to
+/// the JSONL stream (low-volume, runner reads them out-of-band for
+/// E15 progress streaming) AND mirrored into the compact buffers so
+/// the analyzer's compact-only loader (T18.4+) does not need a
+/// side-car JSONL file to find phase boundaries / connect metrics /
+/// resource samples.
 struct EventSink<'a> {
     buffers: CompactBuffers,
     /// Underlying JSONL logger. The proxy is borrowed mutably so the
@@ -217,6 +224,51 @@ impl<'a> EventSink<'a> {
         if self.legacy_jsonl {
             self.logger.log_receive(writer, seq, path, qos, bytes)?;
         }
+        Ok(())
+    }
+
+    // ---- T18.2b: lifecycle event mirroring ----
+    //
+    // The methods below capture phase / connected / eot_* / resource
+    // / clock_sync into the compact buffers. The JSONL emission for
+    // these kinds is the driver's responsibility (still unconditional
+    // -- the JSONL stream is the low-volume runner-observable channel
+    // that E15 / T11.5 consume). Each method below is buffer-only;
+    // it does NOT call the legacy logger.
+
+    /// Mirror a `phase` event into the compact buffers (T18.2b).
+    fn record_phase(&mut self, phase: Phase) -> Result<()> {
+        self.buffers
+            .push_phase(ts_nanos(Utc::now()), phase.as_str())?;
+        Ok(())
+    }
+
+    /// Mirror a `connected` event into the compact buffers (T18.2b).
+    ///
+    /// The driver's `connected` is a self-only lifecycle marker (no
+    /// per-peer rowing here) so `peer = None`. Variants that observe
+    /// per-peer connections may call `buffers.push_connected` with a
+    /// real peer name from inside their own reader-thread code.
+    fn record_connected(&mut self, elapsed_ms: f64, threading_mode: ThreadingMode) -> Result<()> {
+        self.buffers.push_connected(
+            ts_nanos(Utc::now()),
+            None,
+            elapsed_ms as f32,
+            threading_mode.as_str(),
+        )?;
+        Ok(())
+    }
+
+    /// Mirror an `eot_sent` event into the compact buffers (T18.2b).
+    fn record_eot_sent(&mut self, eot_id: u64) -> Result<()> {
+        self.buffers.push_eot_sent(ts_nanos(Utc::now()), eot_id)?;
+        Ok(())
+    }
+
+    /// Mirror a `resource` event into the compact buffers (T18.2b).
+    fn record_resource(&mut self, cpu_percent: f64, memory_mb: f64) -> Result<()> {
+        self.buffers
+            .push_resource(ts_nanos(Utc::now()), cpu_percent as f32, memory_mb as f32)?;
         Ok(())
     }
 
@@ -473,6 +525,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // reader threads the variant declared support for; the default
     // impl is a no-op for Single-only variants. See E14 / T14.1.
     logger.log_phase(Phase::Connect, None)?;
+    sink.record_phase(Phase::Connect)?;
     progress.set_phase(Phase::Connect);
     variant.connect(config.threading_mode)?;
     // Hand the variant a thread-safe logger handle BEFORE reader
@@ -494,14 +547,17 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         config.threading_mode,
         config.recv_buffer_kb,
     )?;
+    sink.record_connected(elapsed_ms, config.threading_mode)?;
 
     // -- Phase 2: Stabilize --
     logger.log_phase(Phase::Stabilize, None)?;
+    sink.record_phase(Phase::Stabilize)?;
     progress.set_phase(Phase::Stabilize);
     std::thread::sleep(Duration::from_secs(config.stabilize_secs));
 
     // -- Phase 3: Operate --
     logger.log_phase(Phase::Operate, Some(&config.workload))?;
+    sink.record_phase(Phase::Operate)?;
     progress.set_phase(Phase::Operate);
 
     let max_throughput = config.workload == "max-throughput";
@@ -758,6 +814,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
         if last_resource_sample.elapsed() >= resource_interval {
             let (cpu, mem) = resource_monitor.sample();
             logger.log_resource(cpu, mem)?;
+            sink.record_resource(cpu, mem)?;
             last_resource_sample = Instant::now();
         }
 
@@ -800,11 +857,13 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // informational; analysis (T11.5) only uses the `ts`.
     let _ = idle_triggered; // bookkeeping kept; both exits emit eot_sent.
     logger.log_eot_sent(0)?;
+    sink.record_eot_sent(0)?;
     progress.mark_eot_sent();
     progress.mark_eot_received();
 
     // -- Phase 5: Silent (drain + flush) --
     logger.log_phase(Phase::Silent, None)?;
+    sink.record_phase(Phase::Silent)?;
     progress.set_phase(Phase::Silent);
 
     let silent_duration = Duration::from_secs(config.silent_secs);
@@ -850,6 +909,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // distinguish a clean run-with-compact-output from one that died
     // before it could finalise.
     logger.log_phase(Phase::Digest, None)?;
+    sink.record_phase(Phase::Digest)?;
     progress.set_phase(Phase::Digest);
 
     let parquet_path = compact_parquet_path(
