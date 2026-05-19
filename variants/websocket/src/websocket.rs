@@ -679,7 +679,14 @@ fn drain_current_peer_into_logger(peer: &mut WsPeer, logger: Option<&LoggerHandl
             Ok(Message::Binary(bytes)) => match protocol::decode_frame(&bytes) {
                 Ok(Frame::Data(update)) => {
                     if let Some(logger) = logger {
-                        if let Err(e) = logger.log_receive(
+                        // T18.3a: `record_receive` mirrors the legacy
+                        // JSONL line into the driver's shared compact
+                        // `EventBuffer`, so the digest-phase Parquet
+                        // file captures every receive observed by the
+                        // Single-mode drain path. Pre-T18.3a this
+                        // helper called `log_receive` and the receive
+                        // was missing from `*.compact.parquet`.
+                        if let Err(e) = logger.record_receive(
                             &update.writer,
                             update.seq,
                             &update.path,
@@ -820,11 +827,17 @@ fn reader_thread_main(
         match ws.read() {
             Ok(Message::Binary(bytes)) => match protocol::decode_frame(&bytes) {
                 Ok(Frame::Data(update)) => {
-                    // T14.10: write the `receive` event directly to
-                    // JSONL from the reader thread. The bounded mpsc
-                    // no longer carries Data items, so the historical
-                    // drop-on-full path is gone.
-                    if let Err(e) = logger.log_receive(
+                    // T14.10: write the `receive` event directly from
+                    // the reader thread. The bounded mpsc no longer
+                    // carries Data items, so the historical drop-on-
+                    // full path is gone.
+                    //
+                    // T18.3a: switched from `log_receive` (legacy
+                    // JSONL only) to `record_receive` so the row also
+                    // lands in the driver's shared compact
+                    // `EventBuffer`. Pre-T18.3a these receives were
+                    // missing from `*.compact.parquet`.
+                    if let Err(e) = logger.record_receive(
                         &update.writer,
                         update.seq,
                         &update.path,
@@ -1785,5 +1798,207 @@ mod tests {
             v.logger.is_some(),
             "attach_logger must persist the handle for use by reader threads"
         );
+    }
+
+    // ----- T18.3a: receive events from both call sites land in the
+    //               shared compact `EventBuffer` -----
+
+    /// Build a `LoggerHandle` with a shared compact-buffer sink wired
+    /// in, mirroring how the driver constructs it in `run_protocol`.
+    /// Returns the handle, the shared `Arc<Mutex<CompactBuffers>>` for
+    /// assertion, and the holding tempdir.
+    fn temp_logger_handle_with_compact(
+        legacy_jsonl: bool,
+    ) -> (
+        LoggerHandle,
+        std::sync::Arc<std::sync::Mutex<variant_base::CompactBuffers>>,
+        tempfile::TempDir,
+    ) {
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logger = Logger::new(
+            dir.path().to_str().expect("tmp path utf8"),
+            "websocket-test",
+            "self",
+            "run01",
+        )
+        .expect("logger ok");
+        let mut handle = LoggerHandle::new(logger);
+        let buffers: StdArc<StdMutex<variant_base::CompactBuffers>> =
+            StdArc::new(StdMutex::new(variant_base::CompactBuffers::new()));
+        handle.attach_compact_sink(StdArc::clone(&buffers), legacy_jsonl);
+        (handle, buffers, dir)
+    }
+
+    /// T18.3a -- Single-mode call site: `drain_current_peer_into_logger`
+    /// pulls a frame off the WS socket and emits the receive via the
+    /// `LoggerHandle`. Post-T18.3a the row must land in the shared
+    /// compact buffer too, not only the legacy JSONL stream.
+    ///
+    /// Setup: stand up a real WS server-side socket, hand the client-
+    /// side `WebSocket<TcpStream>` to a `WsPeer` in Single mode, push a
+    /// data frame from the server, then call
+    /// `drain_current_peer_into_logger`. Assert the compact buffer
+    /// gained exactly one Receive row whose seq / writer / path match
+    /// what the server sent.
+    #[test]
+    fn t18_3a_single_mode_drain_pushes_into_compact_buffer() {
+        use std::net::TcpListener;
+        // Bind to an ephemeral OS-assigned port to avoid collisions
+        // with parallel tests in the same binary.
+        let listener =
+            TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind ok");
+        let listen_addr = listener.local_addr().expect("local_addr");
+        listener.set_nonblocking(false).unwrap();
+
+        // Server thread sends one binary data frame and waits a moment
+        // before letting the connection drop.
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut ws = tungstenite::accept(stream).expect("server upgrade");
+            let body = protocol::encode_data(Qos::ReliableTcp, 42, "/p", "alice", &[1u8; 16]);
+            ws.send(tungstenite::Message::Binary(body))
+                .expect("server send");
+            // Keep the connection up briefly so the client drain can
+            // pull the frame before the socket dies.
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let stream =
+            TcpStream::connect(listen_addr).expect("client connect to localhost test port");
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let url = format!("ws://{listen_addr}/bench");
+        let (ws, _resp) =
+            tungstenite::client::client(url.as_str(), stream).expect("client upgrade");
+        // Use a slightly longer read timeout than the default so the
+        // first `ws.read()` inside the drain helper has enough budget
+        // to surface the inbound frame.
+        let s = ws.get_ref();
+        s.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let mut peer = WsPeer {
+            name: "alice".to_string(),
+            addr: listen_addr,
+            io: PeerIo::Single(ws),
+        };
+
+        let (handle, compact, _tmp) = temp_logger_handle_with_compact(false);
+        drain_current_peer_into_logger(&mut peer, Some(&handle));
+
+        let buf = compact.lock().unwrap();
+        assert_eq!(
+            buf.len(),
+            1,
+            "T17.5 drain helper must push the receive into the compact buffer; got {} rows",
+            buf.len()
+        );
+        assert_eq!(buf.kind[0], variant_base::EventKind::Receive as u8);
+        assert_eq!(buf.seq[0], 42);
+        assert_eq!(buf.bytes[0], 16);
+        assert_eq!(buf.qos[0], 4);
+        assert_eq!(buf.peers.dict(), &["alice".to_string()]);
+        assert_eq!(buf.paths.dict(), &["/p".to_string()]);
+
+        let _ = server_thread.join();
+    }
+
+    /// T18.3a -- Multi-mode call site: a dedicated reader thread pulls
+    /// frames off the WS socket and emits each receive via the
+    /// `LoggerHandle`. Post-T18.3a every such row must also land in
+    /// the shared compact buffer.
+    ///
+    /// Setup is closer to `reader_thread_lifecycle_spawns_and_joins`:
+    /// stand up a real server, hand the client-side WS to
+    /// `start_reader_threads` in Multi mode, push a few data frames
+    /// from the server, wait for the reader to consume them, then
+    /// shut the reader thread down and assert the compact buffer
+    /// captured exactly the rows we sent.
+    #[test]
+    fn t18_3a_multi_mode_reader_thread_pushes_into_compact_buffer() {
+        use std::net::TcpListener;
+        // Bind to an ephemeral OS-assigned port to avoid collisions
+        // with parallel tests in the same binary.
+        let listener =
+            TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind ok");
+        let listen_addr = listener.local_addr().expect("local_addr");
+        listener.set_nonblocking(false).unwrap();
+
+        // Server sends three data frames then sleeps so the client
+        // reader has time to consume before the connection ends.
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut ws = tungstenite::accept(stream).expect("server upgrade");
+            for seq in 1u64..=3 {
+                let body = protocol::encode_data(Qos::ReliableTcp, seq, "/p", "alice", &[7u8; 32]);
+                ws.send(tungstenite::Message::Binary(body))
+                    .expect("server send");
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let stream =
+            TcpStream::connect(listen_addr).expect("client connect to localhost test port");
+        stream.set_nodelay(true).unwrap();
+        let url = format!("ws://{listen_addr}/bench");
+        let (ws, _resp) =
+            tungstenite::client::client(url.as_str(), stream).expect("client upgrade");
+        let s = ws.get_ref();
+        s.set_write_timeout(None).unwrap();
+        s.set_read_timeout(Some(READ_POLL_TIMEOUT)).unwrap();
+
+        let mut v = WebSocketVariant::new("self", dummy_config(Qos::ReliableTcp));
+        v.config.peers.push(PeerDesc {
+            name: "alice".to_string(),
+            addr: listen_addr,
+            role: PairRole::Client,
+        });
+        v.peers.push(WsPeer {
+            name: "alice".to_string(),
+            addr: listen_addr,
+            io: PeerIo::Single(ws),
+        });
+        v.threading_mode = ThreadingMode::Multi;
+
+        let (handle, compact, _tmp) = temp_logger_handle_with_compact(false);
+        v.attach_logger(handle);
+        v.start_reader_threads(ThreadingMode::Multi)
+            .expect("start_reader_threads ok");
+
+        // Poll the compact buffer until the reader thread has pushed
+        // all three rows or a wallclock budget elapses.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let len = compact.lock().unwrap().len();
+            if len >= 3 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "compact buffer never received the 3 frames from reader thread; saw {} rows",
+                    len
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        v.stop_reader_threads().expect("stop_reader_threads ok");
+
+        let buf = compact.lock().unwrap();
+        assert_eq!(
+            buf.len(),
+            3,
+            "Multi-mode reader thread must push every receive into the compact buffer"
+        );
+        assert_eq!(buf.kind, vec![variant_base::EventKind::Receive as u8; 3]);
+        assert_eq!(buf.seq, vec![1, 2, 3]);
+        assert!(buf.bytes.iter().all(|b| *b == 32));
+        assert_eq!(buf.peers.dict(), &["alice".to_string()]);
+        assert_eq!(buf.paths.dict(), &["/p".to_string()]);
+
+        let _ = server_thread.join();
     }
 }
