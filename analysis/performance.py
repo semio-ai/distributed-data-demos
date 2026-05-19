@@ -174,6 +174,16 @@ class PerformanceResult:
     leaves_per_sec: float = 0.0
     bytes_per_sec: float = 0.0
     shape: str = "scalar"
+    # T19.9: per-group QoS read from the ``qos`` column on ``write``
+    # events. Every write row carries the spawn's QoS level (per the
+    # api-contracts schema); a single spawn emits exactly one QoS so the
+    # value collapses to a single integer per (variant, run). Falls
+    # back to ``None`` when the group has no ``write`` events with a
+    # populated qos column (legacy logs / clock-sync shards). The pivot
+    # layer prefers this data-derived value over name-parsing so it
+    # works on spawn names that lack the canonical ``-qos<N>-<mode>``
+    # suffix (e.g. workload-only names like ``dummy-block-flood``).
+    qos: int | None = None
 
 
 def _percentile(data: list[float], p: float) -> float:
@@ -214,6 +224,45 @@ def _connection_metrics(
         return 0.0, 0.0
     elapsed = df.get_column("elapsed_ms")
     return float(elapsed.mean() or 0.0), float(elapsed.max() or 0.0)
+
+
+def _group_qos(group: pl.LazyFrame) -> int | None:
+    """Per-spawn QoS level read from ``write`` events.
+
+    Every ``write`` event row carries the spawn's QoS in the ``qos``
+    column (per the api-contracts compact-log schema). A single spawn
+    emits exactly one QoS level, so a stable single-value choice
+    matches reality; when the group happens to mix QoS values (highly
+    unusual -- would imply a config that pumps multiple QoS through
+    one variant binary) the lexicographically-first non-null value
+    wins for determinism.
+
+    Returns ``None`` when:
+
+    - the ``qos`` column is missing from the shard schema (legacy
+      pre-QoS logs); or
+    - no ``write`` event in the group carries a non-null qos value.
+
+    The pivot layer prefers this data-derived value over parsing the
+    variant name (T19.9), so unsuffixed E19-style names like
+    ``dummy-block-flood`` still pivot onto the correct QoS bucket.
+    """
+    if "qos" not in group.collect_schema().names():
+        return None
+    df = (
+        group.filter(pl.col("event") == "write")
+        .filter(pl.col("qos").is_not_null())
+        .select(pl.col("qos"))
+        .unique()
+        .sort("qos")
+        .collect()
+    )
+    if df.is_empty():
+        return None
+    value = df.item(0, "qos")
+    if value is None:
+        return None
+    return int(value)
 
 
 def _threading_mode(group: pl.LazyFrame) -> str:
@@ -925,6 +974,7 @@ def performance_for_group(
     late_receives = _late_receives_count(group, windows)
     late_tail_count, late_tail_pct = _late_tail_stats(deliveries, p99)
     threading_mode = _threading_mode(group)
+    group_qos = _group_qos(group)
     latency_mean, latency_std = _latency_mean_std(latency_samples)
 
     # T-pivot.1: expected per-writer publish rate parsed from the spawn
@@ -977,4 +1027,5 @@ def performance_for_group(
         leaves_per_sec=leaves_per_sec,
         bytes_per_sec=bytes_per_sec,
         shape=group_shape,
+        qos=group_qos,
     )

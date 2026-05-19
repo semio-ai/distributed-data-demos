@@ -47,8 +47,22 @@ def _make_result(
     p50: float = 1.0,
     p95: float = 5.0,
     p99: float = 10.0,
+    threading_mode: str | None = None,
 ) -> PerformanceResult:
-    """Build a PerformanceResult tagged with a workload shape."""
+    """Build a PerformanceResult tagged with a workload shape.
+
+    ``threading_mode`` defaults to whatever suffix the ``variant`` name
+    carries (``-single`` / ``-multi``) so a test fixture stays
+    consistent without having to repeat the mode on every call. Pass
+    explicitly to override (e.g. legacy variants with no suffix).
+    """
+    if threading_mode is None:
+        if variant.endswith("-multi"):
+            threading_mode = "multi"
+        elif variant.endswith("-single"):
+            threading_mode = "single"
+        else:
+            threading_mode = "single"
     return PerformanceResult(
         variant=variant,
         run=run,
@@ -68,6 +82,7 @@ def _make_result(
         leaves_per_sec=leaves_per_sec,
         ops_per_sec=receives_per_sec,
         bytes_per_sec=receives_per_sec * 8.0,
+        threading_mode=threading_mode,
     )
 
 
@@ -304,16 +319,29 @@ class TestThroughputVsWorkloadShapeChart:
         path = generate_throughput_vs_workload_shape_plot([], tmp_path)
         assert path.exists()
 
-    def test_one_subplot_per_variant_axis(self, tmp_path: Path) -> None:
-        """Three different (transport, workload, mode) axes -> 3 subplots."""
+    def test_one_subplot_per_threading_mode(self, tmp_path: Path) -> None:
+        """T19.9 layout: subplots split on threading mode, not variant axis.
+
+        The pre-T19.9 chart used one subplot per
+        ``(transport, workload, threading_mode)`` tuple with the shape
+        on the x-axis -- this produced mis-labeled x-ticks under the
+        T19.8 fixture (mixed-types bar landing on the ``block-flood``
+        tick because its dominant shape is ``array``). The new layout
+        keys subplots on threading mode only and the x-axis on the
+        workload profile directly, so the bar's tick label always
+        matches the workload it represents.
+        """
         import matplotlib.pyplot as plt
 
         import plots as plots_module
 
+        # Two threading modes -> two subplots; the variant / workload /
+        # qos differences within each mode all collapse into the same
+        # subplot.
         results = [
-            _make_result("custom-udp-10x100hz-qos1-multi", shape="scalar", run="r1"),
-            _make_result("hybrid-100x10hz-qos1-multi", shape="array", run="r2"),
-            _make_result("zenoh-max-qos1-multi", shape="struct", run="r3"),
+            _make_result("custom-udp-10x100hz-qos1-single", shape="scalar", run="r1"),
+            _make_result("hybrid-100x10hz-qos1-single", shape="array", run="r2"),
+            _make_result("custom-udp-10x100hz-qos1-multi", shape="struct", run="r3"),
         ]
         captured: list = []
         original_close = plt.close
@@ -330,21 +358,16 @@ class TestThroughputVsWorkloadShapeChart:
 
         assert captured
         fig = captured[-1]
-        # Each variant axis becomes a subplot; the active ones are
-        # those whose ``get_title()`` is non-empty. Unused grid slots
-        # are turned off via ``set_axis_off`` and produce no title.
-        titled_axes = [ax for ax in fig.axes if ax.get_title()]
-        # The figure's suptitle does not count as a subplot title; the
-        # three variant axes do.
-        variant_titles = [
-            ax.get_title()
-            for ax in titled_axes
-            if "Throughput vs" not in (ax.get_title() or "")
-        ]
-        assert len(variant_titles) == 3, (
-            f"expected 3 variant subplots, got {len(variant_titles)} "
-            f"with titles {variant_titles}"
+        subplot_titles = [ax.get_title() for ax in fig.axes if ax.get_title()]
+        # Expect one subplot per threading mode (single, multi).
+        assert len(subplot_titles) == 2, (
+            f"expected 2 threading-mode subplots, got {len(subplot_titles)} "
+            f"with titles {subplot_titles}"
         )
+        # Subplot titles include the mode label.
+        joined = " ".join(subplot_titles).lower()
+        assert "single" in joined
+        assert "multi" in joined
 
     def test_y_axis_label_is_leaves_per_sec(self, tmp_path: Path) -> None:
         import matplotlib.pyplot as plt
@@ -401,3 +424,113 @@ class TestThroughputVsWorkloadShapeChart:
         assert "" in all_hatches or None in all_hatches  # scalar
         assert any(h and "-" in h for h in all_hatches if h)
         assert any(h and "x" in h for h in all_hatches if h)
+
+
+class TestThroughputVsWorkloadShapeT199:
+    """T19.9: x-axis labels carry workload-profile names, in canonical order."""
+
+    def _capture_figure(self, tmp_path: Path, results):
+        import matplotlib.pyplot as plt
+
+        import plots as plots_module
+
+        captured: list = []
+        original_close = plt.close
+
+        def capture_close(fig=None) -> None:
+            if fig is not None:
+                captured.append(fig)
+
+        plt.close = capture_close  # type: ignore[assignment]
+        try:
+            plots_module.generate_throughput_vs_workload_shape_plot(results, tmp_path)
+        finally:
+            plt.close = original_close  # type: ignore[assignment]
+        assert captured
+        return captured[-1]
+
+    def test_x_axis_labels_are_workload_names(self, tmp_path: Path) -> None:
+        """Visual regression: ticks read ``scalar-flood`` / ``block-flood`` / ``mixed-types``."""
+        results = [
+            _make_result("dummy-scalar-flood", shape="scalar", run="s"),
+            _make_result("dummy-block-flood", shape="array", run="b"),
+            # mixed-types' dominant shape is ``array`` per T19.5 -- the
+            # bar must still land on the ``mixed-types`` tick, not on
+            # the ``block-flood`` tick.
+            _make_result("dummy-mixed-types", shape="array", run="m"),
+        ]
+        # Override the shape of the mixed-types entry by reusing the
+        # _make_result helper (shape comes from the kwarg). For the
+        # purposes of this visual-regression test we set the variant
+        # name to ``dummy-mixed-types`` and shape=``array`` (matching
+        # the T19.8 finding). The chart should now expose ALL three
+        # workload-profile ticks because each variant contributes one.
+        fig = self._capture_figure(tmp_path, results)
+        # Collect every visible tick label across every subplot.
+        tick_labels: list[str] = []
+        for ax in fig.axes:
+            if not ax.get_title():
+                continue
+            tick_labels.extend(t.get_text() for t in ax.get_xticklabels())
+        # Exactly the three canonical workload-profile names must be
+        # present (no ``scalar`` / ``array`` / ``struct`` raw shape
+        # tokens, no missing entries).
+        assert "scalar-flood" in tick_labels
+        assert "block-flood" in tick_labels
+        assert "mixed-types" in tick_labels
+
+    def test_x_axis_labels_in_canonical_order(self, tmp_path: Path) -> None:
+        """Ticks appear in canonical workload order, even when input is shuffled."""
+        results = [
+            _make_result("dummy-mixed-types", shape="struct", run="m"),
+            _make_result("dummy-block-flood", shape="array", run="b"),
+            _make_result("dummy-scalar-flood", shape="scalar", run="s"),
+        ]
+        fig = self._capture_figure(tmp_path, results)
+        active_axes = [ax for ax in fig.axes if ax.get_title()]
+        assert active_axes
+        # Inspect the first active subplot's tick order; the canonical
+        # order applies subplot-wise so a single subplot is sufficient.
+        ax = active_axes[0]
+        labels = [t.get_text() for t in ax.get_xticklabels()]
+        # Filter the canonical three to their order in the actual ticks.
+        canonical_seen = [
+            label
+            for label in labels
+            if label in ("scalar-flood", "block-flood", "mixed-types")
+        ]
+        assert canonical_seen == ["scalar-flood", "block-flood", "mixed-types"]
+
+    def test_canonical_shape_sort_key_helper(self) -> None:
+        """canonical_shape_sort_key orders scalar / array / struct correctly."""
+        from plots import CANONICAL_SHAPE_ORDER, canonical_shape_sort_key
+
+        assert CANONICAL_SHAPE_ORDER == ("scalar", "array", "struct")
+        sorted_shapes = sorted(
+            ["struct", "scalar", "array", "unknown"], key=canonical_shape_sort_key
+        )
+        assert sorted_shapes == ["scalar", "array", "struct", "unknown"]
+
+    def test_canonical_workload_sort_key_helper(self) -> None:
+        """canonical_workload_sort_key orders the four workload profiles."""
+        from plots import (
+            CANONICAL_WORKLOAD_ORDER,
+            canonical_workload_sort_key,
+        )
+
+        assert CANONICAL_WORKLOAD_ORDER == (
+            "scalar-flood",
+            "block-flood",
+            "mixed-types",
+            "max-throughput",
+        )
+        sorted_workloads = sorted(
+            ["mixed-types", "scalar-flood", "block-flood", "novel"],
+            key=canonical_workload_sort_key,
+        )
+        assert sorted_workloads == [
+            "scalar-flood",
+            "block-flood",
+            "mixed-types",
+            "novel",
+        ]

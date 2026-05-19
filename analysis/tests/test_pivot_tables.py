@@ -755,3 +755,185 @@ class TestPivotShapeAware:
         rows = list(csv.DictReader(io.StringIO(text)))
         assert rows[0]["shape"] == "scalar"
         assert rows[0]["workload"] == "scalar-flood"
+
+
+# --- T19.9: tolerant identity resolution for unsuffixed variant names --------
+
+
+def _t199_result(
+    variant: str,
+    *,
+    qos: int | None,
+    shape: str,
+    threading_mode: str = "single",
+    leaves_per_sec: float = 100_000.0,
+    receives_per_sec: float = 100_000.0,
+) -> PerformanceResult:
+    """Build a PerformanceResult mimicking an E19 unsuffixed-name spawn.
+
+    The dataclass carries the data-derived fields (qos / threading_mode
+    / shape) that the runner populates from the per-event columns; the
+    variant name itself omits the canonical
+    ``-<vpt>x<hz>hz-qos<N>-<mode>`` suffix so the legacy parser returns
+    ``None`` on it.
+    """
+    return PerformanceResult(
+        variant=variant,
+        run="run01",
+        connect_mean_ms=0.0,
+        connect_max_ms=0.0,
+        latency_p50_ms=1.0,
+        latency_p95_ms=2.0,
+        latency_p99_ms=3.0,
+        latency_max_ms=4.0,
+        writes_per_sec=receives_per_sec,
+        receives_per_sec=receives_per_sec,
+        jitter_ms=0.0,
+        jitter_p95_ms=0.0,
+        loss_pct=0.0,
+        threading_mode=threading_mode,
+        latency_mean_ms=1.5,
+        latency_std_ms=0.2,
+        shape=shape,
+        leaves_per_sec=leaves_per_sec,
+        ops_per_sec=receives_per_sec,
+        bytes_per_sec=receives_per_sec * 8.0,
+        qos=qos,
+    )
+
+
+class TestResolvePivotIdentity:
+    """T19.9: tolerant identity resolution for unsuffixed E19-style names."""
+
+    def test_canonical_name_unchanged(self) -> None:
+        """Names that match the canonical parser produce the same identity."""
+        from pivot_tables import resolve_pivot_identity
+
+        r = _synthetic_result(
+            "custom-udp-100x100hz-qos1-multi", 9500, 10000, 10000.0, 95.0, 1.2, 0.3
+        )
+        ident = resolve_pivot_identity(r)
+        assert ident is not None
+        assert ident.family == "custom-udp"
+        assert ident.qos == 1
+        assert ident.mode == "multi"
+        assert ident.workload_kind == "scalar-flood"
+
+    def test_unsuffixed_name_uses_dataclass_fields(self) -> None:
+        """Unsuffixed E19 names produce an identity from data, not name parsing."""
+        from pivot_tables import resolve_pivot_identity
+
+        r = _t199_result(
+            "dummy-block-flood",
+            qos=1,
+            shape="array",
+            threading_mode="single",
+        )
+        ident = resolve_pivot_identity(r)
+        assert ident is not None
+        # Family falls back to the full variant name -- not "n/a".
+        assert ident.family == "dummy-block-flood"
+        # qos / mode come from the dataclass fields, not the name.
+        assert ident.qos == 1
+        assert ident.mode == "single"
+        # Workload kind is the T19.9 sentinel; workload_profile is the
+        # user-facing name derived from the shape.
+        assert ident.workload_kind == "workload-profile"
+        assert ident.workload_profile == "block-flood"
+
+    def test_unsuffixed_name_without_data_qos_returns_none(self) -> None:
+        """If the parser fails AND data has no qos, the identity is None."""
+        from pivot_tables import resolve_pivot_identity
+
+        r = _t199_result(
+            "dummy-mixed-types",
+            qos=None,
+            shape="struct",
+        )
+        ident = resolve_pivot_identity(r)
+        assert ident is None
+
+    @pytest.mark.parametrize(
+        "shape, expected_workload",
+        [
+            ("scalar", "scalar-flood"),
+            ("array", "block-flood"),
+            ("struct", "mixed-types"),
+        ],
+    )
+    def test_shape_maps_to_workload_profile(
+        self, shape: str, expected_workload: str
+    ) -> None:
+        """The canonical shape -> workload-profile mapping is preserved."""
+        from pivot_tables import resolve_pivot_identity
+
+        r = _t199_result(
+            f"dummy-{shape}",
+            qos=2,
+            shape=shape,
+        )
+        ident = resolve_pivot_identity(r)
+        assert ident is not None
+        assert ident.workload_profile == expected_workload
+
+
+class TestPivotBuilderT199:
+    """T19.9: pivot table builder handles unsuffixed names without n/a."""
+
+    def test_unsuffixed_names_populate_pivot_cells(self) -> None:
+        """The T19.8 fixture's three workload-only variants populate cells."""
+        results = [
+            _t199_result(
+                "dummy-scalar-flood",
+                qos=1,
+                shape="scalar",
+                leaves_per_sec=100_184.0,
+            ),
+            _t199_result(
+                "dummy-block-flood",
+                qos=1,
+                shape="array",
+                leaves_per_sec=100_198.0,
+            ),
+            _t199_result(
+                "dummy-mixed-types",
+                qos=1,
+                shape="array",  # dominant shape; workload still mixed-types
+                leaves_per_sec=100_170.0,
+            ),
+        ]
+        tables = build_pivot_tables(results)
+        # One pivot per QoS.
+        assert len(tables) == 1
+        table = tables[0]
+        assert table.qos == 1
+        # Each variant becomes its own row (family = full variant name).
+        family_names = {row[0] for row in table.rows}
+        assert "dummy-scalar-flood" in family_names
+        assert "dummy-block-flood" in family_names
+        assert "dummy-mixed-types" in family_names
+        # The three workload-profile columns are present.
+        assert "scalar-flood" in table.columns
+        assert "block-flood" in table.columns
+        assert "mixed-types" in table.columns
+        # The mixed-types variant lands on the ``mixed-types`` column
+        # (data-driven), NOT on the ``block-flood`` column even though
+        # its dominant shape is ``array``.
+        key = (("dummy-mixed-types", "single"), "mixed-types")
+        cell = table.cells.get(key)
+        assert cell is not None
+        assert cell.delivery_pct == pytest.approx(100.0)
+
+    def test_canonical_column_order_includes_workload_profiles(self) -> None:
+        """``scalar-flood`` precedes ``block-flood`` precedes ``mixed-types``."""
+        results = [
+            _t199_result("dummy-mixed-types", qos=1, shape="struct"),
+            _t199_result("dummy-block-flood", qos=1, shape="array"),
+            _t199_result("dummy-scalar-flood", qos=1, shape="scalar"),
+        ]
+        tables = build_pivot_tables(results)
+        table = tables[0]
+        idx_scalar = table.columns.index("scalar-flood")
+        idx_block = table.columns.index("block-flood")
+        idx_mixed = table.columns.index("mixed-types")
+        assert idx_scalar < idx_block < idx_mixed

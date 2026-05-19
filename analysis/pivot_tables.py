@@ -96,13 +96,27 @@ class SpawnIdentity:
     tick_rate_hz: int
     qos: int
     mode: str
-    workload_kind: str  # "scalar-flood" or "max-throughput"
+    # ``workload_kind`` discriminates how to render the pivot column:
+    # ``"scalar-flood"`` uses ``<vpt>x<hz>hz``, ``"max-throughput"``
+    # uses the literal ``max``, and ``"workload-profile"`` (T19.9)
+    # uses the user-facing workload-profile token derived from the
+    # data-attached shape (``scalar-flood`` / ``block-flood`` /
+    # ``mixed-types``). The latter is produced by
+    # :func:`resolve_pivot_identity` for unsuffixed E19-style names.
+    workload_kind: str
+    # T19.9: when ``workload_kind == "workload-profile"``, this carries
+    # the user-facing workload-profile name (e.g. ``"block-flood"``)
+    # derived from the data-attached ``shape``. Empty string for the
+    # legacy scalar-flood / max-throughput kinds.
+    workload_profile_override: str = ""
 
     @property
     def workload_profile(self) -> str:
         """Pivot-column key, e.g. ``1000x100hz`` or ``max``."""
         if self.workload_kind == "max-throughput":
             return "max"
+        if self.workload_kind == "workload-profile":
+            return self.workload_profile_override or "workload-profile"
         return f"{self.values_per_tick}x{self.tick_rate_hz}hz"
 
     @property
@@ -132,6 +146,11 @@ def parse_spawn_name(name: str) -> SpawnIdentity | None:
         custom-udp                       (no QoS / mode suffix)
         zenoh-1000x10hz                  (no QoS / mode suffix)
         clock-sync                       (not a variant spawn)
+
+    For unsuffixed E19-style names (e.g. ``dummy-block-flood``) the
+    pivot builder uses :func:`resolve_pivot_identity` instead, which
+    falls back to ``PerformanceResult`` fields (``qos``,
+    ``threading_mode``, ``shape``) when this parser returns ``None``.
     """
     m = _SPAWN_RE.match(name)
     if m is None:
@@ -161,6 +180,115 @@ def parse_spawn_name(name: str) -> SpawnIdentity | None:
     )
 
 
+# T19.9: workload-only / unsuffixed spawn names (e.g. dummy-block-flood,
+# dummy-mixed-types) do NOT carry the canonical ``-<vpt>x<hz>hz-qos<N>-<mode>``
+# suffix, so :func:`parse_spawn_name` returns ``None`` on them. For the
+# pivot tables we still want a usable row identity in that case --
+# falling back to the dataclass-attached fields (``qos``,
+# ``threading_mode``, ``shape``) which the polars pipeline populates
+# directly from the per-event data columns. The "family" used for the
+# pivot row falls back to the full variant name (so a name like
+# ``dummy-block-flood`` lands on a ``dummy-block-flood`` row instead of
+# collapsing to ``n/a``); the workload-profile column maps from the
+# data-derived shape via :data:`_SHAPE_TO_WORKLOAD_PROFILE`.
+_SHAPE_TO_WORKLOAD_PROFILE: dict[str, str] = {
+    "scalar": "scalar-flood",
+    "array": "block-flood",
+    "struct": "mixed-types",
+}
+
+
+def resolve_pivot_identity(result: PerformanceResult) -> SpawnIdentity | None:
+    """Return a SpawnIdentity for ``result``, preferring data over name parsing.
+
+    Resolution order (T19.9):
+
+    1. Try :func:`parse_spawn_name` on ``result.variant``; if the name
+       matches the canonical ``<family>-<vpt>x<hz>hz-qos<N>-<mode>``
+       shape (or the ``-max-qos<N>-<mode>`` variant), use that
+       identity verbatim. This preserves pre-T19.9 behaviour for every
+       existing canonical config.
+    2. Otherwise build an identity from the dataclass fields:
+       ``result.qos`` (read from the ``qos`` column on ``write``
+       events), ``result.threading_mode`` (read from ``connected``
+       events), and ``result.shape`` (the dominant workload shape).
+       The family is the full ``result.variant`` so the pivot row
+       label reads e.g. ``dummy-block-flood-single`` instead of
+       collapsing to ``n/a``. The workload-profile column is derived
+       from the shape via :data:`_SHAPE_TO_WORKLOAD_PROFILE`.
+
+    Returns ``None`` only when both paths fail -- specifically when the
+    canonical parser fails AND ``result.qos`` is also ``None`` (which
+    means the underlying data has no ``write`` events with a populated
+    qos column). Such rows still appear in the flat Performance Report;
+    they just can't be placed on a per-QoS pivot.
+    """
+    canonical = parse_spawn_name(result.variant)
+    if canonical is not None:
+        return canonical
+    if result.qos is None:
+        # Data has no qos column populated either -- nothing to pivot on.
+        return None
+    # Workload-profile resolution (T19.9): if the variant name itself
+    # contains a canonical workload-profile token (e.g.
+    # ``dummy-block-flood``), use that token directly -- it's more
+    # accurate than the shape-derived fallback, which collapses
+    # ``mixed-types`` onto ``block-flood`` whenever the dominant shape
+    # happens to be ``array``. The shape-derived value is the second-
+    # choice fallback for spawn names that carry no workload token at
+    # all.
+    workload_profile = _workload_from_variant_name(result.variant)
+    if workload_profile is None:
+        shape = result.shape if result.shape else "scalar"
+        workload_profile = _SHAPE_TO_WORKLOAD_PROFILE.get(shape, shape)
+    return SpawnIdentity(
+        family=result.variant,
+        values_per_tick=0,
+        tick_rate_hz=0,
+        qos=int(result.qos),
+        mode=result.threading_mode,
+        # ``workload_kind`` is the discriminator that controls whether
+        # the ratio sub-cell renders ``n/a``. Data-derived rows do NOT
+        # have a nominal rate (vpt / hz are zero) and the receives-to-
+        # expected ratio is computed upstream as ``None`` for them, so
+        # marking the kind as ``"workload-profile"`` (a fresh sentinel)
+        # lets renderers / CSV exporters distinguish "no nominal rate
+        # because max-throughput" from "no nominal rate because the
+        # spawn name didn't encode one". Existing callers that branch
+        # on ``"max-throughput"`` continue to fall into the else-branch
+        # so behaviour is unchanged for them.
+        workload_kind="workload-profile",
+        workload_profile_override=workload_profile,
+    )
+
+
+# Canonical workload-profile tokens that may appear in unsuffixed E19
+# variant names (e.g. ``dummy-block-flood``). Order is significant: the
+# longest prefix is checked first so ``mixed-types`` is matched before
+# ``mixed`` (defensive against future tokens).
+_WORKLOAD_PROFILE_TOKENS: tuple[str, ...] = (
+    "scalar-flood",
+    "block-flood",
+    "mixed-types",
+    "max-throughput",
+)
+
+
+def _workload_from_variant_name(variant: str) -> str | None:
+    """Extract a workload-profile token from a variant name, if present.
+
+    Returns one of :data:`_WORKLOAD_PROFILE_TOKENS` when the variant
+    name ends with the token (preceded by ``-``), e.g.
+    ``dummy-block-flood`` -> ``"block-flood"``. Returns ``None`` when
+    no canonical workload-profile token is recognisable -- the caller
+    then falls back to the shape-derived mapping.
+    """
+    for token in _WORKLOAD_PROFILE_TOKENS:
+        if variant == token or variant.endswith(f"-{token}"):
+            return token
+    return None
+
+
 # Canonical row order across all pivot tables. Asymmetric: families
 # that only support ``multi`` (quic, zenoh, webrtc) get one row, the
 # others get two rows (single + multi). zenoh has a Single-mode entry
@@ -182,7 +310,11 @@ _CANONICAL_ROWS: tuple[tuple[str, str], ...] = (
 )
 
 # Canonical column order. ``max`` last because it is the outlier
-# (unbounded workload).
+# (unbounded workload). The E19 workload-profile tokens
+# (``scalar-flood`` / ``block-flood`` / ``mixed-types``) trail the
+# legacy <vpt>x<hz>hz columns and precede ``max`` per T19.9 so the
+# pivot reads left-to-right in the canonical workload progression
+# (scalar -> block -> mixed -> max).
 _CANONICAL_COLUMNS: tuple[str, ...] = (
     "1000x100hz",
     "1000x10hz",
@@ -191,6 +323,9 @@ _CANONICAL_COLUMNS: tuple[str, ...] = (
     "100x10hz",
     "10x100hz",
     "10x1000hz",
+    "scalar-flood",
+    "block-flood",
+    "mixed-types",
     "max",
 )
 
@@ -284,7 +419,11 @@ def build_pivot_tables(
     """
     by_qos: dict[int, list[tuple[SpawnIdentity, PerformanceResult]]] = {}
     for r in results:
-        identity = parse_spawn_name(r.variant)
+        # T19.9: prefer the data-derived identity so unsuffixed E19-style
+        # names (e.g. ``dummy-block-flood``) still land on the correct
+        # QoS bucket. :func:`resolve_pivot_identity` falls back to the
+        # canonical name parser when the name matches.
+        identity = resolve_pivot_identity(r)
         if identity is None:
             continue
         by_qos.setdefault(identity.qos, []).append((identity, r))
@@ -663,7 +802,9 @@ def _csv_value(value: object) -> str:
 
 def _csv_row(result: PerformanceResult) -> dict[str, str]:
     """Build the per-(variant, run) CSV row dict."""
-    identity = parse_spawn_name(result.variant)
+    # T19.9: use the data-aware resolver so unsuffixed E19-style spawn
+    # names still get populated qos / mode / workload_kind columns.
+    identity = resolve_pivot_identity(result)
     if identity is not None:
         family = identity.family
         vpt = identity.values_per_tick

@@ -192,6 +192,39 @@ _WORKLOAD_LABELS: dict[str, str] = {
 # alphabetical order so a future shape addition still plots cleanly.
 _WORKLOAD_SHAPE_ORDER: tuple[str, ...] = ("scalar", "array", "struct")
 
+# T19.9: canonical orderings for chart axes. These pin the visual sort
+# order of shape and workload-profile axes across every chart and pivot
+# rendering so a reader can scan from left-to-right in a known
+# progression (scalar -> array -> struct for the analyzer-internal
+# shape value; scalar-flood -> block-flood -> mixed-types ->
+# max-throughput for the user-facing workload-profile name).
+# Adding a new shape / workload is a single-line change here.
+#
+# Items not in the list are appended at the end in alphabetical order
+# so new categories still plot cleanly even before this constant is
+# bumped.
+CANONICAL_SHAPE_ORDER: tuple[str, ...] = ("scalar", "array", "struct")
+CANONICAL_WORKLOAD_ORDER: tuple[str, ...] = (
+    "scalar-flood",
+    "block-flood",
+    "mixed-types",
+    "max-throughput",
+)
+
+
+def canonical_shape_sort_key(shape: str) -> tuple[int, str]:
+    """Sort key putting shapes in :data:`CANONICAL_SHAPE_ORDER`, others last."""
+    if shape in CANONICAL_SHAPE_ORDER:
+        return (CANONICAL_SHAPE_ORDER.index(shape), shape)
+    return (len(CANONICAL_SHAPE_ORDER), shape)
+
+
+def canonical_workload_sort_key(workload: str) -> tuple[int, str]:
+    """Sort key putting workloads in :data:`CANONICAL_WORKLOAD_ORDER`, others last."""
+    if workload in CANONICAL_WORKLOAD_ORDER:
+        return (CANONICAL_WORKLOAD_ORDER.index(workload), workload)
+    return (len(CANONICAL_WORKLOAD_ORDER), workload)
+
 
 def _shape_hatch(shape: str | None) -> str:
     """Return the matplotlib hatch pattern for a ``PerformanceResult.shape`` value.
@@ -213,10 +246,13 @@ def _shape_label(shape: str | None) -> str:
 
 
 def _shape_sort_key(shape: str) -> tuple[int, str]:
-    """Sort key putting scalar/array/struct in canonical order, others last."""
-    if shape in _WORKLOAD_SHAPE_ORDER:
-        return (_WORKLOAD_SHAPE_ORDER.index(shape), shape)
-    return (len(_WORKLOAD_SHAPE_ORDER), shape)
+    """Sort key putting scalar/array/struct in canonical order, others last.
+
+    Thin alias around :func:`canonical_shape_sort_key`; kept as an
+    underscore-prefixed helper for the internal chart code that has used
+    this name since T19.6.
+    """
+    return canonical_shape_sort_key(shape)
 
 
 # Small positive epsilon used to clamp lower whisker bounds so the
@@ -1641,176 +1677,283 @@ def generate_latency_cdf_plot(
 _THROUGHPUT_VS_SHAPE_FILENAME: str = "throughput-vs-workload-shape.png"
 
 
-def _group_results_by_variant_axis(
+def _group_results_by_threading_mode(
     results: list[PerformanceResult],
-) -> dict[tuple[str, str, str | None], dict[tuple[str, int | None], PerformanceResult]]:
-    """Bucket performance results into per-variant-axis cells.
+) -> dict[
+    str | None,
+    dict[tuple[str, str, int | None], PerformanceResult],
+]:
+    """Bucket performance results by threading mode for the workload-shape chart.
 
-    The "variant axis" key is ``(transport, workload, threading_mode)``
-    -- everything that identifies a variant *except* QoS and the
-    workload-shape profile, both of which become axes within each
-    subplot of the throughput-vs-workload-shape chart. The inner dict
-    keys on ``(shape, qos)`` so a single subplot can carry up to
-    ``len(shapes) * len(qos)`` bars.
+    T19.9 restructure: the throughput-vs-workload-shape chart's x-axis
+    is the **workload profile** (one tick per profile: scalar-flood,
+    block-flood, mixed-types, max-throughput) so each subplot must
+    span all observed workload profiles in canonical order. Subplots
+    split on threading mode (per the CUSTOM.md spec: "One subplot per
+    threading mode"); within a subplot the bar's hatch + x-position
+    both encode the workload profile (redundant by design -- workload
+    is the dimension under test) and the colour encodes the transport
+    family.
 
-    First entry per ``(shape, qos)`` within a variant wins, matching
-    the existing collapse convention in :func:`_index_parsed_results`.
+    The inner dict keys on ``(transport, workload_profile, qos)`` so
+    a single subplot can carry up to ``len(transports) *
+    len(workload_profiles) * len(qos)`` bars. The workload profile is
+    the user-facing label derived from ``PerformanceResult.shape`` via
+    :func:`_shape_label` (or directly from a parseable variant name,
+    when available -- not currently exercised since the existing chart
+    only consumes ``shape``).
+
+    First entry per inner key wins, matching the existing collapse
+    convention in :func:`_index_parsed_results`.
     """
     buckets: dict[
-        tuple[str, str, str | None],
-        dict[tuple[str, int | None], PerformanceResult],
+        str | None,
+        dict[tuple[str, str, int | None], PerformanceResult],
     ] = {}
     for r in results:
-        transport, workload, qos, threading_mode = _split_variant_name(r.variant)
-        key = (transport, workload, threading_mode)
-        shape = r.shape if r.shape else "scalar"
-        inner = buckets.setdefault(key, {})
-        inner.setdefault((shape, qos), r)
+        transport, _workload_name, qos, threading_mode = _split_variant_name(r.variant)
+        # T19.9: the threading mode on the dataclass is the source of
+        # truth (it's populated from the ``connected`` event's
+        # ``threading_mode`` column). Fall back to the parsed value
+        # from the variant name when the dataclass field is the
+        # default ``"single"`` AND a more specific value was parsed.
+        # In practice the two agree because the runner sets both from
+        # the same TOML dimension.
+        mode = r.threading_mode if r.threading_mode else threading_mode
+        # T19.9: workload-profile resolution. Prefer a canonical
+        # workload-profile token embedded in the variant name (e.g.
+        # ``dummy-block-flood`` -> ``block-flood``) over the shape-
+        # derived mapping. The shape-derived mapping is the fallback
+        # for legacy / scalar-flood-only datasets and collapses
+        # ``mixed-types`` onto ``block-flood`` whenever the dominant
+        # shape happens to be ``array``; the variant-name token is
+        # accurate because the runner sets it from the workload
+        # config dimension, not from the per-event data.
+        workload_profile = _workload_profile_from_variant(r.variant)
+        if workload_profile is None:
+            shape = r.shape if r.shape else "scalar"
+            workload_profile = _shape_label(shape)
+        # Prefer the dataclass qos (T19.9) over the parsed qos.
+        effective_qos = r.qos if r.qos is not None else qos
+        inner = buckets.setdefault(mode, {})
+        inner.setdefault((transport, workload_profile, effective_qos), r)
     return buckets
 
 
-def _variant_axis_label(key: tuple[str, str, str | None]) -> str:
-    """Render a ``(transport, workload, threading_mode)`` tuple as a label."""
-    transport, workload, mode = key
-    parts = [transport]
-    if workload:
-        parts.append(workload)
-    if mode is not None:
-        parts.append(mode)
-    return "-".join(parts)
+# Canonical workload-profile tokens used by :func:`_workload_profile_from_variant`.
+# Order is significant: the longest match is checked first so
+# ``mixed-types`` (the full canonical token) is matched before a
+# hypothetical future ``mixed`` short-form. Lives in plots.py because
+# the chart layer is the user of this mapping; the pivot layer has its
+# own equivalent constant in :data:`pivot_tables._WORKLOAD_PROFILE_TOKENS`.
+_VARIANT_NAME_WORKLOAD_TOKENS: tuple[str, ...] = (
+    "scalar-flood",
+    "block-flood",
+    "mixed-types",
+    "max-throughput",
+)
+
+
+def _workload_profile_from_variant(variant: str) -> str | None:
+    """Return a workload-profile token embedded in a variant name, or ``None``.
+
+    Matches a suffix-style token like ``dummy-block-flood`` (where the
+    last hyphenated segment is one of :data:`_VARIANT_NAME_WORKLOAD_TOKENS`).
+    Returns ``None`` when no canonical token is present -- the caller
+    then falls back to the shape-derived workload label.
+    """
+    for token in _VARIANT_NAME_WORKLOAD_TOKENS:
+        if variant == token or variant.endswith(f"-{token}"):
+            return token
+    return None
+
+
+def _threading_mode_label(mode: str | None) -> str:
+    """Render a threading mode value as a subplot title."""
+    if mode is None or mode == "":
+        return "legacy"
+    return mode
 
 
 def _generate_throughput_vs_workload_shape_for_axis(
     *,
     ax,
-    variant_key: tuple[str, str, str | None],
-    cells: dict[tuple[str, int | None], PerformanceResult],
+    mode_key: str | None,
+    cells: dict[tuple[str, str, int | None], PerformanceResult],
     qos_order: list[int | None],
-    shape_order: list[str],
+    workload_order: list[str],
+    transport_order: list[str],
 ) -> None:
     """Render one subplot of the throughput-vs-workload-shape chart.
 
-    The subplot has one bar group per workload shape on the x-axis and
-    one bar per QoS within each group. Bar hatch encodes the shape
-    (consistent with the comparison-qos restructure for cross-chart
-    legibility) and the bar's edge / colour-tone band can be re-used
-    later if a QoS-by-colour scheme is added. For T19.6 the y-axis is
-    locked to ``leaves_per_sec`` (the canonical cross-workload
-    comparable metric per the api-contracts E19 additions).
+    T19.9 layout: the subplot has one tick per workload profile on the
+    x-axis (``scalar-flood`` / ``block-flood`` / ``mixed-types`` /
+    ``max-throughput`` in canonical order). Each tick groups bars by
+    (transport, QoS) so multiple transports and QoS levels can be
+    overlaid on the same workload column. The bar's hatch encodes the
+    workload (redundantly with the tick label) -- this is intentional
+    per the CUSTOM.md spec, since workload is the dimension under
+    test. The bar's colour encodes the transport family at the
+    threading-mode tone (per the existing comparison-qos convention).
+
+    Y-axis is locked to ``leaves_per_sec`` -- the canonical
+    cross-workload comparable metric per the api-contracts E19
+    additions.
     """
-    transport, _workload, threading_mode = variant_key
-    base_color = _threading_color(transport, threading_mode)
+    n_workloads = len(workload_order)
+    workload_centres = np.arange(n_workloads, dtype=float)
 
-    n_shapes = len(shape_order)
-    n_qos = len(qos_order)
-    shape_centres = np.arange(n_shapes, dtype=float)
-
-    # Sub-bar layout per shape group: spread the per-QoS bars evenly
-    # across [-0.4, +0.4] around the shape's centre. Bar width matches
-    # the inter-bar step minus a small margin so adjacent groups stay
-    # visibly separated.
-    if n_qos == 1:
-        per_qos_offsets = [0.0]
+    # Sub-bar count per workload tick: one bar per (transport, qos)
+    # combination present in the dataset. Spread bars evenly across
+    # [-0.4, +0.4] around each tick centre.
+    n_subbars = max(1, len(transport_order) * len(qos_order))
+    if n_subbars == 1:
+        offsets = [0.0]
         bar_w = 0.6
     else:
-        step = 0.8 / n_qos
+        step = 0.8 / n_subbars
         start = -0.4 + 0.5 * step
-        per_qos_offsets = [start + i * step for i in range(n_qos)]
+        offsets = [start + i * step for i in range(n_subbars)]
         bar_w = step * 0.85
 
-    for shape_idx, shape in enumerate(shape_order):
+    # Build the (transport, qos) sub-bar order: transports in canonical
+    # family order, then QoS ascending within each transport. The hatch
+    # per workload is applied unconditionally so the bar visually
+    # echoes its workload column.
+    sub_order: list[tuple[str, int | None]] = []
+    for transport in transport_order:
+        for qos in qos_order:
+            sub_order.append((transport, qos))
+
+    for wl_idx, workload in enumerate(workload_order):
+        # Map the user-facing workload profile back to the analyzer-
+        # internal shape token for hatch selection. Falls back to the
+        # workload string itself when not in the canonical map -- which
+        # then resolves to the scalar (solid) hatch via _shape_hatch.
+        shape = _workload_to_shape(workload)
         hatch = _shape_hatch(shape)
-        for qos_idx, qos in enumerate(qos_order):
-            r = cells.get((shape, qos))
+        for sub_idx, (transport, qos) in enumerate(sub_order):
+            r = cells.get((transport, workload, qos))
             if r is None:
                 value = float("nan")
             else:
                 value = float(r.leaves_per_sec)
+            color = _threading_color(transport, mode_key)
             ax.bar(
-                [shape_centres[shape_idx] + per_qos_offsets[qos_idx]],
+                [workload_centres[wl_idx] + offsets[sub_idx]],
                 [value],
                 bar_w,
-                color=[base_color],
+                color=[color],
                 edgecolor="black",
                 linewidth=0.3,
                 hatch=hatch,
             )
 
-    ax.set_xticks(shape_centres)
-    ax.set_xticklabels([_shape_label(s) for s in shape_order], rotation=0, fontsize=8)
+    ax.set_xticks(workload_centres)
+    ax.set_xticklabels(workload_order, rotation=0, fontsize=8)
     ax.set_ylabel("leaves/s")
-    ax.set_title(_variant_axis_label(variant_key), fontsize=9)
+    ax.set_title(
+        f"throughput-vs-workload ({_threading_mode_label(mode_key)})", fontsize=9
+    )
     ax.yaxis.grid(True, linestyle="--", alpha=0.5)
     ax.set_axisbelow(True)
+
+
+# Inverse of :data:`_WORKLOAD_LABELS` -- map a user-facing workload
+# profile name back to the analyzer-internal shape token used to look
+# up the bar's hatch pattern. Used by the throughput-vs-workload-shape
+# chart now that the x-axis carries the workload name directly.
+_WORKLOAD_TO_SHAPE: dict[str, str] = {v: k for k, v in _WORKLOAD_LABELS.items()}
+
+
+def _workload_to_shape(workload: str) -> str:
+    """Map a workload-profile label back to its analyzer-internal shape."""
+    return _WORKLOAD_TO_SHAPE.get(workload, workload)
 
 
 def generate_throughput_vs_workload_shape_plot(
     results: list[PerformanceResult],
     output_dir: Path,
 ) -> Path:
-    """Render the per-variant throughput-vs-workload-shape chart (T19.6).
+    """Render the throughput-vs-workload-shape chart (T19.9 layout).
 
-    Layout:
+    Layout (per the CUSTOM.md spec, fixed in T19.9):
 
-    - Per-variant subplot grid (one subplot per unique
-      ``(transport, workload, threading_mode)`` tuple in the dataset).
-    - X-axis on each subplot: workload profile, sorted scalar-flood ->
-      block-flood -> mixed-types (per :data:`_WORKLOAD_SHAPE_ORDER`).
+    - **One subplot per threading mode** (typically ``single`` and/or
+      ``multi``). Each subplot covers every observed workload profile
+      across every variant in that mode -- so a reader can compare
+      ``scalar-flood`` against ``block-flood`` against ``mixed-types``
+      at a glance within the same subplot.
+    - X-axis on each subplot: workload profile, in canonical
+      :data:`CANONICAL_WORKLOAD_ORDER` order (``scalar-flood`` ->
+      ``block-flood`` -> ``mixed-types`` -> ``max-throughput``;
+      workloads outside this list are appended alphabetically at the
+      end). Each tick label is the user-facing workload-profile name,
+      NOT the analyzer-internal shape value.
     - Y-axis: ``PerformanceResult.leaves_per_sec`` -- the canonical
       cross-workload comparable metric per the api-contracts E19
       additions.
-    - One bar per QoS within each workload group. The per-shape hatch
-      mirrors the comparison-qos chart so a reader can correlate bars
-      across the two outputs.
+    - One bar per (transport, QoS) combination per workload tick.
+      The bar's hatch encodes the workload profile (redundantly with
+      the x-tick label, since workload is the dimension under test --
+      the visual reinforcement makes mis-labeling cross-chart
+      impossible) and the bar's colour encodes the transport family
+      at the threading-mode tone.
+
+    The pre-T19.9 layout used one subplot per
+    ``(transport, workload, threading_mode)`` tuple with the shape on
+    the x-axis -- under the T19.8 fixture this produced subplots with
+    a single bar that mis-landed on the shape tick (e.g. mixed-types
+    bar on the ``block-flood`` tick because its dominant shape is
+    ``array``). The new layout fixes that by keying the x-axis on the
+    workload profile directly.
 
     Empty datasets render a single placeholder PNG.
     """
     if not results:
         return _empty_plot(output_dir, filename=_THROUGHPUT_VS_SHAPE_FILENAME)
 
-    buckets = _group_results_by_variant_axis(results)
+    buckets = _group_results_by_threading_mode(results)
     if not buckets:
         return _empty_plot(output_dir, filename=_THROUGHPUT_VS_SHAPE_FILENAME)
 
-    # Determine global axis orderings from the union of every variant
-    # axis's observations so each subplot's x-axis covers the same
-    # ordered set of shapes (gaps show up as missing bars, not as a
+    # Determine global axis orderings from the union of every subplot's
+    # observations so each subplot's x-axis covers the same ordered set
+    # of workload profiles (gaps show up as missing bars, not as a
     # shorter x-axis).
-    shape_set: set[str] = set()
+    workload_set: set[str] = set()
+    transport_set: set[str] = set()
     qos_set: set[int | None] = set()
     for cells in buckets.values():
-        for shape, qos in cells.keys():
-            shape_set.add(shape)
+        for transport, workload, qos in cells.keys():
+            workload_set.add(workload)
+            transport_set.add(transport)
             qos_set.add(qos)
-    shape_order = sorted(shape_set, key=_shape_sort_key)
+    workload_order = sorted(workload_set, key=canonical_workload_sort_key)
+    transport_order: list[str] = [t for t in TRANSPORT_FAMILIES if t in transport_set]
+    if "other" in transport_set:
+        transport_order.append("other")
     qos_order = sorted(qos_set, key=_qos_sort_key)
 
-    # Stable variant-axis ordering: family order, then workload load-
-    # intensity, then ``single`` before ``multi`` before legacy.
-    def variant_sort_key(
-        key: tuple[str, str, str | None],
-    ) -> tuple[int, tuple[int, int, str], int]:
-        transport, workload, mode = key
-        family_rank = (
-            TRANSPORT_FAMILIES.index(transport)
-            if transport in TRANSPORT_FAMILIES
-            else len(TRANSPORT_FAMILIES)
-        )
-        mode_rank = {"single": 0, "multi": 1, None: 2}.get(mode, 3)
-        return family_rank, _workload_load_rank(workload), mode_rank
+    # Stable threading-mode ordering: single, then multi, then legacy.
+    def mode_sort_key(mode: str | None) -> int:
+        if mode == "single":
+            return 0
+        if mode == "multi":
+            return 1
+        return 2
 
-    variant_keys = sorted(buckets.keys(), key=variant_sort_key)
-    n_variants = len(variant_keys)
+    mode_keys = sorted(buckets.keys(), key=mode_sort_key)
+    n_modes = len(mode_keys)
 
-    # Grid shape: prefer a square-ish layout with a width cap so the
-    # subplots stay legible on dense datasets. 3-wide is the sweet spot
-    # for the ~6-9 variant axes in the canonical T19.6 fixture; the
-    # cap auto-extends to 4 cols on larger datasets.
-    ncols = min(4, max(1, n_variants if n_variants <= 3 else 3))
-    nrows = (n_variants + ncols - 1) // ncols
+    # Grid shape: stack subplots vertically (one mode per row) so the
+    # x-axis remains wide. For a single mode this collapses to a single
+    # subplot, which keeps the T19.8 single-runner output readable.
+    ncols = 1
+    nrows = max(1, n_modes)
 
-    subplot_w = 4.5
-    subplot_h = 3.2
+    subplot_w = 8.0
+    subplot_h = 3.6
     legend_band_height = 1.2
     fig_width = max(8.0, subplot_w * ncols)
     fig_height = subplot_h * nrows + legend_band_height
@@ -1818,37 +1961,33 @@ def generate_throughput_vs_workload_shape_plot(
         nrows=nrows, ncols=ncols, figsize=(fig_width, fig_height), squeeze=False
     )
 
-    for idx, variant_key in enumerate(variant_keys):
-        r_idx = idx // ncols
-        c_idx = idx % ncols
-        ax = axes[r_idx][c_idx]
+    for idx, mode_key in enumerate(mode_keys):
+        ax = axes[idx][0]
         _generate_throughput_vs_workload_shape_for_axis(
             ax=ax,
-            variant_key=variant_key,
-            cells=buckets[variant_key],
+            mode_key=mode_key,
+            cells=buckets[mode_key],
             qos_order=qos_order,
-            shape_order=shape_order,
+            workload_order=workload_order,
+            transport_order=transport_order,
         )
 
-    # Hide unused subplot slots so the figure doesn't render empty
-    # axes on the right of the last row.
-    for idx in range(n_variants, nrows * ncols):
-        r_idx = idx // ncols
-        c_idx = idx % ncols
-        axes[r_idx][c_idx].set_axis_off()
-
-    fig.suptitle("Throughput vs workload shape (per variant, leaves/s)", fontsize=11)
+    fig.suptitle(
+        "Throughput vs workload (one subplot per threading mode, leaves/s)",
+        fontsize=11,
+    )
 
     # Two-strip legend: workload (hatch) above QoS (text legend).
     workload_handles: list[matplotlib.patches.Patch] = []
-    for shape in shape_order:
+    for workload in workload_order:
+        shape = _workload_to_shape(workload)
         workload_handles.append(
             matplotlib.patches.Patch(
                 facecolor="white",
                 edgecolor="black",
                 linewidth=0.5,
                 hatch=_shape_hatch(shape),
-                label=_shape_label(shape),
+                label=workload,
             )
         )
 

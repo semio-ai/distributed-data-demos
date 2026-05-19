@@ -200,3 +200,55 @@ Variant              Run          Connect(ms)  Latency p50  p95     p99     Writ
 custom-udp           local-test   12.3         0.5ms        1.2ms   2.3ms   50        0.2%
 dummy                local-test   0.1          0.01ms       0.02ms  0.03ms  50        0.0%
 ```
+
+## Workload-shape dimension (T19.5 + T19.6 / E19)
+
+E19 adds the workload axis to the analysis pipeline. Two new fields
+appear on `write` events: `leaf_count: u32` (default `1`) and
+`shape: string` (default `"scalar"`). Backward-compatible: legacy
+JSONL / compact-Parquet files default both fields when parsing.
+
+**Parse + correlate** (T19.5):
+
+- `parse.py` + `schema.py` read the new fields with sensible defaults.
+- `correlate.py` propagates `leaf_count` / `shape` from `write` to the
+  matching `receive` row by `(writer, seq, path)`. Receivers don't
+  log these fields directly — the wire is opaque, so the metadata
+  lives only on the write side.
+
+**Headline metrics** (T19.5): three distinct throughput numbers per
+spawn:
+
+- `ops_per_sec` = receives / operate_secs.
+- `leaves_per_sec` = sum(leaf_count) / operate_secs (canonical
+  cross-workload comparable metric).
+- `bytes_per_sec` = sum(bytes) / operate_secs.
+
+**Latency canonical unit**: per-WriteOp everywhere. Block-flood /
+mixed-types produce one latency sample per published block;
+scalar-flood preserves per-leaf granularity coincidentally
+(1 leaf = 1 op).
+
+**Pivot + plots** (T19.6):
+
+- `workload` and `shape` become optional pivot dimensions on the
+  existing tables.
+- The existing `comparison-qos` chart is restructured: the two
+  subplots stack **vertically** (not side-by-side), per-variant
+  grouping is preserved, and the per-group bars subdivide by
+  (workload × threading_mode):
+  - Workload distinguished by **fill pattern**: `scalar-flood` solid
+    fill, `block-flood` horizontal-line hatch, `mixed-types`
+    checkered hatch.
+  - Threading_mode distinguished by **color** (existing convention:
+    `single` vs `multi` palette).
+  - Variants that don't support multi threading_mode simply emit
+    fewer bars in their group — no placeholder bars.
+- New "throughput vs workload shape" chart per variant: x-axis =
+  workload profile (sorted), y-axis = `leaves_per_sec`. One subplot
+  per threading mode.
+
+**Backfill discipline**: legacy data (pre-E19) reads back as
+`leaf_count = 1, shape = "scalar"`. Existing scalar-flood results
+stay valid and remain on the same axis as new block-flood /
+mixed-types results. No re-run needed for historical data.
