@@ -59,6 +59,20 @@ class IntegrityResult:
     ordering_error: bool
     duplicate_error: bool
     gap_error: bool
+    # E19 / T19.6: leaf-level loss accounting. Per the locked spec
+    # ``api-contracts/jsonl-log-schema.md`` § E19 additions, ``leaf_count``
+    # is per-WriteOp and a lost op contributes ``leaf_count`` leaves to
+    # the total "scalar values lost" tally. The analyzer surfaces this
+    # alongside the existing op-level loss% so the operator can read
+    # off both "how many publish calls dropped" (existing) and "how
+    # many scalar leaves dropped" (new) on the same row. Backward
+    # compatible: for pre-E19 data where ``leaf_count == 1`` everywhere,
+    # ``leaves_lost == ops_lost`` by construction. ``ops_lost`` is
+    # ``max(0, write_count - receive_count)`` -- the same arithmetic
+    # the delivery% column reflects, surfaced explicitly so the
+    # ``Leaves Lost`` column stays self-contained.
+    ops_lost: int = 0
+    leaves_lost: int = 0
     # T17.9: count of ``backpressure_skipped`` events that the writer
     # emitted at the row's QoS level when ``qos >= 3``. Per
     # ``DESIGN.md`` § 6.5 (Strict No-Skip Contract for QoS 3/4) the
@@ -87,6 +101,103 @@ def _count_writes_per_writer(group: pl.LazyFrame) -> pl.DataFrame:
             pl.col("variant").cast(pl.Utf8),
             pl.col("run").cast(pl.Utf8),
             pl.col("writer").cast(pl.Utf8),
+        )
+        .collect()
+    )
+
+
+def _sum_leaves_written_per_writer(group: pl.LazyFrame) -> pl.DataFrame:
+    """Sum ``leaf_count`` over write events per (variant, run, writer).
+
+    E19 / T19.6: returns one row per writer carrying the total number
+    of *scalar leaves* the writer published. Pre-E19 caches default the
+    ``leaf_count`` column to ``1`` per write so the legacy behaviour
+    (``sum == count``) is preserved without a special case. Null
+    leaf_counts (defensive against malformed cache rows) are treated
+    as ``1`` so a half-populated column still produces meaningful
+    totals.
+    """
+    if "leaf_count" not in group.collect_schema().names():
+        # Pre-T19.5 cache shards predate the column; fall back to
+        # treating every write as one leaf. The schema-version bump in
+        # T19.5 forces a one-shot rebuild on first read so in practice
+        # this branch only fires for in-flight tests against a
+        # synthetic LazyFrame missing the column.
+        return (
+            group.filter(pl.col("event") == "write")
+            .filter(pl.col("seq").is_not_null() & pl.col("path").is_not_null())
+            .group_by(["variant", "run", "runner"])
+            .agg(pl.len().cast(pl.Int64).alias("leaves_written"))
+            .rename({"runner": "writer"})
+            .with_columns(
+                pl.col("variant").cast(pl.Utf8),
+                pl.col("run").cast(pl.Utf8),
+                pl.col("writer").cast(pl.Utf8),
+            )
+            .collect()
+        )
+
+    return (
+        group.filter(pl.col("event") == "write")
+        .filter(pl.col("seq").is_not_null() & pl.col("path").is_not_null())
+        .group_by(["variant", "run", "runner"])
+        .agg(
+            pl.col("leaf_count")
+            .fill_null(1)
+            .cast(pl.Int64)
+            .sum()
+            .alias("leaves_written")
+        )
+        .rename({"runner": "writer"})
+        .with_columns(
+            pl.col("variant").cast(pl.Utf8),
+            pl.col("run").cast(pl.Utf8),
+            pl.col("writer").cast(pl.Utf8),
+        )
+        .collect()
+    )
+
+
+def _sum_leaves_received_per_pair(deliveries: pl.DataFrame) -> pl.DataFrame:
+    """Sum ``leaf_count`` over delivery rows per (variant, run, writer, receiver).
+
+    E19 / T19.6: receives don't carry ``leaf_count`` on the wire; the
+    correlator (``correlate_lazy``) propagates it from the matching
+    write row via the (writer, seq, path) join key. Summing here gives
+    the per-pair "scalar leaves delivered" number that pairs naturally
+    with ``leaves_written`` from :func:`_sum_leaves_written_per_writer`
+    to compute ``leaves_lost = leaves_written - leaves_received`` per
+    (writer, receiver, qos) pair.
+
+    Pre-E19 caches default ``leaf_count`` to ``1`` per row so the
+    legacy behaviour (``leaves_received == receive_count``) is
+    preserved with no special-casing.
+    """
+    if deliveries.is_empty() or "leaf_count" not in deliveries.columns:
+        return pl.DataFrame(
+            schema={
+                "variant": pl.Utf8,
+                "run": pl.Utf8,
+                "writer": pl.Utf8,
+                "receiver": pl.Utf8,
+                "leaves_received": pl.Int64,
+            }
+        )
+    return (
+        deliveries.lazy()
+        .group_by(["variant", "run", "writer", "receiver"])
+        .agg(
+            pl.col("leaf_count")
+            .fill_null(1)
+            .cast(pl.Int64)
+            .sum()
+            .alias("leaves_received")
+        )
+        .with_columns(
+            pl.col("variant").cast(pl.Utf8),
+            pl.col("run").cast(pl.Utf8),
+            pl.col("writer").cast(pl.Utf8),
+            pl.col("receiver").cast(pl.Utf8),
         )
         .collect()
     )
@@ -343,6 +454,8 @@ def integrity_for_group(
     classification falls back to ``"unknown"`` on every row.
     """
     write_counts = _count_writes_per_writer(group)
+    leaves_written = _sum_leaves_written_per_writer(group)
+    leaves_received = _sum_leaves_received_per_pair(deliveries)
     skip_counts = _count_backpressure_skipped_per_writer(group)
     skip_at_reliable_counts = _count_skip_at_reliable_per_writer_qos(group)
     pair_stats = _check_per_pair(deliveries)
@@ -383,6 +496,22 @@ def integrity_for_group(
         on=["variant", "run", "writer"],
         how="left",
     )
+    if not leaves_written.is_empty():
+        joined = joined.join(
+            leaves_written,
+            on=["variant", "run", "writer"],
+            how="left",
+        )
+    else:
+        joined = joined.with_columns(pl.lit(0).cast(pl.Int64).alias("leaves_written"))
+    if not leaves_received.is_empty():
+        joined = joined.join(
+            leaves_received,
+            on=["variant", "run", "writer", "receiver"],
+            how="left",
+        )
+    else:
+        joined = joined.with_columns(pl.lit(0).cast(pl.Int64).alias("leaves_received"))
     if not skip_counts.is_empty():
         joined = joined.join(
             skip_counts,
@@ -424,6 +553,8 @@ def integrity_for_group(
         pl.col("duplicates").fill_null(0),
         pl.col("backpressure_skipped_count").fill_null(0),
         pl.col("skip_at_reliable_count").fill_null(0),
+        pl.col("leaves_written").fill_null(0),
+        pl.col("leaves_received").fill_null(0),
     ).sort(["variant", "run", "writer", "receiver"])
 
     results: list[IntegrityResult] = []
@@ -435,6 +566,20 @@ def integrity_for_group(
         duplicates = int(row["duplicates"])
         backpressure_skipped_count = int(row["backpressure_skipped_count"])
         skip_at_reliable_count = int(row["skip_at_reliable_count"])
+        # E19 / T19.6: leaf-level loss accounting. ``ops_lost`` is the
+        # writer-side count of writes that never made it to this
+        # receiver (clamped at zero -- a writer may publish *after* a
+        # receiver's window closes, which is benign and we don't want
+        # to surface as "negative loss"). ``leaves_lost`` is the
+        # corresponding scalar-value count, derived from the
+        # ``leaf_count`` propagated through the (writer, seq, path)
+        # join key by ``correlate_lazy``. Both collapse to the
+        # op-equivalent on pre-E19 data where ``leaf_count = 1`` for
+        # every row.
+        leaves_written_val = int(row.get("leaves_written") or 0)
+        leaves_received_val = int(row.get("leaves_received") or 0)
+        ops_lost = max(0, write_count - receive_count)
+        leaves_lost = max(0, leaves_written_val - leaves_received_val)
 
         delivery_pct = (receive_count / write_count * 100.0) if write_count > 0 else 0.0
 
@@ -509,6 +654,8 @@ def integrity_for_group(
                 skip_at_reliable_error=skip_at_reliable_error,
                 timeout_classification=t_class,
                 timeout_sub_tags=t_sub,
+                ops_lost=ops_lost,
+                leaves_lost=leaves_lost,
             )
         )
 

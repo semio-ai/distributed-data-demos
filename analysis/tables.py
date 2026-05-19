@@ -61,10 +61,11 @@ def format_integrity_table(
     lines: list[str] = []
     lines.append("Integrity Report")
     # Wider table to accommodate the ``BP-skip`` column added in
-    # T-impl.6 (per-writer count of ``backpressure_skipped`` events)
-    # and the ``Timeout`` column added in T14.17 (per-spawn failure-
-    # cause classification).
-    sep = "-" * 164
+    # T-impl.6 (per-writer count of ``backpressure_skipped`` events),
+    # the ``Timeout`` column added in T14.17 (per-spawn failure-cause
+    # classification), and the ``Leaves Lost`` column added in T19.6
+    # (E19 leaf-level loss accounting).
+    sep = "-" * 185
     lines.append(sep)
 
     # Column widths
@@ -79,6 +80,14 @@ def format_integrity_table(
     w_dupes = 7
     w_gaps = 16
     w_bpskip = 12
+    # T19.6 / E19: ``Leaves Lost`` is the scalar-leaf analogue of the
+    # op-level loss surfaced by ``Delivery%``. For pre-E19 data where
+    # ``leaf_count == 1`` everywhere this equals ``write_count -
+    # receive_count``; for block-flood / mixed-types it can be many
+    # times larger than the op-count gap. Column is wide enough to
+    # render the comma-grouped int with no truncation up to ~9
+    # significant digits.
+    w_leaves_lost = 12
     # T14.17 / T15.6 / T15.11: ``Timeout`` column holds the longest
     # enum value (``variant_self_killed_idle`` = 25 chars) plus a
     # little padding.
@@ -96,6 +105,7 @@ def format_integrity_table(
         + _rpad("Dupes", w_dupes)
         + _rpad("Unresolved gaps", w_gaps)
         + _rpad("BP-skip", w_bpskip)
+        + _rpad("Leaves Lost", w_leaves_lost)
         + "  "
         + _pad("Timeout", w_timeout)
     )
@@ -144,6 +154,7 @@ def format_integrity_table(
             + _rpad(str(r.duplicates), w_dupes)
             + _rpad(gaps_str, w_gaps)
             + _rpad(f"{r.backpressure_skipped_count:,}", w_bpskip)
+            + _rpad(f"{r.leaves_lost:,}", w_leaves_lost)
             + "  "
             + _pad(r.timeout_classification, w_timeout)
         )

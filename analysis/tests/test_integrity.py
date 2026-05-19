@@ -840,3 +840,246 @@ class TestIntegritySkipAtReliable:
         assert carol.qos == 3
         assert carol.skip_at_reliable_count == 1
         assert carol.skip_at_reliable_error
+
+
+class TestIntegrityLeavesLost:
+    """E19 / T19.6: leaves_lost accounting on the integrity report.
+
+    Locked spec: ``leaves_lost == leaves_written - leaves_received``
+    per (writer, receiver, qos) pair. For pre-E19 data where
+    ``leaf_count == 1`` everywhere this equals ``ops_lost``; for
+    block-flood / mixed-types the leaf total can be many multiples
+    larger than the op total.
+    """
+
+    def test_legacy_data_leaves_lost_equals_ops_lost(self) -> None:
+        """Pre-E19 data (leaf_count defaults to 1) -> leaves_lost == ops_lost."""
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=100,
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                seq=2,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=101,
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                seq=3,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=102,
+            ),
+            # Only seq 1 + 3 delivered (seq 2 lost in transit).
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=110,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=3,
+                path="/k",
+                qos=1,
+                bytes=8,
+                offset_ms=112,
+            ),
+        ]
+        results = _verify(events)
+        assert len(results) == 1
+        r = results[0]
+        assert r.write_count == 3
+        assert r.receive_count == 2
+        assert r.ops_lost == 1
+        # leaf_count defaults to 1 on every row -> leaves_lost == ops_lost.
+        assert r.leaves_lost == 1
+        assert r.leaves_lost == r.ops_lost
+
+    def test_block_flood_leaves_lost_is_ops_lost_times_leaf_count(self) -> None:
+        """Block-flood loss: leaves_lost = ops_lost * leaf_count (100 here)."""
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=800,
+                leaf_count=100,
+                shape="array",
+                offset_ms=100,
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                seq=2,
+                path="/k",
+                qos=1,
+                bytes=800,
+                leaf_count=100,
+                shape="array",
+                offset_ms=101,
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                seq=3,
+                path="/k",
+                qos=1,
+                bytes=800,
+                leaf_count=100,
+                shape="array",
+                offset_ms=102,
+            ),
+            # Only seq 1 delivered (seq 2 + 3 lost -> 200 leaves lost).
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=800,
+                offset_ms=110,
+            ),
+        ]
+        results = _verify(events)
+        assert len(results) == 1
+        r = results[0]
+        assert r.write_count == 3
+        assert r.receive_count == 1
+        assert r.ops_lost == 2
+        # 2 lost ops * 100 leaves per op = 200 leaves lost.
+        assert r.leaves_lost == 200
+
+    def test_full_delivery_zero_leaves_lost(self) -> None:
+        """When every op is delivered the leaves_lost column reads 0."""
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=400,
+                leaf_count=50,
+                shape="array",
+                offset_ms=100,
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                seq=2,
+                path="/k",
+                qos=1,
+                bytes=400,
+                leaf_count=50,
+                shape="array",
+                offset_ms=101,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=400,
+                offset_ms=110,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=2,
+                path="/k",
+                qos=1,
+                bytes=400,
+                offset_ms=111,
+            ),
+        ]
+        results = _verify(events)
+        assert len(results) == 1
+        r = results[0]
+        assert r.write_count == 2
+        assert r.receive_count == 2
+        assert r.ops_lost == 0
+        assert r.leaves_lost == 0
+
+    def test_mixed_leaf_counts_sum_correctly(self) -> None:
+        """Mixed-types: per-op leaf_count varies; leaves_lost sums the lost ones."""
+        events = [
+            # Three writes with varied leaf counts.
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=80,
+                leaf_count=10,
+                shape="struct",
+                offset_ms=100,
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                seq=2,
+                path="/k",
+                qos=1,
+                bytes=400,
+                leaf_count=50,
+                shape="struct",
+                offset_ms=101,
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                seq=3,
+                path="/k",
+                qos=1,
+                bytes=240,
+                leaf_count=30,
+                shape="struct",
+                offset_ms=102,
+            ),
+            # Only seq 1 (10 leaves) delivered; seq 2 (50) + seq 3 (30)
+            # lost -> 80 leaves lost total.
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=1,
+                bytes=80,
+                offset_ms=110,
+            ),
+        ]
+        results = _verify(events)
+        assert len(results) == 1
+        r = results[0]
+        assert r.write_count == 3
+        assert r.receive_count == 1
+        assert r.ops_lost == 2
+        # 50 + 30 = 80 leaves lost across two unmatched writes.
+        assert r.leaves_lost == 80
