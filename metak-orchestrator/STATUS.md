@@ -15999,3 +15999,146 @@ commits":
 - `docs(runner/T-ux.1): document line shape and estimator in CUSTOM.md`
 
 STATUS.md update lands as the fifth commit per the existing convention.
+
+---
+
+## Tight regression smoke config (2026-05-21)
+
+Added `configs/two-runner-smoke-tight.toml`: a ~10-12 min/runner smoke
+that exercises all five variant families x three workload profiles
+(scalar-flood, block-flood, mixed-types) x the two QoS extremes (1 and
+4 -- websocket only 4) at a single sweep point (vpt=1000, tick=100Hz).
+Spawn count: 27 per runner (zenoh/quic/webrtc 6 each, hybrid 6,
+websocket 3). Timing: stabilize=3, operate=15, silent=3,
+default_timeout_secs=60. Header comment flags the known-failing
+zenoh@qos=4 cases as INCLUDED ON PURPOSE so the smoke detects when the
+bug is fixed.
+
+Validation:
+- `cargo build -p runner --release` -> green (8.95s, no-op recompile).
+- `target/release/runner.exe --name nonexistent --config
+  configs/two-runner-smoke-tight.toml --log-dir C:/repo/shared/ddd`
+  -> errors with `runner name 'nonexistent' is not in the config
+  runners list: ["alice", "bob"]`. Inspection of `runner/src/main.rs`
+  lines 267-292 confirms `BenchConfig::from_file` (parse +
+  `resolve_templates` + `validate`) runs at line 267 BEFORE the
+  runner-name check at line 270, so reaching the name error proves
+  parse + template resolution + constraint validation all passed.
+  Note: the spec said the "config loaded: ... 27 variant(s)" line
+  should appear before the name error, but in current main.rs that
+  print is at line 285 -- after the name check at 270 -- so it doesn't
+  fire on a bad name. Validation goal is still met.
+- Hand-verified constraints for the (vpt=1000) point: block-flood
+  divisibility 1000 % 100 == 0; mixed-types scalars_max=20 <= vpt=1000
+  and arrays_max=600 <= vpt - scalars_min = 995.
+
+Files touched: `configs/two-runner-smoke-tight.toml` (new) and this
+STATUS.md note. No source code modified. Not committed.
+
+---
+
+## T19.12 completion report -- 2026-05-21 (worker: analysis)
+
+### Files changed
+
+- `analysis/performance.py`
+  - Added `SHAPE_DISPLAY_MIXED = "mixed"` module-level constant.
+  - Added `_shape_display(deliveries) -> str` helper alongside the
+    existing `_dominant_shape`. Computes the DISTINCT set of non-null
+    shape values across the operate-window-scoped deliveries; renders
+    the verbatim value when the set has exactly one entry,
+    `SHAPE_DISPLAY_MIXED` otherwise. Falls back to `"scalar"` when the
+    column is missing / set is empty.
+  - Extended `_shape_aggregates` return type from
+    `(leaves, bytes, shape)` to `(leaves, bytes, shape, shape_display)`
+    and threaded `shape_display` through both early-return paths and
+    the main aggregation path so it stays consistent with the dominant
+    `shape` aggregation (same scoping, same fallbacks).
+  - Added `shape_display: str = ""` field on `PerformanceResult` with a
+    long docstring explaining the rule and why the legacy `shape`
+    field is preserved.
+  - Populated `shape_display=group_shape_display` in
+    `performance_for_group`'s constructor call.
+- `analysis/tables.py`
+  - `format_performance_table` now reads
+    `r.shape_display if r.shape_display else r.shape` for the `Shape`
+    cell. Updated the column-layout block comment to T19.5 / T19.12
+    and to document the new derivation rule + fallback.
+- `analysis/tests/test_tables.py`
+  - Added `_table_body` / `_shape_cell` helpers.
+  - Added `TestPerformanceTableShapeColumn` covering:
+    - homogeneous scalar-flood -> `Shape: scalar`,
+    - homogeneous block-flood -> `Shape: array`,
+    - heterogeneous mixed-types -> `Shape: mixed` (with assertion that
+      `r.shape == "array"` still holds so the legacy field hasn't
+      regressed for plot consumers),
+    - legacy hand-built `PerformanceResult` without `shape_display` ->
+      fallback to `shape`.
+- `analysis/tests/test_workload_shape.py`
+  - Added `TestShapeDisplay` covering the same four cases at the
+    `PerformanceResult` level (no rendering dependency).
+
+### Display rule picked
+
+**Option A**: `"mixed"` when the group spans 2+ distinct shapes;
+verbatim shape otherwise. Chosen over Option B (workload name like
+`"mixed-types"`) because Option A keeps the analyzer's shape vocabulary
+self-contained inside its existing glossary (scalar / array / struct /
+mixed) without coupling the table renderer to workload-profile
+semantics. The rationale is recorded in the `_shape_display` docstring.
+
+### Tests run + delta from baseline
+
+```
+cd analysis && python -m pytest
+================== 441 passed, 6 skipped in 63.71s ==================
+```
+
+T19.10c baseline was 433 / 6. Delta: +8 (4 in `TestShapeDisplay`, 4 in
+`TestPerformanceTableShapeColumn`). No existing tests required
+modification -- pre-existing `result.shape == "array"` assertions for
+homogeneous block-flood / scalar groups remain valid because
+`shape == shape_display` for single-shape groups.
+
+`ruff format --check .` -> "37 files already formatted".
+`ruff check .` -> "All checks passed!".
+
+### Smoke check (`logs/wlshapes-single-20260519_165233`)
+
+Before T19.12 the same fixture's Performance Report row read
+`dummy-mixed-types ... single  array  49,028  100,170  ...` (per the
+T19.8 completion report's issue #6). After T19.12:
+
+```
+Variant               Run             Thread  Shape       Receives/s ...
+dummy-block-flood     wlshapes-single single  array            1,002       100,198 ...
+dummy-mixed-types     wlshapes-single single  mixed           49,028       100,170 ...
+dummy-scalar-flood    wlshapes-single single  scalar         100,184       100,184 ...
+```
+
+- mixed-types row's `Shape` column is now `mixed` (was `array`).
+- scalar-flood row stays `scalar`; block-flood row stays `array` --
+  homogeneous groups unchanged.
+- All other pivot columns (Receives/s, Leaves/s, latency, etc.) are
+  byte-identical to the pre-fix output captured in T19.8.
+- Pivot Tables section (`Pivot Tables (variant x workload, one per
+  QoS)`) is unchanged -- it groups by workload-profile column, not by
+  Shape, and was not in T19.12's scope.
+
+### Deviations from the locked spec
+
+None. The change is display-only (no SCHEMA_VERSION bump), stays
+within `analysis/`, and leaves the workload-shape charts /
+`PerformanceResult.shape` field untouched as required.
+
+### Commits landed
+
+Three small commits on `main` (no remote push), per the project's
+"split unrelated changes" rule:
+
+- `feat(analysis/T19.12): derive Shape column from distinct-shapes set`
+  (performance.py + tables.py).
+- `test(analysis/T19.12): pin Shape-column rendering on the
+  distinct-shapes axis` (test_tables.py + test_workload_shape.py).
+- This STATUS.md update will land as the third commit per the existing
+  convention.
