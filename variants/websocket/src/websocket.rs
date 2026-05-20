@@ -1807,9 +1807,7 @@ mod tests {
     /// in, mirroring how the driver constructs it in `run_protocol`.
     /// Returns the handle, the shared `Arc<Mutex<CompactBuffers>>` for
     /// assertion, and the holding tempdir.
-    fn temp_logger_handle_with_compact(
-        legacy_jsonl: bool,
-    ) -> (
+    fn temp_logger_handle_with_compact() -> (
         LoggerHandle,
         std::sync::Arc<std::sync::Mutex<variant_base::CompactBuffers>>,
         tempfile::TempDir,
@@ -1826,7 +1824,7 @@ mod tests {
         let mut handle = LoggerHandle::new(logger);
         let buffers: StdArc<StdMutex<variant_base::CompactBuffers>> =
             StdArc::new(StdMutex::new(variant_base::CompactBuffers::new()));
-        handle.attach_compact_sink(StdArc::clone(&buffers), legacy_jsonl);
+        handle.attach_compact_sink(StdArc::clone(&buffers));
         (handle, buffers, dir)
     }
 
@@ -1886,7 +1884,7 @@ mod tests {
             io: PeerIo::Single(ws),
         };
 
-        let (handle, compact, _tmp) = temp_logger_handle_with_compact(false);
+        let (handle, compact, _tmp) = temp_logger_handle_with_compact();
         drain_current_peer_into_logger(&mut peer, Some(&handle));
 
         let buf = compact.lock().unwrap();
@@ -1963,7 +1961,7 @@ mod tests {
         });
         v.threading_mode = ThreadingMode::Multi;
 
-        let (handle, compact, _tmp) = temp_logger_handle_with_compact(false);
+        let (handle, compact, _tmp) = temp_logger_handle_with_compact();
         v.attach_logger(handle);
         v.start_reader_threads(ThreadingMode::Multi)
             .expect("start_reader_threads ok");
