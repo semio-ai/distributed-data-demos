@@ -8376,3 +8376,82 @@ cd analysis && python -m pytest -v
 **Sequencing**: must spawn AFTER T19.9 lands because both edit
 `analysis/parse.py` and `analysis/cache.py`. T19.10c picks up T19.9's
 schema version (whatever it ended at) and bumps from there.
+
+### T19.11 — variant-base: remove vestigial `attach_compact_sink` bool param [small]
+
+**Repo**: `variant-base/` + `variants/websocket/` (the only consumer of
+the shim).
+**Owner**: orchestrator → spawn worker (post-E19 polish).
+**Context**: T19.10a kept `LoggerHandle::attach_compact_sink`'s second
+`bool` argument as a no-op shim because removing it would have broken
+the websocket variant's in-tree test at `variants/websocket/src/websocket.rs:1829`,
+and that file was outside the T19.10a worker's variant-base/ scope.
+This task closes the loop.
+
+**Files**:
+- `variant-base/src/logger.rs` — find `LoggerHandle::attach_compact_sink`,
+  remove the no-op `bool` parameter. Confirm via grep that no other
+  in-tree caller passes a meaningful argument.
+- `variants/websocket/src/websocket.rs` (around line 1829) — update the
+  call site to drop the `bool` argument.
+- Any other call site that the orchestrator may have missed (grep
+  `attach_compact_sink` across the workspace; expect only
+  `variant-base/` callers + the one websocket test).
+
+**Tests**:
+- `cargo test --release -p variant-base`
+- `cargo test --release -p variant-websocket` (the test that previously
+  forced the shim must keep passing)
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+- `cargo fmt --check`
+- `cargo build --release` (whole workspace)
+
+**Acceptance**:
+- No call sites pass the bool param anymore.
+- All tests + clippy + fmt pass.
+- `git grep -n attach_compact_sink` shows only the new (cleaner)
+  signature and call sites.
+
+### T19.12 — analysis: fix `Shape` column for mixed-types [small]
+
+**Repo**: `analysis/`.
+**Owner**: orchestrator → spawn worker (post-E19 polish).
+**Context**: T19.8 flagged this as issue #6, and T19.9 explicitly
+excluded it from scope. T19.5's worker had pointed at the right escape
+hatch: `PerformanceResult.shape` is currently a single dominant value
+per group, so when `mixed-types` happens to have `array` as its
+dominant shape, the pivot row shows `Shape: array` for the mixed-types
+row — misleading.
+
+The fix: compute the Shape display value from the delivery-level
+columns (which already carry per-WriteOp shape) instead of from
+`PerformanceResult.shape`. If a group spans multiple shapes, render
+`mixed` (or the canonical name of the workload, if available — worker
+picks). For groups with a single shape, render that shape.
+
+**Files**:
+- `analysis/performance.py` and/or `analysis/tables.py` — adjust the
+  Shape column derivation. The pivot should consult the underlying
+  delivery rows for shape distribution rather than relying on a single
+  scalar field.
+- `analysis/tests/` — add coverage:
+  - A `scalar-flood` fixture renders `Shape: scalar`.
+  - A `block-flood` fixture renders `Shape: array`.
+  - A `mixed-types` fixture renders `Shape: mixed` (or the workload
+    name).
+
+**Validation**:
+```
+cd analysis && python -m pytest -v
+```
+
+Net should still pass (T19.10c baseline was 433 / 6).
+
+**Smoke check**: re-run the analyzer on the T19.8 fixture session
+(`logs/wlshapes-single-20260519_165233`); confirm the mixed-types row
+no longer shows `array`.
+
+**Acceptance**:
+- Mixed-types pivot row no longer displays a single dominant shape.
+- Tests pass.
+- Smoke check confirms.

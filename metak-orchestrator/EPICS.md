@@ -1426,6 +1426,13 @@ E19 adds two workload profiles to cover this gap:
   User-directed at T19.8 acceptance: "we don't have or want to ever
   keep any legacy behaviour, clear it out please." Split into
   T19.10a (variant-base), T19.10b (runner), T19.10c (analysis).
+- **T19.11** variant-base: remove vestigial `attach_compact_sink`
+  bool param shim that T19.10a deliberately left because its only
+  consumer (`variants/websocket` in-tree test) was outside scope.
+- **T19.12** analysis: fix `Shape` column for `mixed-types` rows —
+  derive from delivery-level shape distribution rather than the
+  single-dominant `PerformanceResult.shape`. Pre-existing concern
+  flagged by T19.8 (issue #6) and explicitly excluded from T19.9.
 
 ### Sequencing
 
