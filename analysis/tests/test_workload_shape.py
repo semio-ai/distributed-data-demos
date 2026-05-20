@@ -597,3 +597,154 @@ class TestBlockFloodArithmetic:
         result = _perf(events)
         assert result.shape == "scalar"
         assert result.leaves_per_sec == result.ops_per_sec
+
+
+class TestShapeDisplay:
+    """T19.12: ``shape_display`` honors the distinct-shapes set.
+
+    These tests pin the contract at the PerformanceResult level (not the
+    table-rendering level -- that's in ``test_tables.py``). The display
+    field must:
+
+    1. Render the verbatim shape value when the group is homogeneous.
+    2. Render the literal ``"mixed"`` when the group spans multiple
+       distinct shapes -- the load-bearing fix for the T19.8 issue #6
+       where mixed-types rows displayed ``"array"``.
+    3. Stay consistent with :attr:`PerformanceResult.shape` (the
+       dominant-shape field) for homogeneous groups: when there is
+       only one shape, ``shape_display == shape``.
+    """
+
+    def test_scalar_flood_shape_display_is_scalar(self) -> None:
+        events: list[dict] = [
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000)
+        ]
+        for i in range(1, 4):
+            events.append(
+                make_event(
+                    "write",
+                    runner="alice",
+                    seq=i,
+                    path="/k",
+                    qos=1,
+                    bytes=8,
+                    leaf_count=1,
+                    shape="scalar",
+                    offset_ms=1000 + i,
+                )
+            )
+            events.append(
+                make_event(
+                    "receive",
+                    runner="bob",
+                    writer="alice",
+                    seq=i,
+                    path="/k",
+                    qos=1,
+                    bytes=8,
+                    offset_ms=1010 + i,
+                )
+            )
+        events.append(
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000)
+        )
+        result = _perf(events)
+        assert result.shape == "scalar"
+        assert result.shape_display == "scalar"
+
+    def test_block_flood_shape_display_is_array(self) -> None:
+        events: list[dict] = [
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000)
+        ]
+        for i in range(1, 4):
+            events.append(
+                make_event(
+                    "write",
+                    runner="alice",
+                    seq=i,
+                    path="/k",
+                    qos=1,
+                    bytes=400,
+                    leaf_count=100,
+                    shape="array",
+                    offset_ms=1000 + i,
+                )
+            )
+            events.append(
+                make_event(
+                    "receive",
+                    runner="bob",
+                    writer="alice",
+                    seq=i,
+                    path="/k",
+                    qos=1,
+                    bytes=400,
+                    offset_ms=1010 + i,
+                )
+            )
+        events.append(
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000)
+        )
+        result = _perf(events)
+        assert result.shape == "array"
+        assert result.shape_display == "array"
+
+    def test_mixed_types_shape_display_is_mixed(self) -> None:
+        """Heterogeneous group -> ``shape_display == "mixed"``.
+
+        The dominant-shape field still resolves to the lex-first
+        non-null value (``"array"`` here -- ``a`` < ``s``) because other
+        consumers (legend hatch picker, chart sort-order) want a single
+        stable identifier. ``shape_display`` is the operator-facing
+        label that calls out the heterogeneity.
+        """
+        events: list[dict] = [
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000)
+        ]
+        shapes = ["scalar", "array", "struct"]
+        leaf_counts = [1, 100, 50]
+        sizes = [8, 400, 200]
+        for i, (s, lc, sz) in enumerate(zip(shapes, leaf_counts, sizes), start=1):
+            events.append(
+                make_event(
+                    "write",
+                    runner="alice",
+                    seq=i,
+                    path="/k",
+                    qos=1,
+                    bytes=sz,
+                    leaf_count=lc,
+                    shape=s,
+                    offset_ms=1000 + i,
+                )
+            )
+            events.append(
+                make_event(
+                    "receive",
+                    runner="bob",
+                    writer="alice",
+                    seq=i,
+                    path="/k",
+                    qos=1,
+                    bytes=sz,
+                    offset_ms=1010 + i,
+                )
+            )
+        events.append(
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000)
+        )
+        result = _perf(events)
+        # Dominant shape preserved at lex-first non-null entry.
+        assert result.shape == "array"
+        # Display value honestly reflects heterogeneity.
+        assert result.shape_display == "mixed"
+
+    def test_empty_deliveries_shape_display_defaults_to_scalar(self) -> None:
+        """No deliveries -> fall back to ``"scalar"`` (same default as ``shape``)."""
+        events: list[dict] = [
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000),
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000),
+        ]
+        result = _perf(events)
+        assert result.shape == "scalar"
+        assert result.shape_display == "scalar"

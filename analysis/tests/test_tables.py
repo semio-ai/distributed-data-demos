@@ -391,3 +391,163 @@ class TestIntegrityTableSkipAtReliableAnnotation:
         ]
         table = format_integrity_table(rows)
         assert "skip-at-reliable" not in table
+
+
+def _table_body(table: str) -> str:
+    """Helper: return the rows portion of a performance table (post-header)."""
+    # Layout produced by ``format_performance_table``:
+    #   line 0: "Performance Report"
+    #   line 1: separator
+    #   line 2: header
+    #   line 3: separator
+    #   line 4..: rows
+    lines = table.splitlines()
+    return "\n".join(lines[4:])
+
+
+def _shape_cell(table: str) -> str:
+    """Helper: extract the ``Shape`` column value from the first data row."""
+    lines = table.splitlines()
+    header = lines[2]
+    body = lines[4]
+    # ``Shape`` is a left-aligned 8-char column starting at ``header.index("Shape")``;
+    # use the next column boundary (``Receives/s``) to bound the slice so the
+    # value is trimmed regardless of internal padding.
+    start = header.index("Shape")
+    end = header.index("Receives/s")
+    return body[start:end].strip()
+
+
+class TestPerformanceTableShapeColumn:
+    """T19.12: ``Shape`` column rendered from per-WriteOp distinct-shapes set.
+
+    Pre-T19.12 the column read :attr:`PerformanceResult.shape` directly,
+    which collapses a heterogeneous (mixed-types) group to a single
+    "dominant" shape value -- in practice always ``"array"`` for a
+    mixed-types workload because that's the lex-first non-null shape
+    across the rotating scalar / array / struct sequence. The fix
+    sources the column from :attr:`PerformanceResult.shape_display`
+    (derived in ``performance.py::_shape_display``) which honestly
+    renders ``"mixed"`` when the underlying delivery rows span multiple
+    distinct shapes.
+    """
+
+    def _events_for_shape(self, shape: str | list[str]) -> list[dict]:
+        """Build a per-spawn events list with the given shape(s) on writes.
+
+        Pass a single shape string for a homogeneous workload, or a list
+        of shapes (cycled over writes) to synthesize a mixed-types
+        workload. Receives are always emitted -- the analyzer
+        propagates ``shape`` from the matching write via
+        ``correlate_lazy``, so the receive event itself carries no shape
+        field.
+        """
+        events: list[dict] = [
+            make_event("phase", runner="alice", phase="operate", offset_ms=1000)
+        ]
+        shapes = [shape] if isinstance(shape, str) else shape
+        n_writes = max(len(shapes), 3)
+        for i in range(n_writes):
+            s = shapes[i % len(shapes)]
+            events.append(
+                make_event(
+                    "write",
+                    runner="alice",
+                    seq=i + 1,
+                    path="/k",
+                    qos=1,
+                    bytes=8,
+                    leaf_count=1 if s == "scalar" else 4,
+                    shape=s,
+                    offset_ms=1001 + i,
+                )
+            )
+            events.append(
+                make_event(
+                    "receive",
+                    runner="bob",
+                    writer="alice",
+                    seq=i + 1,
+                    path="/k",
+                    qos=1,
+                    bytes=8,
+                    offset_ms=1010 + i,
+                )
+            )
+        events.append(
+            make_event("phase", runner="alice", phase="silent", offset_ms=2000)
+        )
+        return events
+
+    def test_scalar_flood_renders_shape_scalar(self) -> None:
+        """A homogeneous scalar-flood group renders ``Shape: scalar``."""
+        events = self._events_for_shape("scalar")
+        r = _perf(events)
+        assert r.shape_display == "scalar"
+        table = format_performance_table([r])
+        assert _shape_cell(table) == "scalar"
+
+    def test_block_flood_renders_shape_array(self) -> None:
+        """A homogeneous block-flood group renders ``Shape: array``."""
+        events = self._events_for_shape("array")
+        r = _perf(events)
+        assert r.shape_display == "array"
+        table = format_performance_table([r])
+        assert _shape_cell(table) == "array"
+
+    def test_mixed_types_renders_shape_mixed(self) -> None:
+        """A heterogeneous mixed-types group renders ``Shape: mixed``.
+
+        Pre-T19.12 this row would read ``Shape: array`` because the
+        underlying dominant-shape aggregation picked the lex-first
+        non-null shape across the rotating scalar / array / struct
+        sequence -- which is misleading.
+        """
+        events = self._events_for_shape(["scalar", "array", "struct"])
+        r = _perf(events)
+        # The dominant-shape field still collapses to the lex-first
+        # value (preserved intentionally for plot / hatch consumers).
+        assert r.shape == "array"
+        # The display field reflects the distinct-shapes set honestly.
+        assert r.shape_display == "mixed"
+        table = format_performance_table([r])
+        cell = _shape_cell(table)
+        assert cell == "mixed", (
+            f"Expected mixed-types row to render Shape: mixed, got {cell!r}. "
+            "Pre-T19.12 this rendered as 'array', which misleads the operator "
+            "about a heterogeneous workload."
+        )
+
+    def test_legacy_perfresult_without_shape_display_falls_back_to_shape(
+        self,
+    ) -> None:
+        """Backward-compat: empty ``shape_display`` falls back to ``shape``.
+
+        A ``PerformanceResult`` hand-built without a ``shape_display``
+        (e.g. legacy caches predating T19.12, ad-hoc test fixtures)
+        defaults the new field to the empty string. The renderer must
+        fall back to the older ``shape`` field rather than emit a blank
+        cell.
+        """
+        from performance import PerformanceResult
+
+        r = PerformanceResult(
+            variant="legacy",
+            run="r1",
+            connect_mean_ms=0.0,
+            connect_max_ms=0.0,
+            latency_p50_ms=0.0,
+            latency_p95_ms=0.0,
+            latency_p99_ms=0.0,
+            latency_max_ms=0.0,
+            writes_per_sec=0.0,
+            receives_per_sec=0.0,
+            jitter_ms=0.0,
+            jitter_p95_ms=0.0,
+            loss_pct=0.0,
+            shape="array",
+            # shape_display intentionally omitted -> defaults to "".
+        )
+        assert r.shape_display == ""
+        table = format_performance_table([r])
+        assert _shape_cell(table) == "array"
