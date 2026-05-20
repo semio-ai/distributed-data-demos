@@ -15838,3 +15838,164 @@ the suggested order:
 - `89d8f53` docs(analysis/T19.10c): document post-E19-cleanup per-spawn pair invariant
 
 STATUS.md update lands as the fifth commit per the suggested split.
+
+## T-ux.1 -- runner: progress + ETA line after each spawn -- LANDED
+
+**Scope confirmation**: `runner/` subtree only. Adds a single new stderr
+line per non-final spawn, leaves the T-impl.9 `'<name>' finished:` line
+untouched.
+
+### Exact line shape that landed
+
+```
+[runner:<name>] progress: <i>/<total> done | elapsed <H>h <M>m <S>s | ETA ~<H>h <M>m <S>s
+```
+
+`format_hms` collapses the prefix when it is zero (so a sub-minute run
+reads `47s`, not `0h 00m 47s`; sub-hour run reads `12m 09s`; hour-plus
+run reads `1h 02m 17s`). ASCII only.
+
+The line is suppressed on the final spawn (the run is done -- nothing
+left to estimate). Resume-mode skipped spawns still increment the cursor
+and emit the line, so a burst of skips does not silence the channel.
+
+### Files touched
+
+- `runner/src/progress_eta.rs` -- NEW. Holds `format_hms`,
+  `spawn_nominal_duration`, `estimate_eta`. All pure functions, no I/O.
+  16 unit tests in the same file pin the format breakpoints, the
+  per-spawn nominal sum + timeout fallback, and the hybrid estimator
+  math (including the deterministic case the brief specified: 4 spawns
+  at nominal 30s each, elapsed 70s after spawn 1 -> ETA = 210s).
+- `runner/src/main.rs` -- adds `mod progress_eta;`, the
+  `nominal_per_job` precompute, the `spawn_loop_start` anchor at the
+  top of Phase 2, the `emit_progress_eta` shim, and two call sites
+  (resume-skip arm and post-`finished:` line). Existing `finished:`
+  line is unchanged.
+- `runner/tests/integration.rs` -- new test
+  `progress_eta_line_after_each_non_final_spawn`. Two-spawn
+  variant-dummy config; asserts the progress line appears immediately
+  after the first `finished:` line with cursor `1/2 done`, and that no
+  progress line appears after the second `finished:` line.
+- `runner/CUSTOM.md` -- new "Per-spawn progress + ETA line (T-ux.1)"
+  section right before the existing "Per-spawn stderr capture" block.
+  Pins the line shape, the format breakpoints, the estimator formula,
+  the locked-in design choices, and the files that implement them.
+
+### Nominal-duration helper
+
+Landed in `runner/src/progress_eta.rs::spawn_nominal_duration`. Reads
+`stabilize_secs` / `operate_secs` / `silent_secs` directly from the
+variant's `[variant.common]` table (where the runner already parses
+them as opaque `toml::Value`s for CLI forwarding) and adds
+`inter_qos_grace_ms/1000` for the inter-spawn grace.
+
+The fallback rule: if any of the three phase keys is missing or
+non-integer, the helper returns `Duration::from_secs(variant.timeout_secs.unwrap_or(1))`.
+A safe over-estimate beats `NaN`; the 1s sentinel only fires when
+neither phase keys NOR timeout_secs is declared (configs that should
+not parse in the first place).
+
+### Tests run + results
+
+```
+cargo test --release -p runner --bin runner progress_eta::
+   16 passed; 0 failed (the new unit tests)
+
+cargo test --release -p runner --test integration
+   28 passed; 0 failed; 2 ignored
+   (was 27 passed pre-change; the +1 is the new T-ux.1 integration test.
+    The 2 ignored entries are pre-existing two-runner tests that are
+    skipif-gated on cross-machine network setup.)
+
+cargo clippy --release -p runner -- -D warnings
+   clean
+
+cargo fmt -p runner -- --check
+   (My touched files pass `rustfmt --check` cleanly. The crate-wide
+   invocation still flags four pre-existing diffs in
+   `clock_sync.rs` / `local_addrs.rs` / `protocol.rs` that were already
+   present in the working tree at task start -- those are not in scope
+   for T-ux.1 and were not introduced by this work.)
+```
+
+The full runner unit-test suite was also run end-to-end (`cargo test
+--release -p runner`); 263 passed, 1 ignored. Two existing tests
+(`barrier_coord::tests::two_runner_barrier_exchange_round_trips` and
+`protocol::tests::stale_ready_from_different_run_is_ignored`) failed
+when run alongside the entire suite but passed in isolation -- both are
+existing network/multicast flakes unrelated to this change (their
+failure modes are TCP-barrier timeout and multicast Ready miss, neither
+of which touches the progress+ETA path).
+
+### Smoke run
+
+```
+target/release/runner.exe --name alice --config configs/_t198_single_runner_workload_shapes.toml
+```
+
+(Single-runner, 3-spawn config -- avoided the two-runner configs since
+this machine's multi-machine setup is not configured.) The runner
+produced:
+
+```
+[runner:alice] 'dummy-scalar-flood' finished: status=success, exit_code=0
+[runner:alice] progress: 1/3 done | elapsed 8s | ETA ~16s
+[runner:alice] 'dummy-block-flood' finished: status=success, exit_code=0
+[runner:alice] progress: 2/3 done | elapsed 16s | ETA ~8s
+[runner:alice] 'dummy-mixed-types' finished: status=success, exit_code=0
+Benchmark run: wlshapes-single
+...
+```
+
+Numbers cross-check by hand:
+- Each spawn's nominal = `stabilize(1) + operate(5) + silent(1) +
+  grace(0.250) = 7.25s`.
+- After spawn 1: elapsed 8s, `nominal_so_far = 7.25s`,
+  `nominal_remaining = 14.5s`, `overhead_per_spawn = (8 - 7.25)/1 = 0.75s`,
+  `eta = 14.5 + 0.75 * 2 = 16s`. Matches the line.
+- After spawn 2: elapsed 16s, `nominal_so_far = 14.5s`,
+  `nominal_remaining = 7.25s`, `overhead_per_spawn = (16 - 14.5)/2 = 0.75s`,
+  `eta = 7.25 + 0.75 * 1 = 8s`. Matches the line.
+- No progress line after spawn 3 (final). Matches the contract.
+
+### Edge cases observed
+
+- **Under-budget early stretch**: the estimator already saturates
+  `overhead_per_spawn` at zero (one of the pinned unit tests). On the
+  smoke run the variants ran slightly over their declared phase
+  durations (8s vs nominal 7.25s -- the 0.75s overhead per spawn is
+  spawn / barrier / cleanup time), so the saturation branch did not
+  fire in practice. It will fire in early seconds of long matrices where
+  the first spawn's wall-clock is briefly below its declared nominal --
+  the saturation keeps the ETA from collapsing to zero in that window.
+- **Tiny-terminal wrap risk**: a worst-case line of e.g.
+  `[runner:alice] progress: 144/144 done | elapsed 12h 34m 56s | ETA ~12h 34m 56s`
+  is ~85 chars. Acceptable on the typical 100-120 col terminals
+  benchmark operators use. The line is suppressed on the final spawn
+  anyway, so the "144/144" worst case never actually prints.
+- **Inter-spawn grace fold-in**: the brief said `inter_qos_grace_ms /
+  1000` adds to every spawn's nominal. I followed that literally --
+  over-counts the first spawn of every entry by one grace period, but
+  the overhead correction absorbs the bias within a few spawns. Not
+  worth the extra book-keeping for first-spawn-only.
+
+### Deviations from the spec
+
+None. The locked-in items (hybrid estimator, one new line after the
+existing `finished:` line, T-impl.9 line unchanged) all landed as
+specified. The line shape exactly matches the brief's suggested
+`[runner:<name>] progress: <i>/<total> done | elapsed <Hh Mm Ss> | ETA ~<Hh Mm Ss>`.
+
+### Commits landed
+
+Four small commits on `main` (no remote push), in the order suggested
+by the user-feedback rule "split unrelated changes into separate
+commits":
+
+- `feat(runner/T-ux.1): progress_eta module (format_hms / nominal / estimator)`
+- `feat(runner/T-ux.1): wire progress + ETA line into the spawn loop`
+- `test(runner/T-ux.1): pin line shape in a two-spawn integration test`
+- `docs(runner/T-ux.1): document line shape and estimator in CUSTOM.md`
+
+STATUS.md update lands as the fifth commit per the existing convention.
