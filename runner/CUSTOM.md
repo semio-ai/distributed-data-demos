@@ -168,6 +168,82 @@ the 60s timeout, was TerminateProcess'd before flushing stderr, and the
 runner's only output was the lone status line. With T-impl.9 the same
 run now points the operator at the capture file + JSONL log inline.
 
+### Per-spawn progress + ETA line (T-ux.1)
+
+Immediately after the T-impl.9 `'<name>' finished:` status line (and
+after the resume-mode `skipping '<name>' (resume: ...)` notice), the
+runner prints one extra stderr line that tells the operator where the
+matrix is and roughly how much wall-clock remains:
+
+```
+[runner:<name>] progress: <i>/<total> done | elapsed <H>h <M>m <S>s | ETA ~<H>h <M>m <S>s
+```
+
+The line is **suppressed on the final spawn** (no remaining work to
+estimate). Skipped (resume-mode) spawns still increment the cursor and
+emit the line so a run that resumes through a long skip burst shows
+e.g. `progress: 19/24 done | ...` on the first real spawn rather than
+staying silent.
+
+Format rules (`progress_eta::format_hms`):
+
+- `>= 1h`  -> `1h 02m 17s`
+- `>= 1m`  -> `12m 09s`
+- `< 1m`   -> `47s`
+- zero     -> `0s`
+
+ASCII only so legacy Windows consoles do not garble it.
+
+#### Estimator math
+
+The estimator is **hybrid**: a config-derived sum of remaining phase
+durations plus a measured per-spawn overhead correction. See
+`runner/src/progress_eta.rs`:
+
+```text
+nominal_per_spawn  = stabilize_secs + operate_secs + silent_secs
+                   + inter_qos_grace_ms/1000
+nominal_so_far     = sum of nominal_per_spawn for jobs 1..=i (skipped -> 0)
+nominal_remaining  = sum of nominal_per_spawn for jobs i+1..=total (skipped -> 0)
+overhead_per_spawn = max(0, elapsed - nominal_so_far) / i      (saturating)
+eta                = nominal_remaining + overhead_per_spawn * (total - i)
+```
+
+Wall-clock anchor is captured at the **top of the Phase 2 spawn loop**,
+BEFORE the first ready barrier — discovery + initial clock-sync are
+excluded since they happen once per run and have no predictive value.
+
+Fallback: if any of `stabilize_secs / operate_secs / silent_secs` is
+missing on the variant entry (legacy pre-E5 configs), the nominal for
+that spawn falls back to the variant's `timeout_secs`. Better an
+over-estimate than `NaN`.
+
+Locked-in design choices (do NOT substitute on a refactor):
+
+- **Hybrid estimator only.** Rate-only ("average so far × remaining") and
+  config-only ("nominal_remaining") variants were considered and rejected.
+  Rate-only over-corrects on the first slow spawn; config-only ignores
+  the realistic per-spawn coordination + spin-up overhead that consistently
+  adds 1-3 s on top of the declared phases.
+- **ONE new line, after the existing `finished:` line.** The existing
+  line is FROZEN by T-impl.9 — do not add cursor / ETA fields inline. A
+  separate line keeps the failure-diagnostics tail block visually
+  attached to the status line it diagnoses.
+- **Saturating overhead.** An under-budget early stretch produces
+  `overhead_per_spawn = 0`, NOT a negative number. The ETA never
+  shrinks below `nominal_remaining`.
+
+#### Files
+
+- `runner/src/progress_eta.rs` — `format_hms`, `spawn_nominal_duration`,
+  `estimate_eta`. All pure functions; no I/O.
+- `runner/src/main.rs` — `emit_progress_eta` (the `eprintln!` shim),
+  call sites in the resume-skip arm and after the `finished:` line, plus
+  the `nominal_per_job` precompute and `spawn_loop_start` anchor at the
+  top of the Phase 2 loop.
+- `runner/tests/integration.rs::progress_eta_line_after_each_non_final_spawn`
+  pins the exact line shape on a two-spawn `variant-dummy` run.
+
 ### Per-spawn stderr capture
 
 Every variant child's stderr is redirected to a per-spawn file so panic /
