@@ -8,6 +8,7 @@ mod local_addrs;
 mod message;
 mod progress;
 mod progress_coord;
+mod progress_eta;
 mod protocol;
 mod resume;
 mod spawn;
@@ -18,7 +19,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Benchmark runner -- coordinates benchmark execution across machines.
 #[derive(Parser, Debug)]
@@ -711,6 +712,35 @@ fn run(cli: &Cli) -> Result<()> {
     // Track results for summary table.
     let mut summary: Vec<SummaryRow> = Vec::new();
 
+    // T-ux.1: precompute the nominal wall-clock cost (per spawn) for the
+    // progress + ETA line printed after every spawn. Skipped jobs in the
+    // resume skip set contribute 0 -- they don't take real wall-clock to
+    // "complete" and must not bias the overhead correction.
+    //
+    // The total nominal sum is captured for `nominal_remaining` bookkeeping;
+    // the per-job vector is indexed in lockstep with the spawn loop below.
+    let grace_ms = bench_config.inter_qos_grace_ms();
+    let nominal_per_job: Vec<Duration> = all_jobs
+        .iter()
+        .map(|(src_idx, job)| {
+            if skip_set.contains(&job.effective_name) {
+                Duration::ZERO
+            } else {
+                progress_eta::spawn_nominal_duration(&bench_config.variant[*src_idx], grace_ms)
+            }
+        })
+        .collect();
+    let nominal_total: Duration = nominal_per_job.iter().copied().sum();
+    let mut nominal_so_far = Duration::ZERO;
+
+    // T-ux.1: wall-clock anchor for "elapsed" in the progress+ETA line.
+    // Captured here at the TOP of the spawn loop, before the first ready
+    // barrier of Phase 2, so discovery + initial clock-sync time is NOT
+    // mixed into the predictive elapsed/ETA arithmetic. (Those phases
+    // happen once per run, not per spawn, and have no predictive value.)
+    let spawn_loop_start = Instant::now();
+    let total_jobs = all_jobs.len();
+
     // Count, per source variant entry, how many jobs are after the current
     // one (so the inter-spawn grace fires only between consecutive non-
     // skipped pairs from the same entry). The slice [src_idx..] is enough
@@ -754,6 +784,21 @@ fn run(cli: &Cli) -> Result<()> {
             // spawn so the grace check below does not fire on the next real
             // spawn either (no socket actually held a port).
             last_spawn_was_real_in_entry.insert(*src_idx, false);
+
+            // T-ux.1: emit the progress + ETA line for the skipped job
+            // too. A run that resumes through a burst of skipped spawns
+            // should still show `progress: i/total done` rather than
+            // stay silent until the first real spawn finishes.
+            nominal_so_far += nominal_per_job[job_idx_in_all];
+            let completed = job_idx_in_all + 1;
+            emit_progress_eta(
+                &cli.name,
+                completed,
+                total_jobs,
+                spawn_loop_start.elapsed(),
+                nominal_so_far,
+                nominal_total.saturating_sub(nominal_so_far),
+            );
             continue;
         }
 
@@ -970,6 +1015,21 @@ fn run(cli: &Cli) -> Result<()> {
             cli.name, job.effective_name, status, exit_code
         );
 
+        // T-ux.1: emit the progress + ETA line immediately after the
+        // existing "finished:" eprintln (the existing line shape is
+        // frozen by T-impl.9 diagnostics -- do NOT modify it). Suppressed
+        // on the final spawn since there is nothing to estimate beyond it.
+        nominal_so_far += nominal_per_job[job_idx_in_all];
+        let completed = job_idx_in_all + 1;
+        emit_progress_eta(
+            &cli.name,
+            completed,
+            total_jobs,
+            spawn_loop_start.elapsed(),
+            nominal_so_far,
+            nominal_total.saturating_sub(nominal_so_far),
+        );
+
         // On a non-success spawn (failed or timeout), surface diagnostic
         // context so the operator can investigate without scavenging the
         // logs directory:
@@ -1164,6 +1224,44 @@ fn print_summary(run_id: &str, rows: &[SummaryRow]) {
             row.variant, row.runner, row.status, row.exit_code
         );
     }
+}
+
+/// Print the T-ux.1 per-spawn progress + ETA line.
+///
+/// Emitted to stderr immediately after the existing `'<name>' finished:
+/// status=..., exit_code=...` line (and after the resume-mode skip notice
+/// for jobs in the skip set). The line is suppressed on the final spawn
+/// because there is nothing left to estimate.
+///
+/// Exact shape (ASCII only; pinned by the integration test):
+///
+/// ```text
+/// [runner:<name>] progress: <i>/<total> done | elapsed <H>h <M>m <S>s | ETA ~<H>h <M>m <S>s
+/// ```
+///
+/// `format_hms` collapses the prefix when it is zero, so a sub-minute run
+/// reads `47s` rather than `0h 00m 47s`. See
+/// `progress_eta::estimate_eta` for the hybrid (nominal + measured
+/// overhead) ETA formula.
+fn emit_progress_eta(
+    runner_name: &str,
+    completed: usize,
+    total: usize,
+    elapsed: Duration,
+    nominal_so_far: Duration,
+    nominal_remaining: Duration,
+) {
+    let Some(eta) =
+        progress_eta::estimate_eta(elapsed, nominal_so_far, nominal_remaining, completed, total)
+    else {
+        // Final spawn (or defensive completed==0 case): no ETA to print.
+        return;
+    };
+    eprintln!(
+        "[runner:{runner_name}] progress: {completed}/{total} done | elapsed {} | ETA ~{}",
+        progress_eta::format_hms(elapsed),
+        progress_eta::format_hms(eta),
+    );
 }
 
 /// Print the post-mortem diagnostic block immediately after a non-success
