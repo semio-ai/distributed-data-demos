@@ -320,6 +320,122 @@ fn qos_array_produces_per_qos_log_files() {
     let _ = std::fs::remove_dir_all(&log_dir);
 }
 
+/// T-ux.1: the per-spawn progress + ETA line must appear after the FIRST
+/// spawn's "finished:" line and must be ABSENT after the SECOND (final)
+/// spawn's. The exact shape is pinned here so a future refactor cannot
+/// silently regress the operator-facing diagnostic contract.
+#[test]
+fn progress_eta_line_after_each_non_final_spawn() {
+    if !variant_dummy_exists() {
+        eprintln!("SKIP: variant-dummy.exe not found, build variant-base first");
+        return;
+    }
+
+    // Use a distinct log dir so the test is hermetic relative to the
+    // sibling qos_array test (which uses ./test-logs-qos-array).
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-logs-tux1-progress-eta");
+    let _ = std::fs::remove_dir_all(&log_dir);
+
+    // Reuse the qos-array fixture shape (two spawns: -qos1 and -qos2). It
+    // produces deterministic short-form ETA output (sub-minute spawns) so
+    // we can assert on the line prefix without timing flake.
+    let log_dir_escaped = log_dir.to_string_lossy().replace('\\', "/");
+    let tmp_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-logs-tux1-progress-eta-cfg");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let config_content = format!(
+        r#"run = "tux1"
+runners = ["local"]
+default_timeout_secs = 30
+inter_qos_grace_ms = 0
+
+[[variant]]
+name = "dummy"
+binary = "../target/release/variant-dummy.exe"
+  [variant.common]
+  tick_rate_hz = 5
+  stabilize_secs = 0
+  operate_secs = 1
+  silent_secs = 0
+  workload = "scalar-flood"
+  values_per_tick = 1
+  qos = [1, 2]
+  log_dir = "{log_dir_escaped}"
+  [variant.specific]
+"#
+    );
+    let config_path = tmp_dir.join("tux1.toml");
+    std::fs::write(&config_path, &config_content).unwrap();
+
+    let output = Command::new(runner_binary())
+        .arg("--name")
+        .arg("local")
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}");
+    eprintln!("--- stderr ---\n{stderr}");
+    assert!(
+        output.status.success(),
+        "runner should exit 0, got {:?}",
+        output.status.code()
+    );
+
+    // Locate the two "finished:" lines. There must be exactly two for a
+    // two-spawn run.
+    let finished_indices: Vec<usize> = stderr
+        .lines()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            if l.contains("' finished: status=") {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        finished_indices.len(),
+        2,
+        "expected exactly 2 finished lines in stderr (one per spawn), got {} -- stderr:\n{stderr}",
+        finished_indices.len()
+    );
+
+    let lines: Vec<&str> = stderr.lines().collect();
+
+    // After the FIRST "finished:" line, the next non-empty line on the
+    // same stream must be our T-ux.1 progress line with cursor 1/2.
+    let after_first = lines[finished_indices[0] + 1];
+    assert!(
+        after_first.starts_with("[runner:local] progress: 1/2 done | elapsed ")
+            && after_first.contains(" | ETA ~"),
+        "expected progress+ETA line immediately after first finished line,\n\
+         got: {after_first}\n\
+         (full stderr below)\n{stderr}"
+    );
+
+    // After the SECOND (final) "finished:" line, the progress line must
+    // NOT appear. We allow other lines after it (done-barrier teardown,
+    // resume summary, etc.) but the progress prefix must be absent.
+    let tail_after_final: Vec<&str> = lines[finished_indices[1] + 1..].to_vec();
+    let progress_after_final = tail_after_final
+        .iter()
+        .find(|l| l.starts_with("[runner:local] progress:"));
+    assert!(
+        progress_after_final.is_none(),
+        "no progress line should follow the FINAL spawn's finished line, \
+         got: {progress_after_final:?}\nfull stderr:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 #[test]
 fn qos_omitted_produces_four_log_files() {
     if !variant_dummy_exists() {
