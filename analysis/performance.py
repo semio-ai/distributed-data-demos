@@ -174,6 +174,25 @@ class PerformanceResult:
     leaves_per_sec: float = 0.0
     bytes_per_sec: float = 0.0
     shape: str = "scalar"
+    # T19.12: display value for the pivot ``Shape`` column. Computed
+    # from the DISTINCT set of shape values across the group's
+    # operate-window-scoped deliveries -- in contrast to ``shape`` which
+    # collapses a heterogeneous group to a single dominant value (and
+    # therefore mislabels mixed-types groups as ``array`` whenever
+    # ``array`` happens to be the lex-first non-null entry).
+    #
+    # Rule (Option A from T19.12 brief): single-shape group renders that
+    # shape; multi-shape group renders the literal ``"mixed"``. Pivot /
+    # table renderers should prefer this field over ``shape`` for any
+    # operator-facing label. ``shape`` itself is kept intact for
+    # downstream consumers (plots, hatch picker) that legitimately want
+    # the dominant-shape semantics.
+    #
+    # Default is the empty string so legacy / hand-constructed
+    # ``PerformanceResult`` values (e.g. older test fixtures, hypothetical
+    # cache reloads predating T19.12) cause the renderer to fall back to
+    # ``shape`` -- no hard crash, no misleading label.
+    shape_display: str = ""
     # T19.9: per-group QoS read from the ``qos`` column on ``write``
     # events. Every write row carries the spawn's QoS level (per the
     # api-contracts schema); a single spawn emits exactly one QoS so the
@@ -787,14 +806,14 @@ def _late_receives_count(group: pl.LazyFrame, windows: _OperateWindows) -> int |
 
 def _shape_aggregates(
     deliveries: pl.DataFrame, windows: _OperateWindows
-) -> tuple[int, int, str]:
-    """E19 / T19.5: per-group leaf/byte totals + dominant shape.
+) -> tuple[int, int, str, str]:
+    """E19 / T19.5: per-group leaf/byte totals + dominant shape (+ display).
 
-    Returns ``(leaves_total, bytes_total, shape)`` for the deliveries
-    that fall in each writer's operate window. The window scoping
-    matches ``_write_receive_counts``: a delivery counts when its
-    ``write_ts`` (writer clock) is in ``[operate_start, end_ts]`` per
-    writer, where ``end_ts`` is the writer's ``eot_sent_ts`` if
+    Returns ``(leaves_total, bytes_total, shape, shape_display)`` for
+    the deliveries that fall in each writer's operate window. The window
+    scoping matches ``_write_receive_counts``: a delivery counts when
+    its ``write_ts`` (writer clock) is in ``[operate_start, end_ts]``
+    per writer, where ``end_ts`` is the writer's ``eot_sent_ts`` if
     available else the group's ``silent_start``. This keeps the leaf /
     bytes accounting consistent with the existing throughput numbers.
 
@@ -810,9 +829,16 @@ def _shape_aggregates(
     tie-break is for stability when a synthetic / mixed fixture
     deliberately violates the per-spawn-single-shape assumption.
     Falls back to ``"scalar"`` when no deliveries are present.
+
+    ``shape_display`` (T19.12) is derived from the DISTINCT set of
+    shape values across the same scoped deliveries: a single distinct
+    shape renders as that shape, multiple distinct shapes render as
+    the literal ``"mixed"`` so the pivot's Shape column no longer
+    misleads on heterogeneous (mixed-types) groups. Falls back to
+    ``"scalar"`` when no deliveries are present.
     """
     if deliveries.is_empty():
-        return 0, 0, "scalar"
+        return 0, 0, "scalar", "scalar"
 
     # Build the per-writer end-boundary table -- same shape as the one
     # ``_write_receive_counts`` constructs, but we don't share it
@@ -829,7 +855,8 @@ def _shape_aggregates(
         leaves = int(df[0] or 0)
         bytes_total = int(df[1] or 0)
         shape = _dominant_shape(deliveries)
-        return leaves, bytes_total, shape
+        shape_display = _shape_display(deliveries)
+        return leaves, bytes_total, shape, shape_display
 
     operate_start = windows.operate_start
 
@@ -847,7 +874,7 @@ def _shape_aggregates(
         end_rows.append({"writer": writer, "end_ts": end})
 
     if not end_rows:
-        return 0, 0, "scalar"
+        return 0, 0, "scalar", "scalar"
 
     end_df = pl.DataFrame(
         end_rows,
@@ -869,7 +896,7 @@ def _shape_aggregates(
     )
 
     if scoped.is_empty():
-        return 0, 0, "scalar"
+        return 0, 0, "scalar", "scalar"
 
     totals = scoped.select(
         pl.col("leaf_count").sum().alias("leaves"),
@@ -878,7 +905,8 @@ def _shape_aggregates(
     leaves = int(totals[0] or 0)
     bytes_total = int(totals[1] or 0)
     shape = _dominant_shape(scoped)
-    return leaves, bytes_total, shape
+    shape_display = _shape_display(scoped)
+    return leaves, bytes_total, shape, shape_display
 
 
 def _dominant_shape(deliveries: pl.DataFrame) -> str:
@@ -902,6 +930,53 @@ def _dominant_shape(deliveries: pl.DataFrame) -> str:
     if value is None or value == "":
         return "scalar"
     return str(value)
+
+
+# T19.12: literal used by ``_shape_display`` when a group spans multiple
+# distinct shape values (e.g. ``mixed-types``, where the per-WriteOp
+# shape rotates through scalar / array / struct). Kept as a module-level
+# constant so tests / table renderers can reference it without
+# duplicating the string.
+SHAPE_DISPLAY_MIXED: str = "mixed"
+
+
+def _shape_display(deliveries: pl.DataFrame) -> str:
+    """T19.12: render the pivot ``Shape`` cell honestly for mixed groups.
+
+    Inspects the DISTINCT set of non-null shape values across the
+    (operate-window-scoped) delivery rows for this group:
+
+    - 0 distinct values (e.g. no deliveries, legacy data with the
+      ``shape`` column missing entirely) -> ``"scalar"`` so the column
+      still renders something readable for the operator.
+    - 1 distinct value -> that value verbatim (``"scalar"`` /
+      ``"array"`` / ``"struct"``).
+    - 2+ distinct values -> :data:`SHAPE_DISPLAY_MIXED` so the operator
+      can tell at a glance that the group is heterogeneous.
+
+    This is Option A from the T19.12 brief. Option B (use the workload
+    name, e.g. ``"mixed-types"``) would couple the analyzer's shape
+    vocabulary to the variant-naming vocabulary; ``"mixed"`` is the
+    minimal honest label that stays inside the analyzer's existing
+    shape glossary (scalar / array / struct / mixed) without dragging
+    in workload-profile semantics.
+    """
+    if deliveries.is_empty() or "shape" not in deliveries.columns:
+        return "scalar"
+    distinct = (
+        deliveries.select(pl.col("shape"))
+        .filter(pl.col("shape").is_not_null())
+        .filter(pl.col("shape") != "")
+        .unique()
+        .sort("shape")
+    )
+    n = distinct.height
+    if n == 0:
+        return "scalar"
+    if n == 1:
+        value = distinct.item(0, "shape")
+        return str(value)
+    return SHAPE_DISPLAY_MIXED
 
 
 def _any_uncorrected(deliveries: pl.DataFrame) -> bool:
@@ -960,7 +1035,9 @@ def performance_for_group(
     # ``0.0``. ``shape`` picks the lexicographically-first non-null
     # value; per the E19 contract a single spawn emits exactly one
     # workload profile so this is normally degenerate.
-    leaves_sum, bytes_sum, group_shape = _shape_aggregates(deliveries, windows)
+    leaves_sum, bytes_sum, group_shape, group_shape_display = _shape_aggregates(
+        deliveries, windows
+    )
     ops_per_sec = receives_per_sec
     leaves_per_sec = leaves_sum / duration if duration > 0 else 0.0
     bytes_per_sec = bytes_sum / duration if duration > 0 else 0.0
@@ -1027,5 +1104,6 @@ def performance_for_group(
         leaves_per_sec=leaves_per_sec,
         bytes_per_sec=bytes_per_sec,
         shape=group_shape,
+        shape_display=group_shape_display,
         qos=group_qos,
     )

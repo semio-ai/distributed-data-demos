@@ -225,14 +225,24 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
     w_late = 9
     w_tail = 11
 
-    # Column layout (T19.5):
+    # Column layout (T19.5 / T19.12):
     # The headline ``Receives/s`` column (== ops/sec on the receive
     # side; also exposed as the canonical ``ops_per_sec`` field on
     # PerformanceResult) keeps its T11.5 leading position. ``Leaves/s``
     # and ``Bytes/s`` are E19 additions surfacing the workload-shape
     # throughput numbers introduced by the block-flood / mixed-types
-    # workloads. ``Shape`` carries the dominant shape value for the
-    # group (defaults to ``"scalar"`` for legacy / pre-E19 data).
+    # workloads.
+    #
+    # The ``Shape`` column reads from :attr:`PerformanceResult.shape_display`
+    # (T19.12) -- derived from the DISTINCT set of per-WriteOp shapes
+    # in the underlying delivery rows. Single-shape groups render the
+    # shape verbatim (``scalar`` / ``array`` / ``struct``); heterogeneous
+    # groups (e.g. ``mixed-types`` which spans all three) render
+    # ``mixed`` so the operator-facing label is honest about the
+    # workload composition. Pre-T19.12 / legacy ``PerformanceResult``
+    # instances default ``shape_display`` to the empty string -- the
+    # row falls back to the older ``shape`` field in that case so the
+    # column never blanks out.
     header = (
         _pad("Variant", w_variant)
         + _pad("Run", w_run)
@@ -277,11 +287,18 @@ def format_performance_table(results: list[PerformanceResult]) -> str:
             tail_str = (
                 f"{r.late_receives_tail_count:,} ({r.late_receives_tail_pct:.2f}%)"
             )
+        # T19.12: pivot Shape column prefers ``shape_display`` (derived
+        # from the per-WriteOp distinct-shapes set on the delivery rows)
+        # over the dominant-shape ``shape``. ``shape_display`` defaults
+        # to the empty string on legacy / hand-built PerformanceResult
+        # values predating T19.12; in that case fall back to ``shape``
+        # so the column never renders empty.
+        shape_cell = r.shape_display if r.shape_display else r.shape
         row = (
             _pad(r.variant, w_variant)
             + _pad(r.run, w_run)
             + _pad(r.threading_mode, w_thread)
-            + _pad(r.shape, w_shape)
+            + _pad(shape_cell, w_shape)
             + _rpad(_fmt_rate(r.receives_per_sec), w_rate)
             + _rpad(_fmt_rate(r.leaves_per_sec), w_rate)
             + _rpad(_fmt_rate(r.bytes_per_sec), w_rate)
