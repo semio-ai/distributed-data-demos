@@ -607,11 +607,7 @@ pub fn run_protocol(variant: &mut impl Variant, config: &CliArgs) -> Result<()> 
     // digest-phase Parquet writer sees a complete row set regardless
     // of which thread observed the event.
     let shared_buffers: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
-    // The trailing `false` is a vestigial back-compat parameter retained
-    // for the 2-arg signature in-tree tests in concrete variants still
-    // use; it is ignored — per-event JSONL emission was removed in
-    // T19.10. See `LoggerHandle::attach_compact_sink`.
-    logger_handle.attach_compact_sink(Arc::clone(&shared_buffers), false);
+    logger_handle.attach_compact_sink(Arc::clone(&shared_buffers));
     // The `logger` variable carries lifecycle events (`phase`,
     // `connected`, `eot_sent`, `resource`) into the JSONL stream
     // directly. Per-event observations (write, receive, etc.) flow

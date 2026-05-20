@@ -266,14 +266,7 @@ impl LoggerHandle {
     /// Idempotent: calling twice replaces the previously-wired sink.
     /// Tests typically skip this step and rely on the `None` fallback
     /// (`record_receive` then silently drops the row).
-    ///
-    /// The trailing `_legacy_jsonl` parameter is retained as a
-    /// back-compat shim for in-tree test code in concrete variants
-    /// that called the pre-T19.10 two-argument form. It is ignored —
-    /// per-event JSONL emission is gone, so the flag has no effect.
-    /// New code may pass `false` (or any value) for that argument;
-    /// the parameter may be removed in a later cleanup pass.
-    pub fn attach_compact_sink(&mut self, sink: CompactSink, _legacy_jsonl: bool) {
+    pub fn attach_compact_sink(&mut self, sink: CompactSink) {
         self.compact = Some(sink);
     }
 
@@ -565,7 +558,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut handle = handle_with_logger(&dir);
         let sink: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
-        handle.attach_compact_sink(sink.clone(), false);
+        handle.attach_compact_sink(sink.clone());
 
         handle
             .record_receive("bob", 7, "/bench/0", Qos::ReliableTcp, 128)
@@ -593,7 +586,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut handle = handle_with_logger(&dir);
         let sink: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
-        handle.attach_compact_sink(sink.clone(), false);
+        handle.attach_compact_sink(sink.clone());
         let log_path = handle.inner().lock().unwrap().path().to_path_buf();
 
         handle
@@ -621,7 +614,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut handle = handle_with_logger(&dir);
         let sink: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
-        handle.attach_compact_sink(sink.clone(), false);
+        handle.attach_compact_sink(sink.clone());
 
         let clone_a = handle.clone();
         let clone_b = handle.clone();
@@ -650,7 +643,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut handle = handle_with_logger(&dir);
         let sink: CompactSink = Arc::new(Mutex::new(CompactBuffers::new()));
-        handle.attach_compact_sink(sink.clone(), false);
+        handle.attach_compact_sink(sink.clone());
 
         const THREADS: usize = 4;
         const PER_THREAD: u64 = 250;
