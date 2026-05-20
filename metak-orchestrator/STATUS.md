@@ -16142,3 +16142,179 @@ Three small commits on `main` (no remote push), per the project's
   distinct-shapes axis` (test_tables.py + test_workload_shape.py).
 - This STATUS.md update will land as the third commit per the existing
   convention.
+
+---
+
+## T19.11 completion report -- 2026-05-21 (worker: variant-base + variants/websocket)
+
+**Outcome**: the vestigial `_legacy_jsonl: bool` shim parameter on
+`LoggerHandle::attach_compact_sink` is gone. The method signature is now
+`attach_compact_sink(&mut self, sink: CompactSink)`. The one outside
+consumer (`variants/websocket/src/websocket.rs`) was updated; no other
+variant calls this method.
+
+### Scope confirmation (pre-change grep)
+
+`git grep -n attach_compact_sink` enumerated the following call sites
+(non-doc, non-comment):
+
+- `variant-base/src/driver.rs:614` -- the one production caller.
+- `variant-base/src/logger.rs:276` -- the method definition.
+- `variant-base/src/logger.rs:568, 596, 624, 653` -- four unit-test
+  call sites in the same file.
+- `variants/websocket/src/websocket.rs:1829` -- the one outside-of-
+  variant-base call site (inside a test helper).
+
+No callers in `variants/zenoh`, `variants/quic`, `variants/webrtc`,
+`variants/hybrid`, `variants/custom-udp`, or `runner/`. T19.10a's
+scope assumption held.
+
+### Files changed
+
+- `variant-base/src/logger.rs` -- removed the `_legacy_jsonl: bool`
+  parameter from `LoggerHandle::attach_compact_sink`'s definition;
+  dropped the now-obsolete doc-comment paragraph that documented the
+  shim. Updated four in-file unit-test call sites to the single-arg
+  form.
+- `variant-base/src/driver.rs` -- updated the one production call site;
+  removed the four-line trailing-`false`-rationale comment that became
+  dead text.
+- `variants/websocket/src/websocket.rs` -- updated the
+  `temp_logger_handle_with_compact` test helper: dropped its
+  `legacy_jsonl: bool` parameter (always `false` at every caller) and
+  the corresponding argument to `handle.attach_compact_sink(...)`.
+  Updated both in-tree callers
+  (`t18_3a_single_mode_drain_pushes_into_compact_buffer` and
+  `t18_3a_multi_mode_reader_thread_pushes_into_compact_buffer`) to the
+  zero-arg helper form. The tests already passed `false`, so they were
+  not exercising the legacy dual-emission path -- no further cleanup
+  needed.
+
+### CUSTOM.md / STRUCT.md surgery
+
+No changes required. The post-T19.10a `variant-base/CUSTOM.md`
+"Compact-log Parquet output (T18.1 + T18.2 / E18)" section's
+"Single-source EventSink" paragraph (line 568+) mentions
+`--legacy-jsonl-events` only as a removed CLI flag; it does NOT
+mention the `bool` shim parameter. `variant-base/STRUCT.md` has no
+references to `attach_compact_sink` or the shim either. The
+documentation was already coherent with the post-T19.11 API surface.
+
+### Post-change grep verification
+
+```
+$ git grep -n attach_compact_sink
+metak-orchestrator/EPICS.md:1429:- **T19.11** variant-base: remove vestigial `attach_compact_sink`
+metak-orchestrator/TASKS.md:8380:... (historical task spec, untouched)
+metak-orchestrator/STATUS.md:13640:... (historical T18.3a report, untouched)
+metak-orchestrator/STATUS.md:15459:... (historical T19.10a report, untouched)
+variant-base/src/driver.rs:610:    logger_handle.attach_compact_sink(Arc::clone(&shared_buffers));
+variant-base/src/logger.rs:215:    /// the handle via [`LoggerHandle::attach_compact_sink`], and shares
+variant-base/src/logger.rs:230:    ///   [`LoggerHandle::attach_compact_sink`]. `None` for handles built
+variant-base/src/logger.rs:241:    ///   want compact-buffer mirroring invoke [`Self::attach_compact_sink`]
+variant-base/src/logger.rs:269:    pub fn attach_compact_sink(&mut self, sink: CompactSink) {
+variant-base/src/logger.rs:529:    //   `attach_compact_sink` silently drops the row (and never
+variant-base/src/logger.rs:561,589,617,646: handle.attach_compact_sink(sink.clone());
+variants/websocket/src/websocket.rs:1827:        handle.attach_compact_sink(StdArc::clone(&buffers));
+```
+
+Confirmed: **no `bool` argument appears at any call site**. Every
+non-historical reference uses the new single-arg signature.
+
+### Tests run + results
+
+```
+cargo build --release                  -> clean (all workspace crates)
+cargo test --release -p variant-base -p variant-websocket -- --test-threads=1
+   variant-base unit tests:  164 passed,  0 failed
+   variant-base integration: 19 passed,  0 failed
+   variant-websocket unit:   42 passed,  0 failed
+   variant-websocket integ:  28 passed,  0 failed
+   doc-tests: 1 ignored (build_info banner; was already ignored)
+cargo clippy --release --workspace --all-targets -- -D warnings -> clean
+cargo fmt --check -p variant-base -p variant-websocket          -> clean
+```
+
+**Pre-existing test-suite flakiness note**: `cargo test --release -p
+variant-base` without `--test-threads=1` shows
+`driver::tests::qos3_blocks_on_backpressure_and_warns_once` failing
+intermittently. The test depends on a process-static `AtomicBool`
+(`STRICT_QOS_VIOLATION_WARNED`) shared with `qos4_blocks_*`; running
+the two in parallel causes a flag-state collision. The failure
+reproduces on a clean checkout without my changes and is **not
+caused by T19.11**. Recommend a separate follow-up to add a
+`#[serial_test::serial]`-style guard on the two QoS warning tests,
+or to scope the `AtomicBool` to a per-test cell. Left as-is for this
+task (out of scope).
+
+**Pre-existing cargo fmt diff**: `cargo fmt --check` on the whole
+workspace surfaces a diff in `runner/src/analyze.rs` -- this file
+was modified by a concurrent worker's uncommitted change (visible in
+`git status` alongside `analysis/`, `runner/src/main.rs`, etc.). My
+in-scope packages (`-p variant-base -p variant-websocket`) pass
+`cargo fmt --check` clean.
+
+### Smoke-check observations
+
+**(1)** The two T18.3a tests that previously forced the shim
+(`t18_3a_single_mode_drain_pushes_into_compact_buffer` and
+`t18_3a_multi_mode_reader_thread_pushes_into_compact_buffer`) both
+pass under the new signature. These tests stand up a real
+`tungstenite` server + client, push real WS data frames, and assert
+the receive rows landed in the compact buffer -- they exercise the
+full helper-creates-LoggerHandle-and-attaches-compact-sink path
+end-to-end.
+
+**(2)** Direct `variant-dummy` spawn (production caller of
+`LoggerHandle::attach_compact_sink` in `driver.rs`):
+
+```
+./target/release/variant-dummy.exe \
+  --variant variant-dummy --runner smoke --run smoke01 \
+  --log-dir /tmp/t1911-smoke --qos 4 --workload scalar-flood \
+  --tick-rate-hz 10 --values-per-tick 5 \
+  --stabilize-secs 0 --operate-secs 1 --silent-secs 0 \
+  --launch-ts 2026-05-21T00:00:00Z --peers smoke
+
+[dummy] build: 5ab9c29+dirty (rustc 1.94.1)
+[variant] digest: wrote .../variant-dummy-smoke-smoke01.compact.parquet (122 rows, 3620 bytes)
+{"eot_received":true,"eot_sent":true,"event":"progress","phase":"done","received":55,"sent":55,...}
+```
+
+Clean completion: 55 sends, 55 receives, EOT pair acknowledged,
+digest phase wrote 122 compact rows (55 write + 55 receive + 12
+lifecycle), exit code 0. Confirms the driver's `attach_compact_sink`
+call path is fully functional under the new signature.
+
+A real `variant-websocket` two-runner smoke via
+`configs/two-runner-smoke.toml` was not run because (a) it requires
+two peers and is slow, and (b) the test-suite coverage already
+exercises both T18.3a call sites with real WebSocket I/O over
+loopback. The combination of "all websocket unit tests pass" plus
+"variant-dummy spawn completes cleanly" provides equivalent
+end-to-end signal at a fraction of the wallclock cost.
+
+### Deviations from the locked spec
+
+None. The spec's "If the test was specifically exercising the
+`bool=true` path, it's now stale -- delete it or convert it" escape
+hatch did not apply: every in-tree caller of
+`attach_compact_sink` (both pre- and post-T19.10a) passed `false`.
+The shim was kept by T19.10a purely to preserve the two-argument
+signature for compile-time compatibility, not to exercise any
+behavioural difference. No test deletion or conversion required.
+
+The spec listed CUSTOM.md surgery as a step; I confirmed no
+surgery was needed and noted that explicitly in the "CUSTOM.md /
+STRUCT.md surgery" section above.
+
+### Commits landed
+
+- `refactor(variant-base/T19.11): drop vestigial bool param from
+  LoggerHandle::attach_compact_sink` (logger.rs + driver.rs).
+- `refactor(variants/websocket/T19.11): update attach_compact_sink
+  call site to single-arg form` (websocket.rs).
+- This STATUS.md update lands as the final commit.
+
+(CUSTOM.md touch-up commit was anticipated by the suggested split but
+not needed -- the docs were already coherent.)
