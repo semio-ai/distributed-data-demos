@@ -1106,3 +1106,89 @@ fn two_runner_regression_t17_8_qos3_100pct_delivery() {
         alice_writes.saturating_sub(bob_total_recv_from_alice)
     );
 }
+
+/// E19/T19.X regression: two-runner QoS 4 stall fix.
+///
+/// **Bug**: in the 2026-05-20 smoke run (`smoke-01-20260520_194923`)
+/// every single zenoh QoS 3 and QoS 4 spawn (60 of 60) terminated
+/// with `[variant] watchdog: no progress in 30s during operate phase`
+/// (exit code 2) — a symmetric deadlock unique to the reliable QoS
+/// path on localhost loopback. QoS 1 / QoS 2 spawns of the same
+/// configurations succeeded.
+///
+/// **Root cause**: Zenoh 1.9's default subscriber handler
+/// (`FifoChannel`) is sized at 256 samples and **blocks the Zenoh
+/// routing thread** when full (not drops). Under symmetric
+/// sustained QoS 3/4 traffic, each peer's 256-slot FIFO saturated
+/// within a few milliseconds because the variant's `subscriber_task`
+/// could not drain at line rate; that back-pressure flowed up
+/// through `CongestionControl::Block` on the peer's publishers,
+/// wedged both peers' `publisher.put(...).await`, and ultimately
+/// stalled both driver threads. The T17.8 credit/window protocol
+/// did not help because the deadlock occurs at the Zenoh-engine
+/// layer, beneath the application-level window.
+///
+/// **Fix**: declare every Zenoh subscriber with an explicit
+/// `FifoChannel::new(SUBSCRIBER_FIFO_CAPACITY)` (currently 131 072)
+/// so the routing thread never parks on a full subscriber channel.
+///
+/// **Acceptance**: both peers must exit cleanly (exit code 0, no
+/// `watchdog: no progress` in stderr) over the canonical
+/// `two-runner-zenoh-1000x10hz-qos4-repro.toml` reproducer fixture
+/// (the smallest config that reliably triggered the pre-fix
+/// deadlock on localhost). This test does NOT depend on JSONL
+/// `write` events (which were moved to the compact buffer in T18.2b);
+/// the underlying contract is "the variants do not self-kill via
+/// the T15.11 internal-stall watchdog under sustained reliable
+/// QoS traffic", which the exit-code + stderr-substring checks
+/// here exercise directly.
+#[test]
+#[ignore]
+fn two_runner_regression_qos4_no_watchdog_stall() {
+    let _guard = serialize_tests().lock().unwrap_or_else(|p| p.into_inner());
+    let test_name = "qos4-no-watchdog-stall";
+    if check_binaries_or_skip(test_name) {
+        return;
+    }
+    let fixture = repo_root()
+        .join("variants")
+        .join("zenoh")
+        .join("tests")
+        .join("fixtures")
+        .join("two-runner-zenoh-1000x10hz-qos4-repro.toml");
+
+    // Distinct base port from the other tests so a parallel run
+    // does not collide.
+    let base_port: u16 = 29876;
+    let result = drive_two_runners(
+        &fixture,
+        "zenoh-1000x10hz-qos4-repro",
+        "zenoh-t1610-1000x10hz-qos4-repro",
+        test_name,
+        base_port,
+    );
+
+    // PRIMARY acceptance: no internal-stall watchdog fire on either
+    // peer (the pre-fix failure mode).
+    assert!(
+        !result.combined_stderr.contains("watchdog: no progress"),
+        "{test_name}: stderr contained `watchdog: no progress` -- \
+         FIFO subscriber stall regression. Combined stderr:\n{}",
+        result.combined_stderr
+    );
+    assert!(
+        !result.combined_stderr.contains("panic"),
+        "{test_name}: combined stderr contained `panic`:\n{}",
+        result.combined_stderr
+    );
+
+    // `drive_two_runners` already asserts both peers exited
+    // successfully (exit code 0) and that JSONL files exist; the
+    // exit-success assertion is sufficient to confirm the operate
+    // phase ran to completion without the variant self-killing via
+    // exit code 2.
+    println!(
+        "[{test_name}] both peers exited cleanly in {:.2}s -- no watchdog stall",
+        result.wall_time.as_secs_f64(),
+    );
+}

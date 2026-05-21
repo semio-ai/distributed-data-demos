@@ -9,7 +9,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinSet;
-use zenoh::handlers::FifoChannelHandler;
+use zenoh::handlers::{FifoChannel, FifoChannelHandler};
 use zenoh::pubsub::{Publisher, Subscriber};
 use zenoh::qos::CongestionControl;
 use zenoh::sample::Sample;
@@ -279,6 +279,35 @@ const ACK_WILDCARD_FOR_SELF_PREFIX: &str = "bench/__ack__/*/";
 /// application credit window was wide enough that the data publisher
 /// outran the receiver's drain by multiple ticks worth of in-flight.
 const QOS_STRICT_WINDOW: u64 = 2048;
+
+/// T19.X: Per-subscriber FIFO channel capacity (overrides Zenoh's
+/// default of 256). The default subscriber handler (`FifoChannel`)
+/// **blocks the Zenoh routing thread** when full, not drops -- and
+/// Zenoh's CC=Block back-pressure path on the writer side parks the
+/// publisher's `put().await` once that back-pressure reaches it.
+/// At symmetric high-rate QoS 3/4 (1000 vpt × 10 Hz on localhost
+/// loopback was the smallest reliable reproducer) the 256-slot FIFO
+/// saturates within a few milliseconds, the routing thread parks
+/// before `subscriber_task` can drain, and both peers' publishers
+/// then wedge on `put().await` while their own subscribers are
+/// already parked -- a symmetric deadlock that the T15.11 watchdog
+/// terminates as `variant_self_killed_idle`.
+///
+/// Sized at 131 072 samples so the FIFO never realistically fills
+/// (1000 vpt × 100 Hz × 1 s = 100 K samples per second; one full
+/// second of unservicing peer is the worst burst the bridge mpsc
+/// can plausibly hide). The downstream `recv_tx` bridge (`16384`
+/// capacity, `try_send` semantics with drop-on-full) absorbs the
+/// burst back-pressure on the variant side; this constant raises
+/// the cap on the Zenoh side so the routing thread itself never
+/// parks.
+///
+/// Memory cost: 131 072 × `Sample` (typ. ~64 B + payload) ~= 8 MiB
+/// + payload data per subscriber. With three subscribers per
+/// variant (data, EOT, ack) the per-spawn overhead is well within
+/// the budget recorded by `Sidecar::spawn` and the digest soft
+/// ceiling.
+const SUBSCRIBER_FIFO_CAPACITY: usize = 131_072;
 
 /// T17.8: How often the ack emitter task publishes per-writer ack
 /// watermarks. The trade-off: shorter interval = lower steady-state
@@ -1970,12 +1999,19 @@ impl Variant for ZenohVariant {
         ) = runtime
             .block_on(async {
                 let session = zenoh::open(config).await.map_err(zenoh_err)?;
+                // T19.X: Override the default FIFO subscriber capacity
+                // (256) with [`SUBSCRIBER_FIFO_CAPACITY`] so the
+                // Zenoh routing thread never parks on a full
+                // subscriber channel. See the constant's docstring
+                // for the deadlock-symmetry rationale.
                 let subscriber = session
                     .declare_subscriber(SUBSCRIBER_WILDCARD)
+                    .with(FifoChannel::new(SUBSCRIBER_FIFO_CAPACITY))
                     .await
                     .map_err(zenoh_err)?;
                 let eot_subscriber = session
                     .declare_subscriber(EOT_WILDCARD)
+                    .with(FifoChannel::new(SUBSCRIBER_FIFO_CAPACITY))
                     .await
                     .map_err(zenoh_err)?;
                 // T17.8: ack subscriber listens on
@@ -1991,6 +2027,7 @@ impl Variant for ZenohVariant {
                 // codec.
                 let ack_subscriber = session
                     .declare_subscriber(ack_self_wildcard.clone())
+                    .with(FifoChannel::new(SUBSCRIBER_FIFO_CAPACITY))
                     .await
                     .map_err(zenoh_err)?;
 
