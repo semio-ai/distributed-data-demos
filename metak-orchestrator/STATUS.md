@@ -16318,3 +16318,196 @@ STRUCT.md surgery" section above.
 
 (CUSTOM.md touch-up commit was anticipated by the suggested split but
 not needed -- the docs were already coherent.)
+
+---
+
+## runner: --analyze-full startup prereq check (2026-05-21)
+
+### Problem
+
+A user ran a 2-hour benchmark with `--analyze-full`, then watched the
+post-matrix analyzer fail with `ModuleNotFoundError: No module named
+'polars'`. Prereqs were not checked until AFTER the matrix completed.
+
+### Fix delivered
+
+Startup probe runs immediately when `--analyze-full` is set, after the
+`--log-dir` is resolved but BEFORE coordinator construction (i.e. before
+discovery and before the matrix executes). Only the lexicographically
+lowest-named runner (the one `should_run_analysis` picks) runs the probe;
+other runners print a one-line note and proceed. This avoids forcing
+every runner in the pair to install polars when only alice runs the
+analyzer.
+
+### Files touched + LOC
+
+- `runner/src/analyze.rs` (+108 lines): new `check_python_imports(modules)`
+  helper that spawns `<resolved-python> -c "import m1, m2, ..."`, captures
+  stderr, and returns a structured `Err(msg)` with the Python binary name,
+  the offending stderr, and a Windows-friendly `pip install -r
+  analysis\requirements.txt` recovery hint. `check_analysis_prereqs()` is
+  the public entrypoint hardcoding the analyzer's three dependencies
+  (polars, matplotlib, psutil). Three new unit tests:
+  `check_python_imports_succeeds_for_stdlib_modules` (probe with `sys` /
+  `os`), `check_python_imports_errors_on_missing_module` (probe with a
+  guaranteed-bogus name -- pins the recovery-hint surface),
+  `check_analysis_prereqs_succeeds_when_polars_present` (skips when polars
+  is absent so CI does not fail just because the runner's unit suite ran
+  without analyzer deps). Tests use existing `resolve_python()` for the
+  skip-when-absent gate; no env-state dependency beyond Python itself.
+- `runner/src/main.rs` (+20 lines): the prereq check call site between
+  `validate_log_dir_writable` and the proposed-log-subdir block. Gated on
+  `cli.analyze_full && should_run_analysis(...)`. Failure path goes via
+  `bail!(msg)` so the error bubbles out as a normal anyhow exit (NOT
+  `EX_TEMPFAIL` -- a missing install is operator-fixable, not a
+  retry-with-resume condition). Skip path emits the one-liner
+  `[runner:<name>] --analyze-full set; skipping prereq check (not the
+  analysis runner)`.
+- `runner/tests/integration.rs` (+22 lines): updated
+  `t18_6_analyze_full_invokes_analyzer_after_matrix` to skip when the
+  host environment lacks the analyzer's prereqs (new
+  `analyzer_prereqs_installed()` helper). Previously this test relied on
+  the runner soft-failing through a missing-polars `ModuleNotFoundError`
+  at analyzer-spawn time; the new fail-fast behaviour makes that path
+  unreachable, so the test now skips cleanly. The unit test in `analyze.rs`
+  pins the prereq-check failure path so we did not lose coverage.
+
+Total: +150 LOC across three files, all inside `runner/`. No
+`analysis/` or `metak-shared/` changes.
+
+### Test results
+
+- `cargo build -p runner --release` -- clean.
+- `cargo clippy --release -p runner -- -D warnings` -- clean.
+- `cargo fmt -p runner -- --check` -- clean.
+- `cargo test -p runner --release`: **257 unit tests passed** (4 new),
+  **28 integration tests passed**, 3 ignored (pre-existing). 0 failures.
+
+### Failure-case stderr (what the user sees when polars is missing)
+
+On this dev box, `python3` resolves to a Python install that lacks polars
+(`C:\Users\tiagr\.local\bin\python3.exe` -- a separate install from the
+pyenv shims), so spawning `target/release/runner.exe --name alice
+--config configs/two-runner-smoke.toml --log-dir C:/repo/shared/ddd
+--analyze-full` produced exactly the contract failure path:
+
+```
+[runner:alice] build: aec07af+dirty (rustc 1.94.1)
+[runner:alice] barrier timeout: 120s
+[runner:alice] config loaded: run=smoke-01, 75 variant(s), 2 runner(s), hash=03620884e21b
+[runner:alice] base log dir: C:/repo/shared/ddd (source: --log-dir CLI flag)
+Error: --analyze-full prereq check failed: 'python3 -c "import polars, matplotlib, psutil"' returned Some(1).
+Python stderr:
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import polars, matplotlib, psutil
+ModuleNotFoundError: No module named 'polars'
+Install the analyzer prerequisites with: pip install -r analysis\requirements.txt (forward slashes work too). The runner aborts now so a long benchmark does not run only to have the trailing analysis fail.
+```
+
+The runner exits with a non-zero status (anyhow's default) without
+entering discovery; the operator sees the Python binary the runner
+actually invoked, the verbatim `ModuleNotFoundError` from that
+interpreter, and a one-line PowerShell-friendly remediation. No
+multi-hour benchmark is wasted.
+
+Bob (non-analysis runner) skipped the check cleanly:
+
+```
+[runner:bob] --analyze-full set; skipping prereq check (not the analysis runner)
+[runner:bob] starting discovery...
+```
+
+### Anything surprising
+
+- **Unexpected: which Python the runner finds.** On this box, the
+  bash/PowerShell shell resolves `python3` through pyenv shims (which
+  have polars), but `Command::new("python3")` spawned by the runner
+  picks up `C:\Users\tiagr\.local\bin\python3.exe` first instead --
+  same `where` order, but Windows' executable resolution for a bare
+  command name (no `.bat` / `.exe`) skips `.bat` files. This is
+  exactly the kind of environment skew the prereq check is intended
+  to surface: the user thinks "polars is installed" because their
+  shell session imports it fine, but the runner's actual subprocess
+  invocation lands on a different interpreter. The error message
+  names the offending `python3` so the operator can `pip install` to
+  the right one.
+- **`resolve_python` was already factored** (T18.6 left it as a public
+  helper). I reused it verbatim; the new `check_python_imports` is a
+  thin wrapper that calls `resolve_python()` and then probes the
+  imports. No duplication of the python3-vs-python fallback logic.
+- **No `--no-verify` / clippy bypass.** Suite green on first pass after
+  formatting once.
+- **Integration test had to be updated** (`t18_6_analyze_full_invokes_
+  analyzer_after_matrix`). The previous behaviour was "let the analyzer
+  warn at end-of-run if polars is missing"; the new behaviour is
+  "abort at startup if polars is missing". A test that runs on a host
+  without polars now has no analyzer path to exercise, so it skips
+  cleanly via the new `analyzer_prereqs_installed()` helper. The unit
+  test in `analyze.rs` covers the failure path independently.
+- **No commit landed.** Per the brief, scoped changes only; the
+  orchestrator decides when to commit.
+
+## configs/two-runner-all-variants: workload triplication -- LANDED 2026-05-21
+
+Expanded the headline full-matrix config so each variant family's
+seven (tick_rate_hz, values_per_tick) combinations now run under all
+three E19 workload profiles (scalar-flood, block-flood, mixed-types)
+instead of only scalar-flood. The `-max` entry (workload =
+"max-throughput") is preserved per family.
+
+### What changed
+
+- `configs/two-runner-all-variants.toml`: replaced each family's 7
+  scalar-flood entries with 21 (7 vpt/hz pairs x 3 workloads) plus the
+  unchanged `-max` entry. Naming convention `<fam>-<vpt>x<hz>hz-<wl>`
+  where `<wl>` is `scalar` / `block` / `mixed`. Six families x 22
+  entries = **132 [[variant]] entries** (up from 48).
+- Header comment block rewritten to document the new math and the
+  three-workload coverage. Estimated runtime bumped from ~15-25 min
+  to ~45-75 min (estimate, not a measurement -- noted as such).
+- block-flood entries use `blob_size = values_per_tick / 10` per the
+  canonical example in `configs/two-runner-workload-shapes.toml`:
+  vpt 1000 -> 100, vpt 100 -> 10, vpt 10 -> 1.
+- mixed-types entries scale `mixed_scalars_*` / `mixed_arrays_*` /
+  `mixed_dict_split_max` proportionally to vpt; `workload_seed = 12345`
+  on every mixed entry for determinism. The three vpt tiers (10 / 100
+  / 1000) each use the values prescribed in the brief, all satisfying
+  the schema constraints (`mixed_scalars_max <= vpt`,
+  `mixed_arrays_max <= vpt - mixed_scalars_min`,
+  `mixed_dict_split_max >= 2`).
+- `runner/src/config.rs` test
+  `two_runner_all_variants_expands_to_expected_spawn_list` updated to
+  iterate the three workload suffixes inside the (vpt, hz) loop and to
+  assert the new spawn count (704). The pre-existing
+  `all_repo_configs_parse` test continues to cover parse validity.
+
+### Final spawn count (post-expansion x QoS x threading_modes)
+
+- custom-udp / hybrid: 22 entries x 4 qos x 2 modes = **176 each**
+- quic / zenoh / webrtc: 22 x 4 x 1 (Multi-only, T14.8 gating) = **88 each**
+- websocket: 22 x 2 (qos [3, 4]) x 2 modes = **88**
+- **Total: 704 spawns** (up from 256)
+
+### Validation
+
+- `cargo test --release -p runner all_variants` -- passes
+  (`two_runner_all_variants_expands_to_expected_spawn_list ... ok`).
+  Asserts both the exact 704 spawn-name set and the count.
+- `cargo test --release -p runner all_repo_configs_parse` -- passes
+  (every TOML under `configs/` round-trips through `BenchConfig::from_file`).
+- `cargo clippy --release -p runner --tests -- -D warnings` -- clean.
+- `cargo fmt -p runner -- --check` -- clean.
+
+### Deviations
+
+None. All mixed-types values from the brief satisfy the schema
+constraints; no fall-backs were needed. The full benchmark itself was
+NOT executed (per the brief -- parse-validation is sufficient for a
+config edit).
+
+### Commit
+
+Single commit landed on `main` describing the triplication and the
+test update.
+
