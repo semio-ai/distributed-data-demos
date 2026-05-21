@@ -1483,15 +1483,16 @@ name = "v"
 
     #[test]
     fn two_runner_all_variants_expands_to_expected_spawn_list() {
-        // Locks in the post-E14 spawn list for the headline config: every
-        // (variant family, vpt, hz, qos, threading_mode) combo expected from
-        // the config is present, and no extras have crept in. Math (post-E14
-        // threading_modes = ["single", "multi"] on every template):
-        //   - custom-udp / hybrid: 8 entries x 4 qos x 2 modes  = 64 each
-        //   - quic / zenoh / webrtc: 8 x 4 x 1 (Multi-only, gated by
-        //     supported_modes = ["multi"] per [[variant]])         = 32 each
-        //   - websocket: 8 x 2 (qos [3, 4]) x 2 modes            = 32
-        //   Total: 64 + 64 + 32 + 32 + 32 + 32                   = 256
+        // Locks in the post-E19 spawn list for the headline config: every
+        // (variant family, vpt, hz, workload, qos, threading_mode) combo
+        // expected from the config is present, and no extras have crept in.
+        // Math (post-E19 workload triplication across scalar-flood,
+        // block-flood, mixed-types, plus the original max-throughput entry):
+        //   - custom-udp / hybrid: 22 entries x 4 qos x 2 modes  = 176 each
+        //   - quic / zenoh / webrtc: 22 x 4 x 1 (Multi-only, gated by
+        //     supported_modes = ["multi"] per [[variant]])         = 88 each
+        //   - websocket: 22 x 2 (qos [3, 4]) x 2 modes            = 88
+        //   Total: 176 + 176 + 88 + 88 + 88 + 88                  = 704
         //
         // The runner's `expand_and_gate_jobs` is exercised here (not the raw
         // `spawn_job::expand_variant`) so this test also covers T14.8
@@ -1523,11 +1524,15 @@ name = "v"
             (10, 100),
             (10, 1000),
         ];
+        // Each (vpt, hz) pair appears under three workload shapes (E19).
+        let workloads = ["scalar", "block", "mixed"];
         for fam in &both_modes_families {
             for (vpt, hz) in vpt_hz_pairs {
-                for qos in 1..=4 {
-                    for mode in ["multi", "single"] {
-                        expected.push(format!("{fam}-{vpt}x{hz}hz-qos{qos}-{mode}"));
+                for wl in &workloads {
+                    for qos in 1..=4 {
+                        for mode in ["multi", "single"] {
+                            expected.push(format!("{fam}-{vpt}x{hz}hz-{wl}-qos{qos}-{mode}"));
+                        }
                     }
                 }
             }
@@ -1539,9 +1544,11 @@ name = "v"
         }
         for fam in &multi_only_families {
             for (vpt, hz) in vpt_hz_pairs {
-                for qos in 1..=4 {
-                    for mode in ["multi", "single"] {
-                        expected.push(format!("{fam}-{vpt}x{hz}hz-qos{qos}-{mode}"));
+                for wl in &workloads {
+                    for qos in 1..=4 {
+                        for mode in ["multi", "single"] {
+                            expected.push(format!("{fam}-{vpt}x{hz}hz-{wl}-qos{qos}-{mode}"));
+                        }
                     }
                 }
             }
@@ -1553,9 +1560,11 @@ name = "v"
         }
         // websocket family: qos restricted to [3, 4], both modes.
         for (vpt, hz) in vpt_hz_pairs {
-            for qos in [3, 4] {
-                for mode in ["multi", "single"] {
-                    expected.push(format!("websocket-{vpt}x{hz}hz-qos{qos}-{mode}"));
+            for wl in &workloads {
+                for qos in [3, 4] {
+                    for mode in ["multi", "single"] {
+                        expected.push(format!("websocket-{vpt}x{hz}hz-{wl}-qos{qos}-{mode}"));
+                    }
                 }
             }
         }
@@ -1588,9 +1597,9 @@ name = "v"
         );
         assert_eq!(
             spawn_names.len(),
-            256,
-            "expected (custom-udp + hybrid) 64 each + (quic + zenoh + webrtc) 32 each + \
-             websocket 32 = 256 spawns"
+            704,
+            "expected (custom-udp + hybrid) 176 each + (quic + zenoh + webrtc) 88 each + \
+             websocket 88 = 704 spawns"
         );
     }
 
