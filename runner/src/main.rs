@@ -333,6 +333,34 @@ fn run(cli: &Cli) -> Result<()> {
         );
     }
 
+    // --analyze-full prereq check (fast-fail before discovery / matrix).
+    //
+    // Motivation: the analyzer needs polars / matplotlib / psutil. Before
+    // this check existed, a missing `polars` install was not discovered
+    // until AFTER the matrix completed -- e.g. a 2-hour benchmark followed
+    // by a `ModuleNotFoundError`. We now run the import probe at startup
+    // and abort with a clear message before the runner even reaches
+    // discovery, so the operator fixes the issue in seconds rather than
+    // hours.
+    //
+    // Gating: only the runner that will actually invoke the analyzer
+    // (`should_run_analysis` -> lexicographically lowest name) runs the
+    // probe. The other runner(s) print a one-line note and proceed.
+    // Rationale: if alice is the analyzer and only alice has polars
+    // installed, bob should not abort just because his Python lacks it.
+    if cli.analyze_full {
+        if analyze::should_run_analysis(&cli.name, &bench_config.runners) {
+            if let Err(msg) = analyze::check_analysis_prereqs() {
+                bail!(msg);
+            }
+        } else {
+            eprintln!(
+                "[runner:{}] --analyze-full set; skipping prereq check (not the analysis runner)",
+                cli.name
+            );
+        }
+    }
+
     // Generate a proposed log subfolder name before discovery so it can be
     // negotiated with other runners. The leader (first in the runners list)
     // decides the final name so all runners use the same subfolder.

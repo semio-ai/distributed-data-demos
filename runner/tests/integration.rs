@@ -2600,6 +2600,30 @@ fn python_on_path() -> bool {
     false
 }
 
+/// Probe whether the analyzer's Python prerequisites (polars, matplotlib,
+/// psutil) are installed. The T18.6 end-to-end smoke test needs them
+/// because the runner now fails fast at startup when `--analyze-full` is
+/// set but the imports would later raise `ModuleNotFoundError`. We skip
+/// the integration test (rather than fail CI) when the host environment
+/// lacks them -- the unit test in `analyze::tests` already pins the
+/// happy / failure paths of the prereq check itself.
+fn analyzer_prereqs_installed() -> bool {
+    for candidate in ["python3", "python"] {
+        if let Ok(status) = Command::new(candidate)
+            .arg("-c")
+            .arg("import polars, matplotlib, psutil")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            if status.success() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[test]
 fn t18_6_analyze_full_invokes_analyzer_after_matrix() {
     if !variant_dummy_exists() {
@@ -2608,6 +2632,13 @@ fn t18_6_analyze_full_invokes_analyzer_after_matrix() {
     }
     if !python_on_path() {
         eprintln!("SKIP: no python on PATH, cannot exercise --analyze-full end-to-end");
+        return;
+    }
+    if !analyzer_prereqs_installed() {
+        eprintln!(
+            "SKIP: analyzer prereqs (polars, matplotlib, psutil) not installed; \
+             runner's --analyze-full prereq check would abort before the matrix"
+        );
         return;
     }
 

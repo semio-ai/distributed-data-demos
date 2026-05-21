@@ -91,6 +91,68 @@ fn probe_interpreter(candidate: &str) -> bool {
         .is_ok()
 }
 
+/// Run `python -c "import <m1>, <m2>, ..."` against the resolved Python
+/// interpreter and report whether every module imports cleanly.
+///
+/// Returns `Ok(())` when the import succeeds (Python exits 0). Returns
+/// `Err(msg)` when:
+///   - the resolved Python interpreter could not be located on PATH, OR
+///   - the interpreter spawned but the import statement raised a Python
+///     exception (typically `ModuleNotFoundError`).
+///
+/// The returned message names the Python binary used, includes the full
+/// stderr text from the failed import (so the operator sees the missing
+/// module name verbatim), and finishes with a Windows-friendly recovery
+/// hint pointing at `pip install -r analysis\requirements.txt`. The path
+/// uses backslashes for PowerShell, but either separator works in
+/// practice -- pip canonicalises both.
+///
+/// Factored as `check_python_imports(modules)` rather than hard-coding the
+/// analyzer's three deps so the unit test can pass a guaranteed-missing
+/// module name (e.g. `definitely_not_a_real_module_xyz`) and exercise the
+/// failure path independently of the host environment.
+pub fn check_python_imports(modules: &[&str]) -> Result<(), String> {
+    let python = resolve_python()?;
+    let import_stmt = format!("import {}", modules.join(", "));
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(&import_stmt)
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to spawn '{python} -c \"{import_stmt}\"' for --analyze-full prereq check: {e}; \
+                 install the analyzer prerequisites with: pip install -r analysis\\requirements.txt"
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    let stderr_trimmed = stderr_text.trim();
+    Err(format!(
+        "--analyze-full prereq check failed: '{python} -c \"{import_stmt}\"' returned {:?}.\n\
+         Python stderr:\n{stderr_trimmed}\n\
+         Install the analyzer prerequisites with: pip install -r analysis\\requirements.txt \
+         (forward slashes work too). The runner aborts now so a long benchmark does not run \
+         only to have the trailing analysis fail.",
+        output.status.code()
+    ))
+}
+
+/// Verify the analyzer's Python prerequisites (`polars`, `matplotlib`,
+/// `psutil`) can be imported under the resolved Python interpreter, and
+/// return a helpful error if any are missing.
+///
+/// Called from `main` ONLY when `--analyze-full` is set AND this runner is
+/// the lexicographically lowest name (the one that will actually invoke
+/// the analyzer per `should_run_analysis`). Failing fast here means a
+/// missing `polars` install costs seconds at startup rather than discarding
+/// a multi-hour benchmark when the post-matrix analysis trips over the
+/// missing import.
+pub fn check_analysis_prereqs() -> Result<(), String> {
+    check_python_imports(&["polars", "matplotlib", "psutil"])
+}
+
 /// Run the analyzer if this runner is the lexicographically lowest name in
 /// `runners`. No-op otherwise. Logs (to runner stderr) one of:
 /// - "skipping analysis: this runner is not the lowest-sorted-name"
@@ -271,5 +333,72 @@ mod tests {
                 "error message must name both candidates: {msg}"
             ),
         }
+    }
+
+    /// Quick environment probe: does `<resolved-python> -c "import polars"`
+    /// succeed? Used by `check_analysis_prereqs_succeeds_when_polars_present`
+    /// to skip the happy-path assertion if polars is not installed in the
+    /// test environment -- we don't want CI to fail just because the
+    /// runner-crate's unit suite ran on a machine without analyzer deps.
+    fn host_has_polars() -> bool {
+        let Ok(python) = resolve_python() else {
+            return false;
+        };
+        Command::new(python)
+            .arg("-c")
+            .arg("import polars")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn check_python_imports_succeeds_for_stdlib_modules() {
+        // `sys` and `os` are part of the Python stdlib; if Python resolves
+        // at all, these must import. Skip the test if no Python is on PATH.
+        if resolve_python().is_err() {
+            eprintln!("skipping: no Python on PATH");
+            return;
+        }
+        check_python_imports(&["sys", "os"])
+            .expect("stdlib imports must succeed under a working Python");
+    }
+
+    #[test]
+    fn check_python_imports_errors_on_missing_module() {
+        // Skip if no Python is on PATH; we cannot exercise the failure path
+        // without an interpreter to run.
+        if resolve_python().is_err() {
+            eprintln!("skipping: no Python on PATH");
+            return;
+        }
+        let probe = "definitely_not_a_real_module_xyz";
+        let err = check_python_imports(&[probe]).expect_err("importing a bogus module must fail");
+        assert!(
+            err.contains(probe),
+            "error must mention the offending module name: {err}"
+        );
+        assert!(
+            err.contains("pip install -r analysis"),
+            "error must include the pip-install recovery hint: {err}"
+        );
+        assert!(
+            err.contains("requirements.txt"),
+            "error must point at requirements.txt: {err}"
+        );
+    }
+
+    #[test]
+    fn check_analysis_prereqs_succeeds_when_polars_present() {
+        // Skip if polars (or Python) is not installed in this test
+        // environment -- we don't want CI to fail just because the
+        // runner-crate's unit suite ran without analyzer deps.
+        if !host_has_polars() {
+            eprintln!("skipping: polars not installed in test environment");
+            return;
+        }
+        check_analysis_prereqs().expect("prereqs must pass when polars is installed");
     }
 }
