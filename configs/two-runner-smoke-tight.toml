@@ -1,0 +1,313 @@
+# Tight regression smoke: five variant families x three workload profiles x
+# two QoS extremes (1 and 4) at a single sweep point (vpt=1000, tick=100Hz).
+# Designed as a ~10-12 min/runner sanity check that catches workload-shape,
+# best-effort, AND reliable-QoS regressions in one pass. Use this BEFORE the
+# full smoke (configs/two-runner-smoke.toml, ~2.7h/runner) when iterating on
+# the variant-base, runner, or analysis pipeline.
+#
+# (family, mode) pairs (preserved verbatim from two-runner-smoke.toml):
+#   zenoh      multi
+#   hybrid     single
+#   quic       multi
+#   websocket  single
+#   webrtc     multi
+#
+# Sweep point (single):
+#   1000x100hz   (values_per_tick = 1000, tick_rate_hz = 100)
+# Rationale: the slowest tick with the largest batch is the most likely to
+# reveal backpressure and reliable-QoS bugs across all transports while still
+# fitting in the per-runner time budget.
+#
+# Workloads (applied to every family, in this order):
+#   scalar    workload = "scalar-flood"  -- one leaf per WriteOp, vpt ops/tick
+#   block     workload = "block-flood"   -- vpt/blob_size ops/tick of blob_size leaves
+#   mixed     workload = "mixed-types"   -- heterogeneous scalar/array/struct mix
+#
+# Workload parameters for vpt=1000 (identical to the full smoke):
+#   block: blob_size=100 (10 ops of 100 leaves; 1000 % 100 == 0)
+#   mixed: scalars 5..20, arrays 200..600, split=4, workload_seed=12345
+#   (scalars_max=20 <= vpt=1000; arrays_max=600 <= vpt - scalars_min = 995)
+#
+# QoS axis (pruned to the two extremes for cost):
+#   zenoh, hybrid, quic, webrtc: qos = [1, 4]   (best-effort and full reliable)
+#   websocket:                   qos = [4]      (websocket only supports 3, 4;
+#                                                we keep 4 only to minimize
+#                                                spawn count; the full smoke
+#                                                covers qos=3 on websocket)
+#
+# Timing (per spawn):
+#   stabilize_secs = 3
+#   operate_secs   = 15
+#   silent_secs    = 3
+#   default_timeout_secs = 60
+#
+# Spawn count math (per runner):
+#   zenoh / quic / webrtc (multi):   3 wl x 2 qos x 1 mode x 1 sweep = 6 each -> 18
+#   hybrid (single):                 3 wl x 2 qos x 1 mode x 1 sweep =          6
+#   websocket (single, qos [4]):     3 wl x 1 qos x 1 mode x 1 sweep =          3
+#   Grand total = 27 spawns per runner
+#
+# Expected runtime (per spawn): stabilize + operate + silent + ~5-8s
+# spawn/teardown overhead ~= 26-30s. 27 * ~28s ~= 12-13 min wall-clock per
+# runner under nominal conditions; closer to 10-11 min if spawn overhead is
+# light.
+#
+# KNOWN-FAILING (as of 2026-05-20):
+#   * zenoh @ qos=4 (all three workloads) -- tracked failure, INCLUDED ON
+#     PURPOSE so this smoke detects when the bug is fixed. When zenoh qos=3
+#     is re-added to the matrix, expect the same situation there.
+# All other 24 spawns should pass; any regression is a real signal.
+#
+# Run from the repo root with two terminals (PowerShell):
+#   .\target\release\runner.exe --name alice --config configs\two-runner-smoke-tight.toml
+#   .\target\release\runner.exe --name bob   --config configs\two-runner-smoke-tight.toml
+#
+# Structure mirrors two-runner-smoke.toml: one [[variant_template]] per family
+# carrying the shared common + specific defaults (including the per-family
+# qos pin), and one [[variant]] per workload at the single sweep point.
+
+run = "smoke-tight-01"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+
+# --- Zenoh (multi) ----------------------------------------------------------
+
+[[variant_template]]
+name = "zenoh-base"
+binary = "target/release/variant-zenoh.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 15
+  silent_secs = 3
+  log_dir = "./logs"
+  qos = [1, 4]
+  threading_modes = ["multi"]
+  [variant_template.specific]
+  zenoh_mode = "peer"
+
+# vpt=1000, tick=100Hz
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "zenoh-base"
+name = "zenoh-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+
+# --- Hybrid UDP/TCP (single) ------------------------------------------------
+
+[[variant_template]]
+name = "hybrid-base"
+binary = "target/release/variant-hybrid.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 15
+  silent_secs = 3
+  log_dir = "./logs"
+  qos = [1, 4]
+  threading_modes = ["single"]
+  [variant_template.specific]
+  multicast_group = "239.0.0.1:19503"
+  tcp_base_port = 19900
+
+# vpt=1000, tick=100Hz
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "hybrid-base"
+name = "hybrid-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+
+# --- QUIC (multi) -----------------------------------------------------------
+
+[[variant_template]]
+name = "quic-base"
+binary = "target/release/variant-quic.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 15
+  silent_secs = 3
+  log_dir = "./logs"
+  qos = [1, 4]
+  threading_modes = ["multi"]
+  [variant_template.specific]
+  base_port = 19930
+
+# vpt=1000, tick=100Hz
+[[variant]]
+template = "quic-base"
+name = "quic-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "quic-base"
+name = "quic-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "quic-base"
+name = "quic-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+
+# --- WebSocket (single) -----------------------------------------------------
+
+[[variant_template]]
+name = "websocket-base"
+binary = "target/release/variant-websocket.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 15
+  silent_secs = 3
+  log_dir = "./logs"
+  qos = [4]
+  threading_modes = ["single"]
+  [variant_template.specific]
+  ws_base_port = 19960
+
+# vpt=1000, tick=100Hz
+[[variant]]
+template = "websocket-base"
+name = "websocket-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "websocket-base"
+name = "websocket-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+
+# --- WebRTC (multi) ---------------------------------------------------------
+
+[[variant_template]]
+name = "webrtc-base"
+binary = "target/release/variant-webrtc.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 15
+  silent_secs = 3
+  log_dir = "./logs"
+  qos = [1, 4]
+  threading_modes = ["multi"]
+  [variant_template.specific]
+  signaling_base_port = 19980
+  media_base_port = 20000
+
+# vpt=1000, tick=100Hz
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "scalar-flood"
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "webrtc-base"
+name = "webrtc-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
