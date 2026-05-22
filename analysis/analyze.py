@@ -41,6 +41,42 @@ from pivot_tables import export_csv, format_pivot_for_qos, format_pivot_section
 from tables import format_integrity_table, format_performance_table
 
 
+def _format_elapsed(seconds: float) -> str:
+    """Render ``seconds`` as ``X.Xs`` (<60s) or ``Xm Ys`` (>=60s).
+
+    >>> _format_elapsed(0.0)
+    '0.0s'
+    >>> _format_elapsed(12.34)
+    '12.3s'
+    >>> _format_elapsed(59.95)
+    '60.0s'
+    >>> _format_elapsed(60.0)
+    '1m 0s'
+    >>> _format_elapsed(125.7)
+    '2m 6s'
+    >>> _format_elapsed(119.5)
+    '2m 0s'
+    """
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    remainder = int(round(seconds - minutes * 60))
+    if remainder == 60:
+        minutes += 1
+        remainder = 0
+    return f"{minutes}m {remainder}s"
+
+
+def _progress(msg: str) -> None:
+    """Write a progress line to stderr with an explicit flush.
+
+    Centralized so callers don't have to remember the ``flush=True``
+    invariant -- progress output is meant to appear immediately even
+    when stderr is redirected to a file the operator is tailing.
+    """
+    print(msg, file=sys.stderr, flush=True)
+
+
 class _RSSSampler:
     """Background thread that polls ``psutil`` for peak RSS.
 
@@ -229,6 +265,7 @@ def run_analysis(
     logs_dir: Path,
     *,
     do_summary: bool,
+    started_at: float | None = None,
 ) -> tuple[list[IntegrityResult], list[PerformanceResult]]:
     """Run the full per-group analysis pipeline.
 
@@ -241,19 +278,56 @@ def run_analysis(
     ``cache.discover_groups``). This bounds the working set to one
     group at a time -- correlation, integrity and performance all
     operate on the per-group lazy frame.
+
+    ``started_at`` is the ``time.monotonic()`` value captured at the
+    top of ``main()``; when provided, per-group progress lines include
+    the cumulative wall-clock elapsed since launch so the operator
+    can extrapolate remaining time on long runs.
     """
+    _progress("[stage] Discovering analysis groups...")
+    discover_t0 = time.monotonic()
     groups = discover_groups(logs_dir)
+    discover_elapsed = time.monotonic() - discover_t0
+
+    # Summarize the discovered groups: list up to five variants by
+    # name with run counts so the operator can sanity-check that
+    # discovery picked up the dataset they expected.
+    runs_by_variant: dict[str, int] = {}
+    for variant, _run, _paths in groups:
+        runs_by_variant[variant] = runs_by_variant.get(variant, 0) + 1
+    variant_names = list(runs_by_variant.keys())
+    head = variant_names[:5]
+    rendered = ", ".join(f"{v} ({runs_by_variant[v]} runs)" for v in head)
+    if len(variant_names) > 5:
+        rendered += f", +{len(variant_names) - 5} more"
+    _progress(
+        f"[stage] Discovered {len(groups)} groups "
+        f"({_format_elapsed(discover_elapsed)}): {rendered}"
+        if groups
+        else f"[stage] Discovered 0 groups ({_format_elapsed(discover_elapsed)})"
+    )
 
     integrity_results: list[IntegrityResult] = []
     performance_results: list[PerformanceResult] = []
 
-    for variant, run, shard_paths in groups:
+    total = len(groups)
+    for idx, (variant, run, shard_paths) in enumerate(groups, start=1):
+        prefix = f"[{idx}/{total}]"
+        group_t0 = time.monotonic()
+        _progress(f"{prefix} variant={variant} run={run} shards={len(shard_paths)}")
+
         group = scan_group(shard_paths)
 
         # Materialize delivery records once per group.
+        correlate_t0 = time.monotonic()
         deliveries = correlate_lazy(group).collect()
+        _progress(
+            f"{prefix}   correlated: {deliveries.height} delivery rows "
+            f"({_format_elapsed(time.monotonic() - correlate_t0)})"
+        )
 
         if do_summary:
+            integrity_t0 = time.monotonic()
             # T14.17: pass logs_dir/variant/run so integrity_for_group
             # can attach the per-spawn timeout_classification field
             # to each IntegrityResult row.
@@ -266,13 +340,32 @@ def run_analysis(
                     run=run,
                 )
             )
+            _progress(
+                f"{prefix}   integrity done "
+                f"({_format_elapsed(time.monotonic() - integrity_t0)})"
+            )
 
+        performance_t0 = time.monotonic()
         performance_results.append(
             performance_for_group(group, deliveries, variant, run)
+        )
+        _progress(
+            f"{prefix}   performance done "
+            f"({_format_elapsed(time.monotonic() - performance_t0)})"
         )
 
         # Free per-group materialized data before moving on.
         del deliveries
+
+        group_elapsed = time.monotonic() - group_t0
+        if started_at is not None:
+            cumulative = time.monotonic() - started_at
+            _progress(
+                f"{prefix} done (group {_format_elapsed(group_elapsed)}, "
+                f"cumulative {_format_elapsed(cumulative)})"
+            )
+        else:
+            _progress(f"{prefix} done (group {_format_elapsed(group_elapsed)})")
 
     return integrity_results, performance_results
 
@@ -520,18 +613,37 @@ def main(argv: list[str] | None = None) -> int:
 
     output_dir: Path = args.output.resolve() if args.output else logs_dir / "analysis"
 
+    # Cumulative-elapsed baseline for the run. Captured unconditionally
+    # (separate from the RSS-sampler timing path) so per-stage and
+    # per-group progress lines can report a single consistent
+    # "cumulative since launch" figure regardless of whether
+    # --measure-peak-rss was set.
+    started_at: float = time.monotonic()
+
     sampler: _RSSSampler | None = None
-    started_at: float | None = None
     if args.measure_peak_rss:
         sampler = _RSSSampler()
         sampler.start()
-        started_at = time.monotonic()
 
     try:
         # Step 1: per-shard Parquet cache (build / refresh).
-        update_cache(logs_dir, clear=args.clear)
+        _progress(f"[stage] Updating Parquet cache for {logs_dir}...")
+        cache_t0 = time.monotonic()
+        cache_progress_count = [0]  # mutable counter for closure.
 
-        if not list((logs_dir / ".cache").glob("*.parquet")):
+        def _cache_on_progress(stem: str) -> None:
+            cache_progress_count[0] += 1
+            _progress(f"[cache] built shard {cache_progress_count[0]}: {stem}")
+
+        update_cache(logs_dir, clear=args.clear, on_progress=_cache_on_progress)
+
+        shard_paths = list((logs_dir / ".cache").glob("*.parquet"))
+        _progress(
+            f"[stage] Cache updated: {len(shard_paths)} parquet shards "
+            f"(elapsed: {_format_elapsed(time.monotonic() - cache_t0)})"
+        )
+
+        if not shard_paths:
             print("No events found in log files.", file=sys.stderr)
             return 1
 
@@ -542,7 +654,7 @@ def main(argv: list[str] | None = None) -> int:
         # alone (which is always populated), so no force is needed --
         # this comment documents the intent.
         integrity_results, performance_results = run_analysis(
-            logs_dir, do_summary=do_summary
+            logs_dir, do_summary=do_summary, started_at=started_at
         )
 
         # T-pivot.4: long-form CSV export. Emitted before the summary
@@ -590,7 +702,10 @@ def main(argv: list[str] | None = None) -> int:
         comparison_paths: list[Path] = []
         cdf_paths: list[Path] = []
         drop_rate_paths: list[Path] = []
+        diagrams_t0: float | None = None
         if do_diagrams:
+            _progress("[stage] Generating diagrams...")
+            diagrams_t0 = time.monotonic()
             try:
                 from plots import (
                     generate_comparison_plot,
@@ -640,6 +755,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"Plot saved to: {shape_plot_path}", file=sys.stderr)
 
+            if diagrams_t0 is not None:
+                _progress(
+                    f"[stage] Diagrams done "
+                    f"({_format_elapsed(time.monotonic() - diagrams_t0)})"
+                )
+
         # Step 5: markdown summary. ``summary_performance.md`` is the
         # operator's one-file walkthrough of the dataset: performance
         # table plus per-QoS image embeds. We write it whenever the
@@ -649,6 +770,7 @@ def main(argv: list[str] | None = None) -> int:
         # the user having to remember --dump. Other dump sections
         # (integrity, pivot, warnings, index) still require --dump.
         if do_summary:
+            _progress("[stage] Writing summary_performance.md...")
             output_dir.mkdir(parents=True, exist_ok=True)
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
             performance_md_path = output_dir / "summary_performance.md"
@@ -673,6 +795,7 @@ def main(argv: list[str] | None = None) -> int:
         # regression in the dump cannot block the operator from
         # seeing the tables. Always lands in ``output_dir``.
         if args.dump:
+            _progress("[stage] Writing dump files...")
             late_tail_groups_for_dump: set[tuple[str, str]] = {
                 (p.variant, p.run)
                 for p in performance_results
@@ -697,11 +820,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if sampler is not None:
             peak_bytes = sampler.stop()
-            elapsed = (
-                f"{time.monotonic() - started_at:.2f}s"
-                if started_at is not None
-                else "n/a"
-            )
+            elapsed = f"{time.monotonic() - started_at:.2f}s"
             peak_mib = peak_bytes / (1024.0 * 1024.0)
             peak_gib = peak_bytes / (1024.0 * 1024.0 * 1024.0)
             print(

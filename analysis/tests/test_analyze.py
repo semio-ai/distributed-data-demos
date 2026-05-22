@@ -75,6 +75,31 @@ class TestMeasurePeakRSSFlag:
         assert "--measure-peak-rss" in proc.stdout
 
 
+class TestFormatElapsed:
+    """Coverage for the ``_format_elapsed`` progress-line helper."""
+
+    def test_subminute_uses_one_decimal_seconds(self) -> None:
+        from analyze import _format_elapsed
+
+        assert _format_elapsed(0.0) == "0.0s"
+        assert _format_elapsed(12.34) == "12.3s"
+        assert _format_elapsed(59.94) == "59.9s"
+
+    def test_minute_boundary_rolls_to_minute_form(self) -> None:
+        from analyze import _format_elapsed
+
+        # Just under a minute is still seconds-formatted with one
+        # decimal of precision; at/above 60 s switches to ``Xm Ys``.
+        assert _format_elapsed(60.0) == "1m 0s"
+        assert _format_elapsed(125.7) == "2m 6s"
+
+    def test_carry_when_remainder_rounds_to_sixty(self) -> None:
+        from analyze import _format_elapsed
+
+        # 119.5 -> minutes=1, remainder=round(59.5)=60 -> carry to 2m 0s.
+        assert _format_elapsed(119.5) == "2m 0s"
+
+
 class TestRSSSamplerUnit:
     """Direct unit cover on ``_RSSSampler`` so the round-trip can run
     even when ``psutil`` is missing in CI -- the round-trip suite skips,

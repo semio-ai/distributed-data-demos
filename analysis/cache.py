@@ -558,6 +558,11 @@ def update_cache(
     ``workers * (single-shard peak)`` -- with 100k-row batches and
     ~8 workers this stays well under 1 GB on the largest individual
     file (~2 GB JSONL).
+
+    ``on_progress`` (when set) is invoked once per stale shard right
+    after that shard has been written, with the shard's stem as the
+    single argument. Useful for surfacing operator progress on long
+    cold builds. Not called for already-fresh shards.
     """
     _delete_legacy_pickle(logs_dir)
 
@@ -622,21 +627,20 @@ def update_cache(
             for job in stale_jobs:
                 # job[0] is the stem (canonical <variant>-<runner>-<run>
                 # triple, format-agnostic).
-                if on_progress is not None:
-                    on_progress(job[0])
                 stem, meta = _build_shard_worker(job)
                 metas[stem] = meta
+                if on_progress is not None:
+                    on_progress(stem)
         else:
             with ProcessPoolExecutor(max_workers=n_workers) as pool:
                 futures = {
                     pool.submit(_build_shard_worker, job): job for job in stale_jobs
                 }
-                if on_progress is not None:
-                    for job in stale_jobs:
-                        on_progress(job[0])
                 for future in as_completed(futures):
                     stem, meta = future.result()
                     metas[stem] = meta
+                    if on_progress is not None:
+                        on_progress(stem)
 
     _remove_orphan_shards(logs_dir, valid_stems)
 

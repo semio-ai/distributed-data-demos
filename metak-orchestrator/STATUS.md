@@ -16511,3 +16511,146 @@ config edit).
 Single commit landed on `main` describing the triplication and the
 test update.
 
+
+---
+
+## 2026-05-22 -- analysis worker: per-stage and per-group progress logging
+
+User-visible problem: `python analysis/analyze.py <logs-dir> --summary
+--dump --diagrams` produced zero stdout/stderr output for the entire
+per-group analysis loop on `smoke-01-20260520_194923`. Operator
+couldn't tell whether the process was making progress, stuck, or
+about to finish.
+
+### Files changed
+
+- `analysis/analyze.py` -- added two helpers (`_format_elapsed`,
+  `_progress`); captured `started_at = time.monotonic()`
+  unconditionally at the top of `main()`; instrumented the cache,
+  discovery, per-group loop, diagrams, and markdown-write stages
+  with `[stage]` / `[i/N]` stderr lines (explicit flush). Passes
+  `started_at` into `run_analysis` so per-group lines can include
+  cumulative wall-clock since launch.
+- `analysis/cache.py` -- changed `on_progress` semantics to fire
+  *after* each stale shard is built (on both the serial and parallel
+  paths). Previously the parallel path called it for all jobs
+  upfront before any shard completed, which made it useless for
+  progress display. Docstring updated.
+- `analysis/tests/test_analyze.py` -- added `TestFormatElapsed`
+  with three cases covering sub-minute formatting, minute-boundary
+  roll-over, and the carry case where the rounded seconds remainder
+  equals 60.
+
+### Test results
+
+```
+cd c:\repo\semio\distributed-data-demos\analysis
+python -m pytest tests/ -x
+# 447 passed, 6 skipped in 53.30s (skips are the integration tests
+# against logs/ that require dataset access)
+
+ruff format --check .
+# 37 files already formatted
+
+ruff check .
+# All checks passed!
+
+python -m pytest --doctest-modules analyze.py
+# 1 passed in 0.35s (the _format_elapsed doctest)
+```
+
+### Validation run (mandatory)
+
+```
+python analysis\analyze.py C:\repo\shared\ddd\smoke-01-20260520_194923 \
+    --summary --dump --diagrams 2>progress.log
+```
+
+Wall-clock: **9m51s** (warm cache -- the 544 parquet shards were
+already up to date). Exit code 0.
+
+First 30 lines of `progress.log`:
+
+```
+[stage] Updating Parquet cache for C:\repo\shared\ddd\smoke-01-20260520_194923...
+[stage] Cache updated: 544 parquet shards (elapsed: 0.2s)
+[stage] Discovering analysis groups...
+[stage] Discovered 270 groups (0.0s): hybrid-1000x100hz-block-qos1 (1 runs), hybrid-1000x100hz-block-qos2 (1 runs), hybrid-1000x100hz-block-qos3 (1 runs), hybrid-1000x100hz-block-qos4 (1 runs), hybrid-1000x100hz-mixed-qos1 (1 runs), +265 more
+[1/270] variant=hybrid-1000x100hz-block-qos1 run=smoke-01 shards=6
+[1/270]   correlated: 120040 delivery rows (0.1s)
+[1/270]   integrity done (0.1s)
+[1/270]   performance done (0.2s)
+[1/270] done (group 0.5s, cumulative 0.7s)
+[2/270] variant=hybrid-1000x100hz-block-qos2 run=smoke-01 shards=6
+[2/270]   correlated: 120040 delivery rows (0.1s)
+[2/270]   integrity done (0.1s)
+[2/270]   performance done (0.2s)
+[2/270] done (group 0.4s, cumulative 1.1s)
+[3/270] variant=hybrid-1000x100hz-block-qos3 run=smoke-01 shards=6
+[3/270]   correlated: 60020 delivery rows (0.1s)
+[3/270]   integrity done (0.1s)
+[3/270]   performance done (0.1s)
+[3/270] done (group 0.2s, cumulative 1.4s)
+[4/270] variant=hybrid-1000x100hz-block-qos4 run=smoke-01 shards=6
+[4/270]   correlated: 60020 delivery rows (0.0s)
+[4/270]   integrity done (0.1s)
+[4/270]   performance done (0.1s)
+[4/270] done (group 0.2s, cumulative 1.6s)
+[5/270] variant=hybrid-1000x100hz-mixed-qos1 run=smoke-01 shards=6
+[5/270]   correlated: 993132 delivery rows (0.6s)
+[5/270]   integrity done (0.9s)
+[5/270]   performance done (0.6s)
+[5/270] done (group 2.1s, cumulative 3.7s)
+[6/270] variant=hybrid-1000x100hz-mixed-qos2 run=smoke-01 shards=6
+```
+
+Tail of `progress.log` (stage transitions remain visible through
+the end of the run):
+
+```
+[stage] Generating diagrams...
+Plot saved to: ...comparison-qos1.png
+... (13 more PNG paths)
+[stage] Diagrams done (22.6s)
+[stage] Writing summary_performance.md...
+Summary written to: ...summary_performance.md
+[stage] Writing dump files...
+Dump written: 8 files in ...analysis
+```
+
+Format breakdown (matches the spec):
+- `[stage]` lines for cache update, group discovery, diagrams, and
+  per-file markdown writes.
+- `[i/N]` per-group counter on each iteration of the per-group loop
+  (270 groups in this dataset), with per-step sub-timings for
+  correlate / integrity / performance and a per-group + cumulative
+  total on the close line.
+- Timings use `X.Xs` under one minute, `Xm Ys` above. None of the
+  groups on this warm dataset exceeded 60 s individually.
+
+### Deviations from the spec
+
+- **Cache cold-path `[cache] N/M:` counter**: the spec said "add only
+  if the loop exists." It does exist (`stale_jobs` loop in
+  `update_cache`), but the existing `on_progress` callback was
+  wired *before* shard builds completed on the parallel path,
+  making it useless for progress. I changed the callback to fire
+  *after* each shard build finishes (both serial and parallel
+  paths) and wired the analyzer's `_cache_on_progress` closure to
+  emit `[cache] built shard N: <stem>` lines. On the validation
+  run the cache was warm, so no lines fired -- but the wiring is
+  in place for cold rebuilds. No `M` denominator on the line
+  because the parallel `as_completed` doesn't expose a stable
+  in-flight count cheaply; counter-only is enough to show
+  progress.
+
+- **`flush=True` invariant**: centralized into `_progress(msg)`
+  rather than inlined at every call site, so future progress
+  messages can't forget the flush.
+
+- **`started_at` lifecycle**: spec said "capture at the top of
+  `main()`". The pre-existing code captured it conditionally only
+  when `--measure-peak-rss` was set. I moved the capture to be
+  unconditional and dropped the now-dead `else "n/a"` branch in
+  the `[rss]` reporter.
+
