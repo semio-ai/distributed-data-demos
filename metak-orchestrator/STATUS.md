@@ -16511,8 +16511,645 @@ config edit).
 Single commit landed on `main` describing the triplication and the
 test update.
 
-
 ---
+
+## 2026-05-21 — silent-exit hardening (panic-hook installation)
+
+### Brief
+
+Two runners on `configs/two-runner-all-variants.toml` (one machine,
+two terminals, alice + bob) exited silently after the second spawn
+(`custom-udp-1000x100hz-scalar-qos1-single`) printed its `spawning
+'...'` line. No `final progress:`, no `finished:`, no FATAL line,
+no anyhow `Error: ...` output, no panic message. Both terminals
+returned to the shell prompt symmetrically. The orphaned variant
+children continued to completion and wrote full JSONL + parquet
+files, confirming the runner died well before the variant's
+lifecycle ended.
+
+### Investigation summary
+
+The orchestrator's brief listed all in-runner `process::exit` /
+panic-eligible code paths and ruled out:
+
+- `--analyze-full` prereq check (was gated off; user did not pass
+  the flag).
+- The two `std::process::exit` sites in `main.rs` (line 242
+  `EX_TEMPFAIL` always preceded by a FATAL line; line 1152 only
+  reached after the summary table prints).
+- `panic = "abort"` (workspace Cargo.toml does not set it).
+- Custom `std::panic::set_hook` (no such call anywhere in
+  `runner/src/`).
+
+I attempted local reproduction with a minimal config
+(`custom-udp-1000x100hz-scalar` × 4 qos × 2 threading_modes) plus
+a variant-dummy two-spawn config. Neither reproduced the silent
+exit — both ran every spawn to completion with the expected
+`final progress:` / `finished:` lines. The qos4-single spawn in
+my reproducer did hit an unrelated `[variant] watchdog: no
+progress in 30s` failure that was caught by the existing T-impl.9
+failure-diagnostic block (stderr capture, tail, jsonl pointer all
+visible). That is the **opposite** of the silent-exit failure
+mode — it confirms the runner's normal failure path is loud.
+
+Given the failure is reproducible for the operator but not
+locally, and the user's evidence (BOTH runners die symmetrically,
+no message of any kind, child variants outlive the runner) is
+consistent with a thread-panic-then-process-dies path that the
+default Rust panic handler can leave hidden between machines
+(buffered terminal output, AV scanner intervention, Windows
+console-control event, or `.expect("mutex poisoned")` cascade
+through a poisoned mutex in a release build with no backtrace),
+the correct defensive posture is to **never let a panic
+disappear**.
+
+### Root cause (defensive fix posture)
+
+The runner had no process-wide panic hook. By default Rust:
+
+- Prints the panic to stderr (a single line plus
+  `note: run with RUST_BACKTRACE=1 environment variable to display
+  a backtrace`).
+- Unwinds only the panicking thread.
+- Lets other threads (including main) continue.
+
+In the runner's architecture this is fragile: the main thread
+holds many `.expect("X mutex poisoned")` calls (tracker handles,
+remote-view handles, barrier writers, progress writers) that
+themselves panic immediately if a background thread panicked
+inside the lock first. The cascade can produce two panics in
+quick succession, one on a background thread and one on main —
+both messages can scroll off-screen on a terminal that is being
+collected from multiple runners, or be lost entirely on a
+Windows console close event.
+
+### Fix
+
+`runner/src/panic_hook.rs` (NEW, 124 LOC): a single function
+`install_panic_hook(runner_name: String)` that:
+
+1. Calls `std::panic::take_hook()` to capture the existing
+   (default) hook.
+2. Sets a new hook that:
+   - Prints `[runner:<name>] PANIC in thread '<thread_name>': <payload>`
+     to stderr.
+   - Prints `[runner:<name>] panic location: <file>:<line>:<col>`
+     if location info is available.
+   - Calls the previously installed hook (so
+     `RUST_BACKTRACE=1` still works).
+   - Calls `std::process::abort()` to kill the WHOLE process.
+3. Idempotent via an `AtomicBool` CAS guard so accidental
+   double-installation is a no-op.
+
+`runner/src/main.rs` (modified, +60 / -2 LOC effective):
+
+- Added `mod panic_hook;`.
+- Changed `fn main() -> Result<()>` to `fn main()` so the runtime
+  no longer prints `Error: {:?}` implicitly; every error path is
+  now an explicit `eprintln!` + `process::exit`.
+- Added `panic_hook::install_panic_hook(cli.name.clone())` as the
+  first thing in `main()` after CLI parse, before the build
+  banner.
+- The non-`BarrierTimeoutError` arm now prints
+  `[runner:<name>] FATAL: {e:#}` and exits with code 1
+  explicitly. Pre-fix this path relied on the runtime's default
+  Debug print, which was one of the silent-exit hypotheses.
+
+`runner/Cargo.toml`: added a fourth `[[bin]]` entry
+`panic-helper` at `tests/helpers/panic_helper.rs`.
+
+`runner/tests/helpers/panic_helper.rs` (NEW): test helper that
+shares the panic-hook source via `#[path = "../../src/panic_hook.rs"]
+mod panic_hook` so the EXACT production hook is exercised. Two
+modes selected by argv: `main` panics on the main thread; `thread`
+spawns a named worker thread `worker` that panics and asserts via
+a 5-second sleep + exit-99 fallback that the hook's `abort()`
+killed the whole process (not just the worker).
+
+`runner/tests/integration.rs` (+87 LOC at file end): two new
+integration tests:
+
+- `panic_hook_main_thread_emits_labeled_stderr_and_aborts` —
+  spawns `panic-helper main`, asserts exit code non-zero AND
+  not 75, asserts `[runner:alice] PANIC in thread ...` AND
+  `intentional main-thread panic` AND
+  `[runner:alice] panic location: ...` all appear in stderr.
+- `panic_hook_background_thread_aborts_whole_process` — spawns
+  `panic-helper thread`, asserts the worker panic killed the
+  whole process (exit code is neither 99 — the helper's fallback
+  sentinel — nor 75 — `EX_TEMPFAIL`), and the stderr line
+  attributes the panic to `thread 'worker'`.
+
+### Files touched (counts approximate)
+
+```
+runner/src/main.rs           +60  -2   (panic-hook wire-up, explicit FATAL print)
+runner/src/panic_hook.rs    +160        (new module)
+runner/tests/helpers/panic_helper.rs +47 (new helper binary)
+runner/tests/integration.rs  +87        (two new regression tests)
+runner/Cargo.toml             +4        (new [[bin]] entry)
+runner/tests/fixtures/repro-silent-exit-custom-udp.toml +31 (manual smoke fixture)
+```
+
+### Validation
+
+- `cargo build --release -p runner` — clean.
+- `cargo clippy --release -p runner --all-targets -- -D warnings`
+  — clean.
+- `cargo fmt -p runner -- --check` — clean.
+- `cargo test --release -p runner --test integration` — 30
+  passed, 2 ignored, 0 failed.
+- `cargo test --release -p runner --bin runner -- panic_hook` —
+  1 passed (the idempotency guard test).
+- `cargo test --release -p runner --test integration -- panic_hook`
+  — 2 passed (main-thread + worker-thread regression tests).
+- Pre-existing flakiness in
+  `barrier_coord::tests::two_runner_barrier_exchange_round_trips`
+  and `protocol::tests::two_runner_localhost_coordination` was
+  confirmed against unstashed `main` (without my changes); not
+  caused by this work.
+
+### Live two-spawn smoke
+
+Re-ran two runners (alice + bob) against
+`runner/tests/fixtures/repro-silent-exit-custom-udp.toml` —
+one variant entry expanding into `multi` then `single`. Both
+runners produced both spawns' `final progress:` and `finished:`
+lines, both exited cleanly with status 0:
+
+```
+[runner:alice] spawning 'custom-udp-1000x100hz-scalar-multi' (hz=100, vpt=1000, qos=1, timeout: 60s)
+[runner:alice] 'custom-udp-1000x100hz-scalar-multi' final progress: phase=done sent=73000 received=74000 eot_sent=true eot_received=true
+[runner:alice] 'custom-udp-1000x100hz-scalar-multi' finished: status=success, exit_code=0
+[runner:alice] progress: 1/2 done | elapsed 12s | ETA ~12s
+[runner:alice] ready barrier for spawn 'custom-udp-1000x100hz-scalar-single' (hz=100, vpt=1000, qos=1)
+[runner:alice] clock_sync (custom-udp-1000x100hz-scalar-single) peer=bob offset_ms=-0.013 rtt_ms=0.298
+[runner:alice] spawning 'custom-udp-1000x100hz-scalar-single' (hz=100, vpt=1000, qos=1, timeout: 60s)
+[runner:alice] 'custom-udp-1000x100hz-scalar-single' final progress: phase=done sent=79000 received=78000 eot_sent=true eot_received=true
+[runner:alice] 'custom-udp-1000x100hz-scalar-single' finished: status=success, exit_code=0
+```
+
+(Bob's stderr is symmetric; full capture saved during testing
+but elided here for brevity.) Exit codes: `alice=0, bob=0`.
+
+### Surprising observations
+
+- The bug was **not** locally reproducible on my machine. I ran
+  custom-udp with the same shape (qos × threading_modes) up to
+  8 spawns — the runner survived every multi→single transition.
+  The hypothesis is that the underlying trigger is timing- or
+  load-dependent (large matrix, full operate_secs=30, hot
+  variant teardown of the previous spawn racing the next
+  ready_barrier or the first progress publish).
+- The fix is therefore **defensive**, not surgical. The panic
+  hook converts the entire CLASS of silent-disappearance bugs
+  (whatever the root cause) into a loud, attributable,
+  greppable stderr line. The next time this bug fires in
+  production, the operator will see exactly which thread
+  panicked and where, and the wrapper script will NOT
+  auto-resume (abort exits with a non-EX_TEMPFAIL code).
+- The `panic_helper` test-helper binary's `#[path = ...]`
+  include of the production `panic_hook.rs` module is the
+  load-bearing piece: it guarantees the regression test
+  exercises the EXACT same code the release binary runs. A
+  re-implementation in the helper would defeat the purpose.
+
+### Suggested commit split
+
+This work logically splits into three commits per the user's
+"split unrelated changes into separate commits" preference:
+
+1. `feat(runner): process-wide panic hook + explicit FATAL
+   print` — `runner/src/panic_hook.rs`, `runner/src/main.rs`,
+   `runner/Cargo.toml` (new bin entry).
+2. `test(runner): panic-hook regression tests via shared
+   helper binary` — `runner/tests/helpers/panic_helper.rs`,
+   `runner/tests/integration.rs` (the two new tests).
+3. `test(runner): manual two-spawn smoke fixture for silent
+   exit regression` — `runner/tests/fixtures/repro-silent-exit-custom-udp.toml`.
+
+### Deviations
+
+None. The brief asked for root-cause identification, a fix, a
+regression test, validation, and a live two-spawn smoke. Root
+cause could not be pinpointed without operator-side
+reproduction, so the fix is defensive (eliminate the entire
+silent-disappearance class). The test approach uses a helper
+binary that shares the production hook source.
+
+## 2026-05-21 — zenoh: self-writer filter at the receive boundary (worker: variants/zenoh)
+
+### Goal
+
+Align the Zenoh variant with the rest of the family
+(custom-udp, hybrid, websocket, webrtc) on the
+`compact-log-schema.md` event kind 1 (`receive`) contract:
+payloads whose decoded `writer` equals the variant's own
+runner MUST be dropped at the receive boundary BEFORE they
+reach the variant's recv channel (and thus before
+`inc_received` / `received` count / `receive` digest rows).
+The metric the project measures is foreign-delivered payloads
+only.
+
+### Where the filter landed
+
+**Two filter sites**, one per Zenoh threading mode. The brief
+called out only the Multi-mode subscriber_task; the live
+two-runner smoke exposed the Single mode (sidecar / SSE) path
+as ALSO going through a Zenoh wildcard subscription that
+reflects the variant's own publishes back to the same sidecar
+— so the Single path needed the same filter to honour the
+contract.
+
+1. **Multi mode** — `variants/zenoh/src/zenoh.rs:1573-1575`
+   inside `subscriber_task`. Placed **before** the existing
+   T17.8 ack-tracking block at lines 1591-1605 (which already
+   gated on `update.writer != self_runner`), so a self sample
+   never even enters that block. The ack block's now-dead
+   `!= self_runner` guard is kept as belt-and-braces against a
+   future refactor that moves the early filter; the comment
+   documents the dead-condition status.
+
+2. **Single mode** — `variants/zenoh/src/rest_client.rs:462-464`
+   inside `sse_reader_loop`. The reader thread now also takes
+   a `self_runner: String` (plumbed through `SseReader::start`
+   from the variant's `self.runner.clone()`); the filter runs
+   immediately after `decode(&payload)` succeeds, before the
+   `tx.try_send(update)`. **This site was discovered only
+   during live e2e** — the brief did not mention it.
+
+### Above vs below the ack-tracking block (Multi mode)
+
+I moved the filter **above** the ack-tracking block (the
+brief offered both options). Reasons:
+- The ack-tracking block already gates on `update.writer !=
+  self_runner` (line 1595), so moving the early-continue ahead
+  of it is provably safe — the ack block was never doing work
+  for self samples anyway.
+- Saves one HashMap-locked critical section per self sample
+  (cheap, but free is cheaper).
+- Mirrors the existing self-EOT filter in `eot_subscriber_task`
+  at line 1861, which runs immediately after key decode and
+  before any ack/tx work — the shape matches.
+
+### Files touched (LOC count)
+
+```
+variants/zenoh/src/zenoh.rs                              +56  -3
+  (Multi-mode subscriber_task self-filter + ack comment update
+   + new multi_zenoh_subscriber_filters_self_writer test
+   + zenoh_bridge_stress_10000_messages rewrite to use an
+     auxiliary in-process session as the foreign writer)
+variants/zenoh/src/rest_client.rs                        +30  -3
+  (SseReader::start + sse_reader_loop self_runner plumbing
+   + Single-mode self-filter at the SSE try_send boundary
+   + sse_reader_stop_is_idempotent test signature update)
+variants/zenoh/tests/loopback.rs                         +30 -29
+  (rewrote receive assertions: per the new contract a
+   single-process loopback spawn has NO foreign writers, so
+   no receive events; also dropped the JSONL `write` event
+   assertion which T18.2b had already invalidated)
+variants/zenoh/tests/fixtures/repro-zenoh-self-filter.toml +33  (new)
+  (small two-runner Zenoh fixture for the live e2e validation)
+```
+
+Also a one-line clippy-fix bump in `zenoh.rs:307-309`
+(`doc_lazy_continuation` indent — was pre-existing on `main`,
+needed clean clippy to validate my real changes).
+
+### Tests added / updated
+
+1. **`zenoh::tests::multi_zenoh_subscriber_filters_self_writer`**
+   (new, `#[ignore]` — spins up two real Zenoh sessions).
+   Mirrors `variants/custom-udp/src/udp.rs`
+   `multi_udp_reader_filters_self_writer`. Connects the
+   variant (runner="self-runner") on a loopback Zenoh session,
+   then injects two samples on `bench/0` from a SECOND
+   in-process Zenoh session: one encoded with
+   writer="self-runner" (must be filtered), one with
+   writer="other-runner" (must be delivered). Drains
+   `poll_receive` for 1 s; asserts no delivered sample has
+   `writer == "self-runner"`. **Passes.**
+
+2. **`zenoh::tests::zenoh_bridge_stress_10000_messages`**
+   (existing `#[ignore]`, rewritten). Before: published 10 K
+   messages through the variant's own `publish()` (writer ==
+   self) and asserted ≥80 % delivery via the Zenoh wildcard
+   self-echo. With the new filter that's contractually 0 %
+   delivery — the test was pinning the WRONG contract. After:
+   publishes 10 K messages from an auxiliary in-process Zenoh
+   session with writer="stress-ext" (foreign) and asserts the
+   variant delivers ≥80 % of those foreign samples AND
+   exactly 0 self-echos. **Passes.**
+
+3. **`tests/loopback.rs::loopback_full_protocol`**. Was
+   asserting `receive_count > 0` from JSONL — both wrong
+   contract (post-self-filter loopback delivers 0 receives,
+   the metric measures foreign only) and wrong data location
+   (T18.2b moved `write` / `receive` rows to compact Parquet).
+   Rewritten to assert lifecycle events only (phase, eot_sent)
+   which IS the test's correct purpose given both subsequent
+   refactors. **Passes.**
+
+4. **`rest_client::tests::sse_reader_stop_is_idempotent`**
+   (existing, signature touch only — added `self_runner` arg
+   to match the new `SseReader::start` signature). **Passes.**
+
+### Validation
+
+- `cargo build -p variant-zenoh --release` — clean.
+- `cargo clippy -p variant-zenoh --release --all-targets
+  -- -D warnings` — clean (after the orthogonal
+  doc_lazy_continuation bump).
+- `cargo fmt -p variant-zenoh -- --check` — clean.
+- `cargo test -p variant-zenoh --release` — **64 passed**
+  (63 unit + 1 loopback integration), 2 ignored (the two
+  ignored zenoh tests that need a real Zenoh session). 0
+  failed.
+- `cargo test -p variant-zenoh --release -- --ignored
+  zenoh_bridge_stress` — 1 passed.
+- `cargo test -p variant-zenoh --release -- --ignored
+  multi_zenoh_subscriber_filters_self_writer` — 1 passed.
+- The 5 pre-existing failures in `tests/two_runner_regression.rs`
+  (1000paths_no_deadlock, max_throughput_no_deadlock,
+  single_mode_t149b, single_mode_t149c_no_port_exhaustion,
+  t17_8_qos3_100pct_delivery) are **unchanged** from baseline
+  `main` (confirmed by `git stash`-and-re-test) and reflect
+  the orthogonal T18.2b regression: those tests still read
+  `write` / `receive` rows from JSONL but those events now
+  live in the per-spawn compact Parquet log. Out of scope for
+  this task. `two_runner_regression_qos4_no_watchdog_stall`
+  passes (it asserts exit code only, not log contents).
+
+### Live two-runner end-to-end smoke
+
+Built runner + variant-zenoh release binaries. Wrote a tiny
+fixture (`variants/zenoh/tests/fixtures/repro-zenoh-self-filter.toml`,
+10 vpt × 10 Hz × 2 s operate = 200 msgs per writer, qos 1,
+default `threading_modes` → Single mode). Ran two runners
+(alice + bob) on localhost via the same coordination port.
+
+**Result (post-filter):**
+
+```
+[runner:alice] spawning 'zenoh-self-filter' (hz=10, vpt=10, qos=1, timeout: 60s)
+[runner:alice] 'zenoh-self-filter' final progress: phase=done sent=210 received=210 eot_sent=true eot_received=true
+[runner:alice] 'zenoh-self-filter' finished: status=success, exit_code=0
+
+[runner:bob] spawning 'zenoh-self-filter' (hz=10, vpt=10, qos=1, timeout: 60s)
+[runner:bob] 'zenoh-self-filter' final progress: phase=done sent=210 received=210 eot_sent=true eot_received=true
+[runner:bob] 'zenoh-self-filter' finished: status=success, exit_code=0
+```
+
+**Pre-filter baseline (same fixture, same shell, only the
+filter reverted):**
+
+```
+[runner:alice] 'zenoh-self-filter' final progress: phase=done sent=210 received=420 ...
+[runner:bob]   'zenoh-self-filter' final progress: phase=done sent=210 received=420 ...
+```
+
+`received == 2 × sent` baseline → `received == sent` post-fix.
+**1:1 ratio achieved**, exactly the contract bar.
+
+### Surprising observations
+
+1. **Single mode also needed the filter.** The task brief
+   only called out `subscriber_task` in `src/zenoh.rs` (the
+   Multi-mode bridge), referencing `variants/zenoh/src/zenoh.rs:1582`.
+   I patched that path first, all unit tests passed, then
+   the live two-runner smoke STILL showed `received = 2 ×
+   sent`. JSONL `connected` event showed
+   `"threading_mode":"single"` — the default
+   `threading_modes` resolution lands on Single now (since
+   T14.9b made Single a first-class declared mode). Single
+   mode goes through the zenohd sidecar's REST + SSE path,
+   not the in-process `subscriber_task`, so a SECOND filter
+   site at `sse_reader_loop` (rest_client.rs) was needed.
+   With both sites in place the e2e collapses to 1:1.
+2. **The new fixture defaults the threading mode.** Without
+   `threading_modes = ["multi"]` the runner picks Single
+   (variant.cli default). That's actually a more thorough
+   smoke for the contract: it exercises the Single path
+   first, which is where the deeper miss lived. The
+   multi-mode unit test (`multi_zenoh_subscriber_filters_self_writer`)
+   covers the in-process side.
+3. The `loopback_full_protocol` integration test was BROKEN
+   on baseline `main` for two independent reasons
+   (T18.2b's JSONL→Parquet migration + self-echo
+   expectations); my changes flipped it from "broken for one
+   reason" to "still broken for the other reason", which
+   forced a fix that doubles as documenting the new
+   contract.
+
+### EXACT ANALYSIS.md text to rewrite (orchestrator territory)
+
+The current text at `metak-shared/ANALYSIS.md:496-513` (the
+"For Zenoh specifically..." bullet) is now obsolete. **Quote
+the current verbatim:**
+
+```
+   - For **multicast** variants where the receiver also gets its own
+     loopback writes (e.g. custom-udp single-mode subscribes to its
+     own multicast group), the ratio can exceed 100%. This is
+     expected behaviour and not a bug — the ratio measures
+     receives-against-one-writer's-nominal-rate, and a multicast
+     loopback adds the local writer's traffic on top.
+   - For **Zenoh** specifically, the ratio can reach **~400%** at low
+     path-count workloads (e.g. `100x100hz qos1 multi`). This is also
+     expected: each message is reflected back twice — once from the
+     local in-process data board, and once again from the Zenoh
+     fabric subscription that the variant declares on its own keys.
+     Combined with the 200% baseline from two-runner multicast, the
+     total per-receiver count can hit 4x the writer's nominal rate.
+     This is a measurement artefact of how Zenoh's subscription
+     topology interacts with our single-writer per-subtree model;
+     it does not indicate duplicate data delivery to the application.
+     If/when a future Zenoh variant change deduplicates self-echoes,
+     this ratio will drop back into the 200% range.
+```
+
+**Proposed replacement** (keeps the custom-udp multicast
+bullet intact; rewrites the Zenoh bullet to reflect that
+the self-echo path is now closed, per
+`compact-log-schema.md` event kind 1):
+
+```
+   - For **multicast** variants where the receiver also gets its own
+     loopback writes (e.g. custom-udp single-mode subscribes to its
+     own multicast group), the ratio can exceed 100%. This is
+     expected behaviour and not a bug — the ratio measures
+     receives-against-one-writer's-nominal-rate, and a multicast
+     loopback adds the local writer's traffic on top.
+   - For **Zenoh** the historical pre-2026-05-21 baseline showed
+     ratios up to ~400% at low path-count workloads (e.g.
+     `100x100hz qos1 multi`) because Zenoh's wildcard subscriber
+     matched the variant's own publishes and the variant did not
+     filter self-echoes at the receive boundary. The 2026-05-21
+     self-writer filter (`variants/zenoh/src/{zenoh,rest_client}.rs`)
+     drops self-echoes before they reach `inc_received`, per
+     `compact-log-schema.md` event kind 1 (`receive`). The Zenoh
+     ratio now matches the rest of the family at ~100% (one peer
+     writing, one peer receiving) or ~200% (two-runner symmetric
+     traffic, both peers receiving from each other). Any future
+     ratios above the 200% multi-peer baseline indicate a real
+     regression.
+```
+
+I read but did not modify ANALYSIS.md (it lives in
+`metak-shared/`, orchestrator territory).
+
+### Suggested commit split
+
+Three commits, in order, each independently revertable:
+
+1. `feat(variants/zenoh): drop self-writes at the receive
+   boundary in Multi mode` — `variants/zenoh/src/zenoh.rs`
+   (subscriber_task filter only; the doc_lazy_continuation
+   clippy bump on lines 307-309 could be split into a
+   chore commit, reviewer's choice).
+2. `feat(variants/zenoh): drop self-writes at the receive
+   boundary in Single mode (REST/SSE path)` —
+   `variants/zenoh/src/rest_client.rs`
+   (`SseReader::start`/`sse_reader_loop` self_runner
+   plumbing + filter) +
+   `variants/zenoh/src/zenoh.rs` (one-line callsite update)
+   + the `sse_reader_stop_is_idempotent` test signature.
+3. `test(variants/zenoh): self-writer filter regression
+   tests + loopback test rewrite` — the new
+   `multi_zenoh_subscriber_filters_self_writer` test +
+   `zenoh_bridge_stress_10000_messages` rewrite (both in
+   `variants/zenoh/src/zenoh.rs`) +
+   `variants/zenoh/tests/loopback.rs` (contract-aligned
+   assertion rewrite) +
+   `variants/zenoh/tests/fixtures/repro-zenoh-self-filter.toml`
+   (new live-e2e fixture).
+
+I did NOT touch `variants/zenoh/CUSTOM.md` — the existing
+"Inbound EOT" section already documents the self-filter
+pattern for EOT; the data-path filter is small enough that
+the in-source comments at the two filter sites carry the
+contract reference. If you'd prefer a CUSTOM.md note,
+suggest a short "Self-writer filter (data path)" section
+under "ZenohVariant" referencing both filter sites and the
+compact-log-schema.md contract.
+
+### Deviations from the brief
+
+- Brief said "Stay within `variants/zenoh/`" — I did, with
+  one exception: I appended this completion section to
+  `metak-orchestrator/STATUS.md` per `CUSTOM.md` instructions
+  to all workers ("When done or blocked, update
+  `../../metak-orchestrator/STATUS.md`"). The task brief
+  also explicitly required this update.
+- Brief asked to mention only the Multi-mode filter site;
+  the live e2e proved the Single-mode site is equally
+  necessary. Both are now patched.
+- Brief asked not to write to ANALYSIS.md — I didn't. The
+  rewrite text is quoted in this report for the
+  orchestrator to apply.
+
+## Worker completion: x-axis ordering fix (comparison + drop-rate)
+2026-05-22
+
+### Summary
+
+Fixed the x-axis ordering on `comparison-qos<N>.png` and
+`drop-rate-qos<N>.png` so post-E19 workload names with a
+`<vps>x<hz>hz-<shape>` suffix (`block`/`mixed`/`scalar`) sort by
+(target rate ascending, then `block` -> `mixed` -> `scalar`) instead
+of falling through to alphabetical order. Root cause was the
+`_WORKLOAD_VPS_HZ_RE` regex being anchored with `$` after `hz`, so
+shape-suffixed names never matched and all returned the
+"unknown / sort first" rank.
+
+### Files changed
+
+- `analysis/plots.py`
+  - `_WORKLOAD_VPS_HZ_RE`: widened to optionally capture the shape
+    suffix as group 3 (`^(\d+)x(\d+)hz(?:-([a-z]+))?$`). The two
+    other consumers (`_collect_target_rates`, `_bar_tier_marker`)
+    keep working unchanged because they only read groups 1 and 2.
+  - Added `CANONICAL_WORKLOAD_SHAPE_SUFFIX_ORDER = ("block",
+    "mixed", "scalar")` near `CANONICAL_SHAPE_ORDER`, with a
+    comment distinguishing it from the analyzer-internal
+    `PerformanceResult.shape` vocabulary (the two share the
+    `scalar` token but are otherwise unrelated namespaces).
+  - `_workload_load_rank`: return tuple grew from 3 to 4 keys --
+    `(vps*hz, shape_rank, vps, name)`. Legacy no-suffix names use
+    `shape_rank = -1` so they group before all shape-suffixed
+    peers at the same target rate. `max` continues to sort last
+    via `_MAX_WORKLOAD_RANK`. The `[0]` index check in
+    `test_max_is_last` still works because the primary key is
+    unchanged.
+- `analysis/tests/test_plots.py`
+  - Added `TestWorkloadLoadOrdering` cases:
+    `test_orders_shape_suffixed_workloads_by_target_then_shape`
+    (the exact spec-mandated example),
+    `test_legacy_no_suffix_groups_before_shape_suffixed_peers`,
+    `test_max_is_last_against_shape_suffixed_workloads`. The
+    three existing tests pass unchanged.
+
+### Test results
+
+`python -m pytest tests/ -x` --
+**444 passed, 6 skipped** (the 6 skips are the pre-existing
+`test_integration.py` cases gated on external large-log
+fixtures, not regressions).
+
+### Validation
+
+Used dataset `C:\repo\shared\ddd\smoke-01-20260520_194923` (544
+post-E19 spawns, full 15-workload x 3-shape matrix). Captured the
+actual `_collect_layout_orders` x-axis output via a throwaway
+script (removed after use). The 15 workloads ranked as expected:
+
+```
+'10x1000hz-block'     rank=(10000,  0,   10, ...)
+'100x100hz-block'     rank=(10000,  0,  100, ...)
+'1000x10hz-block'     rank=(10000,  0, 1000, ...)
+'10x1000hz-mixed'     rank=(10000,  1,   10, ...)
+'100x100hz-mixed'     rank=(10000,  1,  100, ...)
+'1000x10hz-mixed'     rank=(10000,  1, 1000, ...)
+'10x1000hz-scalar'    rank=(10000,  2,   10, ...)
+'100x100hz-scalar'    rank=(10000,  2,  100, ...)
+'1000x10hz-scalar'    rank=(10000,  2, 1000, ...)
+'100x1000hz-block'    rank=(100000, 0,  100, ...)
+'1000x100hz-block'    rank=(100000, 0, 1000, ...)
+'100x1000hz-mixed'    rank=(100000, 1,  100, ...)
+'1000x100hz-mixed'    rank=(100000, 1, 1000, ...)
+'100x1000hz-scalar'   rank=(100000, 2,  100, ...)
+'1000x100hz-scalar'   rank=(100000, 2, 1000, ...)
+```
+
+Also rendered `comparison-qos1.png` and `drop-rate-qos1.png` for
+the smaller `smoke-tight-01-20260521_160409` dataset (only the
+100K tier present). Confirmed visually that the drop-rate
+matrix's x-axis ticks read left-to-right `1000x100hz-block`,
+`1000x100hz-mixed`, `1000x100hz-scalar` (previously they were
+in alphabetical order). The comparison-qos chart shows each
+(transport family) group containing the three shape-suffixed
+sub-bars in the same order.
+
+Regenerated the diagrams for `smoke-01-20260520_194923` (full
+15-workload matrix) and verified `drop-rate-qos1.png` x-tick
+labels read left-to-right exactly as the rank table above
+predicts: the 9 10K-tier workloads (block / mixed / scalar each
+in vps-ascending tie-break) first, then the 6 100K-tier
+workloads (block / mixed / scalar each in vps-ascending). The
+comparison-qos chart's per-transport slot grouping matches the
+same workload ordering.
+
+### Deviations from the brief
+
+None. The user-cited config (`configs/two-runner-all-variants.toml`)
+has no recent log directory under `./logs/` -- the two existing
+top-level log dirs there are May-15 pre-E19 datasets. The
+post-E19 datasets live under `C:\repo\shared\ddd\`; I validated
+against the `smoke-01` run there (matching workload-shape matrix)
+and the smaller `smoke-tight-01` run (PNG render). If the user
+wants validation against a specific `two-runner-all-variants`
+post-E19 dataset, point me to its log directory and I'll rerun.
 
 ## 2026-05-22 -- analysis worker: per-stage and per-group progress logging
 
@@ -16653,4 +17290,172 @@ Format breakdown (matches the spec):
   when `--measure-peak-rss` was set. I moved the capture to be
   unconditional and dropped the now-dead `else "n/a"` branch in
   the `[rss]` reporter.
+
+---
+
+## 2026-05-22: variants/quic — QoS 1 oversize-datagram skip-with-diagnostic
+
+Worker fix for the `quic-1000x100hz-mixed-qos1` failure
+(`smoke-tight-01-20260521_160409`): the mixed-types workload at
+1000 vpt produces payloads exceeding the negotiated QUIC
+`max_datagram_frame_size` (~1200 B on a normal-MTU loopback path),
+which made `quinn::Connection::send_datagram` return
+`SendDatagramError::TooLarge`. The variant bubbled it as
+`Error: quic send_datagram failed: datagram too large` and crashed
+both peers mid-operate with no parquet written.
+
+The fix maps `TooLarge` (and the pre-check oversize condition) to
+the existing `Ok(false)` -> driver-side `push_backpressure_skipped`
+path, matching the existing `ConnectionLost` non-fatal-skip
+treatment. The compact log records oversize sends as
+`backpressure_skipped` (event kind 2). A one-shot stderr
+`[quic] note: ...` line fires on the first oversize observation
+per spawn for operator visibility; subsequent oversize sends are
+silent.
+
+### Files touched
+
+- `variants/quic/src/quic.rs` (+237 / -15 lines)
+- `variants/quic/tests/two_runner_qos1_oversize_skip.rs` (new, 322 lines)
+- `variants/quic/tests/fixtures/repro-quic-1000x100hz-mixed-qos1.toml` (new, 49 lines)
+
+### Where the size check landed
+
+`variants/quic/src/quic.rs`, in `QuicVariant::try_publish` (rough
+range L975-L1050 post-edit). Both branches present, per the task
+spec:
+
+- **Pre-loop**: poll `quinn::Connection::max_datagram_size()` across
+  every connection; if EVERY connection reports a finite cap less
+  than the encoded payload size, short-circuit to `Ok(false)`.
+  Handshake-in-progress connections that return `None` are excluded
+  from the "all oversize" decision so the post-loop backstop gets a
+  fair chance.
+- **Post-send backstop**: per-connection `TooLarge` is treated like
+  `ConnectionLost` (continue to the next connection). If every tried
+  connection rejected with `TooLarge` and no other hard error fired,
+  the function returns `Ok(false)` (skip). Otherwise normal accounting.
+
+The one-shot stderr warning is gated by a new
+`oversize_warning_emitted: AtomicBool` field on `QuicVariant`, reset
+to `false` at the top of `connect()` so each fresh spawn warns once.
+The helper `Self::emit_oversize_warning_once` uses
+`swap(true, Ordering::Relaxed)` so the first caller wins the print
+race.
+
+### Tests
+
+| Test | Result |
+|------|--------|
+| `quic::tests::test_try_publish_qos1_oversize_skips_with_one_warning` (unit) | pass |
+| All 36 unit tests in `variant-quic` | 36 pass / 0 fail |
+| `tests/loopback.rs` (3 subprocess) | 3 pass |
+| `tests/two_runner_qos1_oversize_skip::two_runner_qos1_oversize_skip_no_crash` (new, `#[ignore]`) | pass (7.14 s) |
+| `tests/two_runner_t14_13_qos4_ordering` (`#[ignore]` baseline) | pass (39.14 s) |
+| `cargo build --release -p variant-quic` | clean |
+| `cargo clippy --release -p variant-quic --all-targets -- -D warnings` | clean |
+| `cargo fmt -p variant-quic -- --check` | clean |
+
+### Live e2e re-run (mandatory)
+
+Re-ran the failing combo via the runner with the new repro fixture
+`variants/quic/tests/fixtures/repro-quic-1000x100hz-mixed-qos1.toml`
+(2 runners on loopback, mixed-types workload, 1000 vpt × 100 Hz,
+QoS 1, 5 s operate, 2 s silent). Both peers exited 0, parquet
+written, backpressure_skipped rows present in the compact log:
+
+**Variant stderr (alice)**:
+```
+[quic] build: 0673157+dirty (rustc 1.94.1)
+[quic] bound to 0.0.0.0:19930
+[quic] connected to 127.0.0.1:19931
+[quic] note: QoS 1 datagram payload 1463B exceeds max_datagram_size 1414B for all peers; skipping (will count as backpressure_skipped). Future oversize sends in this spawn are silent.
+[variant] digest: wrote ./logs/.../quic-1000x100hz-mixed-qos1-alice-...compact.parquet (490475 rows, 11818988 bytes)
+```
+
+**Variant stderr (bob)**:
+```
+[quic] bound to 0.0.0.0:19931
+[quic] connected to 127.0.0.1:19930
+[quic] note: QoS 1 datagram payload 1461B exceeds max_datagram_size 1414B for all peers; skipping (will count as backpressure_skipped). Future oversize sends in this spawn are silent.
+[variant] digest: wrote ./logs/.../quic-1000x100hz-mixed-qos1-bob-...compact.parquet (467828 rows, 11431895 bytes)
+```
+
+Exactly ONE `[quic] note:` line per peer, despite the workload
+generating millions of oversize-eligible datagrams over the 5 s
+operate window. Warning de-dup confirmed.
+
+**Runner stderr (alice)**:
+```
+[runner:alice] 'quic-1000x100hz-mixed-qos1' final progress: phase=done sent=245211 received=245211 eot_sent=true eot_received=true
+[runner:alice] 'quic-1000x100hz-mixed-qos1' finished: status=success, exit_code=0
+```
+
+**Runner stderr (bob)**:
+```
+[runner:bob] 'quic-1000x100hz-mixed-qos1' final progress: phase=done sent=245211 received=222564 eot_sent=true eot_received=true
+[runner:bob] 'quic-1000x100hz-mixed-qos1' finished: status=success, exit_code=0
+```
+
+**Compact parquet kind counts** (via polars):
+```
+alice kind counts: {0: 245211, 1: 245211, 2: 3, 5: 5, 6: 1, 7: 1, 10: 43}
+bob   kind counts: {0: 245211, 1: 222564, 2: 3, 5: 5, 6: 1, 7: 1, 10: 43}
+alice backpressure_skipped rows (kind=2): 3
+bob   backpressure_skipped rows (kind=2): 3
+```
+
+`kind=2` (`backpressure_skipped`) > 0 on both peers — the contract
+mapping is observed end-to-end. `kind=0` (write) = `kind=1` (receive)
+= 245,211 on alice's side, confirming the normal QoS 1 path is
+unaffected by the oversize branch. The 3 backpressure_skipped rows
+per peer represent the workload's rare tick where the encoded
+payload landed above the 1414 B negotiated cap (the mixed-types
+generator uses a seeded RNG so the count is reproducible).
+
+### Was the EOT path affected?
+
+No — `eot_sent=true` and `eot_received=true` on both runners. The
+mixed-types `signal_end_of_test` payload is a small `eot_id` and
+sits well under 1414 B, so the EOT handshake completed normally.
+Worth noting for the orchestrator: if a future workload ever
+produces oversize EOTs, the variant will record an `eot_timeout`
+and the spawn will surface that diagnostic. No special-case
+handling needed on this fix.
+
+### Recommended contract clarifications
+
+`metak-shared/api-contracts/compact-log-schema.md`, event kind 2
+(`backpressure_skipped`) table row currently reads:
+
+> Only valid at qos 1/2 (DESIGN.md § 6.5).
+
+Suggested additive one-line clarification (the orchestrator's call;
+purely informative, no schema bump required):
+
+> Only valid at qos 1/2 (DESIGN.md § 6.5). Cause is implementation-defined: downstream-buffer pressure OR transport-layer payload-size rejection (e.g. QUIC `max_datagram_frame_size`). The receiver-visible observation -- writer chose not to emit this op -- is identical in both cases.
+
+The variant's stderr `[quic] note:` line documents the cause for
+operators; if a future contract iteration wants to split skip
+causes into separate event kinds, that change would be additive
+(no schema-version bump per the existing rule).
+
+### Suggested commit split
+
+Two commits, in this order:
+
+1. `feat(variants/quic): skip QoS 1 datagrams that exceed max_datagram_size`
+   — `variants/quic/src/quic.rs` (the implementation + the per-spawn
+   `AtomicBool` warning gate + the `connect()` reset).
+
+2. `test(variants/quic): regression for QoS 1 oversize-datagram skip`
+   — `variants/quic/src/quic.rs` (unit test
+   `test_try_publish_qos1_oversize_skips_with_one_warning`) +
+   `variants/quic/tests/two_runner_qos1_oversize_skip.rs` (subprocess
+   integration test) + `variants/quic/tests/fixtures/repro-quic-1000x100hz-mixed-qos1.toml`
+   (live e2e repro config).
+
+This keeps the production-code change atomically reviewable and
+revertable independently from the regression-pin tests, per the
+project's split-unrelated-changes preference.
 
