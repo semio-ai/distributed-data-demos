@@ -1,0 +1,49 @@
+# Live e2e repro for the QoS 1 oversize-datagram bug fixed by the
+# `[quic] note: ...` skip-with-diagnostic path.
+#
+# Pre-fix: the `mixed-types` workload at 1000 vpt produces nested-dict
+# WriteOps with 200-600 array leaves per tick. Encoded payloads
+# routinely exceed QUIC's `max_datagram_frame_size` (~1200 B on a
+# normal-MTU loopback path), and `quinn::Connection::send_datagram`
+# returns `SendDatagramError::TooLarge`. The variant bubbled that as
+# `Error: quic send_datagram failed: datagram too large`, exited 1,
+# and no parquet was written.
+#
+# Post-fix: the variant detects the oversize condition (pre-loop via
+# `max_datagram_size()`, post-send backstop on `TooLarge`), returns
+# `Ok(false)` to the driver which records `backpressure_skipped`,
+# emits one `[quic] note: ...` line on stderr, and the spawn
+# completes normally.
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/quic/tests/fixtures/repro-quic-1000x100hz-mixed-qos1.toml
+#   target/release/runner --name bob   --config variants/quic/tests/fixtures/repro-quic-1000x100hz-mixed-qos1.toml
+
+run = "quic-mixed-qos1-oversize-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 120
+
+[[variant]]
+name = "quic-1000x100hz-mixed-qos1"
+binary = "target/release/variant-quic.exe"
+supported_modes = ["multi"]
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 2
+  operate_secs = 5
+  silent_secs = 2
+  workload = "mixed-types"
+  values_per_tick = 1000
+  qos = 1
+  threading_modes = ["multi"]
+  log_dir = "./logs"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+  [variant.specific]
+  base_port = 19930
