@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -368,6 +369,17 @@ pub struct QuicVariant {
     /// send_loop task. Empty (and `try_publish` falls through to
     /// `publish`) until `connect` populates it.
     connections: Vec<quinn::Connection>,
+    /// One-shot stderr warning gate for the QoS 1 / QoS 2 datagram
+    /// oversize path. The first time `try_publish` observes that the
+    /// encoded datagram exceeds every connection's
+    /// `max_datagram_size()` (or every connection rejects the send
+    /// with `SendDatagramError::TooLarge`), the variant prints one
+    /// `[quic] note: ...` line to stderr and flips this flag. Every
+    /// subsequent oversize observation in the same spawn proceeds
+    /// silently (it still flows through the `Ok(false)` ->
+    /// `backpressure_skipped` accounting path). Reset to `false` at
+    /// the start of each `connect` so a fresh spawn warns once.
+    oversize_warning_emitted: AtomicBool,
 }
 
 impl QuicVariant {
@@ -389,6 +401,44 @@ impl QuicVariant {
             pending_eots: Vec::new(),
             pending_data: std::collections::VecDeque::new(),
             connections: Vec::new(),
+            oversize_warning_emitted: AtomicBool::new(false),
+        }
+    }
+
+    /// Print the per-spawn `[quic] note:` stderr line for an oversize
+    /// QoS 1/2 datagram exactly once. Subsequent oversize sends in the
+    /// same spawn flip through this method silently so stderr is not
+    /// spammed when the workload routinely overshoots
+    /// `max_datagram_size`. Resets at the next `connect()`.
+    ///
+    /// The reported `max_datagram_size` is the smallest finite value
+    /// across all current connections (the bound that actually
+    /// rejected the send). Connections whose handshake has not
+    /// converged yet return `None` from `max_datagram_size()` and are
+    /// excluded from the minimum. If every connection returns `None`
+    /// we report `unknown`.
+    fn emit_oversize_warning_once(&self, needed: usize) {
+        if self.oversize_warning_emitted.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let min_cap = self
+            .connections
+            .iter()
+            .filter_map(|c| c.max_datagram_size())
+            .min();
+        match min_cap {
+            Some(cap) => {
+                eprintln!(
+                    "[quic] note: QoS 1 datagram payload {}B exceeds max_datagram_size {}B for all peers; skipping (will count as backpressure_skipped). Future oversize sends in this spawn are silent.",
+                    needed, cap,
+                );
+            }
+            None => {
+                eprintln!(
+                    "[quic] note: QoS 1 datagram payload {}B exceeds max_datagram_size (unknown -- no peer has a usable cap) for all peers; skipping (will count as backpressure_skipped). Future oversize sends in this spawn are silent.",
+                    needed,
+                );
+            }
         }
     }
 }
@@ -718,6 +768,12 @@ impl Variant for QuicVariant {
                  (quinn requires async); spawn with --threading-mode multi"
             );
         }
+        // Each spawn is allowed to print the oversize-datagram note
+        // exactly once. Reset the gate here so a re-used `QuicVariant`
+        // (or a hypothetical reconnect path) warns again per spawn.
+        self.oversize_warning_emitted
+            .store(false, Ordering::Relaxed);
+
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
 
         // T17.6: bounded sync→async send channel. Unbounded pre-T17.6
@@ -975,6 +1031,35 @@ impl Variant for QuicVariant {
         let data = encode_data(&self.runner, path, qos, seq, payload);
         let needed = data.len();
 
+        // Pre-loop oversize check (path-MTU rejection -- the QoS 1/2
+        // datagram path is bounded by the QUIC `max_datagram_frame_size`
+        // negotiated at handshake, typically ~1200 B on a normal-MTU
+        // path). If EVERY connection reports `max_datagram_size() <
+        // needed` we short-circuit to `Ok(false)` (i.e. tell the driver
+        // this is a `backpressure_skipped`) instead of bubbling the
+        // post-send `SendDatagramError::TooLarge` and crashing the
+        // spawn. The metric-level observation is the same as buffer
+        // pressure: "writer chose not to emit this op." See the
+        // E19/`quic-1000x100hz-mixed-qos1` failure log in
+        // `metak-orchestrator/STATUS.md` for the original repro.
+        //
+        // The check looks at every connection -- not just the first --
+        // because a peer that has not yet completed its handshake
+        // reports `max_datagram_size() == None`, which we treat as "we
+        // do not yet know the cap, defer the rejection to the
+        // post-send backstop." Skipping only when EVERY known cap is
+        // smaller than `needed` keeps that defer in place.
+        let oversize_on_all = !self.connections.is_empty()
+            && self.connections.iter().all(|conn| {
+                conn.max_datagram_size()
+                    .map(|cap| needed > cap)
+                    .unwrap_or(false)
+            });
+        if oversize_on_all {
+            self.emit_oversize_warning_once(needed);
+            return Ok(false);
+        }
+
         // Check whether at least one connection currently has room for
         // this datagram. `datagram_send_buffer_space()` returns the
         // bytes currently free in the outgoing datagram buffer; sending
@@ -995,35 +1080,68 @@ impl Variant for QuicVariant {
         // At least one connection has room. Send on every connection
         // that does; skip connections that don't (they would otherwise
         // evict their own oldest queued datagram on this send). Real
-        // errors (UnsupportedByPeer, Disabled, TooLarge, ConnectionLost)
-        // propagate as the publish-loop ignores its own send failures
-        // today; we surface the first hard error so the driver can log
-        // it consistently.
+        // errors (UnsupportedByPeer, Disabled, ConnectionLost) propagate
+        // as the publish-loop ignores its own send failures today; we
+        // surface the first hard error so the driver can log it
+        // consistently. `TooLarge` is treated as a per-connection skip
+        // (mirrors `ConnectionLost`) and -- if EVERY tried connection
+        // rejects with `TooLarge` -- the function returns `Ok(false)`
+        // so the driver records `backpressure_skipped` instead of
+        // crashing the spawn. This is the post-send backstop for cases
+        // where `max_datagram_size()` returned `None` at the pre-loop
+        // check above or the path MTU shifted mid-spawn.
         let bytes: bytes::Bytes = data.into();
         let mut send_failed: Option<quinn::SendDatagramError> = None;
+        let mut successful_sends: u32 = 0;
+        let mut oversize_rejections: u32 = 0;
+        let mut tried_sends: u32 = 0;
         for conn in &self.connections {
             if conn.datagram_send_buffer_space() < needed {
                 continue;
             }
-            if let Err(e) = conn.send_datagram(bytes.clone()) {
-                // Connection lost is non-fatal here: peers can come and
-                // go during the operate phase. Match the existing
-                // send_loop's "ignore" behaviour and let other
-                // connections still attempt the send.
-                if matches!(e, quinn::SendDatagramError::ConnectionLost(_)) {
+            tried_sends += 1;
+            match conn.send_datagram(bytes.clone()) {
+                Ok(()) => {
+                    successful_sends += 1;
+                }
+                Err(quinn::SendDatagramError::ConnectionLost(_)) => {
+                    // Connection lost is non-fatal here: peers can come
+                    // and go during the operate phase. Match the
+                    // existing send_loop's "ignore" behaviour and let
+                    // other connections still attempt the send.
                     continue;
                 }
-                // First hard error -- record but keep trying so a
-                // partial fan-out is still observed by the rest of the
-                // peers.
-                if send_failed.is_none() {
-                    send_failed = Some(e);
+                Err(quinn::SendDatagramError::TooLarge) => {
+                    // QoS 1/2 datagrams are bounded by the QUIC
+                    // `max_datagram_frame_size`. If we get here the
+                    // pre-loop check missed it (e.g. handshake not yet
+                    // finished and `max_datagram_size()` was `None`).
+                    // Treat as a per-connection skip; the aggregate
+                    // decision below converts an all-`TooLarge` outcome
+                    // into `Ok(false)`.
+                    oversize_rejections += 1;
+                    continue;
+                }
+                Err(e) => {
+                    // First hard error -- record but keep trying so a
+                    // partial fan-out is still observed by the rest of
+                    // the peers.
+                    if send_failed.is_none() {
+                        send_failed = Some(e);
+                    }
                 }
             }
         }
 
         if let Some(e) = send_failed {
             return Err(anyhow::anyhow!("quic send_datagram failed: {}", e));
+        }
+        // All tried sends rejected with `TooLarge` and no other hard
+        // error fired: treat as backpressure-skipped (same logical
+        // outcome as the pre-loop short-circuit).
+        if successful_sends == 0 && oversize_rejections > 0 && oversize_rejections == tried_sends {
+            self.emit_oversize_warning_once(needed);
+            return Ok(false);
         }
         Ok(true)
     }
@@ -1710,6 +1828,110 @@ mod tests {
         );
 
         variant_a.disconnect().expect("disconnect a");
+    }
+
+    /// Regression for `quic-1000x100hz-mixed-qos1` E19 failure:
+    /// QoS 1 datagrams whose encoded payload exceeds every connection's
+    /// `max_datagram_size()` must be SKIPPED (`Ok(false)`), not errored.
+    /// The skip is what the driver maps onto a `backpressure_skipped`
+    /// row in the compact log. The stderr `[quic] note:` line must fire
+    /// EXACTLY ONCE per spawn even when the oversize condition repeats
+    /// many times, so the operator gets one diagnostic and not a flood.
+    #[test]
+    fn test_try_publish_qos1_oversize_skips_with_one_warning() {
+        let port_a = pick_free_udp_port();
+        let port_b = pick_free_udp_port();
+        let addr_a: SocketAddr = format!("127.0.0.1:{}", port_a).parse().unwrap();
+        let addr_b: SocketAddr = format!("127.0.0.1:{}", port_b).parse().unwrap();
+
+        let mut variant_a = QuicVariant::new("a", addr_a, vec![addr_b]);
+        let mut variant_b = QuicVariant::new("b", addr_b, vec![addr_a]);
+
+        variant_b
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect b");
+        std::thread::sleep(Duration::from_millis(200));
+        variant_a
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect a");
+
+        // Wait for A's outbound connection to actually be established
+        // -- without this the burst is a no-op (no connections =>
+        // try_publish returns Ok(true) unconditionally and the
+        // oversize path is never taken).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while variant_a.connections.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !variant_a.connections.is_empty(),
+            "variant A never established an outbound connection to B"
+        );
+
+        // Wait a beat more so the handshake settles and
+        // max_datagram_size() returns a finite value (typically
+        // ~1200 B on loopback). Without this, the pre-loop check
+        // sees None and defers to the post-send backstop, which is
+        // also a valid skip path -- but the unit test wants to
+        // exercise the pre-loop short-circuit specifically.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut max_dg = None;
+        while std::time::Instant::now() < deadline {
+            max_dg = variant_a
+                .connections
+                .iter()
+                .filter_map(|c| c.max_datagram_size())
+                .min();
+            if max_dg.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            max_dg.is_some(),
+            "no connection reported a finite max_datagram_size after 5s"
+        );
+        let cap = max_dg.unwrap();
+
+        // Build a payload large enough that encode_data() produces a
+        // datagram strictly larger than `cap`. The header overhead is
+        // bounded and small (DATA_HEADER_OVERHEAD + writer + path +
+        // seq, see encode_data); a payload of 2 * cap guarantees the
+        // encoded frame exceeds cap regardless of header size.
+        let payload = vec![0xCDu8; cap.saturating_mul(2)];
+
+        // Call try_publish 10 times with the oversize payload.
+        // Every call MUST return Ok(false) (skip), no errors.
+        // The stderr warning gate must flip exactly once.
+        assert!(
+            !variant_a.oversize_warning_emitted.load(Ordering::Relaxed),
+            "oversize warning gate should start clear before any oversize call"
+        );
+        for seq in 0..10u64 {
+            let r = variant_a
+                .try_publish("/bench/0", &payload, Qos::BestEffort, seq)
+                .expect("try_publish must NOT error on oversize -- it must skip");
+            assert!(
+                !r,
+                "try_publish with oversize payload must return Ok(false) (seq={seq})",
+            );
+            assert!(
+                variant_a.oversize_warning_emitted.load(Ordering::Relaxed),
+                "warning gate must be set after the first oversize call (seq={seq})",
+            );
+        }
+
+        // Sanity check: a small payload still succeeds afterwards
+        // (the gate does not break the normal path). Pick a payload
+        // safely below `cap` minus the worst-case header overhead.
+        let small = vec![0x01u8; cap / 4];
+        let r = variant_a
+            .try_publish("/bench/0", &small, Qos::BestEffort, 100)
+            .expect("small try_publish should not error");
+        assert!(r, "small payload should send normally after oversize skip");
+
+        variant_a.disconnect().expect("disconnect a");
+        variant_b.disconnect().expect("disconnect b");
     }
 
     /// For QoS 3/4 (reliable streams) `try_publish` MUST always return
