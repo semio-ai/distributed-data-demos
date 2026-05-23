@@ -631,9 +631,45 @@ def main(argv: list[str] | None = None) -> int:
         cache_t0 = time.monotonic()
         cache_progress_count = [0]  # mutable counter for closure.
 
+        # Lazy psutil import so the RSS line still surfaces on hosts
+        # where psutil happens to be unavailable -- progress reporting
+        # gracefully falls back to "RSS=?" rather than dying.
+        try:
+            import psutil as _psutil
+
+            _orchestrator_proc = _psutil.Process()
+        except Exception:
+            _psutil = None  # type: ignore[assignment]
+            _orchestrator_proc = None  # type: ignore[assignment]
+
+        def _cache_rss_str() -> str:
+            """Report orchestrator + worker children RSS in GB.
+
+            The cache-build path spawns ``ProcessPoolExecutor`` workers;
+            the orchestrator's own RSS is tiny (just the polars
+            scheduler glue), so we sum across the process tree to give
+            the operator a meaningful figure of "RAM in flight" while
+            the cold build is running.
+            """
+            if _orchestrator_proc is None:
+                return "RSS=?"
+            try:
+                total = _orchestrator_proc.memory_info().rss
+                for c in _orchestrator_proc.children(recursive=True):
+                    try:
+                        total += c.memory_info().rss
+                    except Exception:
+                        pass
+                return f"RSS={total / (1024**3):.2f}GB"
+            except Exception:
+                return "RSS=?"
+
         def _cache_on_progress(stem: str) -> None:
             cache_progress_count[0] += 1
-            _progress(f"[cache] built shard {cache_progress_count[0]}: {stem}")
+            _progress(
+                f"[cache] built shard {cache_progress_count[0]}: {stem} "
+                f"({_cache_rss_str()})"
+            )
 
         update_cache(logs_dir, clear=args.clear, on_progress=_cache_on_progress)
 
