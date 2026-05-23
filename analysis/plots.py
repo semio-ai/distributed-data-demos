@@ -146,8 +146,12 @@ _QOS_SUFFIX_RE = re.compile(r"-qos(\d+)$")
 _THREADING_SUFFIX_RE = re.compile(r"-(single|multi)$")
 
 # Workload <vps>x<hz> matcher. The product (vps * hz) is the
-# load-intensity rank used to order workloads inside a family.
-_WORKLOAD_VPS_HZ_RE = re.compile(r"^(\d+)x(\d+)hz$")
+# load-intensity rank used to order workloads inside a family. Post-E19
+# workload names embed an optional ``-<shape>`` suffix
+# (``<vps>x<hz>hz-<shape>`` where shape is one of ``block``, ``mixed``,
+# ``scalar``) so the third capture group is optional and consumers that
+# only care about vps / hz can keep ignoring it.
+_WORKLOAD_VPS_HZ_RE = re.compile(r"^(\d+)x(\d+)hz(?:-([a-z]+))?$")
 
 # Sentinel value used to push the literal "max" workload to the end of
 # the load-intensity ranking. Larger than any plausible vps*hz product.
@@ -210,6 +214,18 @@ CANONICAL_WORKLOAD_ORDER: tuple[str, ...] = (
     "mixed-types",
     "max-throughput",
 )
+
+# User-facing x-axis sort order for the workload-shape suffix embedded in
+# post-E19 workload names (``<vps>x<hz>hz-<shape>``). The shape token here
+# is the **workload-name** suffix vocabulary (``block`` / ``mixed`` /
+# ``scalar``), distinct from the analyzer-internal ``PerformanceResult.shape``
+# value (``scalar`` / ``array`` / ``struct``) that drives the bar hatch in
+# :data:`CANONICAL_SHAPE_ORDER`. The two namespaces happen to share the
+# token ``scalar`` but are otherwise unrelated, so they need separate
+# ordering tables. Items not in the list sort after these in alphabetical
+# order; legacy (no-suffix) names sort with a dedicated sentinel via
+# :func:`_workload_load_rank`.
+CANONICAL_WORKLOAD_SHAPE_SUFFIX_ORDER: tuple[str, ...] = ("block", "mixed", "scalar")
 
 
 def canonical_shape_sort_key(shape: str) -> tuple[int, str]:
@@ -419,26 +435,55 @@ def _split_variant_name(
     return "other", base, qos, threading_mode
 
 
-def _workload_load_rank(workload: str) -> tuple[int, int, str]:
+def _workload_load_rank(workload: str) -> tuple[int, int, int, str]:
     """Return a sort key encoding the load-intensity of a workload.
 
     The primary key is the integer ``vps * hz`` load-intensity score.
-    For tied products the secondary key is ``vps`` (lower-vps-first, so
-    ``100x1000hz`` ranks before ``1000x100hz`` even though both equal
-    100k msgs/s). The tertiary key is the workload name itself for
-    stable ordering of unparseable workloads. The literal string
-    ``max`` is ranked last via ``_MAX_WORKLOAD_RANK``. Anything else
-    falls back to ``-1`` so unknown workloads sort first (then
-    alphabetically by tie-break).
+    The secondary key is the shape-suffix rank from
+    :data:`CANONICAL_WORKLOAD_SHAPE_SUFFIX_ORDER` (``block`` -> ``mixed``
+    -> ``scalar``; unknown shapes after them, legacy no-suffix names
+    sort with a ``-1`` sentinel so they group before all shape-suffixed
+    peers at the same target rate). The tertiary key is ``vps``
+    (lower-vps-first, so ``100x1000hz`` ranks before ``1000x100hz``
+    even though both equal 100k msgs/s) -- the existing tie-break that
+    pre-E19 tests rely on. The quaternary key is the workload name
+    itself for stable ordering of unparseable workloads. The literal
+    string ``max`` is ranked last via ``_MAX_WORKLOAD_RANK``. Anything
+    unparseable falls back to ``-1`` keys so unknown workloads sort
+    first (then alphabetically by tie-break).
+
+    The return-tuple length grew from 3 to 4 with the E19 / T19.6
+    shape-suffix awareness; the only consumer is ``sorted(...,
+    key=_workload_load_rank)`` plus a single ``[0]`` index check in
+    ``test_max_is_last`` (the primary load-intensity key is unchanged).
     """
     if workload == "max":
-        return _MAX_WORKLOAD_RANK, _MAX_WORKLOAD_RANK, workload
+        return (
+            _MAX_WORKLOAD_RANK,
+            _MAX_WORKLOAD_RANK,
+            _MAX_WORKLOAD_RANK,
+            workload,
+        )
     m = _WORKLOAD_VPS_HZ_RE.match(workload)
     if m is None:
-        return -1, -1, workload
+        return -1, -1, -1, workload
     vps = int(m.group(1))
     hz = int(m.group(2))
-    return vps * hz, vps, workload
+    shape_suffix = m.group(3)
+    if shape_suffix is None:
+        # Legacy / pre-E19 names without a shape suffix sort before all
+        # shape-suffixed peers at the same target rate (sentinel ``-1``
+        # is strictly less than every valid index into the canonical
+        # order, including ``0``).
+        shape_rank = -1
+    elif shape_suffix in CANONICAL_WORKLOAD_SHAPE_SUFFIX_ORDER:
+        shape_rank = CANONICAL_WORKLOAD_SHAPE_SUFFIX_ORDER.index(shape_suffix)
+    else:
+        # Unknown shape suffix: sort after every canonical shape but
+        # before ``max``; the workload-name tie-break keeps the order
+        # stable across unknown suffixes.
+        shape_rank = len(CANONICAL_WORKLOAD_SHAPE_SUFFIX_ORDER)
+    return vps * hz, shape_rank, vps, workload
 
 
 def _family_palette(

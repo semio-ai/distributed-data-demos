@@ -83,6 +83,7 @@ binary = "target/release/variant-custom-udp.exe"
   multicast_group = "239.0.0.1:19501"
   buffer_size = 65536
   tcp_base_port = 19800
+  qos = [3]
 
 # --- 1000 vpt x 100 hz ---
 [[variant]]

@@ -260,6 +260,59 @@ class TestWorkloadLoadOrdering:
 
         assert _workload_load_rank("max")[0] > _workload_load_rank("1000x1000hz")[0]
 
+    def test_orders_shape_suffixed_workloads_by_target_then_shape(self) -> None:
+        """Post-E19 workload names with ``-<shape>`` suffixes sort by
+        (vps*hz asc, then block -> mixed -> scalar).
+        """
+        from plots import _workload_load_rank
+
+        workloads = [
+            "1000x1000hz-scalar",
+            "1000x100hz-mixed",
+            "1000x100hz-block",
+            "100x100hz-scalar",
+            "1000x1000hz-block",
+            "1000x1000hz-mixed",
+        ]
+        ordered = sorted(workloads, key=_workload_load_rank)
+        assert ordered == [
+            "100x100hz-scalar",  # 10 K
+            "1000x100hz-block",  # 100 K, shape=block
+            "1000x100hz-mixed",  # 100 K, shape=mixed
+            "1000x1000hz-block",  # 1 M, shape=block
+            "1000x1000hz-mixed",  # 1 M, shape=mixed
+            "1000x1000hz-scalar",  # 1 M, shape=scalar
+        ]
+
+    def test_legacy_no_suffix_groups_before_shape_suffixed_peers(self) -> None:
+        """Pre-E19 names (no shape suffix) sort before shape-suffixed
+        peers at the same target rate, so a mixed dataset still produces
+        a readable left-to-right progression.
+        """
+        from plots import _workload_load_rank
+
+        workloads = [
+            "1000x1000hz-scalar",
+            "1000x1000hz",
+            "1000x1000hz-block",
+        ]
+        ordered = sorted(workloads, key=_workload_load_rank)
+        assert ordered == [
+            "1000x1000hz",  # no suffix (legacy) sorts first at this target rate
+            "1000x1000hz-block",
+            "1000x1000hz-scalar",
+        ]
+
+    def test_max_is_last_against_shape_suffixed_workloads(self) -> None:
+        """``max`` continues to sort last even when shape-suffixed peers
+        share its target-rate slot in the dataset.
+        """
+        from plots import _workload_load_rank
+
+        workloads = ["max", "1000x1000hz-scalar", "1000x1000hz-block"]
+        ordered = sorted(workloads, key=_workload_load_rank)
+        assert ordered[-1] == "max"
+
 
 class TestFamilyPalette:
     def test_returns_distinct_tones_per_workload(self) -> None:
