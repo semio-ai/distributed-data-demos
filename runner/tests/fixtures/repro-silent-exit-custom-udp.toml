@@ -1,0 +1,33 @@
+# Live two-runner smoke regression for the 2026-05-21 silent-exit incident.
+# Used by hand (NOT by `cargo test`) to verify the panic-hook fix produces a
+# clean two-spawn lifecycle on the multi -> single threading-mode transition
+# of one custom-udp source variant. Mirrors the failing prefix of
+# configs/two-runner-all-variants.toml.
+
+run = "repro-silent-exit-custom-udp"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+inter_qos_grace_ms = 250
+
+[[variant_template]]
+name = "custom-udp-base"
+binary = "target/release/variant-custom-udp.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 5
+  silent_secs = 3
+  workload = "scalar-flood"
+  log_dir = "./test-logs-silent-exit-custom-udp"
+  threading_modes = ["multi", "single"]
+  [variant_template.specific]
+  multicast_group = "239.0.0.1:19501"
+  buffer_size = 65536
+  tcp_base_port = 19800
+
+[[variant]]
+template = "custom-udp-base"
+name = "custom-udp-1000x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  qos = 1
