@@ -593,25 +593,8 @@ def _empty_shard_frame() -> pl.DataFrame:
     return pl.DataFrame(schema=SHARD_SCHEMA)
 
 
-def read_compact_parquet(path: Path) -> pl.DataFrame:
-    """Read a ``.compact.parquet`` file and project to ``SHARD_SCHEMA``.
-
-    Steps:
-      1. Read the Parquet KV metadata (schema version, spawn identity,
-         path/peer intern dictionaries).
-      2. Read the ``compact_events`` columnar table.
-      3. Resolve ``path_idx`` / ``peer_idx`` to the interned strings.
-      4. Dispatch by ``kind`` and project each row into the
-         ``SHARD_SCHEMA`` slot defined in the compact-log contract.
-      5. Concatenate the per-kind frames into a single output DataFrame
-         with every ``SHARD_SCHEMA`` column present.
-
-    Raises ``CompactLoadError`` if the file's KV metadata is missing
-    the spawn identity fields the analyzer needs (``variant``,
-    ``runner``, ``run``).
-    """
-    meta = read_compact_metadata(path)
-
+def _validate_meta(path: Path, meta: CompactMeta) -> None:
+    """Raise :class:`CompactLoadError` if spawn identity is incomplete."""
     if meta.variant is None or meta.runner is None or meta.run is None:
         raise CompactLoadError(
             f"{path}: compact-parquet KV metadata is missing one of "
@@ -619,22 +602,72 @@ def read_compact_parquet(path: Path) -> pl.DataFrame:
             f"runner={meta.runner!r}, run={meta.run!r})"
         )
 
-    try:
-        raw = pl.read_parquet(str(path))
-    except Exception as exc:  # noqa: BLE001 -- surface as CompactLoadError
-        raise CompactLoadError(
-            f"failed to read parquet rows from {path}: {exc}"
-        ) from exc
 
-    if raw.is_empty():
-        return _empty_shard_frame()
+def _intern_lookup_df(
+    idx_col: str,
+    str_col: str,
+    values: list[str],
+    *,
+    idx_dtype: pl.DataType = pl.Int32,
+) -> pl.DataFrame:
+    """Build a small in-memory intern-lookup DataFrame.
+
+    ``values`` is the intern dictionary (a Python list of distinct
+    strings); the returned frame has two columns -- the index and the
+    interned string -- so the per-row resolution can be expressed as
+    a left-join on the index.
+    """
+    return pl.DataFrame(
+        {idx_col: list(range(len(values))), str_col: values},
+        schema={idx_col: idx_dtype, str_col: pl.Utf8},
+    )
+
+
+def _build_projection_lazyframe(
+    source: pl.LazyFrame,
+    *,
+    meta: CompactMeta,
+) -> pl.LazyFrame:
+    """Project a compact-events LazyFrame into ``SHARD_SCHEMA`` shape.
+
+    Single-pass lazy projection: every ``SHARD_SCHEMA`` column is
+    expressed as one ``when/then`` chain over the compact ``kind``
+    column. This avoids materialising 12 separate per-kind DataFrames
+    (the legacy implementation) plus the ``how="diagonal"`` concat,
+    so peak memory is bounded by the streaming engine's row-group
+    buffer rather than by ``2x`` the input file size.
+
+    Caller is responsible for kicking off execution -- either by
+    ``collect()`` (legacy ``read_compact_parquet`` path) or
+    ``sink_parquet()`` (new streaming cache build path).
+    """
+    variant = meta.variant
+    runner = meta.runner
+    run = meta.run
+    # Spawn identity is validated by the caller. Mypy needs the
+    # narrowing -- the assertions are cheap and document the contract.
+    assert variant is not None and runner is not None and run is not None
+
+    # Resolve intern indices via small in-memory lookups joined lazily.
+    # The dictionaries are tiny (under ~200 entries on any realistic
+    # workload), so building them eagerly and turning them into lazy
+    # frames keeps the join cheap.
+    paths_lf = _intern_lookup_df(
+        "path_idx", "path_str", meta.paths, idx_dtype=pl.Int32
+    ).lazy()
+    peers_lf = _intern_lookup_df(
+        "peer_idx", "peer_str", meta.peers, idx_dtype=pl.Int32
+    ).lazy()
+    shapes_lf = _intern_lookup_df(
+        "shape_idx", "shape_str", meta.shapes, idx_dtype=pl.UInt32
+    ).lazy()
 
     # The variant's Parquet writer encodes physical types: ts_ns:i64,
     # kind/path_idx/peer_idx/qos/bytes:i32, seq:i64,
     # extra_f32/extra_f32_b:f32, extra_i64:i64, extra_utf8:utf8.
     # Cast to canonical Python-side dtypes so downstream filters /
     # arithmetic don't see Int32-vs-Int64 surprises.
-    frame = raw.with_columns(
+    base = source.with_columns(
         pl.col("ts_ns").cast(pl.Int64),
         pl.col("kind").cast(pl.Int32),
         pl.col("seq").cast(pl.Int64),
@@ -643,110 +676,416 @@ def read_compact_parquet(path: Path) -> pl.DataFrame:
         pl.col("qos").cast(pl.Int32),
     )
 
-    # Resolve intern indices to strings via in-memory lookups. Polars
-    # has no native gather-by-index over a Python list, so we build a
-    # small DataFrame for each dictionary and ``join`` on the index.
-    if meta.paths:
-        paths_df = pl.DataFrame(
-            {
-                "path_idx": list(range(len(meta.paths))),
-                "path_str": meta.paths,
-            },
-            schema={"path_idx": pl.Int32, "path_str": pl.Utf8},
-        )
-        frame = frame.join(paths_df, on="path_idx", how="left")
-    else:
-        frame = frame.with_columns(pl.lit(None, dtype=pl.Utf8).alias("path_str"))
+    # The compact format may or may not carry every optional column,
+    # depending on the writer version. Polars ``scan_parquet`` exposes
+    # the schema lazily via ``collect_schema``; we synthesize any
+    # missing column as a null literal so the downstream projection
+    # can reference them unconditionally.
+    base_schema = base.collect_schema()
+    base_columns = set(base_schema.names())
+    fillers: list[pl.Expr] = []
+    if "bytes" not in base_columns:
+        fillers.append(pl.lit(None, dtype=pl.Int64).alias("bytes"))
+    if "leaf_count" not in base_columns:
+        fillers.append(pl.lit(None, dtype=pl.UInt32).alias("leaf_count"))
+    if "shape_idx" not in base_columns:
+        fillers.append(pl.lit(None, dtype=pl.UInt32).alias("shape_idx"))
+    if "extra_f32" not in base_columns:
+        fillers.append(pl.lit(None, dtype=pl.Float32).alias("extra_f32"))
+    if "extra_f32_b" not in base_columns:
+        fillers.append(pl.lit(None, dtype=pl.Float32).alias("extra_f32_b"))
+    if "extra_i64" not in base_columns:
+        fillers.append(pl.lit(None, dtype=pl.Int64).alias("extra_i64"))
+    if "extra_utf8" not in base_columns:
+        fillers.append(pl.lit(None, dtype=pl.Utf8).alias("extra_utf8"))
+    if fillers:
+        base = base.with_columns(fillers)
 
-    if meta.peers:
-        peers_df = pl.DataFrame(
-            {
-                "peer_idx": list(range(len(meta.peers))),
-                "peer_str": meta.peers,
-            },
-            schema={"peer_idx": pl.Int32, "peer_str": pl.Utf8},
-        )
-        frame = frame.join(peers_df, on="peer_idx", how="left")
-    else:
-        frame = frame.with_columns(pl.lit(None, dtype=pl.Utf8).alias("peer_str"))
+    # Now coerce existing physical types where present.
+    coercions: list[pl.Expr] = []
+    if "bytes" in base_columns:
+        coercions.append(pl.col("bytes").cast(pl.Int64, strict=False))
+    if "leaf_count" in base_columns:
+        coercions.append(pl.col("leaf_count").cast(pl.UInt32, strict=False))
+    if "shape_idx" in base_columns:
+        coercions.append(pl.col("shape_idx").cast(pl.UInt32, strict=False))
+    if coercions:
+        base = base.with_columns(coercions)
 
-    # E19: resolve ``shape_idx`` -> interned shape string via the
-    # ``shape_intern`` dictionary from KV metadata. When the source file
-    # predates E19 the ``shape_idx`` column is absent (older compact
-    # writers never emit it); we synthesize a null column so the
-    # downstream ``shape_str`` lookup still has something to read from.
-    # The ``meta.shapes`` list defaults to ``["scalar"]`` when the KV
-    # metadata key is missing -- see ``read_compact_metadata`` -- so the
-    # join below resolves any present index-0 row to ``"scalar"`` in
-    # the legacy case too.
-    if "shape_idx" not in frame.columns:
-        frame = frame.with_columns(pl.lit(None, dtype=pl.UInt32).alias("shape_idx"))
-    else:
-        frame = frame.with_columns(pl.col("shape_idx").cast(pl.UInt32, strict=False))
-    shapes_df = pl.DataFrame(
-        {
-            "shape_idx": list(range(len(meta.shapes))),
-            "shape_str": meta.shapes,
-        },
-        schema={"shape_idx": pl.UInt32, "shape_str": pl.Utf8},
+    # Resolve intern indices to strings via left joins. ``shape_intern``
+    # always has at least ``["scalar"]`` (see ``read_compact_metadata``)
+    # so the shape join always resolves index 0 -> "scalar".
+    enriched = (
+        base.join(paths_lf, on="path_idx", how="left")
+        .join(peers_lf, on="peer_idx", how="left")
+        .join(shapes_lf, on="shape_idx", how="left")
     )
-    frame = frame.join(shapes_df, on="shape_idx", how="left")
 
-    variant = meta.variant
-    runner = meta.runner
-    run = meta.run
+    # ---- Per-kind conditional projection of every SHARD_SCHEMA column. ----
+    #
+    # Each ``event`` value is determined by the ``kind`` integer per
+    # the contract. Each *output* column is one ``when/then/.../otherwise``
+    # chain; columns not populated for a given kind default to null.
+    # This is the single-pass equivalent of the legacy 12-way concat.
+    #
+    # ``threading_mode`` is sourced from the per-row ``extra_utf8`` on
+    # ``connected`` rows, with the spawn-level metadata as a fallback;
+    # ``recv_buffer_kb`` is purely metadata-stamped (the contract puts
+    # it on the file rather than the row).
+    threading_mode_meta = meta.threading_mode
+    recv_buffer_kb_meta = meta.recv_buffer_kb
 
-    per_kind: list[pl.DataFrame] = [
-        _project_write(frame, variant=variant, runner=runner, run=run),
-        _project_receive(frame, variant=variant, runner=runner, run=run),
-        _project_backpressure_skipped(frame, variant=variant, runner=runner, run=run),
-        _project_gap_detected(frame, variant=variant, runner=runner, run=run),
-        _project_gap_filled(frame, variant=variant, runner=runner, run=run),
-        _project_phase(frame, variant=variant, runner=runner, run=run),
-        _project_connected(
-            frame,
-            variant=variant,
-            runner=runner,
-            run=run,
-            threading_mode_meta=meta.threading_mode,
-            recv_buffer_kb_meta=meta.recv_buffer_kb,
-        ),
-        _project_eot_sent(frame, variant=variant, runner=runner, run=run),
-        _project_eot_received(frame, variant=variant, runner=runner, run=run),
-        _project_eot_timeout(frame, variant=variant, runner=runner, run=run),
-        _project_resource(frame, variant=variant, runner=runner, run=run),
-        _project_clock_sync(frame, variant=variant, runner=runner, run=run),
-    ]
+    # Convenience: which kinds produce a value for each column?
+    kw, kr, kbp, kgd, kgf = (
+        KIND_WRITE,
+        KIND_RECEIVE,
+        KIND_BACKPRESSURE_SKIPPED,
+        KIND_GAP_DETECTED,
+        KIND_GAP_FILLED,
+    )
+    kph, kc, kes, ker, ket, kres, kcs = (
+        KIND_PHASE,
+        KIND_CONNECTED,
+        KIND_EOT_SENT,
+        KIND_EOT_RECEIVED,
+        KIND_EOT_TIMEOUT,
+        KIND_RESOURCE,
+        KIND_CLOCK_SYNC,
+    )
 
-    # Stack the per-kind frames. ``how="diagonal"`` fills missing columns
-    # with nulls -- exactly what we want, since each kind only populates
-    # a subset of ``SHARD_SCHEMA``. Re-order columns to match the
-    # canonical schema and re-cast to keep dtypes deterministic.
-    non_empty = [df for df in per_kind if df.height > 0]
-    if not non_empty:
-        return _empty_shard_frame()
-    combined = pl.concat(non_empty, how="diagonal")
+    kind = pl.col("kind")
+    null_utf8: pl.Expr = pl.lit(None, dtype=pl.Utf8)
 
-    # Add any SHARD_SCHEMA columns the per-kind branches didn't touch
-    # (e.g. ``peer`` only appears on clock_sync; if no clock_sync rows
-    # exist the column won't be in ``combined``). Then select in
-    # canonical order with the canonical dtype.
-    add_missing = [
-        pl.lit(None, dtype=dtype).alias(name)
-        for name, dtype in SHARD_SCHEMA.items()
-        if name not in combined.columns
-    ]
-    if add_missing:
-        combined = combined.with_columns(add_missing)
-    combined = combined.select(
+    # ``event`` -- mapping from kind int to legacy event string.
+    event_expr = (
+        pl.when(kind == kw)
+        .then(pl.lit("write"))
+        .when(kind == kr)
+        .then(pl.lit("receive"))
+        .when(kind == kbp)
+        .then(pl.lit("backpressure_skipped"))
+        .when(kind == kgd)
+        .then(pl.lit("gap_detected"))
+        .when(kind == kgf)
+        .then(pl.lit("gap_filled"))
+        .when(kind == kph)
+        .then(pl.lit("phase"))
+        .when(kind == kc)
+        .then(pl.lit("connected"))
+        .when(kind == kes)
+        .then(pl.lit("eot_sent"))
+        .when(kind == ker)
+        .then(pl.lit("eot_received"))
+        .when(kind == ket)
+        .then(pl.lit("eot_timeout"))
+        .when(kind == kres)
+        .then(pl.lit("resource"))
+        .when(kind == kcs)
+        .then(pl.lit("clock_sync"))
+        .otherwise(null_utf8)
+        .alias("event")
+    )
+
+    # ``seq`` populated on write/receive.
+    seq_expr = (
+        pl.when(kind.is_in([kw, kr]))
+        .then(pl.col("seq"))
+        .otherwise(pl.lit(None, dtype=pl.Int64))
+        .alias("seq")
+    )
+
+    # ``path`` populated on write/receive/backpressure_skipped.
+    path_expr = (
+        pl.when(kind.is_in([kw, kr, kbp]))
+        .then(pl.col("path_str"))
+        .otherwise(null_utf8)
+        .alias("path")
+    )
+
+    # ``writer`` populated on receive/gap_detected/gap_filled/eot_received.
+    writer_expr = (
+        pl.when(kind.is_in([kr, kgd, kgf, ker]))
+        .then(pl.col("peer_str"))
+        .otherwise(null_utf8)
+        .alias("writer")
+    )
+
+    # ``qos`` populated on write/receive/backpressure_skipped.
+    qos_expr = (
+        pl.when(kind.is_in([kw, kr, kbp]))
+        .then(pl.col("qos").cast(pl.Int8, strict=False))
+        .otherwise(pl.lit(None, dtype=pl.Int8))
+        .alias("qos")
+    )
+
+    # ``elapsed_ms`` populated on connected (extra_f32).
+    elapsed_ms_expr = (
+        pl.when(kind == kc)
+        .then(pl.col("extra_f32").cast(pl.Float64))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+        .alias("elapsed_ms")
+    )
+
+    # ``phase`` populated on phase (extra_utf8).
+    phase_expr = (
+        pl.when(kind == kph)
+        .then(pl.col("extra_utf8"))
+        .otherwise(null_utf8)
+        .alias("phase")
+    )
+
+    # ``missing_seq`` on gap_detected (extra_i64); ``recovered_seq`` on
+    # gap_filled (extra_i64).
+    missing_seq_expr = (
+        pl.when(kind == kgd)
+        .then(pl.col("extra_i64"))
+        .otherwise(pl.lit(None, dtype=pl.Int64))
+        .alias("missing_seq")
+    )
+    recovered_seq_expr = (
+        pl.when(kind == kgf)
+        .then(pl.col("extra_i64"))
+        .otherwise(pl.lit(None, dtype=pl.Int64))
+        .alias("recovered_seq")
+    )
+
+    # ``cpu_percent`` / ``memory_mb`` on resource (extra_f32, extra_f32_b).
+    cpu_percent_expr = (
+        pl.when(kind == kres)
+        .then(pl.col("extra_f32").cast(pl.Float32))
+        .otherwise(pl.lit(None, dtype=pl.Float32))
+        .alias("cpu_percent")
+    )
+    memory_mb_expr = (
+        pl.when(kind == kres)
+        .then(pl.col("extra_f32_b").cast(pl.Float32))
+        .otherwise(pl.lit(None, dtype=pl.Float32))
+        .alias("memory_mb")
+    )
+
+    # ``peer`` -- connected (null when peer_idx == PEER_SELF) and
+    # clock_sync (always populated).
+    peer_expr = (
+        pl.when(kind == kc)
+        .then(
+            pl.when(pl.col("peer_idx") == PEER_SELF)
+            .then(null_utf8)
+            .otherwise(pl.col("peer_str"))
+        )
+        .when(kind == kcs)
+        .then(pl.col("peer_str"))
+        .otherwise(null_utf8)
+        .alias("peer")
+    )
+
+    # ``offset_ms`` on clock_sync (extra_i64 holds offset_ns -> /1e6).
+    offset_ms_expr = (
+        pl.when(kind == kcs)
+        .then(pl.col("extra_i64").cast(pl.Float64) / 1_000_000.0)
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+        .alias("offset_ms")
+    )
+
+    # ``rtt_ms`` on clock_sync (extra_f32).
+    rtt_ms_expr = (
+        pl.when(kind == kcs)
+        .then(pl.col("extra_f32").cast(pl.Float64))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+        .alias("rtt_ms")
+    )
+
+    # ``eot_id`` on eot_sent/eot_received (extra_i64 cast to UInt64).
+    eot_id_expr = (
+        pl.when(kind.is_in([kes, ker]))
+        .then(pl.col("extra_i64").cast(pl.UInt64, strict=False))
+        .otherwise(pl.lit(None, dtype=pl.UInt64))
+        .alias("eot_id")
+    )
+
+    # ``eot_missing`` on eot_timeout (extra_utf8).
+    eot_missing_expr = (
+        pl.when(kind == ket)
+        .then(pl.col("extra_utf8"))
+        .otherwise(null_utf8)
+        .alias("eot_missing")
+    )
+
+    # ``wait_ms`` on eot_timeout (extra_i64 -> UInt64).
+    wait_ms_expr = (
+        pl.when(kind == ket)
+        .then(pl.col("extra_i64").cast(pl.UInt64, strict=False))
+        .otherwise(pl.lit(None, dtype=pl.UInt64))
+        .alias("wait_ms")
+    )
+
+    # ``threading_mode`` on connected: per-row extra_utf8 with metadata
+    # fallback.
+    if threading_mode_meta is not None:
+        tm_inner = pl.col("extra_utf8").fill_null(pl.lit(threading_mode_meta))
+    else:
+        tm_inner = pl.col("extra_utf8")
+    threading_mode_expr = (
+        pl.when(kind == kc).then(tm_inner).otherwise(null_utf8).alias("threading_mode")
+    )
+
+    # ``recv_buffer_kb`` -- spawn-level metadata stamped onto connected rows.
+    recv_buf_expr = (
+        pl.when(kind == kc)
+        .then(pl.lit(recv_buffer_kb_meta, dtype=pl.UInt32))
+        .otherwise(pl.lit(None, dtype=pl.UInt32))
+        .alias("recv_buffer_kb")
+    )
+
+    # ``leaf_count`` / ``shape`` populated on write only. ``leaf_count``
+    # defaults to 1 and ``shape`` to ``"scalar"`` when null (legacy
+    # / pre-E19 rows).
+    leaf_count_expr = (
+        pl.when(kind == kw)
+        .then(pl.col("leaf_count").cast(pl.UInt32, strict=False).fill_null(1))
+        .otherwise(pl.lit(None, dtype=pl.UInt32))
+        .alias("leaf_count")
+    )
+    shape_expr = (
+        pl.when(kind == kw)
+        .then(pl.col("shape_str").fill_null(pl.lit("scalar")))
+        .otherwise(null_utf8)
+        .alias("shape")
+    )
+
+    # ``bytes`` populated on write / receive.
+    bytes_expr = (
+        pl.when(kind.is_in([kw, kr]))
+        .then(pl.col("bytes").cast(pl.Int64, strict=False))
+        .otherwise(pl.lit(None, dtype=pl.Int64))
+        .alias("bytes")
+    )
+
+    # Build the final projection in SHARD_SCHEMA column order. ``ts`` /
+    # ``variant`` / ``runner`` / ``run`` are stamped per row using
+    # ``pl.lit``; the remaining columns come from the per-kind
+    # conditional chains above.
+    projected = enriched.select(
+        pl.col("ts_ns").cast(pl.Datetime("ns", "UTC")).alias("ts"),
+        pl.lit(variant, dtype=pl.Categorical).alias("variant"),
+        pl.lit(runner, dtype=pl.Categorical).alias("runner"),
+        pl.lit(run, dtype=pl.Categorical).alias("run"),
+        event_expr.cast(pl.Categorical),
+        seq_expr,
+        path_expr,
+        writer_expr,
+        qos_expr,
+        elapsed_ms_expr,
+        phase_expr,
+        missing_seq_expr,
+        recovered_seq_expr,
+        cpu_percent_expr,
+        memory_mb_expr,
+        peer_expr,
+        offset_ms_expr,
+        rtt_ms_expr,
+        eot_id_expr,
+        eot_missing_expr,
+        wait_ms_expr,
+        threading_mode_expr,
+        recv_buf_expr,
+        leaf_count_expr,
+        shape_expr,
+        bytes_expr,
+    )
+
+    # Match the canonical schema dtypes (especially Categorical/Utf8
+    # for ``event``) and sort by wall-clock ts -- the JSONL parser also
+    # produces ts-sorted output because the variant writes lines in
+    # wall-clock order.
+    projected = projected.select(
         [pl.col(name).cast(dtype) for name, dtype in SHARD_SCHEMA.items()]
     )
+    return projected.sort("ts")
 
-    # Stable order matches the row order of the source compact file
-    # (which is the same insertion order the variant pushed events in)
-    # after the per-kind concat. Sort by ``ts`` to put the rows in
-    # wall-clock order, which is also what the JSONL parser produces
-    # because the variant writes lines in wall-clock order.
-    combined = combined.sort("ts")
 
-    return combined
+def _scan_compact_source(path: Path) -> pl.LazyFrame:
+    """Open a compact-Parquet file as a polars ``LazyFrame``.
+
+    Wraps :func:`pl.scan_parquet` in the same ``CompactLoadError``
+    surface as :func:`read_compact_parquet` so callers see one error
+    type regardless of the read path.
+    """
+    try:
+        return pl.scan_parquet(str(path))
+    except Exception as exc:  # noqa: BLE001 -- surface as CompactLoadError
+        raise CompactLoadError(
+            f"failed to scan parquet rows from {path}: {exc}"
+        ) from exc
+
+
+def stream_compact_to_parquet(
+    src: Path,
+    dst: Path,
+    *,
+    compression: str = "snappy",
+    row_group_size: int | None = None,
+) -> None:
+    """Stream-project a compact-Parquet source into a SHARD_SCHEMA shard.
+
+    Memory-bounded counterpart to :func:`read_compact_parquet`:
+    instead of materialising the full source frame plus 12 per-kind
+    sub-frames (which scaled with file size and was the root cause of
+    the multi-GB worker OOM observed on 270 MB compact files), this
+    function opens the source lazily via :func:`pl.scan_parquet`,
+    projects every ``SHARD_SCHEMA`` column with one ``when/then`` chain
+    per column, and writes the result via :meth:`pl.LazyFrame.sink_parquet`
+    so the streaming engine processes the rows in bounded-memory
+    batches.
+
+    The KV metadata is loaded eagerly (it is small -- just the spawn
+    identity plus the intern dictionaries) so the lazy projection can
+    reference it via ``pl.lit`` and small join tables.
+
+    ``compression`` and ``row_group_size`` are passed through to
+    ``sink_parquet``. The default compression matches the legacy cache
+    writer (``snappy``).
+
+    Raises :class:`CompactLoadError` if the source's KV metadata is
+    missing the spawn identity fields (``variant``/``runner``/``run``).
+    """
+    meta = read_compact_metadata(src)
+    _validate_meta(src, meta)
+
+    source = _scan_compact_source(src)
+    projected = _build_projection_lazyframe(source, meta=meta)
+    try:
+        projected.sink_parquet(
+            str(dst),
+            compression=compression,
+            row_group_size=row_group_size,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise CompactLoadError(
+            f"failed to sink-write compact projection for {src} -> {dst}: {exc}"
+        ) from exc
+
+
+def read_compact_parquet(path: Path) -> pl.DataFrame:
+    """Read a ``.compact.parquet`` file and project to ``SHARD_SCHEMA``.
+
+    Returns the projected DataFrame in memory. Prefer
+    :func:`stream_compact_to_parquet` for the cache-build path so peak
+    memory stays bounded by the streaming engine rather than by the
+    source file size; this function is retained for unit-test callers
+    that need a materialised frame.
+
+    Raises ``CompactLoadError`` if the file's KV metadata is missing
+    the spawn identity fields the analyzer needs (``variant``,
+    ``runner``, ``run``).
+    """
+    meta = read_compact_metadata(path)
+    _validate_meta(path, meta)
+
+    source = _scan_compact_source(path)
+    projected = _build_projection_lazyframe(source, meta=meta)
+    try:
+        return projected.collect()
+    except Exception as exc:  # noqa: BLE001
+        raise CompactLoadError(
+            f"failed to project compact-parquet rows from {path}: {exc}"
+        ) from exc
