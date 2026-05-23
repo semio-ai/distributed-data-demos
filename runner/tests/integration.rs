@@ -2961,3 +2961,116 @@ fn t19_4_block_flood_runs_to_completion_with_variant_dummy() {
 
     let _ = std::fs::remove_dir_all(&log_dir);
 }
+
+// ---------------------------------------------------------------------------
+// Silent-exit hardening (2026-05-21 incident).
+//
+// Background: an operator on configs/two-runner-all-variants.toml observed
+// that two runners (alice + bob) on the same machine exited silently between
+// the `spawning '...'` and `final progress:` lines for the SECOND spawn of
+// the matrix. No panic message, no FATAL line, no anyhow Error: output.
+// The runner now installs a process-wide panic hook (runner/src/panic_hook.rs)
+// that converts any thread panic into a `[runner:<name>] PANIC ...` stderr
+// line followed by `process::abort()`. These tests pin that contract
+// end-to-end against a dedicated helper binary that calls the SAME
+// install_panic_hook function via #[path = ...] include.
+// ---------------------------------------------------------------------------
+
+/// Path to the panic-helper test binary.
+fn panic_helper_binary() -> String {
+    let path = env!("CARGO_BIN_EXE_panic-helper");
+    assert!(
+        Path::new(path).exists(),
+        "panic-helper binary not found at {path}"
+    );
+    path.to_string()
+}
+
+/// Main-thread panic: the hook must print the labelled PANIC line, the
+/// `panic location:` line, and the process must exit with a non-zero,
+/// non-EX_TEMPFAIL code. The exact exit code from `process::abort()`
+/// differs by platform (3 on Windows; SIGABRT on Unix), so we assert
+/// "non-zero AND not 75" rather than a specific value.
+#[test]
+fn panic_hook_main_thread_emits_labeled_stderr_and_aborts() {
+    let output = Command::new(panic_helper_binary())
+        .arg("main")
+        .env("PANIC_HELPER_RUNNER_NAME", "alice")
+        .output()
+        .expect("failed to run panic-helper");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- panic-helper stderr ---\n{stderr}");
+
+    assert!(
+        !output.status.success(),
+        "panic-helper should exit non-zero on main-thread panic, got success status"
+    );
+    let code = output.status.code();
+    assert!(
+        code != Some(75),
+        "panic abort must NOT collide with EX_TEMPFAIL=75 \
+         (wrappers would incorrectly retry --resume); got {code:?}"
+    );
+    assert!(
+        stderr.contains("[runner:alice] PANIC in thread "),
+        "stderr should contain labelled PANIC line; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("intentional main-thread panic"),
+        "stderr should contain the panic payload; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[runner:alice] panic location: "),
+        "stderr should contain panic location line; got:\n{stderr}"
+    );
+}
+
+/// Background-thread panic: the worker thread panics, the hook fires
+/// from that thread, and `process::abort()` MUST kill the whole process
+/// — not just the worker. The helper's main thread sleeps for 5s after
+/// spawning the worker; if the process reached the sleep's end we would
+/// see exit code 99 (and the "process did not abort" stderr line). The
+/// assertion locks in the load-bearing requirement: a background-thread
+/// panic must NOT leave the main thread alive.
+#[test]
+fn panic_hook_background_thread_aborts_whole_process() {
+    let output = Command::new(panic_helper_binary())
+        .arg("thread")
+        .env("PANIC_HELPER_RUNNER_NAME", "bob")
+        .output()
+        .expect("failed to run panic-helper");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- panic-helper stderr ---\n{stderr}");
+
+    assert!(
+        !output.status.success(),
+        "panic-helper should exit non-zero on worker-thread panic, got success status"
+    );
+    let code = output.status.code();
+    assert!(
+        code != Some(99),
+        "worker-thread panic must abort the WHOLE process, but exit code 99 \
+         means the helper's main thread reached the sleep's end -- the panic \
+         hook failed to abort. stderr:\n{stderr}"
+    );
+    assert!(
+        code != Some(75),
+        "worker abort must NOT collide with EX_TEMPFAIL=75; got {code:?}"
+    );
+    assert!(
+        stderr.contains("[runner:bob] PANIC in thread 'worker': "),
+        "stderr should attribute the panic to the named worker thread; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("intentional worker-thread panic"),
+        "stderr should contain the worker's panic payload; got:\n{stderr}"
+    );
+    // The "process did not abort" sentinel from main must NOT appear:
+    // if it did, the hook's abort never fired.
+    assert!(
+        !stderr.contains("process did not abort"),
+        "the hook's abort path must fire before the helper's fallback exit; got:\n{stderr}"
+    );
+}
