@@ -529,11 +529,15 @@ def _remove_orphan_shards(logs_dir: Path, valid_stems: set[str]) -> None:
 
 
 # Empirical: a worker rebuilding the heaviest compact-Parquet shards
-# (270 MB source -> ~5 GB peak resident set during the streamed
-# projection) needs a ballpark of 6 GB free RAM to land safely. Used as
+# (~280 MB source -> ~5 GB peak resident set during the streamed
+# projection -- the polars join + when/then chain still materialise
+# the join output in memory even with the streaming sink) needs a
+# ballpark of 8 GB free RAM to land safely with some headroom. Used as
 # the per-worker budget for the adaptive cap below; tweak via the
-# ``DDD_ANALYSIS_WORKER_RAM_GB`` env var when the workload changes.
-_WORKER_RAM_BUDGET_GB: float = 6.0
+# ``DDD_ANALYSIS_WORKER_RAM_GB`` env var when the workload changes
+# (e.g. lower it on hosts where the dataset's largest compact files
+# are smaller, or raise it before the cache hits multi-GB sources).
+_WORKER_RAM_BUDGET_GB: float = 8.0
 
 
 def _default_workers() -> int:
