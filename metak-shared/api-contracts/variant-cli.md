@@ -167,7 +167,7 @@ Field semantics:
 | `ts` | RFC 3339 with nanoseconds | Wall-clock timestamp at which the line was emitted (UTC). |
 | `phase` | string | One of `"connect"`, `"stabilize"`, `"operate"`, `"eot"`, `"silent"`, `"done"`. Reflects the variant-side protocol driver phase at emission time; `"done"` is the terminal label the variant uses after the driver has torn the transport down and the binary is about to exit. |
 | `sent` | u64 | Monotonic per-spawn aggregate count of successful `try_publish` outcomes (`Ok(true)`). Aggregated across all peers; per-peer breakdown remains in the JSONL `write` events. |
-| `received` | u64 | Monotonic per-spawn aggregate count of `receive` events observed via the driver's `poll_receive` drain loops. Aggregated across all peers; per-peer breakdown remains in the JSONL `receive` events. |
+| `received` | u64 | Monotonic per-spawn aggregate count of `receive` events observed via the driver's `poll_receive` drain loops. Aggregated across all peers; per-peer breakdown remains in the compact-log `receive` rows. **Excludes self-echoes**: per `compact-log-schema.md` event kind 1, variants MUST drop self-written payloads at the receive boundary before they reach `inc_received`, so this counter measures foreign-delivered payloads only. `received > sent` therefore reflects multi-peer delivery (e.g. 2 peers each writing N → each peer receives 2N) rather than loopback inflation. |
 | `eot_sent` | bool | Sticky: flips to `true` after the variant emits its `eot_sent` JSONL event. |
 | `eot_received` | bool | Sticky: flips to `true` once every expected peer EOT has been observed (or immediately, if the expected-peer set is empty -- e.g. single-runner self-loopback). |
 

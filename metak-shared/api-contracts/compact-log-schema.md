@@ -78,7 +78,7 @@ Columnar schema, one row per logical event:
 | `kind` (int) | Symbolic | Required columns | Notes |
 |---|---|---|---|
 | 0 | `write` | `ts`, `seq`, `path_idx`, `qos`, `bytes` | One row per published value. |
-| 1 | `receive` | `ts`, `seq`, `path_idx`, `peer_idx`, `qos`, `bytes` | `peer_idx` = writer. |
+| 1 | `receive` | `ts`, `seq`, `path_idx`, `peer_idx`, `qos`, `bytes` | `peer_idx` = writer. **MUST NOT** include self-echoes: a payload whose writer equals `metainfo.runner` (the runner that produced this digest) is a self-echo and MUST be discarded by the variant at the receive boundary BEFORE the row is emitted. The metric the project measures is foreign-delivered payloads only (peer A → peer B), so loopback / fabric self-reflections that some transports deliver back to the sender are noise to be filtered at the variant, not "received" data. The filter SHOULD be applied as early as possible (e.g. in a reader thread, before any channel enqueue) so the variant does not pay parse + queue cost for traffic it will drop. |
 | 2 | `backpressure_skipped` | `ts`, `path_idx`, `qos` | Only valid at qos 1/2 (DESIGN.md § 6.5). |
 | 3 | `gap_detected` | `ts`, `path_idx`, `peer_idx`, `extra_i64=missing_seq` | QoS 3 only. |
 | 4 | `gap_filled` | `ts`, `path_idx`, `peer_idx`, `extra_i64=recovered_seq` | QoS 3 only. |
