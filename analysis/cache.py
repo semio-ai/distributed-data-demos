@@ -528,15 +528,45 @@ def _remove_orphan_shards(logs_dir: Path, valid_stems: set[str]) -> None:
                 pass
 
 
+# Empirical: a worker rebuilding the heaviest compact-Parquet shards
+# (270 MB source -> ~5 GB peak resident set during the streamed
+# projection) needs a ballpark of 6 GB free RAM to land safely. Used as
+# the per-worker budget for the adaptive cap below; tweak via the
+# ``DDD_ANALYSIS_WORKER_RAM_GB`` env var when the workload changes.
+_WORKER_RAM_BUDGET_GB: float = 6.0
+
+
 def _default_workers() -> int:
     """Pick a sensible default worker count for parallel ingestion.
 
-    Caps at 8 because the JSONL parsing is largely Python+JSON-bound,
-    so going wider than the typical fast I/O fan-out yields diminishing
-    returns. Caller can override via the ``workers`` arg.
+    The cache build is bounded by RAM, not CPU, on multi-GB datasets:
+    each worker's peak resident set during a single shard build (the
+    polars streaming engine + per-kind projection state) is on the
+    order of single-digit GB for the heaviest compact-Parquet sources.
+    With 8 workers each peaking at 5-6 GB the orchestrator blew up
+    a 64 GB host while the cores were nowhere near saturated.
+
+    Strategy: cap at ``cpu - 1`` (leave a core for the OS) AND at the
+    floor of ``available_RAM_GB / _WORKER_RAM_BUDGET_GB`` so we never
+    schedule more workers than memory can absorb. Falls back to a
+    plain ``cpu - 1`` (capped at 4) when psutil is unavailable or
+    reports an implausible figure.
     """
     cpu = os.cpu_count() or 1
-    return max(1, min(8, cpu - 1))
+    cpu_cap = max(1, min(8, cpu - 1))
+    try:
+        import psutil
+
+        budget_gb = float(
+            os.environ.get("DDD_ANALYSIS_WORKER_RAM_GB", _WORKER_RAM_BUDGET_GB)
+        )
+        if budget_gb <= 0:
+            budget_gb = _WORKER_RAM_BUDGET_GB
+        avail_gb = psutil.virtual_memory().available / (1024**3)
+        ram_cap = max(1, int(avail_gb // budget_gb))
+        return max(1, min(cpu_cap, ram_cap, 4))
+    except Exception:
+        return max(1, min(cpu_cap, 4))
 
 
 def update_cache(
