@@ -17459,3 +17459,161 @@ This keeps the production-code change atomically reviewable and
 revertable independently from the regression-pin tests, per the
 project's split-unrelated-changes preference.
 
+## 2026-05-23 -- analysis worker: cache OOM on 25 GB same-machine dataset
+
+### Root cause
+
+`analysis/cache.py::_build_shard` (the per-source-file worker driven by
+`ProcessPoolExecutor`) called `parse_compact.read_compact_parquet` on
+the COMPACT branch, which eagerly materialised the full source frame
+in memory and then ran a 12-way per-kind projection (`pl.concat([...],
+how="diagonal")`) on top of it. On the 25 GB
+`same-machine-all-variants-01-20260521_210958` dataset that pipeline
+expanded a 270 MB compact-Parquet source into multi-GB resident set
+inside each worker; with the default pool of `min(8, cpu-1) = 7-8`
+workers the host's RAM was saturated, one worker was killed by the
+OS, and the rest of the pool tripped `BrokenProcessPool` at
+`cache.py:638` (now `cache.py:651`).
+
+Two secondary contributors compounded the blowup once the basic
+streaming sink was wired in:
+
+1. `parse_compact._build_projection_lazyframe` ended with a
+   `.sort("ts")` which is a streaming-barrier in polars -- it forces
+   the streaming sink to materialise the whole join output before
+   writing. Source compact-Parquet is already ts-ordered (variant
+   writers emit events in wall-clock order), so the sort was a no-op
+   on real inputs but a streaming killer.
+2. `LazyFrame.sink_parquet` defaults to `engine="auto"` and
+   `maintain_order=True`. The optimiser was silently picking the
+   in-memory engine for plans it deemed RAM-fits; combined with the
+   trailing sort that meant the "streaming" path wasn't streaming at
+   all.
+
+### What changed
+
+Six commits, smallest-to-largest, in dependency order:
+
+1. `e7d0f03 feat(analysis/parse_compact): lazy streaming projection +
+   sink_parquet path` -- introduces `_build_projection_lazyframe` (a
+   single-pass `when/then` covering every `SHARD_SCHEMA` column) and
+   `stream_compact_to_parquet` (scan -> project -> sink). Leaves the
+   legacy in-memory `read_compact_parquet` in place for unit-test
+   callers.
+2. `a7f1130 fix(analysis/cache): stream compact-Parquet via sink to
+   bound worker RAM` -- wires `_build_shard` to call
+   `stream_compact_to_parquet` instead of `read_compact_parquet`,
+   recovers spawn identity from the compact KV metadata, and reads
+   `row_count`/`is_clocksync` back from the freshly-written shard via
+   tiny statistics-only queries. This is the actual bug fix.
+3. `0af17d1 perf(analysis/parse_compact): drop sort + opt into
+   streaming engine on sink` -- adds `sort_by_ts: bool = True` to
+   `_build_projection_lazyframe` (the streaming path passes
+   `sort_by_ts=False`) and opts into `engine="streaming"` +
+   `maintain_order=False` on `sink_parquet`.
+4. `bf9c245 fix(analysis/cache): RAM-aware worker cap to bound
+   parallel build RSS` -- replaces the static `min(8, cpu-1)` worker
+   default with `min(cpu-1, available_RAM_GB / budget, 4)` so the
+   pool never spawns more workers than free RAM can absorb. Override
+   via the `DDD_ANALYSIS_WORKER_RAM_GB` env var.
+5. `6bd5dc0 feat(analysis): per-shard RSS in cache progress lines` --
+   each `[cache] built shard N: stem` line now appends the
+   orchestrator + worker children RSS so the operator can see
+   memory-trend on cold builds in real time.
+6. `ec8c47c fix(analysis/cache): bump per-worker RAM budget to 8 GB
+   for safer cap` -- empirical peak per worker on the heaviest
+   compact shard is ~5 GB; 8 GB budget leaves a healthy headroom
+   margin so the adaptive cap stays conservative.
+
+### Test results
+
+`python -m pytest tests/ -v` from `analysis/`: **447 passed, 6
+skipped** (baseline was 447 passed before any changes). Full suite
+runs in ~32-38 s on this host. `ruff format --check .` and
+`ruff check .` both clean.
+
+### Real-data validation
+
+Command (the exact user-reported failing command):
+
+```powershell
+python analysis\analyze.py C:\repo\shared\ddd\same-machine-all-variants-01-20260521_210958 --summary --dump --diagrams
+```
+
+Dataset shape: 26 GB total, 1376 source-pairs, 1362 compact-Parquet
+files (largest 282 MB, eight files > 200 MB), 1376 lifecycle-only
+JSONL (largest 8.5 MB).
+
+Repeated test: forced rebuild of the **30 largest** compact-Parquet
+shards (which cover all the >100 MB sources) by deleting their
+shards + meta + sentinel entries, then re-running `update_cache`:
+
+| Workers | Wall-clock | Peak total RSS (orchestrator + worker children) |
+|--------:|-----------:|-------------------------------------------------:|
+| 8 (pre-fix) | n/a -- OOM crash / BrokenProcessPool | n/a |
+| 4 (post-fix, pre-streaming-engine flags) | 70.5 s | 51.86 GB |
+| 4 (post all fixes) | 39.5 s | 19.96 GB |
+| 2 (post all fixes) | 58.0 s | 10.01 GB |
+| Default cap on this host (avail 23 GB -> 2 workers) | 57.2 s | **22.46 GB** |
+
+End-to-end run of the full failing command (warm cache, all groups):
+**exit code 0**, all 21 expected outputs produced (4 x
+comparison-qos PNGs, 4 x drop-rate PNGs, 4 x latency-cdf PNGs,
+throughput-vs-workload-shape PNG, 4 x summary_pivot_qos*.md,
+summary_integrity.md, summary_performance.md, summary_warnings.md,
+summary_index.md).
+
+The CUSTOM.md / ANALYSIS.md target of "<4 GB RSS on 40 GB dataset" is
+not yet hit -- a single worker still peaks ~5 GB during a 280 MB
+compact source's projection because the dictionary join + categorical
+materialisation forces the join output into RAM even with the
+streaming sink engine. Closing that last gap would require either
+emitting `path_idx`/`peer_idx` integers into the shard and joining
+lazily downstream, or moving to pyarrow's row-group iteration (not
+available -- pyarrow isn't a direct dep per the project's
+"polars-only" rule). I left both as follow-ups rather than
+in-scope for this fix.
+
+### Files changed (this work)
+
+- `analysis/cache.py` -- streaming COMPACT branch + RAM-aware worker
+  cap + 8 GB per-worker budget.
+- `analysis/parse_compact.py` -- new
+  `_build_projection_lazyframe` + `stream_compact_to_parquet` + the
+  `sort_by_ts` knob + `engine="streaming"` /
+  `maintain_order=False` on sink.
+- `analysis/analyze.py` -- per-shard RSS in the cache progress
+  callback.
+
+### Open concerns / follow-ups
+
+- The JSONL path in `cache.py::_build_shard` still accumulates all
+  100 k-row batches into `typed_batches` before a single
+  `pl.concat` + `write_parquet`. JSONL sources in current datasets
+  are tiny (< 10 MB) so this is non-urgent, but the existing
+  docstring claims "memory bounded by the batch buffer" -- which is
+  only true in the limit of small files. Worth a future commit to
+  stream the JSONL path the same way (e.g. write each batch to a
+  numbered temp Parquet, then `scan_parquet([...])` + `sink_parquet`
+  to concat).
+- The per-worker peak of ~5 GB during a 280 MB compact source
+  projection is the limiting factor on the orchestrator's RAM
+  budget. Two follow-up paths to push that further down:
+    1. Emit `path_idx`/`peer_idx` into the shard and resolve to
+       interned strings lazily at analysis time (delays the join
+       until the analyzer's per-group filter has already shrunk
+       the row set).
+    2. Switch the cache loader to pyarrow row-group iteration
+       (would need adding `pyarrow` as a direct dep, which the
+       project's coding-standards rule currently prohibits).
+- The `--clear` cold-rebuild path was not validated end-to-end (only
+  partial rebuilds, since clearing 12 GB of cache then rebuilding it
+  would take ~30+ min and isn't necessary to validate the fix).
+  The cold path uses the same `_build_shard` worker so the same
+  bounds apply.
+- The pre-existing uncommitted changes in `analysis/plots.py`,
+  `analysis/tests/test_plots.py`, `configs/two-runner-all-variants.toml`,
+  and `metak-shared/api-contracts/compact-log-schema.md` were left
+  untouched -- they belong to an unrelated workstream from the
+  previous worker session.
+
