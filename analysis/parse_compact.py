@@ -627,6 +627,7 @@ def _build_projection_lazyframe(
     source: pl.LazyFrame,
     *,
     meta: CompactMeta,
+    sort_by_ts: bool = True,
 ) -> pl.LazyFrame:
     """Project a compact-events LazyFrame into ``SHARD_SCHEMA`` shape.
 
@@ -636,6 +637,16 @@ def _build_projection_lazyframe(
     (the legacy implementation) plus the ``how="diagonal"`` concat,
     so peak memory is bounded by the streaming engine's row-group
     buffer rather than by ``2x`` the input file size.
+
+    ``sort_by_ts`` (default ``True``) appends a final ``.sort("ts")``
+    so the returned frame matches the JSONL-derived ordering. The sort
+    is a barrier for the streaming engine -- it forces a full
+    materialisation -- so the streaming cache-build path
+    (:func:`stream_compact_to_parquet`) passes ``sort_by_ts=False``
+    and relies on the source compact-Parquet already being ts-ordered
+    (variant writers emit events in wall-clock order). The eager
+    :func:`read_compact_parquet` path keeps ``sort_by_ts=True`` to
+    preserve its public contract.
 
     Caller is responsible for kicking off execution -- either by
     ``collect()`` (legacy ``read_compact_parquet`` path) or
@@ -1000,7 +1011,9 @@ def _build_projection_lazyframe(
     projected = projected.select(
         [pl.col(name).cast(dtype) for name, dtype in SHARD_SCHEMA.items()]
     )
-    return projected.sort("ts")
+    if sort_by_ts:
+        projected = projected.sort("ts")
+    return projected
 
 
 def _scan_compact_source(path: Path) -> pl.LazyFrame:
@@ -1052,12 +1065,27 @@ def stream_compact_to_parquet(
     _validate_meta(src, meta)
 
     source = _scan_compact_source(src)
-    projected = _build_projection_lazyframe(source, meta=meta)
+    # ``sort_by_ts=False`` keeps the projection streamable: a final
+    # ``sort`` is a streaming barrier (it forces full materialisation),
+    # and the source compact-Parquet is already ts-ordered because the
+    # variant writers emit events in wall-clock order. The
+    # JSONL-compat ``read_compact_parquet`` path still sorts.
+    projected = _build_projection_lazyframe(source, meta=meta, sort_by_ts=False)
     try:
+        # ``engine="streaming"`` opts into the bounded-memory streaming
+        # engine explicitly (the ``"auto"`` default may pick the
+        # in-memory engine for query plans the optimiser thinks fit in
+        # RAM -- which is exactly the assumption that blew up on the
+        # 270 MB compact files). ``maintain_order=False`` lets the
+        # engine emit row groups as soon as they are ready instead of
+        # buffering for global ordering; the source is already
+        # ts-sorted so this is a no-op semantically.
         projected.sink_parquet(
             str(dst),
             compression=compression,
             row_group_size=row_group_size,
+            maintain_order=False,
+            engine="streaming",
         )
     except Exception as exc:  # noqa: BLE001
         raise CompactLoadError(
