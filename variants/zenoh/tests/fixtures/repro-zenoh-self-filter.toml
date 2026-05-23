@@ -1,0 +1,32 @@
+# Tiny two-runner Zenoh fixture for live validation of the
+# self-writer filter (T-self-filter, 2026-05-21). Per
+# `metak-shared/api-contracts/compact-log-schema.md` event kind 1
+# (`receive`), variants MUST drop self-written payloads at the
+# receive boundary. With the filter in place, each runner's
+# `received` count should equal the PEER's `sent` count (1:1),
+# not 2x (self-echo inflation) or higher (Zenoh fabric reflection).
+#
+# Workload sized very small (10 vpt x 10 hz x 2s operate = 200 msgs
+# per writer) so the test is fast and the comparison is exact.
+# QoS 1 (best-effort), single Zenoh entry.
+
+run = "zenoh-self-filter"
+runners = ["alice", "bob"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-self-filter"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 10
+  stabilize_secs = 2
+  operate_secs = 2
+  silent_secs = 2
+  workload = "scalar-flood"
+  values_per_tick = 10
+  qos = 1
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
