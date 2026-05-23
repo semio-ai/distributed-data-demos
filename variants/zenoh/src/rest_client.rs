@@ -210,14 +210,22 @@ impl SseReader {
     /// `127.0.0.1:<rest_port>`. Returns a handle the variant stores
     /// alongside the sidecar; the reader thread runs until `stop` is
     /// called (or the variant process exits).
-    pub fn start(rest_port: u16, decode: SseDecodeFn) -> Self {
+    ///
+    /// `self_runner` is the variant's own runner name; samples whose
+    /// decoded `writer` field equals `self_runner` are dropped at the
+    /// reader BEFORE they reach the recv channel (per
+    /// `compact-log-schema.md` event kind 1 / `receive`). Zenoh's
+    /// wildcard `bench/**` subscription matches the variant's own
+    /// publishes, so this filter is required to prevent self-echo
+    /// inflation in the variant's `inc_received` counter.
+    pub fn start(rest_port: u16, self_runner: String, decode: SseDecodeFn) -> Self {
         let (tx, rx) = sync_channel::<ReceivedUpdate>(RECEIVE_CHANNEL_CAPACITY);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = stop_flag.clone();
         let handle = std::thread::Builder::new()
             .name(format!("zenoh-sse-{}", rest_port))
             .spawn(move || {
-                sse_reader_loop(rest_port, tx, stop_flag_clone, decode);
+                sse_reader_loop(rest_port, tx, stop_flag_clone, self_runner, decode);
             })
             .expect("spawn zenoh SSE reader thread");
         Self {
@@ -322,6 +330,7 @@ fn sse_reader_loop(
     rest_port: u16,
     tx: SyncSender<ReceivedUpdate>,
     stop_flag: Arc<AtomicBool>,
+    self_runner: String,
     decode: SseDecodeFn,
 ) {
     let host = "127.0.0.1";
@@ -435,6 +444,24 @@ fn sse_reader_loop(
                             Err(_) => continue,
                         };
                         if let Ok(update) = decode(&payload) {
+                            // Self-writer filter (same contract as
+                            // the Multi-mode subscriber_task): per
+                            // `compact-log-schema.md` event kind 1
+                            // (`receive`), variants MUST drop
+                            // payloads whose decoded `writer` equals
+                            // the variant's own runner BEFORE they
+                            // reach the recv channel (and thus
+                            // before `inc_received`). The SSE
+                            // subscription is on `bench/**` and
+                            // matches the sidecar's reflection of
+                            // our own publishes -- so without this
+                            // filter the variant's `received`
+                            // counter double-counts self-echoes
+                            // (e.g. two-runner localhost spawns
+                            // would log `received` == 2 × `sent`).
+                            if update.writer == self_runner {
+                                continue;
+                            }
                             // Drop-on-full: same semantics as the
                             // Multi-mode bridge. A blocked consumer
                             // is preferable to unbounded memory
@@ -943,7 +970,7 @@ mod tests {
     fn sse_reader_stop_is_idempotent() {
         // Point the reader at a bogus port -- it will fail to connect
         // and back off. `stop` must still terminate the thread cleanly.
-        let mut r = SseReader::start(1, fixed_decode);
+        let mut r = SseReader::start(1, "test-runner".to_string(), fixed_decode);
         // Give the loop a chance to spin once.
         std::thread::sleep(Duration::from_millis(60));
         r.stop();

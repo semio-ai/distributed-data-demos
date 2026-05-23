@@ -304,9 +304,9 @@ const QOS_STRICT_WINDOW: u64 = 2048;
 ///
 /// Memory cost: 131 072 × `Sample` (typ. ~64 B + payload) ~= 8 MiB
 /// + payload data per subscriber. With three subscribers per
-/// variant (data, EOT, ack) the per-spawn overhead is well within
-/// the budget recorded by `Sidecar::spawn` and the digest soft
-/// ceiling.
+///   variant (data, EOT, ack) the per-spawn overhead is well within
+///   the budget recorded by `Sidecar::spawn` and the digest soft
+///   ceiling.
 const SUBSCRIBER_FIFO_CAPACITY: usize = 131_072;
 
 /// T17.8: How often the ack emitter task publishes per-writer ack
@@ -1037,7 +1037,11 @@ impl ZenohVariant {
             rest_port,
         );
 
-        let sse_reader = crate::rest_client::SseReader::start(rest_port, MessageCodec::decode);
+        let sse_reader = crate::rest_client::SseReader::start(
+            rest_port,
+            self.runner.clone(),
+            MessageCodec::decode,
+        );
         self.sse_reader = Some(sse_reader);
         trace_if!(
             trace,
@@ -1548,6 +1552,31 @@ async fn subscriber_task(
                         let data: Vec<u8> = sample.payload().to_bytes().to_vec();
                         match MessageCodec::decode(&data) {
                             Ok(update) => {
+                                // Self-writer filter: Zenoh's wildcard
+                                // subscriber matches our own publishes
+                                // on `bench/**`, so payloads we just
+                                // sent come back through this task. The
+                                // compact-log-schema.md event kind 1
+                                // `receive` contract REQUIRES variants
+                                // to drop self-written payloads at the
+                                // receive boundary BEFORE they reach
+                                // the variant's recv channel (and thus
+                                // before `inc_received`); the metric
+                                // the project measures is foreign-
+                                // delivered payloads only. Mirrors the
+                                // existing self-EOT filter at the EOT
+                                // subscriber task and the writer-aware
+                                // gate in the ack-tracking block below
+                                // -- (writer == self) does not register
+                                // anywhere in the variant. Skipping
+                                // here also makes the ack-tracking
+                                // block's `update.writer != self_runner`
+                                // guard a (now-redundant) defence in
+                                // depth: we will never reach it for a
+                                // self sample.
+                                if update.writer == self_runner {
+                                    continue;
+                                }
                                 // T17.8: update the ack-emitter's view of
                                 // "highest reliable seq from this writer"
                                 // BEFORE forwarding to the variant. We
@@ -1559,6 +1588,10 @@ async fn subscriber_task(
                                 // (writer == self) does not register
                                 // self-as-peer, which would cause solo
                                 // runs to gate on their own progress.
+                                // The (b) condition is dead post-self-
+                                // filter above; kept as belt-and-braces
+                                // so a future refactor that moves the
+                                // self filter cannot regress ack noise.
                                 let is_strict = matches!(
                                     update.qos,
                                     Qos::ReliableUdp | Qos::ReliableTcp,
@@ -2903,11 +2936,26 @@ mod tests {
     // exercised the poll_peer_eots trait method that no longer exists.
 
     /// Stress test for the bridge: publish 10000 messages back-to-back
-    /// through a connected ZenohVariant in single-process loopback and
-    /// verify they all land in the receive channel. Gated `#[ignore]`
-    /// because it's slower than the rest of the unit suite (spins up a
-    /// real Zenoh peer and a tokio runtime); run with
-    /// `cargo test --release -- --ignored zenoh_bridge_stress`.
+    /// from an EXTERNAL Zenoh peer and verify the connected
+    /// `ZenohVariant` delivers them through its subscriber bridge.
+    /// Gated `#[ignore]` because it's slower than the rest of the unit
+    /// suite (spins up two real Zenoh peers and a tokio runtime); run
+    /// with `cargo test --release -- --ignored zenoh_bridge_stress`.
+    ///
+    /// **Self-filter contract**: the variant's subscriber drops
+    /// payloads whose `writer == self_runner` BEFORE the bridge
+    /// channel (see `compact-log-schema.md` event kind 1 / `receive`).
+    /// Before that filter landed this test published with the
+    /// variant's OWN runner name as the writer and asserted ≥80 %
+    /// delivery via the loopback echo Zenoh's wildcard subscriber
+    /// reflects back to the publishing session. That delivery was
+    /// always self-echo inflation -- exactly the noise the new
+    /// filter exists to drop -- so the test would now legitimately
+    /// see 0 % delivery on the old shape. We rewrote it to publish
+    /// from a SECOND in-process Zenoh session with a foreign writer
+    /// (`stress-ext`), which is what the bridge throughput contract
+    /// is actually meant to exercise. The previous shape was pinning
+    /// the wrong contract.
     #[test]
     #[ignore]
     fn zenoh_bridge_stress_10000_messages() {
@@ -2918,42 +2966,190 @@ mod tests {
             .connect(variant_base::ThreadingMode::Multi)
             .expect("connect");
 
-        // Give Zenoh a moment to warm up its loopback discovery before we
-        // start measuring delivery — without a brief settle the first
-        // dozens of puts can race the subscriber declaration.
+        // Auxiliary Zenoh session, driven by its own tokio runtime, so
+        // a foreign writer can inject samples onto `bench/**` that the
+        // variant's subscriber will see as non-self.
+        let aux_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("aux runtime");
+        let aux_args = ZenohArgs::parse(&[]).expect("default ZenohArgs");
+        let aux_config = build_zenoh_config(&aux_args).expect("aux config");
+        let aux_session = aux_rt
+            .block_on(async move { zenoh::open(aux_config).await })
+            .expect("open aux session");
+
+        // Give Zenoh a moment to warm up its loopback discovery before
+        // we start measuring delivery — without a brief settle the
+        // first dozens of puts can race the subscriber declaration.
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        for seq in 0..N {
-            let path = format!("/bench/{}", seq % 1000);
-            variant
-                .publish(&path, &[0u8, 1, 2, 3, 4, 5, 6, 7], Qos::BestEffort, seq)
-                .expect("publish");
-        }
+        // Publish from the auxiliary session with writer="stress-ext"
+        // (i.e. NOT the variant's self_runner). These are the foreign
+        // samples the variant's subscriber MUST deliver.
+        aux_rt.block_on(async {
+            for seq in 0..N {
+                let path = format!("/bench/{}", seq % 1000);
+                let key = path_to_key(&path);
+                let encoded = MessageCodec::encode(
+                    "stress-ext",
+                    seq,
+                    Qos::BestEffort,
+                    &path,
+                    &[0u8, 1, 2, 3, 4, 5, 6, 7],
+                );
+                let _ = aux_session.put(key, encoded.to_vec()).await;
+            }
+        });
 
         // Drain receives with a deadline. We tolerate some loss here —
         // the bridge documents that try_send drops when the receive
         // channel is full — but require a strong majority to confirm
         // the bridge isn't deadlocking under sustained pressure.
         let deadline = Instant::now() + std::time::Duration::from_secs(20);
-        let mut received = 0u64;
-        while Instant::now() < deadline && received < N {
+        let mut received_total = 0u64;
+        let mut received_self = 0u64;
+        let mut received_ext = 0u64;
+        while Instant::now() < deadline && received_total < N {
             match variant.poll_receive().expect("poll_receive") {
-                Some(_) => received += 1,
+                Some(u) => {
+                    received_total += 1;
+                    if u.writer == "stress-runner" {
+                        received_self += 1;
+                    } else if u.writer == "stress-ext" {
+                        received_ext += 1;
+                    }
+                }
                 None => std::thread::sleep(std::time::Duration::from_millis(1)),
             }
         }
 
+        // Tear down the aux session before disconnecting the variant.
+        aux_rt.block_on(async move {
+            let _ = aux_session.close().await;
+        });
+        aux_rt.shutdown_timeout(std::time::Duration::from_secs(2));
         variant.disconnect().expect("disconnect");
 
-        // The bridge must not deadlock and must deliver the bulk of the
-        // workload. We assert >=80% rather than 100% because Zenoh's
-        // CongestionControl::Drop is in effect and the receive channel
-        // can drop under pressure -- both of those are acceptable, but
-        // a deadlock or a >50% loss would indicate a real regression.
-        assert!(
-            received as f64 / N as f64 >= 0.8,
-            "bridge stress test received {received}/{N} -- bridge may be deadlocking or dropping excessively",
+        // Self-filter contract: even though Zenoh's wildcard subscriber
+        // matches our own publishes, none of them must have reached
+        // poll_receive (= reached the bridge).
+        assert_eq!(
+            received_self, 0,
+            "self-filter regression: variant's own publishes leaked to poll_receive"
         );
+
+        // The bridge must not deadlock and must deliver the bulk of
+        // the foreign workload. ≥80 % matches the original tolerance:
+        // Zenoh's CongestionControl::Drop is in effect and the receive
+        // channel can drop under pressure -- both acceptable -- but
+        // a deadlock or a >50 % loss would indicate a real regression.
+        assert!(
+            received_ext as f64 / N as f64 >= 0.8,
+            "bridge stress test received {received_ext}/{N} foreign samples -- \
+             bridge may be deadlocking or dropping excessively"
+        );
+    }
+
+    /// Self-writer filter regression (mirrors
+    /// `variants/custom-udp/src/udp.rs` `multi_udp_reader_filters_self_writer`).
+    /// The Zenoh `subscriber_task` MUST drop decoded samples whose
+    /// `writer` field equals the variant's own `self_runner` BEFORE
+    /// they reach the recv channel (and thus before `inc_received`).
+    /// The metric the project measures is foreign-delivered payloads
+    /// only -- per `metak-shared/api-contracts/compact-log-schema.md`
+    /// event kind 1 (`receive`).
+    ///
+    /// We exercise this end-to-end:
+    /// 1. Construct + connect the variant (runner = "self-runner").
+    /// 2. Publish two samples on `bench/0` from an EXTERNAL Zenoh
+    ///    session:
+    ///    - one whose encoded writer is "self-runner" (must be
+    ///      filtered);
+    ///    - one whose encoded writer is "other-runner" (must be
+    ///      delivered).
+    /// 3. Drain `poll_receive` for ~1 s; assert no delivered sample
+    ///    has `writer == "self-runner"`.
+    ///
+    /// Gated `#[ignore]` for the same reason as the bridge stress
+    /// test: it spins up real Zenoh sessions and depends on loopback
+    /// scouting.
+    #[test]
+    #[ignore]
+    fn multi_zenoh_subscriber_filters_self_writer() {
+        let mut variant = ZenohVariant::new("self-runner", &[]).expect("construct variant");
+        variant
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect");
+
+        let aux_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("aux runtime");
+        let aux_args = ZenohArgs::parse(&[]).expect("default ZenohArgs");
+        let aux_config = build_zenoh_config(&aux_args).expect("aux config");
+        let aux_session = aux_rt
+            .block_on(async move { zenoh::open(aux_config).await })
+            .expect("open aux session");
+
+        // Let Zenoh's loopback discovery settle before we publish so
+        // the variant's subscriber is routed for `bench/**` by the
+        // time the aux session's first put fires.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Publish a self-echo first (writer matches the variant's
+        // runner name) and then a foreign one. Order is deliberately
+        // self-first so a failure to filter is visible as a stale
+        // self-echo ahead of the foreign sample in the recv channel.
+        let path = "/bench/0";
+        let key = path_to_key(path);
+        let self_echo = MessageCodec::encode("self-runner", 1, Qos::BestEffort, path, &[0u8; 8]);
+        let other = MessageCodec::encode("other-runner", 2, Qos::BestEffort, path, &[1u8; 8]);
+        aux_rt.block_on(async {
+            let _ = aux_session.put(key, self_echo.to_vec()).await;
+            let _ = aux_session.put(key, other.to_vec()).await;
+        });
+
+        // Drain for up to ~1 s. We accept that Zenoh's loopback
+        // discovery may not have delivered the foreign sample on
+        // every CI host (multicast routing flakes), but ANY self-echo
+        // delivery is a regression.
+        let deadline = Instant::now() + std::time::Duration::from_millis(1000);
+        let mut delivered: Vec<ReceivedUpdate> = Vec::new();
+        while Instant::now() < deadline {
+            match variant.poll_receive().expect("poll_receive") {
+                Some(u) => delivered.push(u),
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+
+        // Tear down before asserting so a failure doesn't leak the
+        // background tasks.
+        aux_rt.block_on(async move {
+            let _ = aux_session.close().await;
+        });
+        aux_rt.shutdown_timeout(std::time::Duration::from_secs(2));
+        variant.disconnect().expect("disconnect");
+
+        // Filter to the path + seqs we control so a noisy CI host
+        // can't pollute the assertion (Zenoh's default scouting can
+        // pick up unrelated peers).
+        let mine: Vec<_> = delivered
+            .into_iter()
+            .filter(|u| u.path == path && (u.seq == 1 || u.seq == 2))
+            .collect();
+        for u in &mine {
+            assert_ne!(
+                u.writer, "self-runner",
+                "self-echo leaked through subscriber_task filter; \
+                 compact-log-schema.md event kind 1 contract violated"
+            );
+        }
+        // We don't require the foreign sample to have arrived (Zenoh
+        // loopback scouting can be flaky on CI); the regression we
+        // pin here is the absence of self-echoes only.
     }
 
     /// T-impl.7: an un-connected `try_publish` returns an error rather
