@@ -20,6 +20,10 @@ path = "tests/helpers/arg_echo.rs"
 name = "stderr-writer"
 path = "tests/helpers/stderr_writer.rs"
 
+[[bin]]
+name = "panic-helper"
+path = "tests/helpers/panic_helper.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }

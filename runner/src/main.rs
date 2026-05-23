@@ -6,6 +6,7 @@ mod clock_sync_log;
 mod config;
 mod local_addrs;
 mod message;
+mod panic_hook;
 mod progress;
 mod progress_coord;
 mod progress_eta;
@@ -207,8 +208,45 @@ const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
 const BUILD_GIT_DIRTY: &str = env!("BUILD_GIT_DIRTY");
 const BUILD_RUSTC: &str = env!("BUILD_RUSTC");
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
+
+    // Install a process-wide panic hook BEFORE anything else can run so
+    // any thread panic — main or background — surfaces a clearly labelled
+    // stderr line AND immediately kills the process. Motivated by an
+    // operator report (2026-05-21) where two runners on a multi-hour
+    // matrix exited silently between the `spawning '...'` and `final
+    // progress:` lines for the second spawn; both terminals returned to
+    // the shell prompt with no panic message, no FATAL line, no anyhow
+    // `Error:` output, and no `finished:` line. Whether the silent exit
+    // was a background thread panic that left the main thread in an
+    // unrecoverable state, an OS-level kill, or an as-yet-unidentified
+    // panic path inside `spawn_and_monitor`, this hook converts the
+    // entire class of "silent runner disappearance" into a loud,
+    // attributable `[runner:<name>] PANIC:` line followed by an
+    // immediate `process::abort()`. The abort path is preferred over
+    // letting the thread unwind and silently dying:
+    //
+    // - A panicking background thread (progress_coord reader, barrier_coord
+    //   reader, stdout-progress reader) by default only kills that thread
+    //   and leaves the main loop intact — but if the main loop later
+    //   waits on a joined thread's data, the wedge can be invisible.
+    //   `abort()` from the hook turns this into an immediate hard exit,
+    //   never silent.
+    // - The hook prints the panic payload, the location, AND the
+    //   thread name (`<unnamed>` when not set) so an operator collecting
+    //   stderr from multiple runners knows which runner died and where.
+    // - `process::abort()` produces a non-zero exit code that is NOT 75
+    //   (`EX_TEMPFAIL`). The wrapper scripts re-launch with --resume
+    //   ONLY on exit 75, so an aborted runner stops the wrapper loop
+    //   and forces operator attention — exactly the right behaviour for
+    //   a real panic.
+    //
+    // Wired before the build banner so a panic during CLI parse (e.g.
+    // a future feature that allocates inside `Cli::parse`) is still
+    // attributable. The hook reads `cli.name` so it is wired *after*
+    // `Cli::parse()` but *before* the banner.
+    panic_hook::install_panic_hook(cli.name.clone());
 
     // Print the build banner immediately after CLI parse, before any
     // discovery/protocol work. The label is `runner:<name>` so the line
@@ -223,10 +261,16 @@ fn main() -> Result<()> {
 
     // Run the actual benchmark, intercepting `BarrierTimeoutError` so we
     // can map it to exit code 75 (EX_TEMPFAIL) for the wrapper scripts.
-    // Any other anyhow::Error propagates back to the runtime and aborts
-    // with the standard non-zero exit (which the wrappers do NOT retry).
+    // Any other anyhow::Error is printed with an explicit `FATAL:`
+    // prefix and exits with code 1 so the operator never has to wonder
+    // whether the runner died with no signal at all. (Pre-2026-05-21
+    // this path returned `Err(e)` from `main()` and relied on the Rust
+    // runtime's default `Debug` impl to print `Error: ...`. That
+    // implicit path was the suspected origin of one of the silent-exit
+    // hypotheses; making the print explicit and labelled removes the
+    // ambiguity.)
     match run(&cli) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(e) => {
             if let Some(bt) = e.downcast_ref::<protocol::BarrierTimeoutError>() {
                 // Single, specific stderr line so the wrapper logs are
@@ -241,7 +285,16 @@ fn main() -> Result<()> {
                 );
                 std::process::exit(EX_TEMPFAIL);
             }
-            Err(e)
+            // Any other anyhow::Error: print loudly and exit non-zero.
+            // `{:#}` collapses the anyhow chain onto one line so the
+            // FATAL line stays grep-friendly. The exit code is 1 so it
+            // is distinguishable from both EX_TEMPFAIL (75) and the
+            // any-variant-failed end-of-matrix exit (also 1, but reached
+            // only after the summary table is printed -- so an operator
+            // seeing exit=1 without a summary table knows it is this
+            // pre-summary failure path).
+            eprintln!("[runner:{}] FATAL: {e:#}", cli.name);
+            std::process::exit(1);
         }
     }
 }
