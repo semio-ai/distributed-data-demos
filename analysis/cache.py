@@ -61,7 +61,7 @@ from typing import Iterator
 import polars as pl
 
 from parse import COLUMN_ORDER, SourceFormat, detect_source_format, iter_rows
-from parse_compact import read_compact_parquet
+from parse_compact import read_compact_metadata, stream_compact_to_parquet
 from schema import SCHEMA_VERSION, SHARD_SCHEMA
 
 CACHE_DIRNAME: str = ".cache"
@@ -313,16 +313,20 @@ def _build_shard(
     Dispatches by ``source_format``:
 
     - :class:`SourceFormat.JSONL` -- stream-parse the JSONL file
-      line-by-line through ``parse.iter_rows``, batching into typed
-      polars DataFrames sized by ``batch_rows`` before a single
-      concat + write.
-    - :class:`SourceFormat.COMPACT` -- read the entire compact-parquet
-      file in one shot via ``parse_compact.read_compact_parquet``;
-      ``batch_rows`` is unused on this path because the columnar
-      compact format is already compact in memory (the file is sized
-      so the whole thing fits comfortably under the analyzer's RSS
-      budget -- the compact format exists precisely to compress what
-      JSONL bloats).
+      line-by-line through ``parse.iter_rows``, writing each
+      ``batch_rows``-sized batch to its own intermediate Parquet file
+      under a per-stem temp directory, then concatenating the
+      intermediates into the final shard via ``pl.scan_parquet`` +
+      ``LazyFrame.sink_parquet``. This keeps peak memory bounded by
+      one batch buffer rather than the whole file's expanded rows.
+    - :class:`SourceFormat.COMPACT` -- stream-project via
+      :func:`parse_compact.stream_compact_to_parquet`, which scans the
+      source compact-Parquet lazily and writes the projected shard via
+      ``sink_parquet`` so the streaming engine handles row-group-sized
+      batches without materialising the full expanded frame. A 270 MB
+      compact file expanding into ~12 per-kind frames previously
+      blew up worker RSS into multi-GB territory; this path keeps it
+      bounded by the polars streaming engine's row-group buffer.
 
     Both paths produce the same ``SHARD_SCHEMA``-shaped Parquet shard,
     so the analyzer's downstream lazy frame doesn't see the difference.
@@ -381,36 +385,43 @@ def _build_shard(
         del typed_batches
 
     elif source_format is SourceFormat.COMPACT:
-        # The compact loader returns the full projected DataFrame in
-        # one go; there is no streaming API at this layer because the
-        # compact format itself is the compression step the streaming
-        # JSONL path was trying to bound. Even a 30 s / 100K msg/s
-        # spawn is on the order of a few MB on disk and ~100 MB
-        # expanded, well within the analyzer's per-shard budget.
-        combined = read_compact_parquet(source_path)
-        combined = combined.select(list(COLUMN_ORDER))
-        row_count = combined.height
+        # Stream-project the compact file into the shard. The KV
+        # metadata block carries the spawn identity, so the variant /
+        # runner / run fields can be recovered without materialising
+        # any row; ``is_clocksync`` and ``row_count`` are read back
+        # from the freshly-written shard via tiny statistics-only
+        # queries. This avoids the previous OOM where a 270 MB
+        # compact file got eagerly expanded into a multi-GB in-memory
+        # frame inside every worker.
+        compact_meta = read_compact_metadata(source_path)
+        if compact_meta.variant is not None:
+            variant = str(compact_meta.variant)
+        if compact_meta.run is not None:
+            run = str(compact_meta.run)
+
+        stream_compact_to_parquet(source_path, parquet_path, compression="snappy")
+
+        # ``pl.scan_parquet().select(pl.len()).collect()`` uses Parquet
+        # row-group statistics, so it doesn't read any column data.
+        row_count = int(
+            pl.scan_parquet(str(parquet_path)).select(pl.len()).collect().item()
+        )
         if row_count > 0:
-            first = combined.row(0, named=True)
-            v = first.get("variant")
-            r = first.get("run")
-            e = first.get("event")
-            if v is not None:
-                variant = str(v)
-            if r is not None:
-                run = str(r)
-            if e is not None or v is not None:
-                e_str = str(e) if e is not None else ""
-                v_str = str(v) if v is not None else ""
-                is_clocksync = (
-                    e_str
-                    in (
-                        "clock_sync",
-                        "clock_sync_sample",
+            head = pl.read_parquet(parquet_path, columns=["event", "variant"], n_rows=1)
+            if not head.is_empty():
+                e = head.get_column("event").cast(pl.Utf8)[0]
+                v = head.get_column("variant").cast(pl.Utf8)[0]
+                if e is not None or v is not None:
+                    e_str = str(e) if e is not None else ""
+                    v_str = str(v) if v is not None else ""
+                    is_clocksync = (
+                        e_str
+                        in (
+                            "clock_sync",
+                            "clock_sync_sample",
+                        )
+                        or v_str == ""
                     )
-                    or v_str == ""
-                )
-        combined.write_parquet(parquet_path, compression="snappy")
 
     else:  # pragma: no cover -- exhaustive enum check
         raise ValueError(f"unsupported source format: {source_format!r}")
