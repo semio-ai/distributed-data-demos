@@ -7343,7 +7343,7 @@ Pre-existing clippy `dead_code` error flagged by the T16.5 worker after a worksp
 **Acceptance**: `cargo clippy --release --workspace --all-targets -- -D warnings` is clean.
 
 
-### T16.10 — Zenoh QoS 3/4 ordering regression after T16.5 [high]
+### T16.10 — Zenoh QoS 3/4 ordering regression after T16.5 [high] — done 2026-05-24
 
 **Repo**: `variants/zenoh/`
 **Status**: filed 2026-05-15 00:39 by orchestrator after the E16 verification smoke.
@@ -7375,6 +7375,268 @@ Pre-existing clippy `dead_code` error flagged by the T16.5 worker after a worksp
 **Out of scope**: QoS 1/2 throughput characterisation. They are best-effort/latest-value; ordering is not contractually required there.
 
 
+### T16.10b — Zenoh QoS 3/4 collapse on cross-WiFi two-machine run [high]
+
+**Repo**: `variants/zenoh/` (investigation first; a fix task will be
+filed only after the failure mode is named).
+**Status**: filed 2026-05-24 by orchestrator after the user surfaced the
+`comparison-qos4.png` plot from
+`C:\repo\shared\ddd\two-machines-all-variants-01-20260523_083845`.
+This is the first cross-**WiFi** (vs wired-LAN) two-machine dataset on the
+orchestrator's record.
+
+**Symptom**: On a two-machine same-AP WiFi run, every
+`zenoh-1000x100hz-{block,mixed,scalar}-{qos3,qos4}-multi` spawn produces
+~0 receive throughput in the qos3/qos4 comparison plots. The dataset
+contains the per-spawn JSONL for every zenoh QoS 3/4 multi spawn but
+**no matching `.compact.parquet`** — confirmed by directory listing —
+indicating the variant exited via `variant_self_killed_idle` (or similar)
+before the digest phase. Other variants (custom-udp, hybrid, quic,
+websocket) finish on the same run and produce compact shards.
+
+**What's new vs T16.10**: T16.10's reproducer
+`variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos3-repro.toml`
+runs at 1 000×10 Hz on wired loopback / wired LAN. This dataset is at
+**1 000×100 Hz over WiFi** — 10× the rate AND a new transport medium.
+WiFi adds link-layer retransmits, airtime contention with the AP, and
+bursty drops that the wired reproducer cannot exhibit. The collapse mode
+may be the same family as T16.10 (ordering or per-publish parallelism
+from T16.5) compounded by link loss, OR a distinct receive-side
+back-pressure interaction with the kernel's WiFi NIC buffer. We don't
+yet know which.
+
+**Dataset**: `C:\repo\shared\ddd\two-machines-all-variants-01-20260523_083845`
+
+Relevant artefacts inside that directory:
+- `analysis/comparison-qos3.png`, `analysis/comparison-qos4.png`,
+  `analysis/drop-rate-qos[34].png`, `analysis/latency-cdf-qos[34].png`
+- `zenoh-1000x100hz-{block,mixed,scalar}-{qos3,qos4}-multi-{alice,bob}-all-variants-01.jsonl`
+- `zenoh-1000x100hz-{block,mixed,scalar}-{qos3,qos4}-multi-{alice,bob}-stderr.txt`
+- `analysis/summary_integrity.md`, `analysis/summary_warnings.md`
+
+**Investigation steps**:
+1. Read every zenoh qos3/qos4 stderr in the dataset and classify the
+   exit reason per spawn (`variant_self_killed_idle`,
+   `runner_idle_terminated`, panic, normal exit, ...).
+2. For each spawn, summarise from the JSONL: total `write` events
+   (writer-side), total `receive` events before exit, and the `phase`
+   timeline (`connect / stabilize / operate / eot / silent / done`).
+   Compare alice vs bob — asymmetric collapse from T16.5 is a known
+   failure mode and will show up as one peer writing M messages while
+   the other writes ~0.
+3. Count `backpressure_skipped` events at QoS 3/4 across the six
+   spawns. Per T17.9, these are contract violations once present.
+4. Decision tree:
+   - Exit via idle-termination AND writes still flowing on one peer →
+     same family as T16.5/T16.10; WiFi just amplifies it.
+   - Exit via `runner_idle_terminated` with both peers idle for ≥5 s →
+     true throughput collapse (kernel WiFi NIC buffer saturation,
+     Zenoh's internal congestion control giving up, ack-window
+     exhaustion, or similar).
+   - Panic / crash in stderr → distinct bug.
+5. Re-run **one** small reproducer locally on **wired** loopback at the
+   same workload shape (`zenoh-1000x100hz-scalar-qos3-multi`,
+   `zenoh-1000x100hz-scalar-qos4-multi`) — same machines, ethernet
+   instead of WiFi — and confirm whether the failure reproduces wired
+   or is WiFi-specific. This disambiguation is the **key output**.
+
+**Acceptance**:
+- Investigation report appended to `metak-orchestrator/STATUS.md` with:
+  - Exit-reason histogram for the 6 zenoh-1000x100hz qos3/qos4 multi
+    spawns (3 workload shapes × 2 QoS).
+  - Per-spawn writer / receiver symmetry table
+    (alice-writes / bob-writes / alice-receives / bob-receives).
+  - `backpressure_skipped` counts per QoS.
+  - Conclusion: is the WiFi failure the same family as T16.10
+    (ordering / asymmetric collapse) or distinct?
+- If **same family as T16.10**: a one-line addition to T16.10's
+  acceptance requiring a WiFi re-validation pass after T16.10's fix
+  lands.
+- If **distinct**: a follow-up task T16.10c filed with a concrete fix
+  direction (NACK-aware back-pressure, kernel buffer tuning, alternate
+  Zenoh congestion-control mode, etc.).
+
+**Out of scope**:
+- Any code change inside `variants/zenoh/`. This is investigation only.
+- Re-running the full 16-spawn cross-WiFi matrix. One targeted wired
+  reproducer at the same workload shape is enough to disambiguate.
+- Tuning the runner's idle-detection threshold (E15 territory).
+- T16.10 itself — it remains open and should proceed in parallel; this
+  task only decides whether T16.10's wired-LAN acceptance is sufficient
+  to call the variant "fixed" on WiFi.
+
+**Dependencies**: T16.10 still open. T16.10b does not block T16.10's
+fix; the two run in parallel.
+
+
+### T16.10c — Zenoh: break publisher↔peer-subscriber coupling for WiFi resilience [high]
+
+**Repo**: `variants/zenoh/` (primary); `runner/` (if a sidecar router is
+spawned alongside the variant); docs in `metak-shared/`.
+**Status**: filed 2026-05-24 by orchestrator after the T16.10b worker
+named the failure as WiFi-specific symmetric deadlock and recommended
+this direction. See STATUS.md "T16.10b completion report — 2026-05-24".
+
+**Problem** (one paragraph, from T16.10b's analysis):
+
+The Multi-mode variant uses peer-to-peer Zenoh sessions; each peer's
+publisher `put().await` is directly coupled to the remote peer's
+subscriber routing thread keeping up. T16.10's `dbb9c70` fix widened the
+subscriber FIFO to ~131 K slots and T17.8 caps the in-flight ack window
+at 2048. On wired LAN that is enough. On WiFi — link-layer retransmits
+(200-500 ms tail bursts), AP airtime contention (multi-second flow
+parking under unrelated traffic), bursty 802.11 drops — both peers'
+subscriber routing threads park simultaneously, both publishers wedge on
+CC=Block, the ack-window watermark stalls at `min_peer_ack`, and neither
+peer makes any progress. The T15.5 watchdog fires identically on both
+sides after 30 s. 12/12 cross-WiFi qos3/qos4 multi spawns in
+`C:\repo\shared\ddd\two-machines-all-variants-01-20260523_083845` show
+this signature exactly.
+
+**Two candidate directions** (worker evaluates and picks):
+
+**(A) Local zenohd router sidecar — strategic.** Each runner spawns a
+local `zenohd` process at startup; the variant operates in Zenoh
+**client mode** against `tcp/127.0.0.1:<router-port>`. The publisher's
+`put().await` now resolves at local-router rate; the router absorbs
+WiFi-side burstiness in its own queue. Reuses the existing T14.9
+(deferred under E14) sidecar idea — and would unlock T14.9's
+WASM-single-threaded-client benefit as a side effect. The runner gains
+a small lifecycle responsibility (spawn router on `connect`, tear it
+down on variant exit). Out-of-process means an extra TCP hop on the
+critical path; need to measure whether the wired-LAN throughput regression
+is acceptable (rough budget: <20 % throughput degradation at QoS 3/4 on
+the wired 1 000×100 Hz workload).
+
+**(B) Larger FIFO + larger ack-window — tactical.** Bump the subscriber
+FIFO and T17.8 ack-window budget so they can absorb multi-second WiFi
+stalls. Cheap to implement, doesn't change topology. Pushes per-spawn
+RSS up (subscriber FIFO at 131 K slots × ~150 B average payload ≈ 20 MB
+per peer; at 1 M slots that's ~150 MB per peer — material on a
+constrained host). Does NOT address the underlying coupling — the
+deadlock just becomes harder to reach, not impossible.
+
+Worker should evaluate (A) first with a small prototype on the wired
+reproducer to characterise the router-overhead cost, then decide. Pick
+(A) if the wired throughput cost is acceptable; pick (B) only if (A) is
+infeasible on Windows (e.g. zenohd packaging issues). Document the
+decision and the wired-overhead measurement in
+`variants/zenoh/CUSTOM.md`.
+
+**Acceptance**:
+- A cross-WiFi two-runner run on the T16.10b dataset's workload
+  (`zenoh-1000x100hz-{scalar,mixed,block}-{qos3,qos4}-multi`) completes
+  with **all 12** (spawn × runner) pairs exiting via
+  `runner_idle_terminated` (clean EOT). Zero `variant_self_killed_idle`.
+- Cross-WiFi delivery ≥ 80 % in both directions at QoS 3/4 across all
+  three workload shapes. (80 % not 99 % because WiFi is genuinely lossy
+  — measure the actual link drop rate and document it.)
+- Wired loopback regression suite still passes:
+  `variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos3-repro.toml`
+  (T16.10's fixture) and the qos4 sibling continue to show Out-of-order 0
+  per T16.10's acceptance, and the wired 1 000×100 Hz scalar qos3 multi
+  reproducer continues to clean-exit.
+- `variants/zenoh/CUSTOM.md` documents the chosen topology and the
+  wired-throughput cost of the change.
+- If direction (A) was chosen: a one-line note in EPICS.md § E14
+  "Future work" section saying T14.9 is closed by T16.10c (router
+  infrastructure now exists in-tree).
+
+**Dependencies**:
+- T16.10 (ordering fix) must land first — T16.10c builds on T16.10's
+  publisher path. Verify before spawning a T16.10c worker.
+- E14 T14.9 (deferred Zenoh router-RPC) is functionally adjacent; if
+  direction (A) is chosen, this task closes T14.9.
+
+**Out of scope**:
+- N>2-peer scaling. WebRTC's 1-peer constraint from E3g stays
+  out-of-scope and so does N-peer Zenoh router work.
+- Changing other variants' topologies. Hybrid / custom-udp / quic /
+  websocket / webrtc are unaffected.
+- Replacing `zenohd` with a custom router.
+- Cross-WiFi CI infrastructure — that's T16.14.
+
+**Validation strategy**:
+- The user owns the cross-WiFi re-validation (per the
+  `metak-shared/coding-standards.md` and prior worker convention —
+  cross-machine validation is not automated). Worker drives the wired
+  reproducer + the wired throughput-overhead measurement; user runs
+  the cross-WiFi acceptance gate. Worker must clearly document the
+  cross-WiFi command for the user to execute (PowerShell).
+
+
+### T16.10d — Zenoh QoS 3/4 higher-rate ordering at 1 000×100 Hz wired [medium]
+
+**Repo**: `variants/zenoh/`
+**Status**: filed 2026-05-24 by orchestrator after T16.10 closed but
+T16.10b's wired-loopback evidence showed residual ordering drift at a
+workload outside T16.10's acceptance window.
+
+**Observation**: T16.10 verified Out-of-order = 0 on its official
+fixtures (`tests/fixtures/two-runner-zenoh-1000x10hz-qos3-repro.toml`
+and the qos4 sibling) at **1 000 paths × 10 Hz**. T16.10b's
+independent wired-loopback at **1 000 paths × 100 Hz** (10× the rate),
+on a binary that already includes the T16.10 fix and the 2026-05-21
+self-writer filter, reports:
+
+```
+Variant                                           Path        QoS  Sent      Rcvd       Out-of-order  Dupes
+zenoh-1000x100hz-scalar-qos3-multi  alice->bob    3    1,422,000 1,443,981  6149          22959
+zenoh-1000x100hz-scalar-qos3-multi  bob->alice    3    1,423,000 1,442,000  130           19000
+```
+
+That is ~0.43 % reorder rate alice→bob, ~0.01 % bob→alice (asymmetric)
+and ~1.6 % apparent duplicate rate. T16.10's `tokio::spawn`-per-publish
+serialiser is still on the table for QoS 3/4 — at 10 Hz it's clean, at
+100 Hz some QoS 3/4 publishes can still race. The asymmetric reorder
+rate (alice→bob ≫ bob→alice) suggests this is publish-side, not
+receive-side.
+
+**Caveat on the Dupes line**: T16.10's worker flagged a `3-duplicate`
+analyser trace artefact on its own qos1/qos3/qos4 runs (exactly 3
+dupes per direction). That artefact is far below the ~22 K / ~19 K
+counts here, so the dupes in this evidence row are NOT just the
+analyser artefact. T16.16 will characterise the analyser side; T16.10d
+should investigate the variant side independently.
+
+**Investigation steps**:
+1. Reproduce locally: create
+   `variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos3-repro.toml`
+   mirroring the T16.10b workload. Run two-runner localhost; collect
+   the analyzer integrity row. Confirm reorder and dupe counts in the
+   same ballpark as the T16.10b evidence.
+2. Inspect `publisher_task` in `variants/zenoh/src/zenoh.rs` at QoS 3/4
+   path. The T16.10 fix made QoS 3/4 publishes serialised via whatever
+   mechanism the worker picked (per-key mpsc queue, inline await, or
+   Zenoh primitive). At 100 Hz tick rate with 1 000 keys = 100 K
+   publish/s, that serialisation may be funnel-overloaded and falling
+   back to a parallel path.
+3. If a parallel path is the cause: tighten the serialiser so 100 K
+   publish/s holds per-key order. If a transport-layer reorder: check
+   whether Zenoh's Multi-mode session offers a stronger
+   per-key-ordered guarantee that the variant isn't opting into.
+
+**Acceptance**:
+- A 1 000×100 Hz two-runner localhost reproducer (qos3 + qos4 multi)
+  shows Out-of-order = 0 across all four (writer→receiver) directions.
+- T16.10's original 1 000×10 Hz reproducers still pass with
+  Out-of-order = 0.
+- Variant-side Dupes count drops below 100 per direction at the same
+  workload (the analyser-side T16.16 may explain a residual single
+  digits).
+- No QoS 1/2 throughput regression vs current main.
+
+**Out of scope**:
+- The analyser 3-dupe trace artefact — that's T16.16.
+- Cross-WiFi acceptance — that's T16.10c.
+
+**Dependencies**:
+- T16.10 (done).
+- Should run BEFORE T16.10c starts: T16.10c will measure wired-throughput
+  overhead of the router topology; doing that on a known-good wired
+  ordering baseline is essential.
+
+
 ### T16.11 — Flake in T16.2 test write_ts_is_captured_before_try_publish [low]
 
 **Repo**: `variant-base/`
@@ -7395,6 +7657,231 @@ guarantee.
 **Acceptance**: 100 iterations of `cargo test --release -p variant-base
 driver::tests::write_ts_is_captured_before_try_publish` pass without
 flake.
+
+
+### T16.12 — variant-base: best-effort compact-parquet flush on watchdog-self-kill [medium]
+
+**Repo**: `variant-base/`
+**Status**: filed 2026-05-24 by orchestrator from T16.10b incidental
+finding #1.
+
+**Problem**: When the T15.5 internal-stall watchdog fires
+(`variant_self_killed_idle`), the variant exits without flushing its
+in-process compact buffers, so the dataset has no `.compact.parquet`
+for the affected spawn. T16.10b investigation could not directly count
+writes, receives, or `backpressure_skipped` events for the six failing
+cross-WiFi zenoh spawns — the diagnostic gap forced deductive analysis
+from JSONL lifecycle events alone.
+
+**Fix**: Wrap the watchdog's exit path with a best-effort
+`digest::flush()` (or equivalent), **bounded** — e.g. 2 s hard timeout
+on the flush so a frozen background thread cannot hang shutdown.
+Whichever rows reached the in-process buffer are written; anything that
+didn't is dropped. The flush should not block on EOT — it's a salvage
+operation, not a graceful close.
+
+**Acceptance**:
+- A synthetic test (e.g. force the watchdog by stalling the operate
+  loop) shows that a partial compact-parquet IS written and contains
+  the writes that were buffered before the stall.
+- Watchdog still exits within `watchdog_timeout_secs + 2 s`. Worst case
+  must not exceed 35 s.
+- Existing T15.x tests still pass; no regression on the
+  clean-exit / EOT path.
+
+**Out of scope**:
+- Changing the watchdog timeout itself.
+- Restructuring the compact buffer to be lock-free / always-flushable.
+
+**Dependencies**: None blocking — independent of T16.10 / T16.10c.
+
+
+### T16.13 — Treat JSONL `resource` cadence as a liveness heartbeat [low]
+
+**Repo**: `analysis/` (read-side) and `metak-shared/api-contracts/jsonl-log-schema.md` (contract clarification).
+**Status**: filed 2026-05-24 by orchestrator from T16.10b incidental
+finding #2.
+
+**Problem**: T16.10b's `block`-shape spawns logged 18 resource samples
+post-`operate` (cleanly limping for ~1.8 s before deadlock); `mixed`
+and `scalar` shapes logged **zero** resource samples post-`operate` —
+i.e. the resource thread starved within ~10 ms of operate entry. This
+cadence is already in the data; it just isn't surfaced as a liveness
+signal. If `resource` events were treated as a 100 ms heartbeat, the
+analyzer could pinpoint freeze-points without needing a partial parquet
+flush (T16.12 complementary, not redundant).
+
+**Scope**:
+- `metak-shared/api-contracts/jsonl-log-schema.md`: pin the `resource`
+  event as a **mandatory** 100 ms heartbeat in `operate` phase (or
+  whatever the current cadence is — confirm and document). Today the
+  contract probably documents it as periodic but not as a heartbeat.
+- `analysis/` (likely `integrity.py` or a new module): add an
+  integrity check "resource-cadence gap > 500 ms during operate phase"
+  that flags the gap with a timestamp.
+- A synthetic JSONL fixture with a 1 s gap mid-operate should produce
+  the new `[FAIL: resource-gap]` annotation.
+
+**Acceptance**:
+- Re-running the analyzer over the T16.10b dataset surfaces the
+  freeze-point timestamp per cross-WiFi zenoh qos3/qos4 multi spawn,
+  matching the empirical observation in T16.10b's report.
+- No false positives on the wired loopback regression run (clean exits
+  have continuous resource cadence).
+
+**Out of scope**:
+- Changing what the variant emits — `resource` is already there. Only
+  the contract wording and the analyzer's interpretation change.
+
+**Dependencies**: None blocking.
+
+
+### T16.14 — Cross-WiFi as a first-class validation surface [low]
+
+**Repo**: orchestrator docs (`metak-orchestrator/`, `metak-shared/`).
+No code change.
+**Status**: filed 2026-05-24 by orchestrator from T16.10b incidental
+finding #3.
+
+**Problem**: Before this week the validation matrix was wired-LAN and
+loopback only. The cross-WiFi dataset
+(`C:\repo\shared\ddd\two-machines-all-variants-01-20260523_083845`)
+is the project's first WiFi run on record and immediately found a
+real Zenoh-Multi-mode failure (now tracked as T16.10c) that no wired
+test could have caught. Going forward, WiFi should be a periodic
+validation surface, not a one-off.
+
+**Scope** (orchestrator-only — no worker spawn):
+- Decide cadence: one full cross-WiFi matrix per release wave, OR a
+  reduced cross-WiFi smoke (e.g. one spawn per variant × qos3/qos4
+  multi only).
+- Identify a feasible WiFi setup that the user can re-run on demand
+  (laptop on hotspot + workstation on same AP? Two laptops on the
+  same AP?). Document the topology in `metak-shared/`.
+- Update `metak-shared/BENCHMARK.md` (S5? S6?) to add a "transport
+  medium" dimension to the matrix doc, noting that wired-LAN and
+  WiFi behave differently and the validation matrix should hit both.
+- Add a one-line acceptance to each future variant epic stating
+  "wired-LAN AND WiFi cross-machine validation required before
+  marking done".
+
+**Acceptance**:
+- `metak-shared/BENCHMARK.md` updated with the WiFi validation
+  expectation.
+- A one-page `metak-shared/wifi-validation-setup.md` describing the
+  topology, what to run, and how to interpret the result.
+- `metak-orchestrator/CUSTOM.md` references the new doc so future
+  orchestrator sessions know about the matrix dimension.
+
+**Out of scope**:
+- Setting up cross-machine CI (orchestrator-owned decision; the user
+  drives cross-machine runs today, and that's fine).
+- Buying / configuring hardware. The user already has the kit.
+- Backfilling the existing variants' epics with WiFi validation —
+  doing that on `main` would be a multi-PR retroactive sweep. Only
+  forward-looking variant epics get the new acceptance line.
+
+**Dependencies**: None blocking. Worth doing once T16.10c lands so the
+WiFi spawn list is known-good baseline-wise.
+
+
+### T16.15 — Port `variants/zenoh/tests/two_runner_regression.rs` to compact-Parquet [medium]
+
+**Repo**: `variants/zenoh/`
+**Status**: filed 2026-05-24 by orchestrator from T16.10 worker
+follow-up #1.
+
+**Problem**: 5 of 6 ignored tests in
+`variants/zenoh/tests/two_runner_regression.rs` —
+`1000paths_no_deadlock`, `max_throughput_no_deadlock`,
+`single_mode_t149b`, `single_mode_t149c_no_port_exhaustion`,
+`t17_8_qos3_100pct_delivery` — currently fail because the in-test
+parser reads `write` / `receive` events out of JSONL, but T18.2b
+moved those events to compact Parquet. Each subprocess still exits
+cleanly with `sent>0` in its stderr; the test's parser counts 0
+and the assertion fails.
+
+This is purely a test-side issue — no variant code change is
+needed. The tests are `#[ignore]`-gated so they don't break CI,
+but the zenoh regression suite is effectively broken until they're
+updated.
+
+**Scope**:
+- Update the helper in `tests/two_runner_regression.rs` that
+  currently parses JSONL events to instead read the per-spawn
+  `.compact.parquet` file. Use the contract documented in
+  `metak-shared/api-contracts/compact-log-schema.md` (event kinds
+  0 = write, 1 = receive, 2 = backpressure_skipped).
+- The runner-stdout-driven counts (`sent=N received=M` in stderr /
+  runner stdout) are an easier alternative if the test only needs
+  totals — consider that if the parquet path adds significant
+  dependency weight.
+- Verify all 6 ignored tests run green:
+  ```powershell
+  cargo test --release -p variant-zenoh --test two_runner_regression -- --ignored --nocapture
+  ```
+- Keep the existing `t17_8_qos3_100pct_delivery` 100% delivery
+  threshold (or per-spawn equivalent).
+
+**Acceptance**:
+- All 6 ignored tests in
+  `variants/zenoh/tests/two_runner_regression.rs` pass.
+- No additional crates added unless absolutely necessary; if `polars`
+  or `arrow` is required, justify in the commit message.
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  remains clean.
+
+**Out of scope**:
+- Adding new test cases or new fixtures.
+- Variant code changes.
+- Other variants' regression suites — only `variants/zenoh/` is
+  affected by this specific T18.2b interaction.
+
+**Dependencies**: None blocking.
+
+
+### T16.16 — analyzer: investigate 3-duplicate trace at EOT window [low]
+
+**Repo**: `analysis/`
+**Status**: filed 2026-05-24 by orchestrator from T16.10 worker
+follow-up #2.
+
+**Observation**: T16.10's worker observed exactly 3 duplicates per
+direction across qos1, qos3, and qos4 reproducer runs. Same count
+across three independent QoS tiers strongly suggests an analyser-side
+double-count rather than a Zenoh on-wire duplicate. The most likely
+culprit: the EOT-window boundary in `integrity.py` (or wherever
+correlate joins write↔receive over the operate window) counting a
+small region of receives twice — possibly the boundary inclusive on
+one side and the EOT-marker itself triple-counted.
+
+**Investigation steps**:
+1. Reproduce: run the qos3 reproducer at low rate and inspect the
+   3 dupe-flagged receive rows in the analyser pipeline. Identify the
+   `seq` / `writer` / `receive_ts` of each.
+2. Check whether each dupe-flagged row corresponds to a `seq` that
+   appears exactly once in the write stream — if so, the dupe is
+   purely analyser-side (the receive_ts is being matched twice).
+3. Inspect the EOT-window boundary logic in
+   `analysis/correlate.py` and `analysis/integrity.py`. Look for
+   any `<=` vs `<` boundary mismatch on the `operate_window_end`
+   timestamp.
+4. Fix the boundary or the join to be strict.
+
+**Acceptance**:
+- Re-running the T16.10 qos3 / qos4 reproducers under the patched
+  analyser shows Dupes = 0 for every (writer, receiver) direction.
+- No regression on `analysis/tests/` (full pytest suite green).
+- Existing dataset integrity rows (`logs/same-machine-all-variants-*`)
+  are not materially worsened by the change.
+
+**Out of scope**:
+- The much-larger ~22 K / ~19 K dupe trace from T16.10b's
+  1 000×100 Hz wired reproducer — that count is far above any
+  boundary artefact and belongs to T16.10d's variant-side
+  investigation.
+
+**Dependencies**: None blocking.
 
 
 ---
