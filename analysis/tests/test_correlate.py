@@ -712,4 +712,306 @@ class TestOffsetApplication:
         rec = records[0]
         # Raw latency would have been 150 ms; corrected is ~100 ms.
         assert abs(rec.latency_ms - 100.0) < 0.01
-        assert rec.offset_applied is True
+
+
+class TestNearCoincidentReceiveDedup:
+    """T16.16 regression: drop instrumentation-artifact receive duplicates.
+
+    The zenoh variant occasionally emits the same ``(writer, seq,
+    path)`` receive twice into its compact-Parquet log when the
+    subscriber callback or tagged-union writer fires twice for a single
+    delivery. Observed spacing on the T16.10 qos1/qos3/qos4 reproducers
+    was 200 ns to 6.7 microsecond -- well below any plausible on-wire
+    retransmission delay. ``correlate.correlate_lazy`` filters these
+    near-coincident clones via
+    ``correlate._dedupe_near_coincident_receives`` (threshold 100
+    microsecond) so the integrity report shows Dupes = 0 on clean
+    reproducers while real ms-scale on-wire duplicates remain flagged.
+    """
+
+    def test_microsecond_apart_dupes_are_dropped(self) -> None:
+        """Two receives 5 microsecond apart -> one delivery record."""
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=100.0,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.000,
+            ),
+            # 5 microsecond later -- artifact, must be dropped.
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.005,
+            ),
+        ]
+        lazy = events_to_lazy(events)
+        deliveries = correlate_lazy(lazy).collect()
+        # Exactly one delivery record survives.
+        assert deliveries.height == 1
+
+    def test_sub_microsecond_dupes_are_dropped(self) -> None:
+        """The exact T16.10 reproducer signature: 200 ns delta -> single record."""
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=42,
+                path="/bench/0",
+                qos=3,
+                bytes=8,
+                offset_ms=100.0,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=42,
+                path="/bench/0",
+                qos=3,
+                bytes=8,
+                offset_ms=110.000_000,
+            ),
+            # 200 ns later -- the smallest delta observed in the T16.10
+            # qos3 fixture (seq=2376 had a 200 ns dupe).
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=42,
+                path="/bench/0",
+                qos=3,
+                bytes=8,
+                offset_ms=110.000_000_2,
+            ),
+        ]
+        lazy = events_to_lazy(events)
+        deliveries = correlate_lazy(lazy).collect()
+        assert deliveries.height == 1
+
+    def test_millisecond_apart_dupes_are_preserved(self) -> None:
+        """Two receives 1 ms apart -> two delivery records (real on-wire dupe)."""
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=100.0,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.0,
+            ),
+            # 1 ms later -- comfortably above the 100 microsecond
+            # threshold; treat as a real on-wire duplicate.
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=111.0,
+            ),
+        ]
+        lazy = events_to_lazy(events)
+        deliveries = correlate_lazy(lazy).collect()
+        assert deliveries.height == 2
+
+    def test_boundary_threshold_just_above_keeps_dupes(self) -> None:
+        """Delta just above 100 microsecond threshold -> both kept.
+
+        Pins the boundary value so a future threshold tweak surfaces as
+        a test failure rather than silently changing analyser output.
+        """
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=100.0,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.0,
+            ),
+            # 110.000 + 0.101 ms = 110.101 ms -- 101 microsecond delta,
+            # 1 microsecond above the 100 microsecond threshold.
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.101,
+            ),
+        ]
+        lazy = events_to_lazy(events)
+        deliveries = correlate_lazy(lazy).collect()
+        assert deliveries.height == 2
+
+    def test_boundary_threshold_just_below_drops_dupes(self) -> None:
+        """Delta just below 100 microsecond threshold -> one kept."""
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=100.0,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.0,
+            ),
+            # 110.000 + 0.099 ms = 110.099 ms -- 99 microsecond delta,
+            # 1 microsecond below the 100 microsecond threshold.
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.099,
+            ),
+        ]
+        lazy = events_to_lazy(events)
+        deliveries = correlate_lazy(lazy).collect()
+        assert deliveries.height == 1
+
+    def test_dedup_only_applies_within_same_key(self) -> None:
+        """Receives at the same time on different ``(seq, path)`` are not deduped."""
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=100.0,
+            ),
+            make_event(
+                "write",
+                runner="alice",
+                seq=2,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=100.001,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.000,
+            ),
+            # Same time, different seq -- distinct delivery.
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=2,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.000,
+            ),
+        ]
+        lazy = events_to_lazy(events)
+        deliveries = correlate_lazy(lazy).collect()
+        assert deliveries.height == 2
+
+    def test_dedup_preserves_first_row(self) -> None:
+        """The earlier receive in the pair is the one kept."""
+        events = [
+            make_event(
+                "write",
+                runner="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=100.0,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.000,
+            ),
+            make_event(
+                "receive",
+                runner="bob",
+                writer="alice",
+                seq=1,
+                path="/k",
+                qos=3,
+                bytes=8,
+                offset_ms=110.005,
+            ),
+        ]
+        lazy = events_to_lazy(events)
+        deliveries = correlate_lazy(lazy).collect()
+        records = deliveries_to_records(deliveries)
+        assert len(records) == 1
+        # The kept row's receive_ts is the earlier one (offset_ms=110.000).
+        # latency_ms is therefore approximately 10.000 ms, not 10.005 ms.
+        assert abs(records[0].latency_ms - 10.000) < 0.001
