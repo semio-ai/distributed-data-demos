@@ -7565,7 +7565,7 @@ decision and the wired-overhead measurement in
   cross-WiFi command for the user to execute (PowerShell).
 
 
-### T16.10d — Zenoh QoS 3/4 higher-rate ordering at 1 000×100 Hz wired [medium]
+### T16.10d — Zenoh QoS 3/4 higher-rate ordering at 1 000×100 Hz wired [medium] — done 2026-05-24
 
 **Repo**: `variants/zenoh/`
 **Status**: filed 2026-05-24 by orchestrator after T16.10 closed but
@@ -7785,7 +7785,7 @@ validation surface, not a one-off.
 WiFi spawn list is known-good baseline-wise.
 
 
-### T16.15 — Port `variants/zenoh/tests/two_runner_regression.rs` to compact-Parquet [medium]
+### T16.15 — Port `variants/zenoh/tests/two_runner_regression.rs` to compact-Parquet [medium] — done 2026-05-24
 
 **Repo**: `variants/zenoh/`
 **Status**: filed 2026-05-24 by orchestrator from T16.10 worker
@@ -7840,7 +7840,7 @@ updated.
 **Dependencies**: None blocking.
 
 
-### T16.16 — analyzer: investigate 3-duplicate trace at EOT window [low]
+### T16.16 — analyzer: investigate 3-duplicate trace at EOT window [low] — done 2026-05-24
 
 **Repo**: `analysis/`
 **Status**: filed 2026-05-24 by orchestrator from T16.10 worker
@@ -7882,6 +7882,170 @@ one side and the EOT-marker itself triple-counted.
   investigation.
 
 **Dependencies**: None blocking.
+
+
+### T16.17 — Audit threading-mode coverage across all variant fixtures [medium]
+
+**Repos**: `variants/*/tests/fixtures/`, `configs/`, plus
+`metak-orchestrator/EPICS.md` for E14 task acceptance.
+**Status**: filed 2026-05-24 by orchestrator after T16.10d and T16.15
+workers independently surfaced the same coverage gap.
+
+**Problem**: E14 T14.8 changed the default `threading_modes` to
+`["single"]` for backwards-compatibility. Any fixture that does NOT
+explicitly set `threading_modes` now silently runs in Single mode.
+Two independent workers on 2026-05-24 discovered:
+
+1. **T16.10d worker**: T16.10's original 10 Hz qos3/qos4 reproducer
+   fixtures omit `threading_modes` and default to Single. T16.10's
+   `publisher_task` fix (which lives in the Multi-mode in-process
+   path) was thus never exercised end-to-end by the official fixture
+   set — the test passed because it ran the zenohd sidecar HTTP-PUT
+   path, which trivially preserves ordering.
+2. **T16.15 worker**: Existing zenoh `1000paths`, `max`, and `t149b`
+   fixtures default to Single mode after T14.8, but their thresholds
+   were sized for Multi (the only mode pre-T14.8). T16.15 pinned them
+   to Multi in the test harness (`materialize_fixture`) as a
+   short-term mitigation, but the underlying fixture files are still
+   silently wrong.
+
+This is a **project-wide audit** task because the same gap likely
+affects fixtures in `variants/custom-udp/`, `variants/hybrid/`,
+`variants/quic/`, `variants/websocket/`, and possibly `configs/`.
+
+**Scope**:
+- Inventory every `*.toml` under `variants/*/tests/fixtures/` and
+  `configs/` and identify which omit `threading_modes`.
+- For each, decide: should this fixture exercise Single, Multi, or
+  both? Document the decision in a one-line comment at the top of
+  each fixture file.
+- Add an explicit `threading_modes = [...]` to every fixture that
+  matters. Don't rely on the default for any fixture intended to
+  validate a specific code path.
+- Audit any test threshold that was sized for one mode but now
+  silently runs the other. Adjust threshold sizing OR pin the mode
+  explicitly.
+- Update `metak-shared/coding-standards.md` (or a new fixture-style
+  doc) to require explicit `threading_modes` on every fixture going
+  forward.
+
+**Acceptance**:
+- Every fixture under `variants/*/tests/fixtures/` and `configs/`
+  has an explicit `threading_modes` setting.
+- A grep test in CI (or a documented pre-commit check) rejects any
+  new fixture missing `threading_modes`.
+- All variant test suites still pass (no threshold-sizing
+  regressions exposed by the explicit mode).
+
+**Out of scope**:
+- Changing the T14.8 default itself. The default-to-Single is
+  intentional for backwards-compat. The fix is to make fixtures
+  explicit, not to change the language.
+- Adding new fixture cases. Existing fixtures only.
+
+**Dependencies**: T16.15 done (the pin-in-test-harness mitigation is
+already in place; this task replaces it with a proper fixture-side
+fix).
+
+
+### T16.18 — Restore T16.15's relaxed test thresholds [low]
+
+**Repo**: `variants/zenoh/tests/`.
+**Status**: filed 2026-05-24 by orchestrator from T16.15 worker's
+documented trade-off.
+
+**Problem**: T16.15 ported `tests/two_runner_regression.rs` to
+compact-Parquet but relaxed several per-direction thresholds because
+the receive-clock-scoped denominator (the natural one for the
+compact-Parquet read path) drops the writer's last tick of writes
+relative to the legacy JSONL approach. The relaxations:
+
+- `1000paths_no_deadlock`: per-direction `== 100%` → `>= 80%`.
+- `max_throughput_no_deadlock`: `>= 80%` → `>= 20%`.
+- `single_mode_t149b`: per-direction `>= 80%` → "at least one
+  direction `>= 30%`".
+
+These are real coverage rollbacks — the tests now run, but they
+catch much less. The original 100% / ≥80% thresholds matched the
+contract (QoS 3/4 are reliable tiers).
+
+**Fix direction**: Replicate `analysis/performance.py`'s
+`_write_receive_counts` write-clock-scoped denominator logic in the
+test harness. That requires per-event `(writer, seq, path)`
+correlation across the two compact files. Lift the helper out of
+`analysis/performance.py` into a shared `analysis/lib/` module or
+similar so the Rust test can shell out to a Python invocation; or
+re-implement in Rust if the helper is short.
+
+**Acceptance**:
+- `1000paths_no_deadlock`: per-direction `== 100%` restored.
+- `max_throughput_no_deadlock`: `>= 80%` restored.
+- `single_mode_t149b`: per-direction `>= 80%` restored.
+- All 6 ignored tests still pass.
+- No new external Python invocation cost in the default test set
+  (still `cargo test --release -p variant-zenoh` with no environment
+  prep).
+
+**Out of scope**:
+- Changing the analysis-side `_write_receive_counts` algorithm.
+- Adding new fixtures or new tests.
+- Refactoring the test harness beyond what's needed for the
+  threshold restoration.
+
+**Dependencies**: T16.15 done.
+
+
+### T16.19 — Investigate QoS 4 completeness at 1 000×100 Hz Multi mode [medium]
+
+**Repo**: `variants/zenoh/`.
+**Status**: filed 2026-05-24 by orchestrator from T16.10d worker's
+observation.
+
+**Problem**: T16.10d's `two-runner-zenoh-1000x100hz-qos4-repro.toml`
+fixture shows OoO = 0 and Dupes = 0 (the fix worked) but completeness
+is only 45-67 % per direction. The worker attributes this to
+T17.8's credit window. That warrants verification — T17.8 was
+designed to **back-pressure** the publisher cleanly, not to drop
+deliveries below 100 %. If the credit window is genuinely capping
+throughput, the publisher should slow down to match the receiver,
+not drop writes; the variant should never emit a `write` event for a
+sample that can't be delivered.
+
+QoS 4 is the strictest reliability tier in the project's contract.
+A 45 % completeness at QoS 4 on a wired-loopback 1 000-path workload
+is, at face value, a contract violation.
+
+**Investigation steps**:
+1. Confirm via T17.8's design (see EPICS § E17 and STATUS.md
+   "T17.8 — variants/zenoh") whether the credit window is supposed
+   to back-pressure publish() or whether it's allowed to skip.
+2. Inspect the publisher path in `variants/zenoh/src/zenoh.rs` and
+   `subscriber_task` to determine whether incomplete deliveries
+   correspond to writes that were emitted but never received, or
+   writes that were silently skipped.
+3. Cross-check with `backpressure_skipped` event counts in the
+   compact-Parquet (T17.9 added the flag for contract violation
+   detection). If non-zero at QoS 4 on these runs, that's an
+   immediate FAIL signal.
+4. Conclude: is this a real bug, an expected back-pressure latency
+   (in which case the workload is intentionally over-rate and
+   should be documented), or a credit-window sizing issue?
+
+**Acceptance**:
+- Either: 1 000×100 Hz qos4 Multi-mode reproducer shows ≥ 99 %
+  per-direction completeness with OoO = 0 / Dupes = 0;
+- Or: the project documents that 1 000×100 Hz qos4 Multi is
+  intentionally over-rate and the credit-window-driven incomplete
+  delivery is the expected response, with a clear note in
+  `variants/zenoh/CUSTOM.md` and a relaxed acceptance threshold on
+  the reproducer fixture.
+
+**Out of scope**:
+- Changing T17.8's credit/window design itself.
+- Anything below 1 000 paths or below 100 Hz — those workloads have
+  not shown this completeness issue.
+
+**Dependencies**: T16.10d done.
 
 
 ---

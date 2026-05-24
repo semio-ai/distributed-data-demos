@@ -18443,3 +18443,92 @@ clean.
    the final 3-of-3-pass verification; the assertion shape and
    thresholds I locked in are stable against that binary. No
    coordination needed with T16.10d.
+
+
+## 2026-05-24 — T16.10d / T16.15 / T16.16 closed; three new follow-ups filed
+
+All three sibling workers from the resume-spawn wave delivered cleanly.
+
+- **T16.10d**: `4b1013a` (fixtures) → `2ddd566` (fix) → `8c72346`
+  (docs) → `2307332` (status). Multi-mode 1 000×100 Hz qos3/qos4
+  reproducers now show OoO = 0 / Dupes = 0 per direction. Real root
+  cause was Zenoh 1.9's `autoconnect_strategy = "always"` causing
+  redundant TCP routes on simultaneous discovery — NOT the
+  publisher_task serialisation that T16.10 fixed. Two-layer fix:
+  deterministic `"greater-zid"` strategy + per-writer sliding-window
+  dedup.
+- **T16.15**: `571cc7b` (Cargo dev-deps) → `0b0f7de` (test rewrite) →
+  `6bebaed` (status). All 6 ignored two-runner regression tests pass
+  3 consecutive runs via compact-Parquet read.
+- **T16.16**: `4d4226b` (fix) → `bab7636` (test) → `1e477a0` (status).
+  Analyser-side dedup in `correlate.py::_dedupe_near_coincident_receives`
+  filters same-key receives within 100 μs. T16.10's qos1/3/4
+  reproducers now show Dupes = 0.
+
+T16.10d, T16.15, T16.16 marked **done 2026-05-24** in TASKS.md.
+
+### Three follow-ups filed in TASKS.md
+
+The workers surfaced three independent issues, none of which were in
+their own task scopes:
+
+- **T16.17 [medium]** — audit `threading_modes` coverage across ALL
+  variant fixtures + configs. Two workers (T16.10d, T16.15)
+  independently discovered that E14 T14.8's default-to-Single
+  silently invalidated multiple existing fixtures. T16.10's official
+  fixtures default to Single and so never exercised the in-process
+  publisher_task path that T16.10's fix targeted; T16.15's
+  thresholds were sized for Multi but fixtures defaulted to Single.
+  Project-wide audit needed because this likely affects other
+  variants too (`custom-udp`, `hybrid`, `quic`, `websocket`).
+
+- **T16.18 [low]** — restore T16.15's relaxed thresholds.
+  T16.15 documented a coverage rollback (1000paths 100% → ≥80%, max
+  ≥80% → ≥20%, t149b per-direction ≥80% → "at least one direction
+  ≥30%") because replicating analysis/performance.py's
+  write-clock-scoped denominator in the test harness was out of
+  scope. Once the helper is liftable, restore the original
+  thresholds.
+
+- **T16.19 [medium]** — investigate QoS 4 completeness at 1 000×100 Hz
+  Multi mode. T16.10d's qos4 reproducer shows 45-67% per-direction
+  completeness with OoO = 0 / Dupes = 0. Worker attributed this to
+  T17.8's credit window, but T17.8 was meant to back-pressure
+  cleanly, not drop. QoS 4 is the strictest reliability tier; this
+  is a contract question that needs resolving — either fix to ≥99%
+  or document the workload as intentionally over-rate.
+
+### Cross-cutting observation
+
+The 2026-05-24 wave found TWO bugs that the official T16.10 fix
+target (publisher_task ordering) was supposed to have caught but
+didn't, because the official fixtures didn't exercise the affected
+code path:
+
+1. The variant-side multicast-route dedup bug (closed by T16.10d).
+2. The completeness regression at high rate (T16.19, open).
+
+Both are due to T16.10's fixtures running Single mode (zenohd
+sidecar) instead of Multi mode (in-process publisher_task /
+subscriber_task). This is the project-wide threading-mode coverage
+gap that T16.17 will close.
+
+### Open queue snapshot
+
+**Done in this conversation wave**: T16.10, T16.10b, T16.10d, T16.15,
+T16.16.
+
+**Filed, not spawned yet** (pending user direction):
+- T16.10c [high] — cross-WiFi Zenoh resilience (router-sidecar OR
+  FIFO/ack bump). Now unblocked — T16.10d landed, wired baseline
+  is known-good.
+- T16.12 [medium] — variant-base watchdog flush.
+- T16.13 [low] — analyser resource-cadence heartbeat.
+- T16.14 [low] — cross-WiFi CI surface (docs).
+- T16.17 [medium] — fixture threading-mode audit.
+- T16.18 [low] — restore relaxed thresholds.
+- T16.19 [medium] — qos4 completeness investigation.
+
+**Active in-flight**: none.
+
+
