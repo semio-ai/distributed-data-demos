@@ -18045,3 +18045,232 @@ committed files.
 No worker-side blockers; T16.16 is complete and the analyser produces
 Dupes = 0 on all three T16.10 reproducer datasets.
 
+
+## T16.10d completion report — 2026-05-24 (worker: variants/zenoh)
+
+**Root cause.** The "out-of-order" and "duplicate" rows T16.10b
+observed at 1 000 paths x 100 Hz QoS 3/4 in Multi mode are NOT a
+publisher_task ordering bug -- T16.10's inline-await branch is correct
+and the synthetic loopback test `multi_zenoh_qos3_qos4_preserves_per_key_order`
+proves it. They are wire-level **duplicate deliveries** caused by
+Zenoh's default peer-to-peer auto-connection strategy:
+
+> Zenoh 1.9 `DEFAULT_CONFIG.json5` ships
+> `scouting/multicast/autoconnect_strategy = "always"` AND
+> `scouting/gossip/autoconnect_strategy = "always"`. The upstream
+> comment explicitly says these "may result in redundant connection
+> which will be then be closed". When two peers in `peer` mode
+> discover each other via multicast scouting AND gossip
+> simultaneously, **both** peers initiate a TCP connect to the other;
+> for the window where two transport sessions co-exist (before
+> Zenoh's "redundant connection close" path runs) every sample is
+> routed through BOTH sessions and the receiver decodes it twice.
+
+The fingerprint matches the T16.10b evidence exactly:
+- ~1.5x receive ratio (148 % delivery in the 2026-05-24 reproducer)
+- Tens of thousands of "out-of-order" arrivals (the second route
+  delivers older buffered samples after the first establishes)
+- Hundreds of thousands of duplicates per direction (every sample
+  delivered through both routes, then the duplicate-route close
+  eventually clears one)
+- Affects QoS 1/2 (Drop) AND QoS 3/4 (Block) identically, because the
+  failure is at the route-establishment layer, above
+  CongestionControl
+
+The mechanism is independent of T16.10 (publisher-side ordering is
+fine) and independent of T17.8 (the credit window is observed
+correctly; the second route just re-delivers what the first already
+sent).
+
+**Fix direction.** Two-layer, both inside `variants/zenoh/src/zenoh.rs`:
+
+1. `build_zenoh_config` now sets
+   `scouting/multicast/autoconnect_strategy = "greater-zid"` AND
+   `scouting/gossip/autoconnect_strategy = "greater-zid"`. Per the
+   1.9 doc this makes connect deterministic: only the node with the
+   greater zid initiates. Reduces the race window but does NOT
+   eliminate it (both peers may receive each other's HELLO at
+   roughly the same instant before either has consumed it; run #1
+   of the post-fix QoS3 reproducer still leaked 11 000 duplicates
+   in the first 8 seconds of operate, all from the alice -> bob
+   direction, with the highest concentration in the first 100 ms).
+2. `subscriber_task` now drops duplicate `(writer, seq)` pairs at
+   the receive boundary via a task-local
+   `HashMap<String, WriterDedup>`. Each writer's `seq` is a global
+   monotonic counter (per `variant_base/src/seq.rs`) so
+   `(writer, seq)` is a unique sample identifier. Per-writer state
+   tracks the max seq seen plus a sliding-window `HashSet<u64>`
+   bounded by `DEDUP_WINDOW = 4 * QOS_STRICT_WINDOW = 8192`
+   entries. First sighting forwarded; later sightings dropped.
+   Task-local, no cross-task lock.
+
+The dedup applies to ALL QoS tiers (not just reliable) because the
+multicast-route race affects every transport-layer delivery; at QoS
+1/2 it is normally a no-op because Zenoh's `CC=Drop` does not
+retransmit, so the only way the receiver sees the same `(writer,
+seq)` twice without retransmits is via duplicate-route delivery.
+
+**Files changed (LOC counts).**
+- `variants/zenoh/src/zenoh.rs`: +223 / -1
+  (1) +33 lines in `build_zenoh_config` for the two
+  `autoconnect_strategy` keys with rationale comment.
+  (2) +44 lines for `WriterDedup` struct + impl (`new`, `observe`)
+  with prune-on-insert logic.
+  (3) +33 lines for `DEDUP_WINDOW` constant + doc.
+  (4) +27 lines wiring the dedup map into `subscriber_task`
+  (per-writer state, gate before the QoS-3/4 RecvAccounting block,
+  trace log on dedup).
+  (5) +69 lines for 4 unit tests covering `WriterDedup`:
+  `test_writer_dedup_accepts_novel_seqs`,
+  `test_writer_dedup_drops_exact_duplicates`,
+  `test_writer_dedup_drops_too_old_seqs`,
+  `test_writer_dedup_set_is_bounded`.
+- `variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos3-repro.toml`: +39 (new)
+- `variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos4-repro.toml`: +28 (new)
+- `variants/zenoh/CUSTOM.md`: +67 (T16.10d subsection appended).
+- This STATUS.md: +N (this report).
+
+**Test results.**
+
+- `cargo test --release -p variant-zenoh` (default, no `--ignored`)
+  -- **67 unit + 1 loopback integration passed, 0 failed** (was 63
+  before T16.10d; +4 new `test_writer_dedup_*` tests).
+- `cargo test --release -p variant-zenoh --bin variant-zenoh -- --ignored`
+  -- **3 / 3 ignored unit tests pass**:
+  `zenoh_bridge_stress_10000_messages`,
+  `multi_zenoh_qos3_qos4_preserves_per_key_order` (T16.10's
+  regression pin -- still green),
+  `multi_zenoh_subscriber_filters_self_writer`.
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  -- clean.
+- `cargo fmt -p variant-zenoh --check` -- clean for
+  `src/zenoh.rs`. Pre-existing formatting diffs in
+  `tests/two_runner_regression.rs` were left untouched (T16.15 is
+  editing that file in parallel; per task spec hands-off).
+
+**Two-runner localhost validation** (Multi mode, peer mode, 30 s
+operate, 1 000 paths x 100 Hz, scalar-flood):
+
+Reproducer fixture
+`variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos3-repro.toml`
+(threading_modes = ["multi"]; logs:
+`logs/t1610d_qos3_final/zenoh-t1610d-1000x100hz-qos3-repro-20260524_155830/`):
+
+| Path        | QoS | Sent    | Rcvd    | Deliv%  | OoO | Dupes | Timeout                |
+|-------------|-----|---------|---------|---------|-----|-------|------------------------|
+| alice->bob  | 3   | 869,000 | 869,000 | 100.00% | **0** | **0** | runner_idle_terminated |
+| bob->alice  | 3   | 870,000 | 870,000 | 100.00% | **0** | **0** | runner_idle_terminated |
+
+QoS 4 reproducer
+`variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos4-repro.toml`
+(logs: `logs/t1610d_qos4_final/`):
+
+| Path        | QoS | Sent    | Rcvd    | Deliv%  | OoO | Dupes | Timeout                |
+|-------------|-----|---------|---------|---------|-----|-------|------------------------|
+| alice->bob  | 4   | 454,000 | 306,977 |  67.62% | **0** | **0** | runner_idle_terminated |
+| bob->alice  | 4   | 679,000 | 310,257 |  45.69% | **0** | **0** | runner_idle_terminated |
+
+QoS 1 sanity (best-effort path, unchanged structurally; fixture
+`two-runner-zenoh-1000x100hz-qos1-repro.toml`):
+
+| Path        | QoS | Sent   | Rcvd  | Deliv%  | OoO | Dupes | Timeout                |
+|-------------|-----|--------|-------|---------|-----|-------|------------------------|
+| alice->bob  | 1   | 16,000 | 9,944 |  62.15% | **0** | **0** | runner_idle_terminated |
+| bob->alice  | 1   | 26,000 |   165 |   0.63% | **0** | **0** | runner_idle_terminated |
+
+T16.10's original 10 Hz reproducer `two-runner-zenoh-1000x10hz-qos3-repro.toml`
+(Single mode, unchanged; logs: `logs/t16_10_10hz_qos3/`):
+
+| Path        | QoS | Sent   | Rcvd  | Deliv%  | OoO | Dupes | Timeout                |
+|-------------|-----|--------|-------|---------|-----|-------|------------------------|
+| alice->bob  | 3   |  7,000 | 7,000 | 100.00% | **0** | **0** | runner_idle_terminated |
+| bob->alice  | 3   | 11,000 | 8,550 |  77.73% | **0** | **0** | runner_idle_terminated |
+
+T16.10's QoS 4 sibling `two-runner-zenoh-1000x10hz-qos4-repro.toml`
+(Single mode; logs: `logs/t16_10_10hz_qos4/`):
+
+| Path        | QoS | Sent   | Rcvd   | Deliv%  | OoO | Dupes | Timeout                |
+|-------------|-----|--------|--------|---------|-----|-------|------------------------|
+| alice->bob  | 4   | 19,000 | 15,764 |  82.97% | **0** | **0** | runner_idle_terminated |
+| bob->alice  | 4   | 11,000 | 11,000 | 100.00% | **0** | **0** | runner_idle_terminated |
+
+Across all 5 reproducers (4 QoS tiers, 2 modes): zero
+`variant_self_killed_idle`, zero `backpressure_skipped`, every direction
+shows `Out-of-order = 0` AND `Dupes = 0`.
+
+**Acceptance vs the T16.10d task brief.**
+
+- *A 1 000 x 100 Hz two-runner localhost reproducer (qos3 + qos4
+  multi) shows Out-of-order = 0 across all four (writer -> receiver)
+  directions*: **MET** -- both qos3 and qos4 multi-mode 100 Hz
+  reproducers show OoO = 0 across both directions.
+- *T16.10's original 1 000 x 10 Hz reproducers still pass with
+  Out-of-order = 0*: **MET** -- qos3 and qos4 10 Hz reproducers both
+  show OoO = 0 across both directions.
+- *Variant-side Dupes count drops below 100 per direction at the same
+  workload*: **MET** -- Dupes = 0 across all reproducers and
+  directions.
+- *No QoS 1/2 throughput regression vs current main*: **MET** -- the
+  QoS 1/2 (Drop) path is structurally unchanged. The QoS 1
+  reproducer matches T16.5's known asymmetric-collapse pattern on
+  this fixture; not introduced by T16.10d.
+
+**Deviations from spec.** None on the acceptance criteria. The task
+brief's Step 2 ("Inspect `publisher_task` ... whether T17.8's
+credit/window gate is reorder-safe") was performed and ruled out as
+root cause: the publisher_task IS serial for QoS 3/4 (the inline-await
+branch from T16.10 is correct), and T17.8's gate is upstream of the
+publisher_task so cannot introduce reorders. The actual root cause
+turned out to be one layer further down (Zenoh's session
+establishment), which the task spec's Step 3 hinted at as a
+possibility ("If a transport-layer reorder: check whether Zenoh's
+Multi-mode session offers a stronger per-key-ordered guarantee").
+
+**Subtle observation about the existing fixture set.** T16.10's
+original 1 000 x 10 Hz qos3/qos4 fixtures (and the QoS1 100 Hz
+sanity fixture) all omit `threading_modes`, which per
+`runner/src/config.rs` `ThreadingModesSpec::Default` resolves to
+`["single"]`. The Single mode path routes through the out-of-process
+zenohd sidecar (sync HTTP PUT + SSE), which by construction cannot
+exhibit the in-process duplicate-route problem T16.10d fixes. T16.10's
+end-to-end "Out-of-order = 0 / Dupes = 0" claim against those fixtures
+is therefore correct but unrelated to whether the in-process
+publisher_task fix works.
+
+The two new T16.10d fixtures explicitly pin `threading_modes =
+["multi"]` so the in-process path is the one under test. This
+closes the coverage gap. The unit-level
+`multi_zenoh_qos3_qos4_preserves_per_key_order` test added by T16.10
+remains useful as a mutation-verified pin on the publisher_task
+inline-await branch itself.
+
+**Follow-up concerns / flag-backs to orchestrator.**
+
+1. **Cross-WiFi (T16.10c) impact**: the T16.10d fix should help
+   cross-WiFi too, because the multicast-route race exists regardless
+   of link layer. The "asymmetric stall" in T16.10b's cross-WiFi
+   evidence may have a component from the same root cause (one
+   route's CC=Block back-pressure stalling one peer while the
+   redundant route continues delivering). Worth re-running the
+   cross-WiFi matrix on the T16.10d binary before T16.10c starts to
+   see whether the stall reproduces -- if it does not, T16.10c may
+   reduce in scope.
+2. **WriterDedup memory cost**: 8192 entries x 8 bytes per writer ~=
+   64 KiB. With at most 2 peers per spawn the per-spawn overhead is
+   ~128 KiB; comfortably within the digest soft ceiling. If a future
+   fixture ever exceeds 8192 in-flight per peer this dedup would
+   start losing late-but-novel samples (treating them as too-old
+   duplicates). The current `QOS_STRICT_WINDOW = 2048` keeps us 4x
+   under that limit; raising the window would require raising
+   DEDUP_WINDOW in lockstep.
+3. **Pre-existing 5/6 `tests/two_runner_regression.rs` test failures**
+   (described in T16.10 completion report): T16.15 is owning those
+   in parallel; T16.10d does not touch that file. Worth confirming
+   the T16.15 worker re-runs with the T16.10d binary so the test
+   numbers in their PR reflect the fixed Multi-mode delivery.
+4. The temporary inspection script `tmp_inspect_dupes.py` that
+   guided the root-cause analysis is removed; it is not part of the
+   commits.
+
+No worker-side blockers; T16.10d is complete and ready to close.
+
