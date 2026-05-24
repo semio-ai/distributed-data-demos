@@ -338,6 +338,14 @@ Tests covering this contract live in `src/zenoh.rs` `tests` mod:
 - `test_try_publish_qos1_default_path_returns_ok_true` -- single-write
   sanity case verifying the message is enqueued with the right `qos`
   tag for downstream cache routing.
+- `multi_zenoh_qos3_qos4_preserves_per_key_order` (ignored) -- synthetic
+  two-session loopback regression added 2026-05-24. Publishes 200 seqs
+  across 4 keys for both `ReliableUdp` and `ReliableTcp` (1 600 messages
+  total) from a connected `ZenohVariant` to an in-process auxiliary
+  Zenoh session, then asserts each `(qos, key)` receive stream is
+  strictly monotonically increasing. Mutation-verified: replacing the
+  inline-await branch with the buggy `tokio::spawn` path makes the test
+  fail at the first observable reorder.
 
 ## Peer-coordinated back-pressure (T17.8, reopens T16.12)
 

@@ -3152,6 +3152,191 @@ mod tests {
         // pin here is the absence of self-echoes only.
     }
 
+    /// T16.10 regression: QoS 3/4 publishes from one Zenoh session to
+    /// another MUST preserve per-key send order. The pre-T16.10 bug
+    /// was that `publisher_task` `tokio::spawn`-ed every put as an
+    /// independent task -- two concurrent `put().await` futures for
+    /// the same key under `CongestionControl::Block` could complete
+    /// in arbitrary order, producing out-of-order receives. T16.10's
+    /// fix is the inline-await branch in `publisher_task` for
+    /// reliable QoS (see CUSTOM.md "T16.10 -- QoS 3/4 ordering
+    /// preservation").
+    ///
+    /// We drive a synthetic two-session loopback (variant publishes,
+    /// auxiliary session subscribes + verifies) for both QoS 3
+    /// (`ReliableUdp`) and QoS 4 (`ReliableTcp`) across multiple keys
+    /// to maximally exercise the per-key ordering invariant.
+    ///
+    /// Gated `#[ignore]` for the same reason as the bridge stress
+    /// test: it spins up two real Zenoh sessions and depends on
+    /// loopback scouting. Run with
+    /// `cargo test --release -p variant-zenoh -- --ignored
+    ///  multi_zenoh_qos3_qos4_preserves_per_key_order`.
+    #[test]
+    #[ignore]
+    fn multi_zenoh_qos3_qos4_preserves_per_key_order() {
+        // Each (qos, key) pair will get this many samples, exercising
+        // the publisher_task's reliable-await branch back-to-back.
+        const SEQS_PER_KEY: u64 = 200;
+        // Spread across enough keys that any spawn-style concurrency
+        // between keys would visibly reorder samples on the wire.
+        const KEYS: &[&str] = &["/bench/0", "/bench/1", "/bench/2", "/bench/3"];
+
+        let mut variant = ZenohVariant::new("ordering-pub", &[]).expect("construct variant");
+        variant
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect");
+
+        // Auxiliary session: its own runtime, its own subscriber. We
+        // verify ordering on the wire as observed by an INDEPENDENT
+        // Zenoh peer (vs the variant's own subscriber, which would be
+        // self-filtered).
+        let aux_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("aux runtime");
+        let aux_args = ZenohArgs::parse(&[]).expect("default ZenohArgs");
+        let aux_config = build_zenoh_config(&aux_args).expect("aux config");
+        let (aux_session, aux_subscriber) = aux_rt.block_on(async move {
+            let session = zenoh::open(aux_config).await.expect("open aux session");
+            let subscriber = session
+                .declare_subscriber(SUBSCRIBER_WILDCARD)
+                .await
+                .expect("declare aux subscriber");
+            (session, subscriber)
+        });
+
+        // Give Zenoh's loopback discovery + interest declaration time
+        // to settle before the variant's first publish, so the aux
+        // subscriber is routed for `bench/**` by the time we start.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Publish across both reliable QoS tiers. For each (qos, key)
+        // we send `SEQS_PER_KEY` samples interleaved across keys so
+        // the publisher_task's drain loop sees a multi-key stream --
+        // the exact shape that broke pre-T16.10.
+        for qos in [Qos::ReliableUdp, Qos::ReliableTcp] {
+            for seq in 0..SEQS_PER_KEY {
+                for path in KEYS {
+                    variant
+                        .publish(path, &[0u8; 8], qos, seq)
+                        .expect("variant publish");
+                }
+            }
+        }
+
+        // Drain on the aux session with a deadline. We expect the
+        // bulk of samples to land -- localhost loopback at QoS 3/4
+        // with CongestionControl::Block is reliable, even with the
+        // T17.8 window gate -- but we tolerate some drop margin
+        // because the wildcard subscriber's internal queue can drop
+        // under heavy traffic. The CONTRACT this test pins is
+        // ordering, not throughput.
+        //
+        // `per_key_seqs[(qos, path)] = Vec<seq>` in receive order.
+        let mut per_key_seqs: std::collections::HashMap<(u8, String), Vec<u64>> =
+            std::collections::HashMap::new();
+        let total_expected = SEQS_PER_KEY * (KEYS.len() as u64) * 2; // 2 QoS tiers.
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        let mut received_total = 0u64;
+        aux_rt.block_on(async {
+            while Instant::now() < deadline && received_total < total_expected {
+                let recv_deadline = tokio::time::sleep(std::time::Duration::from_millis(200));
+                tokio::pin!(recv_deadline);
+                tokio::select! {
+                    sample = aux_subscriber.recv_async() => {
+                        let sample = match sample {
+                            Ok(s) => s,
+                            Err(_) => break,
+                        };
+                        let bytes = sample.payload().to_bytes();
+                        let decoded = match MessageCodec::decode(&bytes) {
+                            Ok(u) => u,
+                            Err(_) => continue,
+                        };
+                        // Only count samples we sent via the variant on
+                        // this run. Zenoh scouting on a noisy CI host
+                        // can pick up unrelated peers.
+                        if decoded.writer != "ordering-pub" {
+                            continue;
+                        }
+                        if !matches!(decoded.qos, Qos::ReliableUdp | Qos::ReliableTcp) {
+                            continue;
+                        }
+                        per_key_seqs
+                            .entry((decoded.qos.as_int(), decoded.path.clone()))
+                            .or_default()
+                            .push(decoded.seq);
+                        received_total += 1;
+                    }
+                    _ = &mut recv_deadline => {
+                        // No traffic for 200 ms -- assume we're done.
+                        if received_total > 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Tear down BEFORE asserting so a failed assertion doesn't
+        // leak the background subscriber + runtime.
+        aux_rt.block_on(async move {
+            drop(aux_subscriber);
+            let _ = aux_session.close().await;
+        });
+        aux_rt.shutdown_timeout(std::time::Duration::from_secs(2));
+        variant.disconnect().expect("disconnect");
+
+        // Sanity: we must have observed SOMETHING on every (qos, key)
+        // pair, otherwise the test doesn't prove ordering anywhere.
+        // The threshold is set to half the requested count to absorb
+        // wildcard-subscriber queue drops on slow CI -- ordering still
+        // means "every sample we DID see is in-order".
+        let min_per_key = SEQS_PER_KEY / 2;
+        for qos in [Qos::ReliableUdp, Qos::ReliableTcp] {
+            for path in KEYS {
+                let seqs = per_key_seqs
+                    .get(&(qos.as_int(), (*path).to_string()))
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(
+                    seqs.len() as u64 >= min_per_key,
+                    "QoS {:?} path {:?}: only {}/{} samples received \
+                     -- below the {} minimum required to prove ordering",
+                    qos,
+                    path,
+                    seqs.len(),
+                    SEQS_PER_KEY,
+                    min_per_key,
+                );
+
+                // T16.10 CORE INVARIANT: per-key seqs must arrive in
+                // monotonically non-decreasing order (= strictly
+                // increasing because the publish loop used distinct
+                // seqs per (qos, key)). A single "later seq appears
+                // before earlier seq" is the regression.
+                let mut last: Option<u64> = None;
+                for s in &seqs {
+                    if let Some(prev) = last {
+                        assert!(
+                            *s > prev,
+                            "QoS {:?} path {:?}: out-of-order receive -- \
+                             seq {} arrived after seq {} \
+                             (T16.10 ordering regression)",
+                            qos,
+                            path,
+                            s,
+                            prev,
+                        );
+                    }
+                    last = Some(*s);
+                }
+            }
+        }
+    }
+
     /// T-impl.7: an un-connected `try_publish` returns an error rather
     /// than `Ok(false)`. Mirrors the QUIC variant's contract: the
     /// no-connection state is a user error, not a backpressure signal.
