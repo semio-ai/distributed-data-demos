@@ -403,6 +403,68 @@ struct RecvAccounting {
     per_writer_max_seq: HashMap<String, u64>,
 }
 
+/// T16.10d: Per-writer receive-side dedup state, owned by
+/// `subscriber_task` (no sharing — strictly task-local). Each remote
+/// writer gets its own [`WriterDedup`] entry; the entries are populated
+/// lazily on first sight of a new writer name.
+///
+/// See [`DEDUP_WINDOW`] for motivation. The dedup is intentionally
+/// applied to ALL QoS tiers, not just reliable: even at QoS 1/2 the
+/// Zenoh multicast-route race can deliver the same sample twice during
+/// the connection-establishment window, which the analyser would then
+/// surface as duplicates on every QoS tier identically.
+struct WriterDedup {
+    /// Highest `seq` ever observed from this writer. Lazily initialised
+    /// on first receive (no value = "no max yet"; treat as 0).
+    max_seq: u64,
+    /// Set of `seq` values seen within `[max_seq - DEDUP_WINDOW, max_seq]`.
+    /// Pruned on every insert that advances `max_seq` past `seq + DEDUP_WINDOW`.
+    /// Bounded size = [`DEDUP_WINDOW`] entries.
+    seen: HashSet<u64>,
+}
+
+impl WriterDedup {
+    fn new() -> Self {
+        Self {
+            max_seq: 0,
+            seen: HashSet::new(),
+        }
+    }
+
+    /// Return `true` if `seq` is a duplicate (already observed) and
+    /// should be dropped; `false` if novel and should be forwarded to
+    /// the variant's recv channel. On a novel seq the state is
+    /// updated: the seq is recorded in `seen`, `max_seq` is advanced
+    /// if larger, and any entries below `max_seq - DEDUP_WINDOW` are
+    /// pruned.
+    fn observe(&mut self, seq: u64) -> bool {
+        // Stale seq beyond our dedup window: we no longer have evidence
+        // either way, but at typical workloads (1000 paths × 100 Hz with
+        // QOS_STRICT_WINDOW = 2048) a seq more than DEDUP_WINDOW = 8192
+        // below max means the writer is ~8 ticks behind our high-water
+        // mark -- which can only happen if it is a true Zenoh-internal
+        // very-late retransmit. Treat as duplicate to keep the dedup
+        // semantics deterministic; the analyser will see a small
+        // delivery-rate dip but never a duplicate row.
+        if self.max_seq > DEDUP_WINDOW && seq + DEDUP_WINDOW < self.max_seq {
+            return true;
+        }
+        if !self.seen.insert(seq) {
+            // Already saw this seq within the window.
+            return true;
+        }
+        if seq > self.max_seq {
+            self.max_seq = seq;
+            // Prune anything that has now fallen out of the window.
+            if self.max_seq > DEDUP_WINDOW {
+                let cutoff = self.max_seq - DEDUP_WINDOW;
+                self.seen.retain(|&s| s >= cutoff);
+            }
+        }
+        false
+    }
+}
+
 /// T17.8: Writer-side state shared between the driver thread (the
 /// strict-QoS publish gate) and the `ack_subscriber_task` (which feeds
 /// new per-peer watermarks in). The condvar wakes the gate whenever a
@@ -610,6 +672,39 @@ fn values_per_tick_from_env() -> Option<u32> {
 /// the JSONL receive log will simply show fewer matches than writes, which
 /// is exactly what the analysis tool measures.
 const RECEIVE_CHANNEL_CAPACITY: usize = 16384;
+
+/// T16.10d: Receive-side deduplication window. Each writer's `seq` is a
+/// global monotonic counter (one per write across all keys; see
+/// `variant_base/src/seq.rs`). With T17.8's [`QOS_STRICT_WINDOW`] = 2048
+/// in-flight cap, any seq the writer can currently have on the wire is in
+/// `[max_acked_by_us + 1, max_acked_by_us + 2048]`. Anything below
+/// `max_seq_seen - DEDUP_WINDOW` has either already been delivered or is
+/// a "very old" duplicate and we drop it (the analyser-side accounting
+/// then matches the writer-side log exactly).
+///
+/// **Why dedup is necessary in Multi mode**: Zenoh's default
+/// `autoconnect_strategy = "always"` for peer-to-peer briefly races
+/// when two peers in `peer` mode discover each other via multicast
+/// scouting AND gossip simultaneously. Both peers initiate a TCP
+/// connect; for the brief window where two transport sessions co-
+/// exist (before Zenoh's "redundant connection close" path runs)
+/// the same sample is delivered through BOTH routes, producing
+/// ~1.5x receive ratio (148 % delivery), tens of thousands of
+/// out-of-order arrivals (the second route delivers older buffered
+/// samples after the first), and hundreds of thousands of
+/// duplicates at 1 000-path × 100 Hz QoS 3 / QoS 4 workloads.
+/// Setting `autoconnect_strategy = "greater-zid"` in
+/// `build_zenoh_config` reduces but does not eliminate the race
+/// (both peers can still receive each other's multicast HELLO at
+/// roughly the same instant); the receive-side dedup gate closes
+/// the residual window deterministically.
+///
+/// Sized at 4× `QOS_STRICT_WINDOW` (= 8192) so the receiver tolerates
+/// up to 4 unacknowledged ticks of redundancy before treating a
+/// re-delivery as a novel sample. Memory per writer: 8192 × 8 bytes
+/// ≈ 64 KiB; with at most 2 peers per spawn the total receive-side
+/// dedup overhead is ≈ 128 KiB, well within the digest soft ceiling.
+const DEDUP_WINDOW: u64 = 4 * QOS_STRICT_WINDOW;
 
 /// T16.5: maximum number of in-flight `publisher.put(...).await` futures
 /// the publisher task allows to run concurrently. Each pending put holds
@@ -1213,6 +1308,34 @@ fn build_zenoh_config(args: &ZenohArgs) -> Result<zenoh::Config> {
         .insert_json5("transport/link/rx/buffer_size", "8388608")
         .map_err(zenoh_err)?;
 
+    // T16.10d: When two peers in `peer` mode discover each other via
+    // multicast scouting AND gossip simultaneously, Zenoh's default
+    // `autoconnect_strategy = "always"` makes BOTH peers initiate a
+    // TCP connect to the other. The race window where two sessions
+    // co-exist allows the same sample to traverse both routes,
+    // producing ~1.5x receive ratios (148 % delivery), tens of
+    // thousands of "out-of-order" receives (the second route replays
+    // older samples once it stabilises), and very large duplicate
+    // counts at 1 000-path × 100 Hz QoS 3 / QoS 4 workloads. The
+    // upstream comment on the "always" default explicitly says it
+    // "may result in redundant connection which will be then be
+    // closed" — in practice the close window is wide enough at this
+    // load to leak ~50 % duplicates per spawn.
+    //
+    // Setting both scouting paths (multicast + gossip) to
+    // `greater-zid` makes the connect side deterministic: only the
+    // node with the lexicographically greater zid initiates, so the
+    // pair establishes exactly one transport session and ordering
+    // collapses back to the single-route case T16.10's inline-await
+    // already proves. The configured value is parsed by serde via
+    // the `kebab-case` rename on `AutoConnectStrategy` (Zenoh 1.9).
+    config
+        .insert_json5("scouting/multicast/autoconnect_strategy", "\"greater-zid\"")
+        .map_err(zenoh_err)?;
+    config
+        .insert_json5("scouting/gossip/autoconnect_strategy", "\"greater-zid\"")
+        .map_err(zenoh_err)?;
+
     Ok(config)
 }
 
@@ -1537,12 +1660,21 @@ async fn subscriber_task(
     trace: bool,
 ) {
     let mut dropped = 0u64;
+    // T16.10d: per-writer dedup state. See `WriterDedup` doc + the
+    // `DEDUP_WINDOW` constant for the motivation. Task-local because
+    // only this task reads/writes the map; no Mutex needed.
+    let mut dedup_state: HashMap<String, WriterDedup> = HashMap::new();
+    let mut deduped = 0u64;
     loop {
         tokio::select! {
             biased;
             _ = &mut shutdown_rx => {
                 if trace {
-                    trace_now!("subscriber_task: shutdown signal received; dropped_total={}", dropped);
+                    trace_now!(
+                        "subscriber_task: shutdown signal received; dropped_total={} deduped_total={}",
+                        dropped,
+                        deduped,
+                    );
                 }
                 break;
             }
@@ -1575,6 +1707,28 @@ async fn subscriber_task(
                                 // depth: we will never reach it for a
                                 // self sample.
                                 if update.writer == self_runner {
+                                    continue;
+                                }
+                                // T16.10d: drop duplicates introduced by
+                                // Zenoh's multicast-route race window (see
+                                // DEDUP_WINDOW / WriterDedup docs). Even at
+                                // QoS 1/2 the race can deliver the same
+                                // sample twice, so dedup gates all QoS tiers.
+                                // Per-writer state is task-local and lazily
+                                // populated.
+                                let dedup_entry = dedup_state
+                                    .entry(update.writer.clone())
+                                    .or_insert_with(WriterDedup::new);
+                                if dedup_entry.observe(update.seq) {
+                                    deduped += 1;
+                                    if trace && deduped.is_multiple_of(1000) {
+                                        trace_now!(
+                                            "subscriber_task: dedup dropped seq={} writer={} (total deduped={})",
+                                            update.seq,
+                                            update.writer,
+                                            deduped,
+                                        );
+                                    }
                                     continue;
                                 }
                                 // T17.8: update the ack-emitter's view of
@@ -3539,6 +3693,74 @@ mod tests {
         assert_eq!(decode_ack_payload(&[0; 7]), None);
         assert_eq!(decode_ack_payload(&[0; 9]), None);
         assert_eq!(decode_ack_payload(&[0; 16]), None);
+    }
+
+    #[test]
+    fn test_writer_dedup_accepts_novel_seqs() {
+        // T16.10d: first sight of a seq is novel -> observe returns
+        // false (not a dup) and the state advances.
+        let mut d = WriterDedup::new();
+        assert!(!d.observe(1));
+        assert!(!d.observe(2));
+        assert!(!d.observe(3));
+        // max_seq tracks the highest observed.
+        assert_eq!(d.max_seq, 3);
+        // Out-of-order but still novel within the window is accepted.
+        assert!(!d.observe(7));
+        assert!(!d.observe(5)); // late arrival, within window
+        assert_eq!(d.max_seq, 7);
+    }
+
+    #[test]
+    fn test_writer_dedup_drops_exact_duplicates() {
+        // T16.10d: re-observing the same seq within the window returns
+        // true (dedup it).
+        let mut d = WriterDedup::new();
+        assert!(!d.observe(42));
+        assert!(d.observe(42), "second sighting must be dedup");
+        assert!(!d.observe(43));
+        assert!(d.observe(43), "second sighting must be dedup");
+        // Out-of-order duplicate also dedup'd.
+        assert!(!d.observe(40));
+        assert!(d.observe(40));
+    }
+
+    #[test]
+    fn test_writer_dedup_drops_too_old_seqs() {
+        // T16.10d: a seq more than DEDUP_WINDOW below max is treated as
+        // duplicate (the dedup set has been pruned past it; we cannot
+        // tell novel from old, so the safe behaviour is "drop"). The
+        // analyser-side cost is at most a tiny delivery-rate dip if a
+        // very late retransmit lands; the win is deterministic dedup
+        // against the multicast-race duplicates.
+        let mut d = WriterDedup::new();
+        let big = DEDUP_WINDOW * 2;
+        // Advance max past 2 * DEDUP_WINDOW.
+        assert!(!d.observe(big));
+        // A seq more than DEDUP_WINDOW below max is dropped.
+        let stale = big - DEDUP_WINDOW - 1;
+        assert!(d.observe(stale));
+        // A seq exactly DEDUP_WINDOW below max is still accepted
+        // (boundary inclusive: max - DEDUP_WINDOW is fresh).
+        let edge = big - DEDUP_WINDOW;
+        assert!(!d.observe(edge));
+    }
+
+    #[test]
+    fn test_writer_dedup_set_is_bounded() {
+        // T16.10d: as max_seq advances, the seen-set is pruned to stay
+        // within DEDUP_WINDOW entries. Pumping a strictly-ascending
+        // stream of seqs must NOT grow the set unboundedly.
+        let mut d = WriterDedup::new();
+        for s in 0..(DEDUP_WINDOW * 4) {
+            assert!(!d.observe(s));
+        }
+        assert!(
+            d.seen.len() as u64 <= DEDUP_WINDOW + 1,
+            "seen set grew past DEDUP_WINDOW: {} > {}",
+            d.seen.len(),
+            DEDUP_WINDOW,
+        );
     }
 
     #[test]
