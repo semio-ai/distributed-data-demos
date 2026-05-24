@@ -67,3 +67,19 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# T16.15: read the per-spawn `.compact.parquet` digest from
+# `two_runner_regression.rs` so the operate-window-scoped delivery
+# checks lifted to test-side (the same shape the JSONL parser had
+# pre-T18.2b) can be evaluated against per-event observations.
+# `parquet` 53.x is already pulled into the workspace by `variant-base`
+# (both as a runtime and a dev-dep there) so this adds zero new crates
+# to the dependency graph -- only re-declares the existing dep here as
+# a dev-dep so the test target can `use parquet::...` directly.
+parquet = "53"
+# T16.15: `serde_json` is used to decode the `peers` and `paths`
+# intern dictionaries from the compact-Parquet KV file metadata
+# (stored as JSON-encoded `Vec<String>` per
+# `metak-shared/api-contracts/compact-log-schema.md`). Already a
+# runtime dep of variant-zenoh (T14.9a sidecar config), declared
+# again here so the test target has explicit visibility.
+serde_json = "1"
