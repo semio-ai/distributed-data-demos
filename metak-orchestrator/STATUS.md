@@ -17776,3 +17776,113 @@ re-validated all four acceptance gates against fresh logs.
 
 No worker-side blockers; T16.10 is complete and ready to close.
 
+
+## 2026-05-24 — incident: T16.10 worker discarded unstaged orchestrator content
+
+While the T16.10 worker (`9dde4e3 status(2026-05-24 T16.10)`) was
+running, the orchestrator had three sections accumulating in
+STATUS.md's working tree:
+1. T16.10b filing note (orchestrator-side announcement).
+2. The T16.10b investigation worker's full completion report
+   (~250 lines: exit-reason histogram, writer/receiver symmetry,
+   wired-loopback reproducer result, WiFi-specific conclusion).
+3. The orchestrator's decision recording T16.10c filing rationale.
+
+The T16.10 worker's commit landed as +159 / -0 lines — a clean append
+on a file reset to HEAD. The destructive op (almost certainly
+`git checkout/restore -- metak-orchestrator/STATUS.md`) leaves no
+reflog trail. All three orchestrator sections were lost from the
+working tree.
+
+The analytical content was already captured in TASKS.md entries
+T16.10c (cross-WiFi fix direction) and T16.10d (higher-rate ordering
+follow-up), so the project's forward-going decisions are intact. The
+lost STATUS.md text was secondary historical documentation. No
+worker output was lost.
+
+Memory entry filed
+(`feedback_workers_no_discard_uncommitted.md`) to brief future
+workers that orchestrator-owned files are read-then-append only.
+A coding-standards.md update + AGENTS.md worker-rules update are
+follow-up writing-tasks for the orchestrator.
+
+### T16.10b investigation — condensed historical record
+
+For the full report, see commits / file states from this session.
+Key findings preserved for the project record:
+
+- **Dataset**: `C:\repo\shared\ddd\two-machines-all-variants-01-20260523_083845`
+  (first cross-WiFi two-machine dataset on the project record).
+- **Symptom**: 12 / 12 zenoh-1000x100hz-{block,mixed,scalar}-qos[34]-multi
+  spawns (6 spawn-shapes × 2 runners) all exited via
+  `variant_self_killed_idle` (T15.5 30 s watchdog) before reaching
+  `eot`. No `.compact.parquet` was produced for any of them.
+- **Symmetry**: NOT the T16.5 asymmetric-collapse pattern — both peers
+  freeze identically at the same wall-clock offset after operate-entry.
+  Scalar and mixed shapes freeze within ~10 ms of operate entry
+  (zero post-operate `resource` samples); block shape limps for
+  ~1.8 s (18 samples) before freeze.
+- **Wired-loopback reproducer** at the same workload
+  (`zenoh-1000x100hz-scalar-qos3-multi`, both runners on 127.0.0.1,
+  same binary family `aab87a5+dirty`): **PASSES** — both peers reach
+  `phase=done`, exit code 0, ~1.42 M writes, ~1.44 M receives
+  (~101 % delivery), zero BP-skip, exit reason
+  `runner_idle_terminated` (clean EOT). The wired run incidentally
+  showed non-zero Out-of-order (6149 + 130) and Dupes (~22 K + ~19 K)
+  which are folded into T16.10d (higher-rate ordering investigation).
+- **Conclusion**: WiFi-specific failure mode → file T16.10c with
+  router-mode topology as the primary direction; T16.10's wired-LAN
+  acceptance is sufficient for wired runs and does NOT need a WiFi
+  re-validation clause appended.
+
+### T16.10b proposed fix direction (now reflected in T16.10c)
+
+Multi-mode peer-to-peer Zenoh sessions tightly couple each peer's
+publisher `put().await` to the remote peer's subscriber routing
+thread. WiFi's link-layer retransmits, AP airtime contention, and
+bursty 802.11 drops park both sides simultaneously; T17.8's
+ack-window stalls at `min_peer_ack`; both publishers wedge; the
+watchdog fires identically on both sides. A local zenohd router per
+machine breaks the coupling: each peer's publisher resolves at
+local-router rate, the router absorbs WiFi-side burstiness on its
+own queue.
+
+
+## 2026-05-24 — T16.10 closed; T16.10d / T16.15 / T16.16 filed
+
+T16.10 marked **done 2026-05-24** in TASKS.md per the worker's
+acceptance: Out-of-order = 0 at 1 000×10 Hz qos3 + qos4 reproducer
+fixtures, no `variant_self_killed_idle`, QoS 1 sanity preserved,
+synthetic-loopback regression test
+(`multi_zenoh_qos3_qos4_preserves_per_key_order`) now in place.
+Worker commits: `798833e` (test) + `9dde4e3` (status).
+
+Three new follow-ups filed in TASKS.md:
+
+- **T16.10d [medium]** — Zenoh higher-rate ordering at 1 000×100 Hz
+  wired. T16.10b's wired-loopback (binary already includes T16.10 +
+  T17.8 + self-writer filter) showed Out-of-order = 6 149 / 130 and
+  Dupes ~22 K / ~19 K at 10× the rate of T16.10's official fixture.
+  Investigation-first. **Should land before T16.10c starts** so the
+  T16.10c wired-throughput-cost measurement runs on a known-good
+  baseline.
+
+- **T16.15 [medium]** — port
+  `variants/zenoh/tests/two_runner_regression.rs` to compact-Parquet.
+  5 of 6 ignored tests broken by T18.2b's JSONL → compact-Parquet
+  migration. Pure test-side change. Zenoh regression suite is
+  effectively broken until this lands.
+
+- **T16.16 [low]** — analyser EOT-window 3-duplicate trace. Exactly
+  3 dupes per direction across qos1 / qos3 / qos4 — analyser-side
+  double-count, not Zenoh on-wire. Small boundary fix in
+  `correlate.py` or `integrity.py`. Independent of T16.10d's
+  much-larger ~22 K dupe trace.
+
+**Active in-flight**: none.
+
+**Unblocked but not spawned yet** (pending user direction):
+- T16.10c (depends on T16.10 — satisfied; T16.10d recommended first).
+- T16.10d / T16.12 / T16.13 / T16.14 / T16.15 / T16.16 — all
+  independent of each other.
+
