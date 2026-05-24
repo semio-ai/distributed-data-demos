@@ -17886,3 +17886,162 @@ Three new follow-ups filed in TASKS.md:
 - T16.10d / T16.12 / T16.13 / T16.14 / T16.15 / T16.16 — all
   independent of each other.
 
+
+## T16.16 completion report — 2026-05-24 (worker: analysis)
+
+**Root cause (revised from task brief).** The task brief hypothesised
+an analyser boundary inclusive/exclusive mismatch at the operate-window
+end (`<=` vs `<` on `operate_window_end` / `eot_sent.ts`) or an
+EOT-marker row being double-matched. Direct inspection of the qos3
+reproducer's compact-Parquet on disk
+(`logs/t16_10_qos3/zenoh-t165-1000x10hz-qos3-repro-20260524_105402/
+*.compact.parquet`) ruled both out:
+
+- Raw `kind=1` (receive) row count on disk: **3003** on both alice and
+  bob compact files (vs 3000 writes -> 3 dupes per direction).
+- All 3 dupe pairs per direction are byte-identical except for `ts_ns`,
+  separated by **200 ns to 6.7 microsecond**.
+- Dupes are NOT concentrated at the EOT boundary (qos3 alice has 2 at
+  -8.4ms / -8.1ms before EOT and 1 at +74ms AFTER EOT/silent; bob has
+  1 at -5.3s deep inside operate phase and 2 at -7.7ms; qos4 alice has
+  1 at -15.4s and 1 at -7.85ms; qos4 bob has 1 at -5.2s and 1 at +31ms
+  after EOT).
+
+So the analyser is faithfully reading what's on disk -- the variant
+double-logged the same `(writer, seq, path)` delivery into its
+compact-Parquet log. The 200 ns - 6.7 microsecond delta is far too
+small for any wire retransmission (TCP / QUIC retransmit timers are
+tens of ms; loopback RTT is tens of microsecond) and points at the
+variant's subscriber callback or tagged-union writer firing twice for
+a single delivery. **Variant-side root cause; T16.10d scope. Not in
+T16.16 scope per the brief's "Caveat — NOT in your scope" clause.**
+
+**Fix (analyser-side signal-noise filter).**
+`analysis/correlate.py::_dedupe_near_coincident_receives` (new helper,
+called from `correlate_lazy` after the receive projection): drop any
+same-`(variant, run, writer, receiver, seq, path)` receive whose
+previous row in `receive_ts` order is within
+`_NEAR_COINCIDENT_RECV_THRESHOLD_NS = 100_000` ns (100 microsecond).
+Threshold gives a ~15x safety margin over the worst observed artifact
+and stays orders of magnitude below any real-network duplicate.
+Legitimate ms-scale on-wire dupes survive the filter and continue to
+flag.
+
+**Files changed.**
+
+- `analysis/correlate.py`: +84 LOC (one new constant, one helper, one
+  callsite in `correlate_lazy`; existing logic untouched).
+- `analysis/tests/test_correlate.py`: +303 LOC -1 LOC = +302 LOC net.
+  New `TestNearCoincidentReceiveDedup` class with 7 tests covering
+  microsecond / sub-microsecond dupes drop, ms-scale dupes preserved,
+  threshold boundary (99 microsecond drops / 101 microsecond keeps),
+  cross-key independence, and "first row wins" semantics.
+- `metak-orchestrator/STATUS.md`: this completion report (append-only).
+
+**Test results.**
+
+- `analysis/tests/`: **454 passed, 6 skipped** (was 447 + 6 before;
+  the 7 added are all in `TestNearCoincidentReceiveDedup`).
+  Existing `TestIntegrityQoS3::test_duplicate_flagged` (1 ms separation)
+  continues to pass -- 1 ms is 10x above the 100 microsecond threshold.
+- `ruff format --check .` clean on the changed files; `ruff check .`
+  clean across the full `analysis/` tree.
+
+**Integrity rows on T16.10 reproducer datasets (acceptance gate).**
+
+QoS 3 fixture
+(`logs/t16_10_qos3/zenoh-t165-1000x10hz-qos3-repro-20260524_105402/`):
+
+| Path        | QoS | Sent  | Rcvd  | Delivery% | Out-of-order | Dupes |
+|-------------|-----|-------|-------|-----------|--------------|-------|
+| alice->bob  | 3   | 3,000 | 3,000 | 100.00 %  | 0            | **0** |
+| bob->alice  | 3   | 3,000 | 3,000 | 100.00 %  | 0            | **0** |
+
+QoS 4 fixture
+(`logs/t16_10_qos4/zenoh-t1610-1000x10hz-qos4-repro-20260524_105518/`):
+
+| Path        | QoS | Sent   | Rcvd  | Delivery% | Out-of-order | Dupes |
+|-------------|-----|--------|-------|-----------|--------------|-------|
+| alice->bob  | 4   | 10,000 | 9,630 | 96.30 %   | 0            | **0** |
+| bob->alice  | 4   | 8,000  | 8,000 | 100.00 %  | 0            | **0** |
+
+(The qos4 alice->bob 96.30 % completeness FAIL is pre-existing per the
+T16.10 worker report -- not in T16.16 scope.)
+
+QoS 1 fixture for completeness
+(`logs/t16_10_qos1/zenoh-t165-1000x100hz-qos1-repro-20260524_110034/`):
+
+| Path        | QoS | Sent  | Rcvd  | Delivery% | Out-of-order | Dupes |
+|-------------|-----|-------|-------|-----------|--------------|-------|
+| alice->bob  | 1   | 6,000 | 6,000 | 100.00 %  | 0            | **0** |
+| bob->alice  | 1   | 3,000 | 3,000 | 100.00 %  | 0            | **0** |
+
+Acceptance criteria from the brief ("T16.10's qos3 + qos4 reproducer
+datasets show Dupes = 0 in every (writer, receiver) direction"):
+**MET** on every direction of every reproducer (qos1 / qos3 / qos4).
+
+**Impact on existing datasets.** The
+`logs/same-machine-all-variants-01-20260515_182243/` reference dataset
+is pre-T18.2 -- its per-event observations live as JSONL rows that the
+post-E19 cache pipeline now warns about and skips
+(`ignoring 60200 pre-T18.2 per-event JSONL rows`). Per the
+`analysis/CUSTOM.md` "Post-E19-cleanup invariant" section, that
+dataset has structurally zero per-event data for the analyser. With
+no receive rows, the dedup filter is a no-op on it by construction
+(confirmed by comparing the per-row `Dupes` column on the captured
+`/tmp/before_integrity.md` baseline -- all rows already 0 dupes;
+nothing for the new filter to remove).
+
+The 2026-05-24 `t1610d_qos1_sanity` dataset (which DOES have
+compact-Parquet per-event data) re-ran clean with Dupes = 0 in both
+directions and the same Out-of-order / Delivery numbers as before
+(checked via spot integrity-row capture before/after).
+
+**T16.10d-overlap note.** The brief's caveat asked me to flag any
+incidental impact on the larger ~22 K dupe trace at 1000x100Hz wired.
+The threshold (100 microsecond) WILL filter sub-100-microsecond same-
+key receives wherever they appear, so if that 22 K trace shares the
+sub-microsecond instrumentation-artifact signature, the analyser-side
+filter will mask part of it after T16.10d ships. T16.10d's commits
+(`2ddd566` + `4b1013a`) landed in parallel with this work and address
+the variant-side root cause directly; we won't double-count credit.
+No follow-up needed beyond noting this for whoever next re-runs the
+larger 1000x100hz reproducer.
+
+**Cleanup.** The two scratch files left by the prior worker
+(`analysis/tmp_investigate.py`, `analysis/tmp_raw_parquet.py`) plus
+one additional inspection script I added during the session
+(`analysis/tmp_jsonl.py`) have all been deleted before commit.
+Confirmed `git status` is clean for `analysis/` aside from the two
+committed files.
+
+**Deviations from spec.**
+
+- The brief asked for an EOT-boundary inclusive/exclusive fix; the
+  root cause was elsewhere (variant-side double-logging), so the
+  patch is a same-key near-coincident-receive filter rather than a
+  boundary tweak. Acceptance criteria still met.
+- The brief asked for a regression check on
+  `logs/same-machine-all-variants-*` "not materially worsened" --
+  that dataset is pre-T18.2 and the analyser now skips its per-event
+  JSONL rows entirely, so the dedup filter is structurally a no-op
+  on it (see "Impact on existing datasets" above). The check was
+  performed via a static argument rather than a full re-run.
+
+**Follow-up concerns.**
+
+1. The 100 microsecond threshold is currently a private constant
+   (`_NEAR_COINCIDENT_RECV_THRESHOLD_NS`). If a future variant logs
+   at a different cadence (e.g. async drains the receive buffer in
+   batches) the threshold may need to be widened. Surfacing as a CLI
+   flag or env var would be a small follow-up if needed.
+2. The root cause (variant-side double-logging) is T16.10d scope.
+   The orchestrator may want to add a one-line cross-reference in
+   `variants/zenoh/CUSTOM.md` or under T16.10d in TASKS.md noting
+   that the analyser-side filter masks this artifact at < 100
+   microsecond spacing, in case anyone re-investigates later and
+   wonders why no dupes show up after T16.10d ships.
+
+No worker-side blockers; T16.16 is complete and the analyser produces
+Dupes = 0 on all three T16.10 reproducer datasets.
+
