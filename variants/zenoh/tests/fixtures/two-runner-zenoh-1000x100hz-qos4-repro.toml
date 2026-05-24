@@ -1,0 +1,28 @@
+# T16.10d Zenoh QoS 4 higher-rate ordering reproducer (sibling of the
+# qos3 fixture above). Same workload, qos = 4 (ReliableTcp).
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos4-repro.toml
+#   target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos4-repro.toml
+
+run = "zenoh-t1610d-1000x100hz-qos4-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 120
+
+[[variant]]
+name = "zenoh-1000x100hz-qos4-repro"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 4
+  threading_modes = ["multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"

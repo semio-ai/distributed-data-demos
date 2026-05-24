@@ -1,0 +1,39 @@
+# T16.10d Zenoh QoS 3 higher-rate ordering reproducer.
+#
+# T16.10 verified Out-of-order = 0 on the official 1000x10hz qos3
+# reproducer. T16.10b's wired-loopback dataset at 1000 paths * 100 Hz
+# (10x the rate, ~100 K reliable publish/s per peer) showed:
+#
+#   alice->bob  3   1,422,000 sent   1,443,981 rcvd   Out-of-order 6149   Dupes ~22,959
+#   bob->alice  3   1,423,000 sent   1,442,000 rcvd   Out-of-order  130   Dupes ~19,000
+#
+# This fixture targets the same workload at the same rate so the
+# T16.10d investigation can drive the symptom on a developer host
+# (two-runner localhost) without round-tripping through the production
+# matrix.
+#
+# Run from the repo root in two terminals:
+#   target/release/runner --name alice --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos3-repro.toml
+#   target/release/runner --name bob   --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos3-repro.toml
+
+run = "zenoh-t1610d-1000x100hz-qos3-repro"
+runners = ["alice", "bob"]
+default_timeout_secs = 120
+
+[[variant]]
+name = "zenoh-1000x100hz-qos3-repro"
+binary = "target/release/variant-zenoh.exe"
+
+  [variant.common]
+  tick_rate_hz = 100
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  values_per_tick = 1000
+  qos = 3
+  threading_modes = ["multi"]
+  log_dir = "./logs"
+
+  [variant.specific]
+  zenoh_mode = "peer"
