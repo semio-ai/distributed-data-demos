@@ -347,6 +347,73 @@ Tests covering this contract live in `src/zenoh.rs` `tests` mod:
   inline-await branch with the buggy `tokio::spawn` path makes the test
   fail at the first observable reorder.
 
+**T16.10d -- multicast-route deduplication at 1000x100hz**
+
+T16.10b's wired-loopback evidence (binary `aab87a5+dirty`, Multi mode)
+showed 6K-22K "out-of-order" receives and 19K-23K "duplicates" per
+direction at 1 000 paths x 100 Hz QoS 3/4 -- past T16.10's inline-await
+fix had landed. Investigation reproduced the bug on
+`logs/t1610d_qos3_run2/` showing 148 % delivery (1.5x receive ratio),
+~100K reorders, ~900K duplicates per direction. The
+`multi_zenoh_qos3_qos4_preserves_per_key_order` unit test passes; the
+publisher_task itself is genuinely serial. The bug is at a different
+layer.
+
+**Root cause**: Zenoh's default `autoconnect_strategy = "always"` for
+peer-to-peer (per `DEFAULT_CONFIG.json5` lines 154-156: "may result in
+redundant connection") makes BOTH peers initiate a TCP connect when
+they discover each other via multicast scouting AND gossip
+simultaneously. For the window where two transport sessions co-exist
+(before Zenoh's "redundant connection close" path completes) the same
+sample is delivered through BOTH routes. The interleaved-streams shape
+in the per-key receive seqs and the 100 ms-scale ts_ns gaps between
+"duplicate" rows match a second-route delivery rather than a
+retransmit. Affects every QoS tier equally because the failure is at
+the route-establishment layer, above CC.
+
+**Fix**:
+1. `build_zenoh_config` now sets
+   `scouting/multicast/autoconnect_strategy = "greater-zid"` AND
+   `scouting/gossip/autoconnect_strategy = "greater-zid"`. Per the
+   1.9 doc this makes the connect side deterministic: only the node
+   with the lexicographically greater zid initiates. This reduces but
+   does not eliminate the race (both peers may receive each other's
+   HELLO at roughly the same instant), so:
+2. `subscriber_task` now drops duplicate `(writer, seq)` pairs at the
+   receive boundary via a task-local
+   `HashMap<String, WriterDedup>`. Each writer's `seq` is a global
+   monotonic counter (see `variant_base/src/seq.rs`) so
+   `(writer, seq)` is a unique sample identifier. The dedup tracks the
+   max seq seen per writer plus a sliding-window
+   `HashSet<u64>` bounded by `DEDUP_WINDOW = 4 * QOS_STRICT_WINDOW =
+   8192` entries. First sighting forwarded; later sightings dropped.
+   No cross-task locking (the dedup map is task-local; the dedup
+   decision is made before the recv channel send).
+
+Dedup is applied to all QoS tiers (not just reliable) because the
+multicast-route race affects every transport-layer delivery; at QoS
+1/2 it is normally a no-op because the only way the receiver sees the
+same `(writer, seq)` twice without retransmits is via duplicate-route
+delivery.
+
+Unit tests covering the dedup state machine:
+- `test_writer_dedup_accepts_novel_seqs`
+- `test_writer_dedup_drops_exact_duplicates`
+- `test_writer_dedup_drops_too_old_seqs`
+- `test_writer_dedup_set_is_bounded`
+
+Multi-mode acceptance fixtures added for T16.10d:
+- `variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos3-repro.toml`
+- `variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos4-repro.toml`
+
+Both explicitly pin `threading_modes = ["multi"]` -- T16.10's original
+10 Hz fixtures default to Single mode (per
+`runner/src/config.rs` `ThreadingModesSpec::Default`), which routes
+through the out-of-process zenohd sidecar and trivially preserves
+ordering; the publisher_task + subscriber_task in-process path was
+never end-to-end exercised by the official fixture set before this
+follow-up.
+
 ## Peer-coordinated back-pressure (T17.8, reopens T16.12)
 
 Filed 2026-05-18 as part of epic E17 ("Strict No-Skip Contract for
