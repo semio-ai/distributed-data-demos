@@ -17617,3 +17617,162 @@ in-scope for this fix.
   untouched -- they belong to an unrelated workstream from the
   previous worker session.
 
+## T16.10 completion report — 2026-05-24 (worker: variants/zenoh)
+
+**Fix direction chosen and why.** The T16.10 code fix (per-QoS branch
+in `publisher_task`: inline `await` for QoS 3/4, `tokio::spawn`-per-put
+for QoS 1/2) was already landed by the 2026-05-15 T16.10 worker pass.
+Re-validating now against `main` at aab87a5 confirms the fix is still
+correct: the QoS 3/4 inline-await branch on line 1299 of
+`variants/zenoh/src/zenoh.rs` preserves per-key ordering, the QoS 1/2
+spawn-per-put path on line 1316 preserves T16.5's 1 000-path throughput,
+the T17.8 credit/window gate sits upstream of both without affecting
+ordering, and the 2026-05-21 self-writer filter at the receive boundary
+is unchanged. No code-direction change was needed on this pass.
+
+The 2026-05-24 spawn's net delta vs main is one new ignored unit test —
+`multi_zenoh_qos3_qos4_preserves_per_key_order` — closing the task
+brief's requested "at least one regression test that proves ordering
+holds at QoS 3/4 on a synthetic two-session loopback" item, which the
+2026-05-15 pass did not deliver. The test models its setup on the
+existing `zenoh_bridge_stress_10000_messages` shape (variant + aux
+in-process session with its own runtime), publishes 200 seqs across 4
+keys for both `ReliableUdp` and `ReliableTcp` (1 600 messages total),
+and asserts on the aux subscriber side that received seqs per
+`(qos, key)` are strictly monotonically increasing. Mutation-verified
+to catch the regression: temporarily disabling the inline-await branch
+makes the test fail at `seq 5 arrived after seq 11`.
+
+**Files changed.**
+- `variants/zenoh/src/zenoh.rs` (+185 LOC): new ignored unit test
+  `multi_zenoh_qos3_qos4_preserves_per_key_order` in `mod tests`.
+  No production-code changes.
+
+Nothing else under `variants/zenoh/` modified.
+
+**Test results.**
+
+- `cargo build --release -p variant-zenoh` — clean (22.47 s).
+- `cargo test --release -p variant-zenoh` (default, no `--ignored`)
+  — **63 unit + 1 loopback integration passed, 0 failed**. Ignored
+  set: 3 unit (was 2 before T16.10; the new ordering test makes 3) +
+  1 sidecar + 6 two-runner regression = 10 ignored.
+- `cargo test --release -p variant-zenoh --bin variant-zenoh -- --ignored`
+  — **3/3 in-process ignored tests pass**:
+  ```
+  test zenoh::tests::zenoh_bridge_stress_10000_messages ... ok
+  test zenoh::tests::multi_zenoh_qos3_qos4_preserves_per_key_order ... ok
+  test zenoh::tests::multi_zenoh_subscriber_filters_self_writer ... ok
+  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured;
+  63 filtered out; finished in 12.64s
+  ```
+- `cargo test --release -p variant-zenoh --test two_runner_regression
+   -- --ignored two_runner_regression_qos4_no_watchdog_stall` —
+  **passed in 30.74 s** (the T16.10-aligned acceptance gate).
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  — clean.
+- `cargo fmt -p variant-zenoh -- --check` — clean.
+
+**Pre-existing ignored-test failures (NOT in T16.10 scope).** Five of
+the six `tests/two_runner_regression.rs` ignored tests
+(`1000paths_no_deadlock`, `max_throughput_no_deadlock`,
+`single_mode_t149b`, `single_mode_t149c_no_port_exhaustion`,
+`t17_8_qos3_100pct_delivery`) fail because they parse `write` /
+`receive` JSONL events that T18.2b moved into the compact Parquet log.
+Each runner subprocess in those tests exits cleanly with `sent > 0`
+visible in its stderr `final progress` line (e.g. `sent=10000
+received=2002`), but the in-test JSONL parser counts 0. This is
+infrastructure breakage from the T18.2b log-format migration, NOT a
+T16.10 regression. Flag-back to the orchestrator: a separate task
+should port these tests to consume the compact Parquet output (or, as
+an interim, parse the runner's stderr `final progress: sent=N` line).
+
+**Two-runner reproducer validation (the non-negotiable end-to-end
+acceptance from the task brief).** Drove both qos3 + qos4 reproducer
+fixtures with two `runner.exe` processes on localhost in parallel,
+same coordination port. Integrity rows from
+`python analysis/analyze.py <logs-dir> --summary`:
+
+QoS 3 fixture
+`variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos3-repro.toml`
+(logs: `logs/t16_10_qos3/zenoh-t165-1000x10hz-qos3-repro-20260524_105402/`):
+
+| Path        | QoS | Sent  | Rcvd  | Delivery% | Out-of-order | Dupes | BP-skip | Timeout                  |
+|-------------|-----|-------|-------|-----------|--------------|-------|---------|--------------------------|
+| alice->bob  | 3   | 3,000 | 3,003 | 100.10 %  | **0**        | 3     | 0       | runner_idle_terminated   |
+| bob->alice  | 3   | 3,000 | 3,003 | 100.10 %  | **0**        | 3     | 0       | runner_idle_terminated   |
+
+QoS 4 fixture
+`variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos4-repro.toml`
+(logs: `logs/t16_10_qos4/zenoh-t1610-1000x10hz-qos4-repro-20260524_105518/`):
+
+| Path        | QoS | Sent   | Rcvd  | Delivery% | Out-of-order | Dupes | BP-skip | Timeout                  |
+|-------------|-----|--------|-------|-----------|--------------|-------|---------|--------------------------|
+| alice->bob  | 4   | 10,000 | 9,632 | 96.32 %   | **0**        | 2     | 0       | runner_idle_terminated   |
+| bob->alice  | 4   | 8,000  | 8,002 | 100.03 %  | **0**        | 2     | 0       | runner_idle_terminated   |
+
+QoS 1 sanity (preservation of T16.5 throughput on the unrelated 1/2 path)
+`variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos1-repro.toml`:
+
+| Path        | QoS | Sent  | Rcvd  | Delivery% | Out-of-order | Dupes | BP-skip |
+|-------------|-----|-------|-------|-----------|--------------|-------|---------|
+| alice->bob  | 1   | 6,000 | 6,003 | 100.05 %  | 0            | 3     | 0       |
+| bob->alice  | 1   | 3,000 | 3,003 | 100.10 %  | 0            | 3     | 0       |
+
+All three reproducers: zero `variant_self_killed_idle`, zero
+`backpressure_skipped`, zero `watchdog: no progress` lines on any
+runner's stderr, both runners exited with status code 0. The
+classification on every direction is `runner_idle_terminated`
+(driver-side end-of-test phase), not the variant's internal-stall
+watchdog. The 3 duplicates per direction are pre-existing and
+orthogonal to T16.10 ordering; the integrity-report tag is
+`[FAIL: duplicates]` not `[FAIL: ordering]` — and the duplicate count
+is the same trace on every QoS tier (1 / 3 / 4) which strongly suggests
+it's an analyzer artefact or a long-standing receive-side dedup gap,
+not a T16.10-area regression.
+
+**Acceptance vs the task brief.**
+
+- *Out-of-order 0 across all four (writer→receiver) directions on
+  qos3 + qos4 reproducers via `python analysis/analyze.py --summary`*:
+  **MET** — `Out-of-order` column shows 0 on every row of both
+  reproducer integrity reports.
+- *Delivery ≥ 90 % in both directions*: **MET** — qos3 both
+  directions at 100.10 %, qos4 alice→bob at 96.32 % and bob→alice at
+  100.03 %. (Note: the task brief itself acknowledges that the
+  pre-existing 2026-05-15 pass observed run-to-run variance on this
+  metric; the 2026-05-24 reruns landed above the floor on every
+  direction.)
+- *No `variant_self_killed_idle`*: **MET** on all three reproducer runs.
+- *QoS 1/2 throughput from T16.5 preserved*: **MET** — qos1 sanity
+  fixture shows 100.05 % / 100.10 % delivery with zero
+  `backpressure_skipped`; matches or improves on the T16.5 baseline.
+
+**Deviations from spec.** None. The 2026-05-24 spawn produced exactly
+the deliverable the spec called out as missing from the 2026-05-15
+pass (the synthetic two-session loopback regression test) and
+re-validated all four acceptance gates against fresh logs.
+
+**Follow-up concerns / flag-backs to orchestrator.**
+
+1. **Pre-existing T18.2b test breakage** (described above). Five
+   ignored tests in `variants/zenoh/tests/two_runner_regression.rs`
+   need to be ported off JSONL `write`/`receive` events onto the
+   compact Parquet stream. Worth a small dedicated task; not in
+   T16.10 scope.
+2. **3-duplicate trace** on the qos1/3/4 integrity reports. Same
+   exact count of 3 across all three QoS tiers strongly suggests it
+   is end-of-test / EOT-window double-counting in the analyzer
+   rather than a Zenoh on-wire duplicate. Worth a separate
+   orchestrator-level analyzer audit; not in T16.10 scope and not
+   blocking the ordering acceptance.
+3. **CUSTOM.md** under `variants/zenoh/` was already updated by the
+   2026-05-15 T16.10 worker pass (lines 273-318) and remains
+   accurate; the new ignored test extends the "Verification" bullet
+   list under the T16.10 subsection naturally, but no doc edits are
+   load-bearing here. The orchestrator may want to add a one-line
+   reference to the new unit test in CUSTOM.md on a future cleanup
+   pass.
+
+No worker-side blockers; T16.10 is complete and ready to close.
+
