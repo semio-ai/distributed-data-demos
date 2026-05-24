@@ -226,6 +226,68 @@ def _attach_offsets(deliveries: pl.DataFrame, offsets: pl.DataFrame) -> pl.DataF
     )
 
 
+# T16.16: ``(writer, seq, path)`` receive pairs separated by less than
+# this many nanoseconds are treated as one delivery instrumented twice
+# rather than two real on-wire receives.
+#
+# Background: on the T16.10 zenoh qos1/qos3/qos4 same-host reproducers
+# the variant occasionally emits the same ``(writer, seq, path)``
+# receive twice into its compact-Parquet log. Observed spacing on those
+# reproducers: **200 ns to 6.7 microsecond** (16 dupe pairs across
+# qos1/qos3/qos4 fixtures, every single one < 7 microsecond). That
+# delta is incompatible with any plausible on-wire retransmission
+# -- even an in-process callback fires later than 200 ns -- so the
+# second row is an instrumentation artifact, most likely the variant's
+# subscriber callback or its tagged-union writer firing twice for a
+# single delivery.
+#
+# Threshold selection: 100 microsecond gives a ~15x safety margin
+# above the largest observed artifact (6.7 microsecond) and stays
+# well below any wire-level retransmission delay (a TCP / QUIC
+# retransmit timer is tens of ms minimum; a real on-wire dupe from a
+# multipath / forked delivery is at least one full RTT, which is
+# tens of microsecond on loopback and hundreds of microsecond on
+# real LAN). Any same-key receive pair within this window is treated
+# as the same delivery; anything wider is preserved and surfaces as
+# a real duplicate on the integrity report.
+_NEAR_COINCIDENT_RECV_THRESHOLD_NS: int = 100_000
+
+
+def _dedupe_near_coincident_receives(receives: pl.LazyFrame) -> pl.LazyFrame:
+    """Drop same-key receive rows that are within microseconds of each other.
+
+    Groups by ``(variant, run, writer, receiver, seq, path)``, sorts each
+    group by ``receive_ts``, and keeps a row only when the previous
+    row in its group is missing or more than
+    :data:`_NEAR_COINCIDENT_RECV_THRESHOLD_NS` ns away.
+
+    Legitimate wire-level duplicates (ms-scale retransmissions) are
+    preserved -- only sub-millisecond clones are filtered. See the
+    callsite in :func:`correlate_lazy` for the rationale.
+    """
+    return (
+        receives.sort(
+            ["variant", "run", "writer", "receiver", "seq", "path", "receive_ts"]
+        )
+        .with_columns(
+            pl.col("receive_ts")
+            .shift(1)
+            .over(["variant", "run", "writer", "receiver", "seq", "path"])
+            .alias("__prev_receive_ts")
+        )
+        .filter(
+            pl.col("__prev_receive_ts").is_null()
+            | (
+                (pl.col("receive_ts") - pl.col("__prev_receive_ts"))
+                .dt.total_nanoseconds()
+                .abs()
+                > _NEAR_COINCIDENT_RECV_THRESHOLD_NS
+            )
+        )
+        .drop("__prev_receive_ts")
+    )
+
+
 def correlate_lazy(group: pl.LazyFrame) -> pl.LazyFrame:
     """Build a per-group delivery-record lazy frame.
 
@@ -297,6 +359,28 @@ def correlate_lazy(group: pl.LazyFrame) -> pl.LazyFrame:
             pl.col("qos").alias("receive_qos"),
         )
     )
+
+    # T16.16: drop near-coincident same-key receive rows.
+    #
+    # On the T16.10 qos1/qos3/qos4 reproducers the variant occasionally
+    # emits the same ``(writer, seq, path)`` receive twice into its
+    # compact-Parquet log, separated by only a few hundred nanoseconds
+    # to a few microseconds (observed range 200 ns - 6.7 microsecond).
+    # That sub-microsecond delta is incompatible with any plausible
+    # on-wire retransmission (loopback RTT is ~10 microsecond, real LAN
+    # tens of microsecond at minimum, retransmit timers tens of ms),
+    # so the second row is an instrumentation artifact -- the variant's
+    # subscriber callback or its tagged-union writer fired twice for a
+    # single delivery. The analyzer treats any same-key pair within
+    # ``_NEAR_COINCIDENT_RECV_THRESHOLD_NS`` of each other as a single
+    # delivery and drops the later row.
+    #
+    # Legitimate wire-level duplicates (e.g. a true Zenoh on-wire dupe
+    # or a transport retransmission) have ms-scale spacing and survive
+    # the filter so the integrity report still flags them. See
+    # ``metak-orchestrator/STATUS.md`` (T16.16 completion report) for
+    # the observed delta distribution.
+    receives = _dedupe_near_coincident_receives(receives)
 
     joined = receives.join(
         writes,
