@@ -187,11 +187,22 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     analyze_full: bool,
 
-    /// Variant-specific arg passthrough: `--variant-arg <variant>.<key>=<value>` (T9.5).
+    /// Variant-specific arg passthrough: `--variant-arg <selector>.<key>=<value>` (T9.5 / T9.5a).
     ///
-    /// Repeatable. Each entry is split on the first `.` (variant name) and
-    /// the first `=` (key/value boundary). At spawn time the parsed
-    /// overrides for the matching variant are merged into the existing
+    /// The `<selector>` is glob-matched against `[[variant]].name`
+    /// (post-template-resolution, pre-array-expansion). `*` matches
+    /// zero-or-more characters, `?` matches exactly one. No character
+    /// classes, no escape sequences. A selector with no glob
+    /// metacharacters is a literal full-string match.
+    ///
+    /// Repeatable. Each entry is split on the first `.` (selector / key
+    /// boundary) and the first `=` (key / value boundary). At spawn time
+    /// the parsed entries are walked in CLI order and every entry whose
+    /// selector matches the spawn's source variant name contributes its
+    /// `(key, value)` to a per-spawn override map; later entries overwrite
+    /// earlier ones on key conflict (so `'*.X=default'` followed by
+    /// `'zenoh-*.X=override'` gives the override on zenoh-* spawns and the
+    /// default elsewhere). The resolved map is then merged into the
     /// `[variants.<variant>.specific]` table: CLI keys win over TOML keys
     /// on conflict, CLI-only keys are appended. The runner forwards the
     /// merged values verbatim through the variant CLI -- it does NOT
@@ -199,12 +210,14 @@ struct Cli {
     /// their own arg values.
     ///
     /// Example:
-    ///   --variant-arg zenoh.multicast_interface=192.168.1.68 \
-    ///   --variant-arg zenoh.zenoh_listen=tcp/0.0.0.0:7447 \
-    ///   --variant-arg quic.cert_path=/etc/quic.pem
+    ///   --variant-arg 'zenoh-*.multicast_interface=192.168.1.68'
+    ///   --variant-arg '*.workload_seed=42'
     ///
-    /// Filed as T9.5 to support per-machine specific values without
-    /// splitting the shared TOML config (e.g. per-machine NIC pins).
+    /// Quote the selector when it contains `*` or `?` so the shell does
+    /// not expand the glob against the local filesystem (matters on
+    /// PowerShell and POSIX shells alike).
+    ///
+    /// Filed as T9.5 (literal selector) and widened to glob in T9.5a.
     #[arg(long, action = clap::ArgAction::Append)]
     variant_arg: Vec<String>,
 }
@@ -337,27 +350,27 @@ fn run(cli: &Cli) -> Result<()> {
         cli.name, cli.barrier_timeout_secs
     );
 
-    // T9.5: parse the per-variant `--variant-arg <variant>.<key>=<value>`
-    // overrides up front so a malformed entry aborts before discovery.
-    // Returns an empty map when no flags were given (the typical case).
+    // T9.5 / T9.5a: parse the per-variant `--variant-arg
+    // <selector>.<key>=<value>` overrides up front so a malformed entry
+    // aborts before discovery. Returns an empty Vec when no flags were
+    // given (the typical case).
+    //
+    // The selector is glob-matched against `[[variant]].name` at spawn
+    // time; CLI order is preserved here and resolution (per-spawn) is
+    // last-CLI-position-wins. The startup banner emits one line per CLI
+    // entry, naming the selector verbatim, so an operator can confirm
+    // the glob they typed is what the runner saw (a frequent T9.5 trap
+    // was a silently-dropped literal selector — making the selector
+    // visible up-front closes that gap).
     let variant_arg_overrides = cli_args::parse_variant_arg_overrides(&cli.variant_arg)?;
-    if !variant_arg_overrides.is_empty() {
-        let mut variants_sorted: Vec<&String> = variant_arg_overrides.keys().collect();
-        variants_sorted.sort();
-        for v in variants_sorted {
-            let inner = &variant_arg_overrides[v];
-            let mut keys_sorted: Vec<&String> = inner.keys().collect();
-            keys_sorted.sort();
-            let summary = keys_sorted
-                .iter()
-                .map(|k| format!("{}={}", k, cli_args::toml_value_to_string(&inner[*k])))
-                .collect::<Vec<_>>()
-                .join(", ");
-            eprintln!(
-                "[runner:{}] --variant-arg overrides for '{}': {}",
-                cli.name, v, summary
-            );
-        }
+    for entry in &variant_arg_overrides {
+        eprintln!(
+            "[runner:{}] --variant-arg selector '{}': {}={}",
+            cli.name,
+            entry.selector,
+            entry.key,
+            cli_args::toml_value_to_string(&entry.value)
+        );
     }
 
     // Load and validate config.
@@ -1008,12 +1021,23 @@ fn run(cli: &Cli) -> Result<()> {
             })
         };
 
-        // T9.5: look up the per-variant `--variant-arg` overrides for
-        // this spawn. The lookup key is the source `variant.name`
+        // T9.5 / T9.5a: resolve the per-variant `--variant-arg` overrides
+        // for this spawn. The lookup uses the source `variant.name`
         // (post-template-resolution, pre-array-expansion), NOT the
         // effective_name which carries `-qos<N>` / `-<vpt>x<hz>hz`
         // suffixes -- the CLI flag is variant-typed, not spawn-typed.
-        let cli_overrides_for_spawn = variant_arg_overrides.get(&variant.name);
+        //
+        // `resolve_for_variant` walks every CLI entry in order and
+        // glob-matches its selector against `variant.name`; later
+        // entries overwrite earlier ones on key conflict.
+        let resolved_with_selectors =
+            cli_args::resolve_for_variant(&variant_arg_overrides, &variant.name);
+        let cli_overrides_for_spawn = cli_args::drop_selector_provenance(&resolved_with_selectors);
+        let cli_overrides_arg = if cli_overrides_for_spawn.is_empty() {
+            None
+        } else {
+            Some(&cli_overrides_for_spawn)
+        };
 
         let args = cli_args::build_variant_args(
             variant,
@@ -1028,25 +1052,39 @@ fn run(cli: &Cli) -> Result<()> {
             job.threading_mode,
             job.recv_buffer_kb,
             &peer_hosts,
-            cli_overrides_for_spawn,
+            cli_overrides_arg,
         );
 
-        // T9.5: provenance log line so operators see exactly which
+        // T9.5 / T9.5a: provenance log line so operators see exactly which
         // specific args were effective for this spawn and where each
-        // value came from. Suppressed when there are no specific args
-        // at all (don't be noisy on variants without `[variant.specific]`
-        // and no `--variant-arg` for them).
-        let provenance =
-            cli_args::specific_arg_provenance(variant.specific.as_ref(), cli_overrides_for_spawn);
+        // value came from. CLI-sourced keys carry the selector that
+        // contributed them so the user can see e.g.
+        // `multicast_interface=192.168.1.80 (cli: zenoh-*)`. Suppressed
+        // when there are no specific args at all (don't be noisy on
+        // variants without `[variant.specific]` and no matching
+        // `--variant-arg`).
+        let cli_overrides_with_selectors_arg = if resolved_with_selectors.is_empty() {
+            None
+        } else {
+            Some(&resolved_with_selectors)
+        };
+        let provenance = cli_args::specific_arg_provenance(
+            variant.specific.as_ref(),
+            cli_overrides_with_selectors_arg,
+        );
         if !provenance.is_empty() {
             let rendered = provenance
                 .iter()
-                .map(|(k, v, p)| {
-                    let tag = match p {
-                        cli_args::SpecificArgProvenance::Toml => "toml",
-                        cli_args::SpecificArgProvenance::Cli => "cli",
-                    };
-                    format!("{}={} ({})", k, v, tag)
+                .map(|(k, v, p, sel)| match p {
+                    cli_args::SpecificArgProvenance::Toml => format!("{}={} (toml)", k, v),
+                    cli_args::SpecificArgProvenance::Cli => match sel {
+                        Some(s) => format!("{}={} (cli: {})", k, v, s),
+                        // Defensive: a Cli provenance entry should always
+                        // carry the selector that produced it. If for any
+                        // reason it does not, fall back to the bare `(cli)`
+                        // tag rather than panicking.
+                        None => format!("{}={} (cli)", k, v),
+                    },
                 })
                 .collect::<Vec<_>>()
                 .join(", ");

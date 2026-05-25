@@ -7,46 +7,63 @@ fn to_kebab_flag(key: &str) -> String {
     format!("--{}", key.replace('_', "-"))
 }
 
-/// Parse raw `--variant-arg <variant>.<key>=<value>` entries into a nested
-/// map keyed by variant name (T9.5).
+/// One parsed `--variant-arg <selector>.<key>=<value>` entry (T9.5a).
+///
+/// The `selector` is the raw user-supplied string before the first `.`. It
+/// is interpreted as a glob pattern (`*` zero-or-more, `?` exactly-one) by
+/// [`resolve_for_variant`]; a selector with no glob metacharacters is a
+/// literal match (backward compat with T9.5).
+///
+/// `value` is always a `toml::Value::String` — the runner does not interpret
+/// the user-supplied text beyond split-and-forward.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VariantArgEntry {
+    pub selector: String,
+    pub key: String,
+    pub value: toml::Value,
+}
+
+/// Parse raw `--variant-arg <selector>.<key>=<value>` entries into a flat,
+/// CLI-order-preserving list (T9.5a).
 ///
 /// Each entry is split on:
-///   - the **first** `.` to separate the variant name from the rest, and
+///   - the **first** `.` to separate the selector from the rest, and
 ///   - the **first** `=` in the rest to separate the key from the value.
+///
+/// The selector is **NOT** interpreted at parse time — it is stored as the
+/// raw user-supplied string. Glob interpretation happens at
+/// [`resolve_for_variant`] time on a per-spawn basis.
 ///
 /// Empty value (e.g. `foo.bar=`) is **accepted**: the override is stored
 /// as the empty string. This makes `--variant-arg` viable for flags whose
 /// value is empty/optional. Variants that require a non-empty value should
 /// reject empty values themselves at parse time.
 ///
-/// Multiple entries for the same variant accumulate into one inner map.
-/// Within a single variant, later occurrences of the same key overwrite
-/// earlier ones (CLI-level "last one wins" — useful for shell wrappers
-/// that append a default and then an override).
+/// CLI order is preserved verbatim — later entries do NOT overwrite earlier
+/// ones at parse time. Conflict resolution is the resolver's job
+/// (last-CLI-position wins per-variant, see [`resolve_for_variant`]).
 ///
 /// Returns `Err` for malformed input naming the offending entry.
-pub fn parse_variant_arg_overrides(
-    raw: &[String],
-) -> Result<HashMap<String, HashMap<String, toml::Value>>> {
-    let mut out: HashMap<String, HashMap<String, toml::Value>> = HashMap::new();
+pub fn parse_variant_arg_overrides(raw: &[String]) -> Result<Vec<VariantArgEntry>> {
+    let mut out: Vec<VariantArgEntry> = Vec::with_capacity(raw.len());
     for entry in raw {
-        // Split off the variant name on the first `.`.
-        let (variant, rest) = entry.split_once('.').ok_or_else(|| {
+        // Split off the selector on the first `.`.
+        let (selector, rest) = entry.split_once('.').ok_or_else(|| {
             anyhow!(
-                "malformed --variant-arg '{}': expected '<variant>.<key>=<value>' (missing '.')",
+                "malformed --variant-arg '{}': expected '<selector>.<key>=<value>' (missing '.')",
                 entry
             )
         })?;
-        if variant.is_empty() {
+        if selector.is_empty() {
             return Err(anyhow!(
-                "malformed --variant-arg '{}': variant name (before the first '.') is empty",
+                "malformed --variant-arg '{}': selector (before the first '.') is empty",
                 entry
             ));
         }
         // Split key from value on the first `=`.
         let (key, value) = rest.split_once('=').ok_or_else(|| {
             anyhow!(
-                "malformed --variant-arg '{}': expected '<variant>.<key>=<value>' (missing '=')",
+                "malformed --variant-arg '{}': expected '<selector>.<key>=<value>' (missing '=')",
                 entry
             )
         })?;
@@ -56,11 +73,111 @@ pub fn parse_variant_arg_overrides(
                 entry
             ));
         }
-        out.entry(variant.to_string())
-            .or_default()
-            .insert(key.to_string(), toml::Value::String(value.to_string()));
+        out.push(VariantArgEntry {
+            selector: selector.to_string(),
+            key: key.to_string(),
+            value: toml::Value::String(value.to_string()),
+        });
     }
     Ok(out)
+}
+
+/// Match a glob `pattern` against a `candidate` string (T9.5a).
+///
+/// Supports only:
+///   - `*` — matches zero or more of any character (greedy with backtracking).
+///   - `?` — matches exactly one character.
+///
+/// No character classes, no escape sequences, no `**`. A pattern with no
+/// glob metacharacter is a literal full-string equality match (backward
+/// compat with the T9.5 contract).
+///
+/// Selector strings are short (variant names); a recursive backtrack on
+/// `*` is fine here.
+pub fn glob_match(pattern: &str, candidate: &str) -> bool {
+    let pat: &[u8] = pattern.as_bytes();
+    let cand: &[u8] = candidate.as_bytes();
+    fn rec(pat: &[u8], cand: &[u8]) -> bool {
+        if pat.is_empty() {
+            return cand.is_empty();
+        }
+        match pat[0] {
+            b'*' => {
+                // Try matching `*` against 0, 1, 2, ... characters.
+                if rec(&pat[1..], cand) {
+                    return true;
+                }
+                if cand.is_empty() {
+                    return false;
+                }
+                rec(pat, &cand[1..])
+            }
+            b'?' => {
+                if cand.is_empty() {
+                    false
+                } else {
+                    rec(&pat[1..], &cand[1..])
+                }
+            }
+            c => {
+                if cand.is_empty() || cand[0] != c {
+                    false
+                } else {
+                    rec(&pat[1..], &cand[1..])
+                }
+            }
+        }
+    }
+    rec(pat, cand)
+}
+
+/// Resolve the effective `--variant-arg` overrides for a given
+/// `variant_name` (T9.5a).
+///
+/// Walks `entries` in CLI order; each entry whose selector
+/// [`glob_match`]es `variant_name` inserts or **overwrites** the resolved
+/// `(key, (value, selector))` pair. Later CLI entries therefore win over
+/// earlier ones on key conflict — including across different selectors.
+///
+/// Document this precedence behaviour to operators: ordering matters. For
+/// example, writing
+///
+/// ```text
+/// --variant-arg '*.X=default' --variant-arg 'zenoh-*.X=override'
+/// ```
+///
+/// gets the override on `zenoh-*` spawns and the default elsewhere. Reverse
+/// the order and the default wins everywhere. There is no implicit
+/// "literal beats glob" specificity ranking.
+///
+/// The tuple's second element is the **selector** that contributed this
+/// key, used by the spawn-time provenance log line annotation
+/// `(cli: <selector>)`.
+pub fn resolve_for_variant(
+    entries: &[VariantArgEntry],
+    variant_name: &str,
+) -> HashMap<String, (toml::Value, String)> {
+    let mut out: HashMap<String, (toml::Value, String)> = HashMap::new();
+    for entry in entries {
+        if glob_match(&entry.selector, variant_name) {
+            out.insert(
+                entry.key.clone(),
+                (entry.value.clone(), entry.selector.clone()),
+            );
+        }
+    }
+    out
+}
+
+/// Strip the per-selector provenance off a resolver result to feed
+/// `build_variant_args`, which only needs a `HashMap<key, value>`.
+pub fn drop_selector_provenance(
+    resolved: &HashMap<String, (toml::Value, String)>,
+) -> HashMap<String, toml::Value> {
+    resolved
+        .iter()
+        .map(|(k, (v, _sel))| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Format a TOML value as a CLI argument string.
@@ -235,28 +352,43 @@ pub enum SpecificArgProvenance {
 /// each value came from (`toml`, `cli`). Used by `main.rs` to emit the
 /// provenance log line. Result is sorted lexicographically by key.
 ///
-/// `cli_overrides` is the inner map for **this spawn's variant** only
-/// (caller looked up the right entry already).
+/// `cli_overrides_with_selectors` is the per-spawn resolved map from
+/// [`resolve_for_variant`] — each entry carries both the value and the
+/// selector that contributed it. The selector flows into the tuple's
+/// fourth element when provenance is `Cli`; for `Toml` it is `None`.
+///
+/// Returns tuples `(key, formatted_value, provenance, selector_opt)`.
 pub fn specific_arg_provenance(
     toml_specific: Option<&toml::value::Table>,
-    cli_overrides: Option<&HashMap<String, toml::Value>>,
-) -> Vec<(String, String, SpecificArgProvenance)> {
-    let mut entries: HashMap<String, (toml::Value, SpecificArgProvenance)> = HashMap::new();
+    cli_overrides_with_selectors: Option<&HashMap<String, (toml::Value, String)>>,
+) -> Vec<(String, String, SpecificArgProvenance, Option<String>)> {
+    let mut entries: HashMap<String, (toml::Value, SpecificArgProvenance, Option<String>)> =
+        HashMap::new();
     if let Some(specific) = toml_specific {
         for (key, val) in specific {
-            entries.insert(key.clone(), (val.clone(), SpecificArgProvenance::Toml));
+            entries.insert(
+                key.clone(),
+                (val.clone(), SpecificArgProvenance::Toml, None),
+            );
         }
     }
-    if let Some(overrides) = cli_overrides {
-        for (key, val) in overrides {
+    if let Some(overrides) = cli_overrides_with_selectors {
+        for (key, (val, selector)) in overrides {
             // CLI wins; tag as CLI regardless of whether it was a new key
             // or an override of a TOML key.
-            entries.insert(key.clone(), (val.clone(), SpecificArgProvenance::Cli));
+            entries.insert(
+                key.clone(),
+                (
+                    val.clone(),
+                    SpecificArgProvenance::Cli,
+                    Some(selector.clone()),
+                ),
+            );
         }
     }
-    let mut out: Vec<(String, String, SpecificArgProvenance)> = entries
+    let mut out: Vec<(String, String, SpecificArgProvenance, Option<String>)> = entries
         .into_iter()
-        .map(|(k, (v, p))| (k, toml_value_to_string(&v), p))
+        .map(|(k, (v, p, sel))| (k, toml_value_to_string(&v), p, sel))
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -931,6 +1063,16 @@ name = "v"
     // T9.5: --variant-arg passthrough — parser + merge tests.
     // -----------------------------------------------------------------
 
+    // Test helper: lift a flat `HashMap<key, value>` into the shape that
+    // `build_variant_args` now expects from a caller-provided resolver
+    // output stripped of the per-selector provenance.
+    fn cli_overrides_from(
+        entries: &[VariantArgEntry],
+        variant_name: &str,
+    ) -> HashMap<String, toml::Value> {
+        drop_selector_provenance(&resolve_for_variant(entries, variant_name))
+    }
+
     #[test]
     fn parse_variant_arg_rejects_entry_with_no_dot_or_equals() {
         let raw = vec!["foo".to_string()];
@@ -968,21 +1110,21 @@ name = "v"
 
     #[test]
     fn parse_variant_arg_rejects_dotless_after_first_eq() {
-        // `=bar` — variant is empty before the first `.`, but split_once('.')
-        // returns None first. To exercise the empty-variant guard we need an
+        // `=bar` — selector is empty before the first `.`, but split_once('.')
+        // returns None first. To exercise the empty-selector guard we need an
         // entry that has a `.` but starts with it.
         let raw = vec![".key=value".to_string()];
         let err = parse_variant_arg_overrides(&raw).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("variant name") && msg.contains("empty"),
-            "expected empty-variant-name error, got: {msg}"
+            msg.contains("selector") && msg.contains("empty"),
+            "expected empty-selector error, got: {msg}"
         );
     }
 
     #[test]
     fn parse_variant_arg_rejects_empty_key() {
-        // variant present, but key (between '.' and '=') is empty.
+        // selector present, but key (between '.' and '=') is empty.
         let raw = vec!["zenoh.=value".to_string()];
         let err = parse_variant_arg_overrides(&raw).unwrap_err();
         let msg = format!("{err}");
@@ -998,10 +1140,27 @@ name = "v"
         // flag-only / take an empty value).
         let raw = vec!["zenoh.flag=".to_string()];
         let out = parse_variant_arg_overrides(&raw).unwrap();
-        let zenoh = out.get("zenoh").unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].selector, "zenoh");
+        assert_eq!(out[0].key, "flag");
+        assert_eq!(out[0].value, toml::Value::String(String::new()));
+    }
+
+    #[test]
+    fn parse_variant_arg_preserves_cli_order() {
+        // Two entries with the same selector and same key but different
+        // values — the parser preserves CLI order verbatim. The resolver
+        // (separately tested) picks the last on conflict.
+        let raw = vec!["zenoh.X=first".to_string(), "zenoh.X=second".to_string()];
+        let out = parse_variant_arg_overrides(&raw).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].value, toml::Value::String("first".into()));
+        assert_eq!(out[1].value, toml::Value::String("second".into()));
+        // The resolver collapses the duplicate; the second wins.
+        let resolved = resolve_for_variant(&out, "zenoh");
         assert_eq!(
-            zenoh.get("flag").unwrap(),
-            &toml::Value::String(String::new())
+            resolved.get("X").unwrap().0,
+            toml::Value::String("second".into())
         );
     }
 
@@ -1012,16 +1171,18 @@ name = "v"
             "zenoh.zenoh_mode=peer".to_string(),
         ];
         let out = parse_variant_arg_overrides(&raw).unwrap();
-        assert_eq!(out.len(), 1, "exactly one variant expected: {out:?}");
-        let zenoh = out.get("zenoh").unwrap();
-        assert_eq!(zenoh.len(), 2);
+        // After T9.5a the parser preserves CLI order as a flat list.
+        // The resolver collapses to a per-variant map.
+        assert_eq!(out.len(), 2);
+        let resolved = resolve_for_variant(&out, "zenoh");
+        assert_eq!(resolved.len(), 2);
         assert_eq!(
-            zenoh.get("multicast_interface").unwrap(),
-            &toml::Value::String("192.168.1.68".to_string())
+            resolved.get("multicast_interface").unwrap().0,
+            toml::Value::String("192.168.1.68".to_string())
         );
         assert_eq!(
-            zenoh.get("zenoh_mode").unwrap(),
-            &toml::Value::String("peer".to_string())
+            resolved.get("zenoh_mode").unwrap().0,
+            toml::Value::String("peer".to_string())
         );
     }
 
@@ -1033,8 +1194,13 @@ name = "v"
         ];
         let out = parse_variant_arg_overrides(&raw).unwrap();
         assert_eq!(out.len(), 2);
-        assert!(out.contains_key("zenoh"));
-        assert!(out.contains_key("quic"));
+        let zenoh = resolve_for_variant(&out, "zenoh");
+        let quic = resolve_for_variant(&out, "quic");
+        assert!(zenoh.contains_key("multicast_interface"));
+        assert!(quic.contains_key("cert_path"));
+        // No cross-contamination.
+        assert!(!zenoh.contains_key("cert_path"));
+        assert!(!quic.contains_key("multicast_interface"));
     }
 
     #[test]
@@ -1042,10 +1208,12 @@ name = "v"
         // The value half can itself contain `=`; we split on the FIRST `=`.
         let raw = vec!["zenoh.connection_string=key=value;other=stuff".to_string()];
         let out = parse_variant_arg_overrides(&raw).unwrap();
-        let zenoh = out.get("zenoh").unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].selector, "zenoh");
+        assert_eq!(out[0].key, "connection_string");
         assert_eq!(
-            zenoh.get("connection_string").unwrap(),
-            &toml::Value::String("key=value;other=stuff".to_string())
+            out[0].value,
+            toml::Value::String("key=value;other=stuff".to_string())
         );
     }
 
@@ -1056,11 +1224,119 @@ name = "v"
         // survive intact.
         let raw = vec!["zenoh.multicast_interface=192.168.1.68".to_string()];
         let out = parse_variant_arg_overrides(&raw).unwrap();
-        let zenoh = out.get("zenoh").unwrap();
+        assert_eq!(out.len(), 1);
         assert_eq!(
-            zenoh.get("multicast_interface").unwrap(),
-            &toml::Value::String("192.168.1.68".to_string())
+            out[0].value,
+            toml::Value::String("192.168.1.68".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------
+    // T9.5a: glob_match + resolve_for_variant.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn glob_match_literal() {
+        assert!(glob_match("zenoh", "zenoh"));
+        assert!(!glob_match("zenoh", "zenoh-x"));
+        assert!(!glob_match("zenoh", ""));
+    }
+
+    #[test]
+    fn glob_match_star() {
+        assert!(glob_match("zenoh-*", "zenoh-1000x100hz-scalar"));
+        assert!(glob_match("zenoh-*", "zenoh-"));
+        assert!(!glob_match("zenoh-*", "quic-x"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn glob_match_question() {
+        assert!(glob_match("v?", "v1"));
+        assert!(!glob_match("v?", "v"));
+        assert!(!glob_match("v?", "v12"));
+        assert!(glob_match("???", "abc"));
+        assert!(!glob_match("???", "ab"));
+    }
+
+    #[test]
+    fn glob_match_star_at_both_ends() {
+        assert!(glob_match("*zenoh*", "x-zenoh-y"));
+        assert!(glob_match("*zenoh*", "zenoh"));
+        assert!(glob_match("*zenoh*", "zenoh-tail"));
+        assert!(glob_match("*zenoh*", "head-zenoh"));
+        assert!(!glob_match("*zenoh*", "ze-noh"));
+    }
+
+    #[test]
+    fn glob_match_mixed_metacharacters() {
+        // `v-?-*` matches `v-X-anything` for any single X then any tail.
+        assert!(glob_match("v-?-*", "v-a-1000x100hz"));
+        assert!(!glob_match("v-?-*", "v--1000x100hz"));
+    }
+
+    #[test]
+    fn resolve_for_variant_glob_hits_family() {
+        // The user-facing case: `zenoh-*` selector matches every
+        // template-derived zenoh variant.
+        let raw = vec!["zenoh-*.multicast_interface=192.168.1.80".to_string()];
+        let entries = parse_variant_arg_overrides(&raw).unwrap();
+        let resolved = resolve_for_variant(&entries, "zenoh-1000x100hz-scalar");
+        let (val, sel) = resolved.get("multicast_interface").unwrap();
+        assert_eq!(val, &toml::Value::String("192.168.1.80".to_string()));
+        assert_eq!(sel, "zenoh-*");
+
+        // Same selector against an unrelated variant: no hit.
+        let resolved_other = resolve_for_variant(&entries, "quic-base");
+        assert!(resolved_other.is_empty());
+    }
+
+    #[test]
+    fn resolve_for_variant_literal_still_works() {
+        // Backward compat with T9.5 — a selector with no glob chars is a
+        // literal full-string match. `quic.cert=X` must NOT match
+        // `quic-base` because the literal does not equal the candidate.
+        let raw = vec!["quic.cert=/etc/quic.pem".to_string()];
+        let entries = parse_variant_arg_overrides(&raw).unwrap();
+        let resolved_quic = resolve_for_variant(&entries, "quic");
+        assert_eq!(resolved_quic.len(), 1);
+        assert_eq!(
+            resolved_quic.get("cert").unwrap().0,
+            toml::Value::String("/etc/quic.pem".into())
+        );
+        let resolved_quic_base = resolve_for_variant(&entries, "quic-base");
+        assert!(resolved_quic_base.is_empty());
+    }
+
+    #[test]
+    fn resolve_for_variant_later_overrides_earlier_with_different_selectors() {
+        // CLI order `*.X=a` then `zenoh-*.X=b`: for `zenoh-y` the resolved
+        // value is `b` (the later entry wins on key conflict).
+        let raw = vec!["*.X=a".to_string(), "zenoh-*.X=b".to_string()];
+        let entries = parse_variant_arg_overrides(&raw).unwrap();
+        let resolved = resolve_for_variant(&entries, "zenoh-y");
+        let (val, sel) = resolved.get("X").unwrap();
+        assert_eq!(val, &toml::Value::String("b".into()));
+        assert_eq!(sel, "zenoh-*");
+
+        // Reverse order — the catchall is now last; it wins.
+        let raw_rev = vec!["zenoh-*.X=b".to_string(), "*.X=a".to_string()];
+        let entries_rev = parse_variant_arg_overrides(&raw_rev).unwrap();
+        let resolved_rev = resolve_for_variant(&entries_rev, "zenoh-y");
+        let (val_rev, sel_rev) = resolved_rev.get("X").unwrap();
+        assert_eq!(val_rev, &toml::Value::String("a".into()));
+        assert_eq!(sel_rev, "*");
+    }
+
+    #[test]
+    fn resolve_for_variant_no_match_returns_empty() {
+        // A glob that matches nothing: the resolver returns an empty map
+        // and the caller emits no `--` separator / no provenance line.
+        let raw = vec!["quic-*.foo=bar".to_string()];
+        let entries = parse_variant_arg_overrides(&raw).unwrap();
+        let resolved = resolve_for_variant(&entries, "zenoh-1000x100hz-scalar");
+        assert!(resolved.is_empty());
     }
 
     #[test]
@@ -1272,26 +1548,136 @@ binary = "./x"
 
     #[test]
     fn specific_arg_provenance_tags_correctly() {
-        // TOML: a=1, b=2. CLI: b=3, c=4.
-        // Expected provenance: a=1 (toml), b=3 (cli), c=4 (cli).
+        // TOML: a=1, b=2. CLI (via resolver): b=3, c=4 both attributed to
+        // selector `v*`. Expected provenance: a=1 (toml, no selector),
+        // b=3 (cli, selector "v*"), c=4 (cli, selector "v*").
         let mut toml_table = toml::value::Table::new();
         toml_table.insert("a".into(), toml::Value::String("1".into()));
         toml_table.insert("b".into(), toml::Value::String("2".into()));
 
-        let mut overrides: HashMap<String, toml::Value> = HashMap::new();
-        overrides.insert("b".to_string(), toml::Value::String("3".to_string()));
-        overrides.insert("c".to_string(), toml::Value::String("4".to_string()));
+        let mut overrides: HashMap<String, (toml::Value, String)> = HashMap::new();
+        overrides.insert(
+            "b".to_string(),
+            (toml::Value::String("3".to_string()), "v*".to_string()),
+        );
+        overrides.insert(
+            "c".to_string(),
+            (toml::Value::String("4".to_string()), "v*".to_string()),
+        );
 
         let prov = specific_arg_provenance(Some(&toml_table), Some(&overrides));
-        let by_key: HashMap<String, (String, SpecificArgProvenance)> = prov
+        let by_key: HashMap<String, (String, SpecificArgProvenance, Option<String>)> = prov
             .iter()
-            .map(|(k, v, p)| (k.clone(), (v.clone(), *p)))
+            .map(|(k, v, p, sel)| (k.clone(), (v.clone(), *p, sel.clone())))
             .collect();
-        assert_eq!(by_key["a"], ("1".to_string(), SpecificArgProvenance::Toml));
-        assert_eq!(by_key["b"], ("3".to_string(), SpecificArgProvenance::Cli));
-        assert_eq!(by_key["c"], ("4".to_string(), SpecificArgProvenance::Cli));
+        assert_eq!(
+            by_key["a"],
+            ("1".to_string(), SpecificArgProvenance::Toml, None)
+        );
+        assert_eq!(
+            by_key["b"],
+            (
+                "3".to_string(),
+                SpecificArgProvenance::Cli,
+                Some("v*".to_string())
+            )
+        );
+        assert_eq!(
+            by_key["c"],
+            (
+                "4".to_string(),
+                SpecificArgProvenance::Cli,
+                Some("v*".to_string())
+            )
+        );
         // Lexicographic emit order.
-        let keys: Vec<&String> = prov.iter().map(|(k, _, _)| k).collect();
+        let keys: Vec<&String> = prov.iter().map(|(k, _, _, _)| k).collect();
         assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn specific_arg_provenance_includes_selector() {
+        // CLI key carries `Some(selector)` matching whatever the resolver
+        // attached; TOML-sourced keys carry `None`.
+        let mut toml_table = toml::value::Table::new();
+        toml_table.insert("x".into(), toml::Value::String("from-toml".into()));
+
+        let raw = vec!["zenoh-*.multicast_interface=192.168.1.80".to_string()];
+        let entries = parse_variant_arg_overrides(&raw).unwrap();
+        let resolved = resolve_for_variant(&entries, "zenoh-1000x100hz-scalar");
+
+        let prov = specific_arg_provenance(Some(&toml_table), Some(&resolved));
+        let by_key: HashMap<String, (String, SpecificArgProvenance, Option<String>)> = prov
+            .iter()
+            .map(|(k, v, p, sel)| (k.clone(), (v.clone(), *p, sel.clone())))
+            .collect();
+        assert_eq!(by_key["x"].2, None, "TOML-sourced key has no selector");
+        assert_eq!(
+            by_key["multicast_interface"].2,
+            Some("zenoh-*".to_string()),
+            "CLI-sourced key carries the contributing selector"
+        );
+    }
+
+    #[test]
+    fn build_args_glob_override_propagates_to_specific_args() {
+        // End-to-end: parse `zenoh-*.multicast_interface=192.168.1.80`,
+        // resolve for variant `zenoh-1000x100hz-scalar`, call
+        // `build_variant_args`, assert the trailing args contain
+        // `--multicast-interface 192.168.1.80`.
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "zenoh-1000x100hz-scalar"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  qos = 3
+  [variant.specific]
+  zenoh_mode = "peer"
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+
+        let raw = vec!["zenoh-*.multicast_interface=192.168.1.80".to_string()];
+        let entries = parse_variant_arg_overrides(&raw).unwrap();
+        let overrides_for_spawn = cli_overrides_from(&entries, &v.name);
+
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            &v.name,
+            3,
+            100,
+            1000,
+            ThreadingMode::Multi,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
+            &peers,
+            Some(&overrides_for_spawn),
+        );
+        let sep_idx = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("specific section must be present");
+        let specific = &args[sep_idx + 1..];
+        // Lex order: multicast_interface, zenoh_mode.
+        assert_eq!(
+            specific,
+            &[
+                "--multicast-interface".to_string(),
+                "192.168.1.80".to_string(),
+                "--zenoh-mode".to_string(),
+                "peer".to_string(),
+            ],
+            "glob-resolved override must propagate to the trailing specific args"
+        );
     }
 }
