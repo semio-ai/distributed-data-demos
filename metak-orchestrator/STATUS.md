@@ -18532,3 +18532,394 @@ T16.16.
 **Active in-flight**: none.
 
 
+## T16.10c completion report — 2026-05-25 (worker: variants/zenoh)
+
+### Conclusion
+
+**Needs Option A (router sidecar) — flagged back to orchestrator.** No
+code change beyond a small synthetic-jitter testing hook landed under
+T16.10c. The wired-LAN baseline on T16.10d is clean; the cross-WiFi
+failure mode is reproducible on localhost via a subscriber-side
+synthetic jitter; every Option B variant (window bump, gate fail-safe,
+bridge bump) I attempted either regresses the wired-LAN baseline or
+fails to reach the actual deadlock surface (Zenoh's CC=Block on the
+publisher, parked because the peer's subscriber routing thread is
+parked).
+
+Recommendation:
+1. **First**, user re-runs the cross-WiFi matrix on the current main
+   binary (T16.10d landed yesterday — autoconnect-strategy = "greater-zid"
+   + WriterDedup). The T16.10b dataset was collected on `0673157`
+   which is pre-T16.10d. If T16.10d's autoconnect fix alone resolves
+   the cross-WiFi case (e.g. because the actual root cause was the
+   duplicate-route race rather than receive-side back-pressure),
+   T16.10c can close with zero code changes.
+2. **If T16.10d alone is not sufficient**, the orchestrator should
+   spawn an Option A worker (touches `runner/` for sidecar
+   lifecycle + `variants/zenoh/` for client-mode wiring). My
+   synthetic test on localhost can then validate the Option A fix
+   before the user re-runs cross-WiFi.
+
+### Investigation timeline
+
+**Step 1 — orient on the two datasets** (~10 min):
+
+For the representative spawn `zenoh-1000x100hz-scalar-qos3-multi`,
+side-by-side known-good (same-machine `20260521_210958`) vs known-bad
+(cross-WiFi `20260523_083845`):
+
+| Aspect              | Known-good (same-machine)  | Known-bad (cross-WiFi)               |
+|---------------------|----------------------------|--------------------------------------|
+| Binary build        | `dbb9c70+dirty` (pre-T16.10d) | `0673157` (pre-T16.10d)           |
+| compact-parquet     | Present (both peers)       | **Absent** (both peers)              |
+| jsonl row count     | 254 / 255 (full progress)  | **4 / 4** (lifecycle only)           |
+| Last phase emitted  | `done`                     | `operate`                            |
+| Watchdog stderr     | None                       | `watchdog: no progress in 30s during operate phase` (both) |
+| Exit reason         | `runner_idle_terminated`   | `variant_self_killed_idle` (both)    |
+
+The cross-WiFi peers reached operate, never emitted a single progress
+event, then T15.5 self-killed at +30 s. This is the signature
+T16.10b's worker catalogued for all 12 zenoh-1000x100hz qos3/qos4
+multi spawns. Wired-baseline T16.10d binary on the same workload
+shape exits clean.
+
+**Step 2 — build T16.10d binary on current main and baseline**:
+
+```
+target/release/runner.exe --name {alice,bob} --config variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos3-repro.toml
+```
+
+Result: both peers `phase=done`, exit 0, ~2.5M compact rows each, no
+watchdog. T16.10d's baseline at 1 000 paths × 100 Hz Multi-mode QoS 3
+is clean on localhost loopback.
+
+**Step 3 — minimal synthetic-burst reproducer added** (the only
+production-code change in this task):
+
+Two env vars in `subscriber_task` (`ZENOH_TEST_SUB_JITTER_MS` and
+`ZENOH_TEST_SUB_JITTER_EVERY`, both 0 / "off" by default) make the
+subscriber `tokio::time::sleep(N ms)` on every Mth recv'd sample.
+Production runs unset both and the hot path is bit-for-bit
+identical to the T16.10d-verified code. The synthetic jitter
+approximates a peer whose receive routing thread is parked
+(the cross-WiFi failure model from T16.10b).
+
+```rust
+// variants/zenoh/src/zenoh.rs subscriber_task:
+if sub_jitter_ms > 0 {
+    sample_count = sample_count.wrapping_add(1);
+    if sample_count.is_multiple_of(sub_jitter_every) {
+        tokio::time::sleep(Duration::from_millis(sub_jitter_ms)).await;
+    }
+}
+```
+
+**Step 4 — reproduce the deadlock on localhost**:
+
+```powershell
+$env:ZENOH_TEST_SUB_JITTER_MS = "500"
+$env:ZENOH_TEST_SUB_JITTER_EVERY = "50"
+# both runners as before
+```
+
+Result on current main (T16.10d + my env-var hooks, no further fix):
+- alice: `phase=operate sent=4145 received=0 eot_sent=false`, exit 2
+  (`variant_self_killed_idle`, watchdog stderr emitted).
+- bob: `phase=done sent=3000 received=2097 eot_sent=true`, exit 0.
+
+The signature matches cross-WiFi T16.10b exactly: one peer wedges in
+operate with the watchdog firing, the other gives up via the
+runner-idle-termination path. **Synthetic burstiness alone, without
+any code change, reproduces the cross-WiFi deadlock on localhost.**
+Therefore the deadlock is not specific to the WiFi link layer — it
+is a property of the in-process Zenoh peer-mode topology under
+receive-side back-pressure.
+
+**Step 5 — Option B attempt 1: bump `QOS_STRICT_WINDOW` from 2048 → 16384**:
+
+The cross-WiFi failure shape (alice publishes a tick-batch immediately
+on operate-entry, gate engages at 2048, bob's ack never advances, alice
+wedges at the gate condvar) suggests the gate window is the binding
+surface and a wider window would let alice absorb a multi-hundred-ms
+peer stall. Tried 16 384 (matching `PUBLISH_CHANNEL_CAPACITY`).
+
+Result on the synthetic burst test: **aggressive jitter (500 ms /
+50 samples) passes cleanly** — both peers `phase=done`, exit 0,
+sent=18000 / received=~1900 each. The widened window absorbs the
+synthetic stall.
+
+Result on the **regression** test (same fixture, **no** jitter,
+should match the T16.10d-verified baseline): **FAIL** — alice sent
+339 K, bob received 66 K (asymmetric 5× overflow), bob's watchdog
+fired with exit 2. This is exactly the T17.8 catalogued asymmetric
+collapse — alice outruns bob far enough that Zenoh's CC=Block
+back-pressure on the publisher (which sits downstream of our gate)
+parks bob's subscriber routing thread, which then never recovers.
+The T17.8 narrowing of the window from 8 192 → 2 048 was precisely
+to avoid this. **Reverted.**
+
+**Step 6 — Option B attempt 2: bounded gate wait (5 s fail-safe)**:
+
+Approach: keep the 2 048 window, but if `wait_for_window` parks for
+> 5 s on a single call, release the gate and let the publish proceed
+anyway. The driver thread is then unblocked, the T15.5 watchdog sees
+forward motion, and the variant doesn't self-kill. The strict-no-skip
+contract is best-effort under degraded conditions, not strict.
+
+Result on the regression test (no jitter): **PASS** — both peers
+`phase=done`, sent ≈ received ≈ 1.26 M, no fail-safe warnings
+(the 5 s budget was never hit). The fail-safe is invisible to
+normal-condition traffic.
+
+Result on the synthetic burst test (500 ms / 50): **FAIL** — alice
+`phase=operate sent=4112 received=349`, killed by the runner's 120 s
+timeout. **The fail-safe was never invoked** (zero "window gate max
+wait" stderr lines).
+
+Diagnosis: the deadlock is downstream of the gate. The chain is
+
+```
+peer subscriber jitters
+  -> peer Zenoh inbound buffer fills
+  -> local publisher.put().await blocks (CC=Block)
+  -> local publisher_task blocks
+  -> local bridge mpsc fills
+  -> local driver's try_send returns Full, falls back to blocking_send
+  -> driver wedged on blocking_send (NOT on the gate)
+  -> the gate's fail-safe is irrelevant; the driver isn't parked there
+```
+
+Bumping the bridge capacity (the third Option B family member) would
+only delay step 5 → 6 by an additional N publishes; it cannot
+fundamentally avoid the chain because `publisher.put().await` itself
+is parked on Zenoh's CC=Block. **Reverted.**
+
+**Step 7 — every Option B path exhausted**:
+
+Window bump regresses. Gate fail-safe doesn't reach the real
+deadlock surface. Bridge bump only delays the wedge. The remaining
+options are:
+- Disable CC=Block entirely (would re-introduce the asymmetric-drop
+  failure mode T-impl.7 fixed -- reliable QoS becomes best-effort).
+- Move Zenoh routing out-of-process (**Option A**, the router
+  sidecar from the task brief).
+- Wait for upstream Zenoh to support a non-deadlocking back-pressure
+  primitive (no such primitive currently exists in zenoh 1.9).
+
+Per the task brief: "If at any point you decide you need to touch
+`runner/` for a router sidecar, STOP. Append a note to STATUS.md".
+I am stopping here.
+
+### Caveat — synthetic test is more aggressive than realistic WiFi
+
+The subscriber-side synthetic jitter applies a hard sleep on the
+recv loop, which halts Zenoh's RX routing thread entirely for the
+sleep duration. Real WiFi packet loss adds 10-100 ms link-layer
+retransmits per dropped frame without halting the routing thread.
+
+In a less-aggressive synthetic test (50 ms / 1 000 samples ≈ 5 %
+effective stall, simulating moderate WiFi degradation), **both peers
+on the current main binary completed cleanly** with 98 % delivery,
+phase=done, exit 0. This suggests that T16.10d's autoconnect-strategy
+fix may already be sufficient for realistic WiFi conditions, even
+though my worst-case synthetic test deadlocks.
+
+**This is why my recommendation is: user re-runs the cross-WiFi
+matrix on the current main binary BEFORE the orchestrator decides
+to spawn an Option A worker.** Real WiFi may behave more like the
+mild synthetic test (passes cleanly on T16.10d) than the aggressive
+one (deadlocks).
+
+### Files changed (LOC counts)
+
+- `variants/zenoh/src/zenoh.rs`: +34 lines (env-var hooks in
+  `subscriber_task` for `ZENOH_TEST_SUB_JITTER_MS` /
+  `ZENOH_TEST_SUB_JITTER_EVERY`). Both vars off by default; production
+  hot path is bit-for-bit identical to the T16.10d-verified flow.
+- `variants/zenoh/CUSTOM.md`: +51 lines (new "T16.10c -- synthetic
+  subscriber-jitter env-var hooks" section documenting the new env
+  vars + the PowerShell incantation for reproducing the deadlock
+  signature on localhost).
+- `metak-orchestrator/STATUS.md`: this completion report (append-only).
+- No `runner/` changes.
+- No `metak-shared/` changes.
+- No new fixtures (the existing
+  `variants/zenoh/tests/fixtures/two-runner-zenoh-1000x100hz-qos3-repro.toml`
+  is the reproducer; the env-var hooks layer onto it).
+
+### Test results
+
+- `cargo test --release -p variant-zenoh` (default): **67 unit + 1
+  loopback integration passed, 0 failed**. Identical to the
+  pre-T16.10c baseline.
+- `cargo test --release -p variant-zenoh --bin variant-zenoh --
+  --ignored`: **3 / 3 ignored unit tests pass**
+  (`zenoh_bridge_stress_10000_messages`,
+  `multi_zenoh_qos3_qos4_preserves_per_key_order`,
+  `multi_zenoh_subscriber_filters_self_writer`).
+- `cargo clippy --release --workspace --all-targets -- -D warnings`:
+  **clean**.
+
+End-to-end reproducer runs (all on current main + my hooks, with
+the env vars unset unless noted):
+
+| Reproducer                                            | alice exit | bob exit | alice sent / recv      | bob sent / recv        | Notes                            |
+|-------------------------------------------------------|------------|----------|------------------------|------------------------|----------------------------------|
+| `two-runner-zenoh-1000x10hz-qos3-repro.toml`          | 0 (done)   | 0 (done) | sent 14K / recv 6K     | sent 6K / recv 10K     | T16.10 official fixture          |
+| `two-runner-zenoh-1000x10hz-qos4-repro.toml`          | 0 (done)   | 0 (done) | sent 31K / recv 36K    | sent 51K / recv 30K    | T16.10 official fixture          |
+| `two-runner-zenoh-1000x100hz-qos3-repro.toml` (no jit)| 0 (done)   | 0 (done) | sent 1.26M / recv 1.26M| sent 1.26M / recv 1.26M| T16.10d baseline, 100% delivery  |
+| Same fixture + JITTER_MS=50, EVERY=1000 (5%)          | 0 (done)   | 0 (done) | sent 177K / recv 174K  | sent 177K / recv 174K  | ~98% delivery, realistic WiFi    |
+| Same fixture + JITTER_MS=500, EVERY=50 (aggressive)   | **2** (kill)| 0 (done)| sent 4145 / recv 0     | sent 3000 / recv 2097  | Reproduces cross-WiFi signature  |
+
+The Out-of-order = 0 and Dupes = 0 properties from the T16.10d
+acceptance gate are preserved on every reproducer (none of my hooks
+touch the publisher_task or the dedup gate). The deadlock-under-
+aggressive-jitter result is what motivates the Option A flag-back.
+
+### PowerShell incantation for the user to validate cross-WiFi
+
+**Step 1 -- verify T16.10d alone suffices** (do this FIRST):
+
+Build on both machines, then run the standard cross-WiFi matrix
+config exactly as for the T16.10b dataset, with the env vars unset
+(production behaviour):
+
+```powershell
+# On both machines (alice and bob), build and ensure the binary is fresh:
+cargo build --release -p runner -p variant-zenoh
+
+# Verify the env vars are NOT set (they default to "off" anyway,
+# but a sanity check costs nothing):
+Remove-Item env:ZENOH_TEST_SUB_JITTER_MS -ErrorAction SilentlyContinue
+Remove-Item env:ZENOH_TEST_SUB_JITTER_EVERY -ErrorAction SilentlyContinue
+
+# Two terminals (alice, bob); each on its own machine.
+# Single-spawn minimal reproducer:
+# Terminal A (alice machine):
+target\release\runner.exe --name alice `
+  --config variants\zenoh\tests\fixtures\two-runner-zenoh-1000x100hz-qos3-repro.toml `
+  --log-dir .\logs\t1610c-crosswifi-validate
+
+# Terminal B (bob machine):
+target\release\runner.exe --name bob `
+  --config variants\zenoh\tests\fixtures\two-runner-zenoh-1000x100hz-qos3-repro.toml `
+  --log-dir .\logs\t1610c-crosswifi-validate
+```
+
+**Expected output that means "T16.10d already fixed it"** (this is
+the outcome that would let us close T16.10c with zero further code
+changes):
+
+- Both runners exit 0.
+- Both runners' stderr ends with
+  `'zenoh-1000x100hz-qos3-repro' final progress: phase=done sent=N received=M eot_sent=true eot_received=true`
+  where N is around 800K-1.3M (rate × time × vpt) and M is at least
+  50 % of N (the 80 % delivery acceptance bar from the T16.10c task
+  brief; on a real WiFi link the realistic number will be 70-95 %).
+- Neither variant stderr contains the substring
+  `watchdog: no progress in 30s during operate phase`.
+- The log directory contains BOTH peers' `*.compact.parquet` files
+  (size > 0).
+
+**Expected output that means "T16.10c still needs Option A"**:
+
+- Either runner exits with non-zero status (likely `exit_code=2` for
+  the variant-side watchdog path, or `status=timeout` if the variant
+  is wedged past the 120 s default barrier).
+- The corresponding variant stderr contains
+  `watchdog: no progress in 30s during operate phase`.
+- That peer's `.compact.parquet` is missing or empty.
+
+If the second outcome reproduces on the cross-WiFi setup, the next
+step is for the orchestrator to spawn an Option A worker (sidecar
+router lifecycle in `runner/`, client-mode wiring in
+`variants/zenoh/`). My env-var hooks then serve as the localhost
+acceptance harness for the Option A fix.
+
+**Step 2 -- if you want to deliberately probe the deadlock surface**
+(synthetic on a single machine; not load-bearing for the cross-WiFi
+acceptance):
+
+```powershell
+$env:ZENOH_TEST_SUB_JITTER_MS = "500"
+$env:ZENOH_TEST_SUB_JITTER_EVERY = "50"
+# Then run the same two-runner reproducer in two terminals on the
+# same machine. One peer will hit the variant-side watchdog; the
+# other will exit cleanly. This is the WiFi-failure signature reproduced
+# without WiFi. Use this to validate Option A once it lands.
+```
+
+### Deviations from the task spec
+
+1. The task brief asked the worker to "verify whether T16.10d's
+   autoconnect-strategy fix alone might already resolve the
+   cross-machine deadlock" via synthetic burstiness. My synthetic
+   burstiness DOES deadlock the T16.10d binary -- but the synthetic
+   test is more aggressive than realistic WiFi (a less-aggressive
+   variant passes cleanly), so I cannot from my evidence alone
+   conclude that T16.10d is insufficient for the actual cross-WiFi
+   case. The cross-WiFi re-run on real hardware is the
+   authoritative check. I've prepared the PowerShell incantation for
+   that re-run above.
+2. The task brief listed FIFO bump / ack-window bump (Option B) as
+   the recommended starting points. I tried the window bump in
+   isolation and it regresses the wired-LAN baseline (T17.8's
+   asymmetric-drop failure mode reappears). The fail-safe gate
+   timeout (another Option B family member I tried) doesn't reach
+   the actual deadlock surface. A bridge bump would only delay the
+   wedge. None of the Option B family carries the load; this is the
+   "flag-back to orchestrator" trigger per the task brief's
+   guardrail.
+3. I did not touch `runner/`. The task brief's guardrail says STOP
+   before touching `runner/` for the sidecar; I am stopping at the
+   investigation + minimal hook stage exactly as specified.
+
+### Follow-up concerns
+
+1. **The real cross-WiFi behaviour is still unknown.** The 2026-05-23
+   cross-WiFi dataset was on `0673157` (pre-T16.10d). It is plausible
+   that T16.10d alone resolves the actual cross-WiFi case because the
+   underlying cause was the duplicate-route delivery race (which
+   T16.10d's autoconnect-strategy fix addresses directly) rather
+   than the receive-side back-pressure my synthetic test exposes.
+   The user re-running the cross-WiFi matrix is the cheapest way to
+   find out -- much cheaper than spawning an Option A worker
+   speculatively.
+
+2. **Tasks to file if cross-WiFi still fails after the T16.10d re-run**:
+   - T16.10c.A (was the original "Option A" direction in the task
+     brief) -- spawn a per-runner `zenohd` sidecar at runner
+     startup, route the variant's session via client mode against
+     `tcp/127.0.0.1:<port>`. This is the same architecture T14.9b
+     (Single mode) already exercises, just with the variant
+     reconfigured to route data through the sidecar in Multi mode
+     too. Estimated scope: ~200-400 LOC across `variants/zenoh/`
+     (session-mode flag + connect logic) and `runner/` (sidecar
+     lifecycle invocation per spawn).
+   - T16.10c.B (Option B FIFO bump if a less invasive partial fix
+     proves sufficient on actual WiFi) -- the surface that could
+     plausibly help is the Zenoh subscriber FIFO (currently 131 K;
+     could go to 524 K) combined with the `transport/link/rx/buffer_size`
+     (currently 8 MiB; could go to 32 MiB). Neither addresses the
+     fundamental coupling but both buy more headroom for a peer
+     subscriber that recovers from a stall. Cheaper than Option A
+     if real-WiFi stalls are short bursts (<1 s).
+
+3. **Synthetic-jitter env vars are intentionally undocumented in
+   the CLI / fixture surface.** They live in the variant only and
+   require setting an env var to activate. Production runs are
+   unaffected. The env-var-based gating (rather than a TOML knob)
+   keeps the testing hook out of the normal config surface so
+   future fixtures cannot accidentally enable it.
+
+4. **The wired-LAN production matrix (e.g.
+   `logs/same-machine-all-variants-01-20260521_210958/`) is
+   incidentally a known-good baseline at 1 000-path × 100 Hz QoS 3/4
+   Multi mode.** The 2026-05-25 re-validation runs from this task
+   confirm the T16.10d binary still produces clean exits on that
+   workload. No regression.
+
+No worker-side blockers; T16.10c is parked pending the user's
+cross-WiFi re-run of the T16.10d binary.
+
+
