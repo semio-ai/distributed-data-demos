@@ -19565,3 +19565,135 @@ T9.5b was filed to close.
 - No `CUSTOM.md` note (the task marked this optional). The
   inline comment in `zenoh.rs::ZenohArgs::parse` plus the test
   names sufficiently document the `--` sentinel contract.
+
+## 2026-05-25 — T16.20: completion report
+
+**Status**: complete. Localhost gate green across all four QoS levels;
+binary + procedure doc + PowerShell wrapper handed off to user for the
+cross-machine WiFi run.
+
+### Files added
+
+- `variants/zenoh/examples/cross_machine_smoke.rs` (~440 lines, single
+  example target; no Cargo.toml changes — cargo auto-discovers
+  `examples/*.rs`).
+- `variants/zenoh/examples/CROSS_MACHINE_SMOKE.md` (four-test procedure
+  doc).
+- `variants/zenoh/examples/run_cross_machine_smoke.ps1` (operator
+  wrapper; one positional arg = local WiFi IPv4; prints the per-test
+  pub/sub commands for both machines, does NOT spawn processes — the
+  operator stays in control of the two-machine orchestration).
+
+Commit: `caafb35 feat(variant-zenoh): cross_machine_smoke example +
+procedure doc + powershell wrapper`.
+
+### Localhost gate (final tally lines, copy-pasted)
+
+10 hz × 10 vpt × 5 s duration → 500 publishes total per QoS level;
+sub started first, pub started 2 s after sub with `--wait-peers 1`:
+
+```
+=== QoS 1 ===
+PUB: [smoke] FINAL pub total = 500
+SUB: [smoke] FINAL sub total = 500 unique_keys = 10
+=== QoS 2 ===
+PUB: [smoke] FINAL pub total = 500
+SUB: [smoke] FINAL sub total = 500 unique_keys = 10
+=== QoS 3 ===
+PUB: [smoke] FINAL pub total = 500
+SUB: [smoke] FINAL sub total = 500 unique_keys = 10
+=== QoS 4 ===
+PUB: [smoke] FINAL pub total = 500
+SUB: [smoke] FINAL sub total = 500 unique_keys = 10
+```
+
+500/500 = 100 % across all four levels. Gate green (the spec asks for
+≥ 95 % across all four).
+
+### Design choices that diverged from the task spec
+
+1. **QoS mapping uses the variant's actual mapping, not the spec's
+   literal (Reliability, CC) table.** The task spec lists
+   QoS 1=BestEffort/Drop, 2=BestEffort/Block, 3=Reliable/Drop,
+   4=Reliable/Block, but the bench variant only ever sets
+   `CongestionControl` (Drop for QoS 1/2, Block for QoS 3/4) and
+   never sets `Reliability`. The spec itself instructs the worker to
+   match the variant's mapping where the two diverge. The smoke
+   therefore configures only `CongestionControl` (1/2 → Drop, 3/4 →
+   Block) and leaves `Reliability` at Zenoh's default. The file
+   header documents both the variant mapping and the spec mapping.
+   Additional reason `Reliability` is not set: `zenoh::qos::Reliability`
+   is gated behind zenoh-1.9's `unstable` feature flag, which the
+   variant does not enable.
+
+2. **Added `--wait-peers <N>` and `--wait-peers-timeout-secs <S>`
+   flags (not in the spec).** Without these, the two-process
+   localhost gate dropped 10-30 % of CC=Drop publishes during the
+   multicast-scouting warm-up window: the publisher starts publishing
+   the instant `declare_publisher` returns, before peer discovery
+   completes, and CC=Drop silently discards those samples. With
+   `--wait-peers 1` the publisher blocks for up to 10 s until the
+   session reports at least one connected peer, after which the gate
+   reaches 500/500 on every QoS level. The spec's localhost-gate
+   acceptance criterion (≥ 95 %) is achievable without the flag (we
+   measured 88-100 % run-to-run) but it's not reliable; the flag is
+   off by default (`--wait-peers 0`) so the spec-compliant "no extra
+   warmup" semantics are still the default.
+
+3. **Peer-discovery uses `session.info().peers_zid()` polled once
+   per second**, not a LivelinessToken subscription. The spec said
+   "worker picks whichever is least invasive"; the polled
+   `peers_zid` Box-iterator is a single sync call with no side-channel
+   declares, and emits a `[smoke] peers: ...` line only when the
+   visible-peer set changes.
+
+4. **Mirrored the variant's transport/link tuning and
+   `scouting/{multicast,gossip}/autoconnect_strategy = "greater-zid"`
+   config.** Not strictly required by the spec but otherwise the
+   smoke would exercise a materially different transport profile
+   than the bench, and the bisection would be invalidated.
+
+5. **No `Cargo.toml` change.** Cargo auto-discovers
+   `examples/cross_machine_smoke.rs` without an explicit `[[example]]`
+   block, so the file was left untouched.
+
+### PowerShell incantation (paste-ready)
+
+Run on the local machine (substitute the local WiFi IPv4 in place of
+`<local-wifi-ipv4>`):
+
+```powershell
+# From the repo root.
+cargo build --release -p variant-zenoh --example cross_machine_smoke
+.\variants\zenoh\examples\run_cross_machine_smoke.ps1 <local-wifi-ipv4>
+```
+
+The wrapper script prints the four pub/sub command pairs the operator
+should run on alice + bob. It does NOT spawn the actual cross-machine
+processes — the operator drives the two terminals manually, swapping
+roles to exercise both directions. See
+`variants/zenoh/examples/CROSS_MACHINE_SMOKE.md` for the full bisection
+matrix and what each test outcome implies (firewall vs T17.8 vs
+multicast-discovery vs raw TCP).
+
+### Flag-backs (observations worth follow-up; NOT fixed here per scope)
+
+- **Variant's QoS path leaves `Reliability` at Zenoh's default**, even
+  though Zenoh exposes `.reliability(...)` as a publisher-builder
+  method behind the `unstable` feature. Whether the bench's
+  cross-WiFi 0 % delivery is partly attributable to the default
+  Reliability setting on the data path (vs explicitly Reliable for
+  QoS 3/4) is an open question that the smoke cannot answer because
+  it would need the same opt-in. File as a follow-up if the
+  cross-machine smoke at QoS 3/4 also shows zero deliveries — the
+  diagnostic value would justify gating the variant on `unstable`
+  or pinning to a zenoh release that stabilises the knob.
+
+- **The `unstable` feature also gates `session.info().links()` and
+  `session.info().transports()`**, which would have been useful
+  diagnostic surface in the smoke (per-link counters, per-transport
+  byte totals). Same suggested follow-up.
+
+Both flag-backs are observations, not fixes; the smoke is the
+diagnostic, and finding the bug is the next task.
+
