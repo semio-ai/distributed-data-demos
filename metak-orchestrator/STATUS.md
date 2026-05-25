@@ -19778,3 +19778,207 @@ Only T9.5c is strictly necessary to fix the user's hardware —
 but T9.5/a/b are durable improvements (the `--variant-arg` channel
 is genuinely useful for the upcoming 4-machine runs).
 
+## 2026-05-25 — T9.5c: completion report
+
+**Status**: complete. Localhost gate green across all four QoS levels
+on both peers; ready for the user's two-Windows-host WiFi
+validation.
+
+### Files touched
+
+- `variants/zenoh/src/zenoh.rs` — `ZenohArgs.peer_tcp_base_port`
+  field + parser branch for `--zenoh-peer-tcp-base-port` (validates
+  non-zero; rejects non-numeric with a clear message), free helper
+  `derive_peering_endpoints` (sorts the peer pairs defensively;
+  errors on u16 overflow), free helper `derive_peer_tcp_port`,
+  `build_zenoh_config` signature widened to accept
+  `&[(String, String)] peer_pairs` and `runner_name`, call-site at
+  the Multi-mode `connect` branch updated to feed those in from
+  `self.peer_name_host_pairs()` + `self.runner`, three aux-config
+  test sites + two multicast-interface test sites updated to pass
+  empty peers / "aux" runner. New stderr line emitted from
+  `build_zenoh_config`: `[zenoh] explicit peering: listen=tcp/0.0.0.0:<n>
+  connect=[tcp/<peer>:<n>, ...]` or
+  `[zenoh] explicit peering: solo (no --peers entries beyond self)`.
+  15 new tests covering parser, derivation, build-config flow,
+  multicast-not-disabled regression.
+- `variants/zenoh/CUSTOM.md` — append-only `## T9.5c — explicit
+  Multi-mode peering via --zenoh-peer-tcp-base-port` section
+  documenting the flag, derivation rule, operator override semantics,
+  Windows-multi-NIC rationale, and the user-facing PowerShell
+  incantation. No restructuring of existing content.
+
+### Commit shas
+
+- `aab03b6` — `feat(variant-zenoh): --zenoh-peer-tcp-base-port +
+  explicit connect/endpoints from --peers (T9.5c)`
+- `5ab1ce7` — `docs(variant-zenoh): CUSTOM.md note on explicit
+  peering (T9.5c)`
+- (this commit, status append) — `status(T9.5c): completion report`
+
+### Test count delta
+
+`cargo test --release -p variant-zenoh`: **94 passed** (79 baseline +
+15 new), 3 ignored, 0 failed.
+
+The 15 new tests:
+
+- `peer_tcp_base_port_default_is_7447` — constant pinned + default
+  parser state confirmed.
+- `peer_tcp_base_port_accepts_override` — `--zenoh-peer-tcp-base-port
+  9000` round-trips.
+- `peer_tcp_base_port_rejects_zero` — clear error.
+- `peer_tcp_base_port_rejects_non_numeric` — clear error.
+- `derive_peering_endpoints_two_peers_runner_alice` — listen 7447,
+  connect tcp/192.168.1.77:7448.
+- `derive_peering_endpoints_two_peers_runner_bob` — listen 7448,
+  connect tcp/127.0.0.1:7447.
+- `derive_peering_endpoints_three_peers_alphabetical_indices` —
+  bob (index 1) listens 7448, connects to alice (7447) + charlie
+  (7449) in alphabetical order.
+- `derive_peering_endpoints_sorts_unordered_input` — defensive
+  re-sort invariant.
+- `derive_peering_endpoints_solo_emits_nothing` — empty peer pairs
+  → (None, []).
+- `derive_peering_endpoints_overflow_errors` — base_port=65535 with
+  multiple peers errors with clear "overflow" / "u16::MAX" message.
+- `build_config_emits_listen_and_connect_for_two_peers` — JSON5
+  serialisation round-trip on a built `zenoh::Config`.
+- `build_config_swaps_listen_and_connect_for_other_peer` — same
+  inputs, other runner_name.
+- `build_config_solo_emits_no_connect_endpoints` — solo path.
+- `build_config_user_listen_override_wins_but_connect_still_derived`
+  — operator-listen override semantics.
+- `build_config_explicit_peering_does_not_disable_multicast_scouting`
+  — regression: T16.10d `"greater-zid"` setting still present.
+
+`cargo clippy --release --workspace --all-targets -- -D warnings` —
+clean.
+
+`cargo fmt -p variant-zenoh -- --check` — the two diffs printed
+predate this task and live in `tests/two_runner_regression.rs`
+(unmodified by T9.5c); `git status` confirmed only
+`variants/zenoh/src/zenoh.rs` + `variants/zenoh/CUSTOM.md`
+modified.
+
+### Smoke procedure used
+
+Scratch config `configs/_t9_5c_smoke.toml` (trimmed copy of
+`configs/two-runner-zenoh-all.toml`: `zenoh-base` template +
+single `[[variant]]` `zenoh-10x100hz-scalar`, `stabilize_secs=1
+operate_secs=2 silent_secs=1`, `default_timeout_secs=60`,
+`runners=["alice","bob"]`, `threading_modes=["multi"]`).
+
+Built with `cargo build --release -p variant-zenoh`. Ran both
+runners simultaneously from the worker's bash:
+
+- alice (background): `./target/release/runner.exe --name alice
+  --config configs/_t9_5c_smoke.toml` — **NO** `--variant-arg`
+  for multicast_interface (the whole point of T9.5c is that this
+  is not needed).
+- bob (foreground): `./target/release/runner.exe --name bob
+  --config configs/_t9_5c_smoke.toml`
+
+Both ran to completion. All 8 spawn instances (qos1/2/3/4 × alice/bob)
+reported `status=success, exit_code=0`. Scratch config deleted
+post-smoke; `git status` clean under `configs/` before commit.
+
+### The gate — captured proof
+
+`logs/t9_5c_smoke-20260525_154938/zenoh-10x100hz-scalar-qos1-{alice,bob}-stderr.txt`,
+line 2 (sample across all 8 spawns):
+
+```
+alice: [zenoh] explicit peering: listen=tcp/0.0.0.0:7447 connect=[tcp/127.0.0.1:7448]
+bob:   [zenoh] explicit peering: listen=tcp/0.0.0.0:7448 connect=[tcp/127.0.0.1:7447]
+```
+
+(Alphabetically alice is index 0, bob index 1, so alice listens on
+the base port and connects to bob's index+1 port; bob is the
+mirror.)
+
+Runner stderr (final-progress lines aggregated from variant JSONL):
+
+```
+[runner:alice] 'zenoh-10x100hz-scalar-qos1' final progress: phase=done sent=2000 received=2010 eot_sent=true eot_received=true
+[runner:bob]   'zenoh-10x100hz-scalar-qos1' final progress: phase=done sent=2010 received=2000 eot_sent=true eot_received=true
+[runner:alice] 'zenoh-10x100hz-scalar-qos2' final progress: phase=done sent=2010 received=2010 eot_sent=true eot_received=true
+[runner:bob]   'zenoh-10x100hz-scalar-qos2' final progress: phase=done sent=2010 received=2010 eot_sent=true eot_received=true
+[runner:alice] 'zenoh-10x100hz-scalar-qos3' final progress: phase=done sent=2000 received=2010 eot_sent=true eot_received=true
+[runner:bob]   'zenoh-10x100hz-scalar-qos3' final progress: phase=done sent=2010 received=2000 eot_sent=true eot_received=true
+[runner:alice] 'zenoh-10x100hz-scalar-qos4' final progress: phase=done sent=2010 received=2010 eot_sent=true eot_received=true
+[runner:bob]   'zenoh-10x100hz-scalar-qos4' final progress: phase=done sent=2010 received=2010 eot_sent=true eot_received=true
+```
+
+`received > 0` on all 8 spawns. Delivery ratio is ~100 % (the
+±10-message bracket is the standard CC=Drop tolerance + stabilize/
+silent-window framing). The QoS 1 multi spawn — the explicit gate
+the task spec called out — shows `received=2000` on bob and
+`received=2010` on alice.
+
+`multi_zenoh_qos3_qos4_preserves_per_key_order` (the ignored loopback
+regression CUSTOM.md mentions) also re-passes alongside the existing
+unit tests when run via `cargo test --release -p variant-zenoh --
+multi_zenoh --ignored` (2 ignored tests run, both pass).
+
+### Deviations from the spec
+
+- Function signature: `build_zenoh_config` was extended with
+  `peer_pairs: &[(String, String)]` and `runner_name: &str`
+  positional parameters rather than plumbing the peer info through
+  `ZenohArgs`. The signature change kept all three pre-existing
+  aux-config test sites trivial (`build_zenoh_config(&aux_args, &[],
+  "aux")`); plumbing through `ZenohArgs` would have required a
+  matching `parse(extra)`-side change to read the same `--peers`
+  the variant already reads in `peer_name_host_pairs`. The
+  task brief explicitly authorised either choice.
+- Test count: spec said "~7 new tests"; delivered 15. The extra
+  coverage is `peer_tcp_base_port_rejects_non_numeric` (parser
+  edge case), `derive_peering_endpoints_sorts_unordered_input`
+  (defensive-resort invariant),
+  `derive_peering_endpoints_overflow_errors` (the u16 overflow
+  contract), `derive_peering_endpoints_solo_emits_nothing` (the
+  solo short-circuit), and
+  `build_config_explicit_peering_does_not_disable_multicast_scouting`
+  (T16.10d-strategy non-regression). Each adds independent
+  signal.
+- Solo log line: the spec text says "When solo: print [zenoh]
+  explicit peering: solo (no --peers entries beyond self)". The
+  implementation reaches the same branch whether `peer_pairs.is_empty()`
+  literally OR derived_connect is empty and listen was not set
+  (which collapses to the same operator-facing condition: this
+  runner has no peers to talk to). Both shapes print the same line.
+
+### User-facing PowerShell incantation (cross-WiFi validation)
+
+SIMPLER than T9.5 — no `--variant-arg` at all because explicit
+peering defaults to `base_port = 7447` and derives the rest from
+the `--peers` map the runner already injects:
+
+```powershell
+# alice (Ethernet 192.168.1.68 — or whatever NIC the runner config picks)
+target\release\runner.exe --name alice `
+  --config configs\two-runner-zenoh-all.toml
+
+# bob (Ethernet 192.168.1.102)
+target\release\runner.exe --name bob `
+  --config configs\two-runner-zenoh-all.toml
+```
+
+If TCP/7447-7448 collide with other infrastructure (Zenoh routers
+the operator runs, etc.), override the base port via the T9.5a glob:
+
+```powershell
+target\release\runner.exe --name alice `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg 'zenoh-*.zenoh_peer_tcp_base_port=20447'
+```
+
+Expected proof in `logs/<run>-<ts>/<spawn>-<runner>-stderr.txt`:
+
+```
+[zenoh] explicit peering: listen=tcp/0.0.0.0:7447 connect=[tcp/<peer-IP>:7448]
+```
+
+…with `received > 0` on the QoS 1 multi spawn's final progress.
+
