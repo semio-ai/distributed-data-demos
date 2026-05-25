@@ -333,3 +333,64 @@ on multi-NIC Windows hosts). One-line operator invocation example:
 runner.exe --name alice --config configs/two-runner-zenoh-all.toml \
   --variant-arg zenoh.multicast_interface=192.168.1.68
 ```
+
+### T9.5a (2026-05-25): selector is a glob
+
+T9.5 shipped literal selector matching. On the user's first cross-WiFi
+gate run against `configs/two-runner-zenoh-all.toml` the selector
+`zenoh` matched nothing — the config's `[[variant_template]]` expands
+into 22 variants named `zenoh-1000x100hz-scalar`, …, `zenoh-max` and
+no variant is literally named `zenoh`. The override was parsed (the
+startup log confirmed it) but silently dropped at spawn time. T9.5a
+widens the selector to a glob so the obvious incantation
+`--variant-arg 'zenoh-*.X=Y'` covers the whole family.
+
+**Glob syntax.** Only two metacharacters are recognised:
+- `*` — matches zero or more of any character (greedy with backtracking).
+- `?` — matches exactly one character.
+
+No character classes (`[abc]`), no escape sequences, no `**`. The
+selector is matched against `[[variant]].name`
+(post-`[[variant_template]]` resolution, pre-array-expansion) using full-
+string match semantics: the pattern must match the entire variant name,
+not just a prefix or substring. `'*zenoh*'` is therefore the
+"substring contains" form.
+
+**Backward compat.** A selector with no glob metacharacter is a literal
+full-string match (the T9.5 contract). `quic.cert=X` matches only a
+variant literally named `quic`; it does **not** match `quic-base`. The
+exact behaviour T9.5's tests pinned still holds for any operator who
+was already typing literal selectors.
+
+**Precedence on key conflict.** When the same key appears in multiple
+matching `--variant-arg` entries the **last CLI-position entry wins** —
+including across different selectors. There is no implicit "literal
+beats glob" specificity ranking. This lets the operator write
+`--variant-arg '*.X=default' --variant-arg 'zenoh-*.X=override'` to get
+the override on `zenoh-*` spawns and the default elsewhere; reverse the
+order and the default wins everywhere. Document the ordering
+explicitly to operators — it is the only knob.
+
+**Startup log and provenance line.** The runner emits one banner line
+per CLI entry rather than one per variant; each line carries the literal
+selector string so a typo is visible before discovery:
+
+```
+[runner:alice] --variant-arg selector 'zenoh-*': multicast_interface=192.168.1.68
+```
+
+The per-spawn provenance line carries the contributing selector for
+CLI-sourced keys:
+
+```
+[runner:alice] spawn 'zenoh-1000x100hz-qos3-repro' specific args:
+  multicast_interface=192.168.1.68 (cli: zenoh-*), zenoh_mode=peer (toml)
+```
+
+TOML-sourced keys still print as `key=value (toml)` with no selector
+annotation.
+
+**Shell quoting.** Quote the selector when it contains `*` or `?` so
+the shell does not expand the glob against the local filesystem before
+the runner sees it. On PowerShell single quotes are sufficient
+(`'zenoh-*.X=Y'`); on POSIX shells the same single-quote form works.

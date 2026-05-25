@@ -948,3 +948,53 @@ split-and-forward).
 Filed as T9.5. First consumer is the Zenoh variant's
 `--multicast-interface` flag (see `variants/zenoh/CUSTOM.md`).
 Full contract in `metak-shared/api-contracts/variant-cli.md` § T9.5.
+
+## T9.5a (2026-05-25): selector is a glob
+
+T9.5 shipped literal selector matching, which silently dropped overrides
+whenever the operator's selector did not equal a `[[variant]].name`
+verbatim — the user-facing case being a config built from a
+`[[variant_template]]` named `zenoh-base` and 22 expansion-time variants
+like `zenoh-1000x100hz-scalar`, `zenoh-1000x100hz-block`, etc.
+`--variant-arg zenoh.X=Y` matched nothing because no variant was literally
+named `zenoh`.
+
+T9.5a widens the selector to a **glob**: `*` matches zero-or-more
+characters, `?` matches exactly one. No character classes, no escape
+sequences. A selector with no glob metacharacter is a literal full-string
+match (backward compatible with the T9.5 contract).
+
+```
+runner.exe --name alice --config configs/two-runner-zenoh-all.toml `
+  --variant-arg 'zenoh-*.multicast_interface=192.168.1.68'
+```
+
+The `'zenoh-*'` selector matches every variant whose name begins with
+`zenoh-`, so the override propagates to every zenoh-* spawn the matrix
+expands to. `'*.X=Y'` is the "apply to all variants" escape hatch. Quote
+the selector in PowerShell (or any POSIX shell) to keep the shell from
+expanding the glob against the local filesystem.
+
+When the same key appears in multiple matching entries the **later
+CLI-position entry wins** — there is no implicit "literal beats glob"
+specificity ranking. This lets the operator write
+`--variant-arg '*.X=default' --variant-arg 'zenoh-*.X=override'` and get
+the override on zenoh-* spawns and the default elsewhere; reverse the
+order and the default wins.
+
+The startup banner emits one line per CLI entry naming the selector
+verbatim, e.g. `--variant-arg selector 'zenoh-*':
+multicast_interface=192.168.1.68`, so a typo in the selector is visible
+before discovery rather than discovered mid-matrix. The per-spawn
+provenance line carries the contributing selector on CLI-sourced keys:
+
+```
+[runner:alice] spawn 'zenoh-1000x100hz-qos3-repro' specific args:
+  multicast_interface=192.168.1.68 (cli: zenoh-*), zenoh_mode=peer (toml)
+```
+
+Implementation lives in `runner/src/cli_args.rs`:
+`VariantArgEntry` (CLI-order-preserving parsed entry), `glob_match`
+(inline recursive backtrack), `resolve_for_variant` (per-spawn map
+resolver), and `drop_selector_provenance` (callsite helper for
+`build_variant_args`).

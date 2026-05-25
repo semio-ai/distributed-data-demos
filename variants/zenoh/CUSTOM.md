@@ -1201,3 +1201,32 @@ Or, when unset:
   names, extend the parser.
 - IPv6. Unsupported by the current implementation; revisit when
   there's a concrete dual-stack use case.
+
+### T9.5a (2026-05-25): the `--variant-arg` selector is now a glob
+
+The runner-side T9.5a change widens `--variant-arg <selector>.<key>=<value>`
+so the `<selector>` is glob-matched against `[[variant]].name`. The user-
+facing impact for the Zenoh variant: `configs/two-runner-zenoh-all.toml`
+expands its `zenoh-base` template into 22 variants named
+`zenoh-1000x100hz-scalar`, `zenoh-1000x100hz-block`, …, `zenoh-max`. Use
+the glob `'zenoh-*'` to apply one multicast-interface pin across the
+whole family rather than typing 22 literal selectors:
+
+```powershell
+# alice (Ethernet 192.168.1.68)
+target\release\runner.exe --name alice `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg 'zenoh-*.multicast_interface=192.168.1.68'
+
+# bob (Ethernet 192.168.1.102)
+target\release\runner.exe --name bob `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg 'zenoh-*.multicast_interface=192.168.1.102'
+```
+
+**Single-quote the selector** so PowerShell does not expand `*` against
+the local filesystem before passing the arg through. The earlier T9.5
+PowerShell incantation in this section (`zenoh.multicast_interface=...`)
+would silently apply to nothing on this config because no variant is
+literally named `zenoh` post-template expansion. Keep the unquoted-literal
+form only for configs whose `[[variant]].name` is exactly `zenoh`.
