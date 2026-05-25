@@ -414,173 +414,83 @@ ordering; the publisher_task + subscriber_task in-process path was
 never end-to-end exercised by the official fixture set before this
 follow-up.
 
-## Peer-coordinated back-pressure (T17.8, reopens T16.12)
+## Peer-coordinated back-pressure (T17.8) — removed in T9.5d
 
-Filed 2026-05-18 as part of epic E17 ("Strict No-Skip Contract for
-QoS 3 / QoS 4"). **Supersedes the earlier T16.12 "throughput cliff
-accepted as documentation" state — that documentation is rescinded
-and the cliff is now mechanically eliminated for QoS 3/4.**
+**Status**: REMOVED 2026-05-25 (T9.5d), per direct user request. The
+T17.8 application-level credit/ack/dedup wrapper that sat on top of
+Zenoh's native QoS no longer exists. The benchmark now measures
+Zenoh-native QoS only — the `Reliability` + `CongestionControl`
+mapping in `build_publisher_*`, nothing else.
 
-### Why this exists
+### What was removed
 
-Zenoh's native `CongestionControl::Block` (the per-publisher reliable
-back-pressure primitive) produces an **asymmetric stall** at sustained
-≥ ~50 K msg/s reliable load: one peer's `publisher.put(...).await`
-parks indefinitely while the other peer continues publishing for the
-full operate window. T16.12 catalogued the failure shape in detail.
-The chain that produces it:
+- The `bench/__ack__/<receiver>/<writer>` side-channel
+  (`ACK_KEY_PREFIX`, `ack_key_for`, `ack_wildcard_for_self`,
+  `parse_ack_key`, `encode_ack_payload`, `decode_ack_payload`).
+- The application-level credit window (`QOS_STRICT_WINDOW = 2048`,
+  `WindowGate`, `WindowState`, `wait_for_window` on the publish path).
+- The ack subscriber + emitter tasks (`ack_subscriber_task`,
+  `ack_emitter_task`, `RecvAccounting`, the 25 ms heartbeat, the
+  pre-seeded peer ack map).
+- The receive-side multicast-route dedup (`WriterDedup`,
+  `DEDUP_WINDOW = 8192`, the per-writer task-local dedup state in
+  `subscriber_task`).
+- The bridge channel up-sizing tied to the credit window
+  (`PUBLISH_CHANNEL_CAPACITY` reverted from 16384 to a plain 4096 —
+  one tick of headroom on the heaviest 1000-vpt fixture, no
+  wrapper-tuned multiplier).
+- The publish-side gate call (`gate.wait_for_window(seq)?` in the
+  reliable arm of `publish`) and the subscriber-side ack emission
+  (writes to `per_writer_max_seq` from `subscriber_task`).
 
-1. T16.10's inline `await` on the single `publisher_task` (kept for
-   QoS 3/4 ordering) parks when Zenoh's internal Block queue
-   saturates.
-2. The variant's bounded mpsc bridge fills behind the parked task.
-3. The driver's `blocking_send` parks the driver thread itself.
-4. The driver no longer services its tick loop, the resource monitor,
-   or the T15.5 variant-side idle detector.
-5. T15.11's watchdog terminates the variant at +30 s with exit code 2
-   (`variant_self_killed_idle`) — a clean shutdown, but with delivery
-   well below the 100 % contract DESIGN.md § 6.5 requires for QoS 3/4.
+### What stays (explicit per the user request)
 
-E17's user decision (2026-05-18) explicitly authorises throughput
-collapse as the trade for delivery: "we manage to coordinate the
-peers even if that costs throughput". The mechanism below realises
-that trade.
+- Zenoh-native QoS: the per-publisher `CongestionControl::Drop` (QoS
+  1/2) vs `CongestionControl::Block` (QoS 3/4) mapping in
+  `build_publisher_*` (the two pre-declared publisher caches in
+  `connect`). This is the Zenoh primitive the bench is meant to
+  measure.
+- The EOT protocol on `bench/__eot__/**` (runner/variant-base
+  contract; not application-level QoS).
+- Explicit Multi-mode peering (T9.5c).
+- `--multicast-interface` pin (T9.5).
+- Transport buffer tuning (`transport/link/tx/queue/size/*`,
+  `transport/link/rx/buffer_size`).
+- `autoconnect_strategy = "greater-zid"` (T16.10d routing
+  determinism, not application QoS).
+- T16.10's inline-await for QoS 3/4 ordering on `publisher_task`
+  (still single-task per-key serialisation; the spawn-per-put split
+  on the QoS 1/2 Drop path is unchanged).
+- The `SUBSCRIBER_FIFO_CAPACITY = 131_072` E19/T19.X cap (Zenoh
+  routing-thread parking fix; independent of the wrapper).
 
-### Design choice (Option B from T17.8's prototype menu)
+### Failure modes now exposed
 
-The variant runs an **application-level credit/window protocol** over
-a dedicated Zenoh side-channel, layered on top of `CC=Block` (which is
-retained as a last-resort safety net but is no longer the dominant
-back-pressure surface at QoS 3/4):
+The wrapper existed to mechanically eliminate the QoS 3/4 asymmetric
+stall T16.12 documented (the `variant_self_killed_idle` watchdog
+exit under sustained ≥ ~50 K msg/s reliable load). With the wrapper
+gone, that failure mode is back in scope — and that is precisely
+what the bench is intended to measure. Operators should expect
+Zenoh-native QoS 3/4 to collapse throughput, drop, or self-kill via
+the T15.11 watchdog at high loads; report those as raw
+Zenoh-behaviour data points, not regressions.
 
-- **Receiver-side**: `subscriber_task` updates a shared
-  `per_writer_max_seq: HashMap<String, u64>` on every QoS 3/4 receive
-  from a non-self writer. A dedicated `ack_emitter_task` snapshots
-  the map every `ACK_EMIT_INTERVAL` (25 ms) and publishes one
-  `u64` watermark per known remote writer to
-  `bench/__ack__/<self>/<writer>` (with `CC=Drop` — acks are
-  idempotent latest-value heartbeats; a dropped ack is recovered on
-  the next 25 ms tick).
-- **Sender-side**: a dedicated `ack_subscriber_task` listens on the
-  wildcard `bench/__ack__/*/<self>` and feeds `(peer, max_seq)` pairs
-  into a `WindowGate`. The gate's `peer_acks` map is **pre-seeded** at
-  `connect` time from the runner-injected `--peers` list with
-  watermark 0 — so the credit window is active from the FIRST publish
-  rather than only after the first real ack arrives.
-- **Driver-side**: at the QoS 3/4 entry to `publish` on the variant's
-  main thread, the gate is consulted via `WindowGate::wait_for_window`:
-  the call blocks (on a `std::sync::Condvar`) until
-  `seq <= min_peer_ack + QOS_STRICT_WINDOW` (2048). The block is on
-  the DRIVER thread directly, **not** on the publisher_task or the
-  bridge mpsc; that distinction is critical — parking the driver here
-  preserves the rest of the tokio runtime (publisher_task,
-  subscriber_task, ack_emitter, ack_subscriber) so peer acks continue
-  to flow in and open the window incrementally.
+### Verification post-removal
 
-### Why this is **not** Option A (credit / window over a explicit
-credit topic)
+- `cargo test --release -p variant-zenoh`: 79 unit tests + 1
+  loopback integration test pass (test count delta from pre-T9.5d:
+  -15, exactly the wrapper-coverage tests deleted).
+- `cargo clippy --release --workspace --all-targets -- -D warnings`:
+  clean.
+- `cargo fmt -p variant-zenoh -- --check`: clean.
+- Localhost smoke (T9.5d gate, scratch `_t9_5d_smoke.toml`, two
+  runners local, 4 vpt × 10 Hz × 4 s operate): all four QoS levels
+  reach `phase=done` with 164/164 sent==received on both peers, and
+  the JSONL log subfolder contains zero `__ack__` keys.
 
-Option A from the T17.8 prototype menu was a "tokens granted by the
-receiver" credit protocol where the receiver explicitly publishes
-"I grant you N more sends". Option B (watermarks) is equivalent in
-information content — `outstanding = next_seq - max_seq_acked`
-mathematically equals `granted_tokens - consumed_tokens` for any
-monotonic seq stream — but watermarks are **idempotent**: a duplicate
-or out-of-order ack does nothing harmful, whereas a duplicate credit
-grant would inflate the window. Lower complexity for the same
-guarantee; chosen on those grounds.
-
-Option C (sidecar `zenohd` router) remains out of scope.
-
-### Architecture summary
-
-```
-  driver thread                tokio runtime
-                       data                       data
-  publish(qos>=3)─────┬────────► publisher_task ──────► Zenoh ──► peer.subscriber_task
-        │             │                                                │
-        │             ▼                                                ▼
-  WindowGate ◄──┐  bridge(16384)                              per_writer_max_seq
-   .wait        │                                                     │
-        │       │                                                     ▼
-        │       │                                              ack_emitter (25 ms tick)
-        │       │                                                     │
-        │       │                                                     ▼
-        │       │                                              ack topic (CC=Drop)
-        │       │                                                     │
-        ▼       │                                                     ▼
-  ack_subscriber◄───────────────────────────────────────── (peer's ack samples)
-```
-
-### Tuning
-
-- `QOS_STRICT_WINDOW = 2048` — bounded in-flight messages per peer.
-  Sized to one tick-batch of the heaviest 1000-vpt fixture so the
-  gate engages after roughly one tick of un-acked work, while still
-  being large enough to absorb a single ack-cycle hiccup at the
-  highest supported workload.
-- `ACK_EMIT_INTERVAL = 25 ms` — 40 Hz heartbeat. Side-channel cost
-  is negligible (≤2 peers × 40 Hz × ≤2 writers = ≤160 ack-publish/s).
-- `PUBLISH_CHANNEL_CAPACITY = 16384` — bridge mpsc capacity. Raised
-  from the pre-T17.8 1024 so the WindowGate is the binding
-  back-pressure surface (the gate parks the driver on a condvar
-  BEFORE the bridge fills). At QoS 1/2 the bridge is still the
-  back-pressure surface; the deeper queue marginally delays the
-  first `Ok(false)` under a momentary burst but does not break the
-  best-effort contract.
-- `WINDOW_GATE_WAKE_INTERVAL = 100 ms` — defensive periodic wake of
-  the condvar so a missed notify or the watchdog's 1 Hz sampler
-  always observe forward motion within one tick of an ack arrival.
-
-### Loopback / solo configurations
-
-`peer_acks` is empty (no `--peers` injected, or the variant is the
-only entry in `--peers`). `wait_for_window` short-circuits on an empty
-map and the gate is a no-op. Solo runs publish unthrottled; the
-`zenoh_bridge_stress_10000_messages` ignored test exercises this path.
-
-### Ordering preservation (T16.10 invariant)
-
-`publisher_task` still awaits `publisher.put(...).await` **inline** for
-QoS 3/4, exactly as T16.10 specified. The credit/window protocol sits
-upstream of that serial drain; it constrains in-flight depth but does
-not introduce per-key parallelism on the reliable path. The
-`Out-of-order 0` property the T16.10 fixtures verify is therefore
-preserved.
-
-### QoS 1/2 path
-
-Unchanged from T-impl.7 / T16.5 / T16.10. The strict-QoS gate is
-skipped (`matches!(qos, Qos::ReliableUdp | Qos::ReliableTcp)` is the
-gate's entry guard). QoS 1/2 still uses the bridge mpsc + spawn-per-
-put + `CC=Drop` for best-effort delivery with `try_publish` returning
-`Ok(false)` on bridge saturation as the back-pressure signal.
-
-### Verification
-
-- Unit tests in `src/zenoh.rs` `tests` mod:
-  - `test_ack_key_round_trip_and_wildcard_intersection`
-  - `test_parse_ack_key_rejects_bad_shapes`
-  - `test_ack_payload_encode_decode_roundtrip` /
-    `test_ack_payload_decode_rejects_wrong_length`
-  - `test_window_gate_no_peers_never_blocks`
-  - `test_window_gate_within_window_passes`
-  - `test_window_gate_blocks_until_ack_arrives`
-  - `test_window_gate_shutdown_unblocks_waiters`
-  - `test_window_gate_ack_does_not_regress`
-  - `test_window_gate_min_across_peers`
-  - `test_publish_qos3_no_peers_known_does_not_block`
-- Integration test `two_runner_regression_t17_8_qos3_100pct_delivery`
-  (ignored) drives the canonical
-  `two-runner-zenoh-1000x10hz-qos3-repro.toml` reproducer with both
-  peers running locally and asserts the asymmetric stall is gone
-  (no `watchdog: no progress` in stderr, both runners exit code 0)
-  and at least some cross-peer delivery flows in both directions.
-- T17.10 (production two-machine matrix re-run on real hardware) is
-  the canonical acceptance gate for "100 % delivery"; the local
-  single-machine harness shows wide run-to-run variance because the
-  two peers share the same tokio runtime + Zenoh localhost stack
-  (extra contention not present on a real two-machine deployment).
+The single new unit test `multi_zenoh_qos_round_trip_post_wrapper_removal`
+(ignored) exercises a Multi-mode QoS 4 loopback round-trip without
+any ack infra and asserts the reliable tiers deliver every sample.
 
 ## Threading modes (T14.7 / T14.9)
 
