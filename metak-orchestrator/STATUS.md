@@ -19237,3 +19237,160 @@ The "workers must never discard orchestrator changes" rule
 (2026-05-24) was the only memory file relevant to T9.5; it
 remains accurate. The "Windows-runnable commands" rule was applied
 (PowerShell-quoted glob examples in the T9.5a spec).
+
+
+## 2026-05-25 — T9.5a: completion report
+
+Worker scope: glob-match the `--variant-arg <selector>.<key>=<value>`
+selector against `[[variant]].name` so a single
+`--variant-arg 'zenoh-*.multicast_interface=X'` covers every variant
+the `zenoh-base` template expands into.
+
+### Files touched
+
+- `runner/src/cli_args.rs` — `VariantArgEntry`, `glob_match`,
+  `resolve_for_variant`, `drop_selector_provenance`, plus the parser
+  reshape and the `specific_arg_provenance` selector field. Existing
+  T9.5 tests adapted (no deletions); 11 new tests under `tests` mod.
+- `runner/src/main.rs` — call-site update for the spawn-loop resolver
+  pipeline, the per-spawn provenance line carries `(cli: <selector>)`,
+  the startup banner now emits one line per CLI entry naming the
+  literal selector, and the clap doc-comment on `--variant-arg` is
+  rewritten to lead with the glob semantics.
+- `metak-shared/api-contracts/variant-cli.md` — append-only
+  "T9.5a (2026-05-25): selector is a glob" sub-section under the
+  existing T9.5 entry.
+- `runner/CUSTOM.md` — append-only paragraph after the existing T9.5
+  paragraph.
+- `variants/zenoh/CUSTOM.md` — append-only note inside the existing
+  `--multicast-interface` T9.5 section.
+
+### Commits
+
+- `a093136 feat(runner): glob-match --variant-arg selectors (T9.5a)`
+  — parser reshape + glob matcher + resolver + per-spawn callsite
+  + provenance + startup-banner UX changes + clap doc rewrite + 11
+  new tests. Folded together because the type signatures couple
+  them (the parser's new return type would not compile against the
+  old call site).
+- `67e4806 docs(contracts,runner,variant-zenoh): glob selector for --variant-arg (T9.5a)`
+  — the three append-only documentation updates.
+
+### Test count delta
+
+- `cargo test --release -p runner`: 273 → **284 passed** (+11 new),
+  1 ignored. (One barrier-coord TCP test, `barrier_coord::tests::
+  two_runner_barrier_exchange_round_trips`, flaked once during a
+  parallel run on the harness and passed cleanly on rerun in
+  isolation. Unrelated to T9.5a — port-binding race in the existing
+  test setup.)
+- `cargo test --release -p variant-zenoh`: 75 passed (unchanged from
+  the T9.5 baseline; variant-zenoh had no work in this task and the
+  rerun is purely a regression sanity).
+- `cargo clippy --release --workspace --all-targets -- -D warnings`:
+  clean.
+- `cargo fmt -p runner -- --check`: clean (one fmt fix applied after
+  the initial clippy run flagged the new test setup as multi-line).
+
+### Smoke procedure used
+
+Procedure B (trimmed scratch config). Authored
+`configs/_t9_5a_smoke.toml` with the same `[[variant_template]]
+zenoh-base` shape as `configs/two-runner-zenoh-all.toml` plus a single
+`[[variant]] zenoh-10x10hz-scalar` entry pinned to `threading_modes =
+["multi"]` and `qos = 1`, stabilize/operate/silent windows shortened
+to 1 / 5 / 1 s for a sub-30-second run. Ran two runners locally:
+
+```
+target/release/runner.exe --name alice --config configs/_t9_5a_smoke.toml `
+  --variant-arg 'zenoh-*.multicast_interface=127.0.0.1'
+target/release/runner.exe --name bob   --config configs/_t9_5a_smoke.toml `
+  --variant-arg 'zenoh-*.multicast_interface=127.0.0.1'
+```
+
+Both runners exited 0. Scratch config deleted after the smoke per
+the brief.
+
+### Acceptance signals observed
+
+1. **Startup banner names the selector verbatim** (both runners):
+
+   ```
+   [runner:alice] --variant-arg selector 'zenoh-*': multicast_interface=127.0.0.1
+   ```
+
+2. **Per-spawn provenance line carries `(cli: <selector>)`**:
+
+   ```
+   [runner:alice] spawn 'zenoh-10x10hz-scalar' specific args:
+     multicast_interface=127.0.0.1 (cli: zenoh-*), zenoh_mode=peer (toml)
+   ```
+
+3. **Captured stderr** under
+   `logs/zenoh-t95a-smoke-20260525_123437/zenoh-10x10hz-scalar-alice-stderr.txt`
+   shows `[zenoh] multicast interface: auto`, NOT
+   `[zenoh] multicast interface: 127.0.0.1`. Per the T9.5a brief's
+   acceptance text this is a pre-existing fidelity gap; the brief
+   permits noting it and not chasing it. See the deviation entry below
+   for the actual root cause I uncovered while verifying.
+
+### Deviations from the task spec
+
+- **Runner-side commit split.** The spec listed five logical commits
+  (refactor / feature / UX / docs / status report). The first three
+  collapse into one because their type signatures couple
+  (`parse_variant_arg_overrides`' new return type, the
+  `resolve_for_variant` API, the `specific_arg_provenance` fourth
+  tuple element, and the main.rs call site all change together; an
+  intermediate state would not compile). Folded per the brief's
+  explicit allowance: "fold them into one commit if the type
+  signatures couple them". The docs commit and this STATUS report are
+  separate per the brief.
+
+### New follow-up concerns surfaced during the work
+
+- **Pre-existing variant-zenoh args-parser bug eats `--` separator.**
+  While verifying acceptance signal 3 I traced why the captured stderr
+  said `auto` instead of `127.0.0.1`. The runner's args composition is
+  correct (verified by inspection of `build_variant_args` output and
+  by direct-invocation comparison). The variant binary, however, fails
+  to pick up `--multicast-interface 127.0.0.1` when the runner-
+  injected `--peers ... -- --multicast-interface 127.0.0.1 ...` shape
+  is present. Reproducer:
+
+  ```
+  # Without --peers in the arg list: works.
+  ./target/release/variant-zenoh.exe ... -- --multicast-interface 127.0.0.1 ...
+    → [zenoh] multicast interface: 127.0.0.1 (pinned via --multicast-interface)
+
+  # With --peers in the arg list, same trailing --: broken.
+  ./target/release/variant-zenoh.exe ... --peers alice=... -- --multicast-interface 127.0.0.1 ...
+    → [zenoh] multicast interface: auto
+  ```
+
+  Root cause: clap's `trailing_var_arg = true` preserves the `--`
+  token inside `extra` when there are unknown args (like `--peers`)
+  ahead of it. Then `ZenohArgs::parse`'s lenient skip-unknown branch
+  treats `--` as a `--<name>` pair and consumes the following token
+  (`--multicast-interface`) as if it were the value. The pin never
+  reaches `build_zenoh_config`. This is a bug in
+  `variants/zenoh/src/zenoh.rs::ZenohArgs::parse` (the lenient
+  fallthrough should skip `--` as a single token, not as a
+  `--name value` pair), not in T9.5a's runner-side wiring. Filing it
+  here as a follow-up; the user's original cross-WiFi failure is
+  consistent with this bug masking the multicast-interface pin even
+  when T9.5a's runner side is correctly wired. T16.10c's cross-WiFi
+  gate should NOT be considered closed by T9.5a alone — the variant-
+  side bug needs a companion fix.
+- **No literal-vs-glob specificity ranking.** Current behaviour is
+  last-CLI-position wins on key conflict. The spec called this out as
+  the intended design, but operators writing
+  `'*.X=default' 'foo-*.X=A' '*.Y=other'` may be surprised that the
+  catchall's `Y=other` clobbers an earlier per-family override. The
+  resolver doc-comment names this explicitly and the doc-banner
+  references the rule too; if real operator confusion shows up,
+  reconsider via a new task rather than retrofitting precedence here.
+- **No selector-matches-nothing warning.** A user-typed
+  `'qix-*.X=Y'` that hits no variant is silently dropped. The brief
+  put this out of scope; flag for a future polish task if operator
+  reports come in.
