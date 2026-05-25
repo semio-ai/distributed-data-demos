@@ -1128,3 +1128,76 @@ without halting the routing thread entirely). A passing wired-LAN
 re-run of the cross-WiFi matrix on the T16.10d binary is the
 authoritative cross-WiFi check; this synthetic test is for designing
 and validating fixes BEFORE that real-network re-run.
+
+## T9.5 — `--multicast-interface <ipv4>`
+
+Pins Zenoh's multicast scouting to a specific local IPv4 interface
+by setting `scouting/multicast/interface` to the supplied IP string.
+Default behaviour (unset) leaves Zenoh at its `"auto"` interface
+selection.
+
+### Why this exists (multi-NIC Windows pathology)
+
+On a Windows host with both Ethernet AND WiFi active on the same
+subnet (e.g. both NICs holding 192.168.1.x addresses on the same
+LAN), Zenoh's `"auto"` pick can land on a different NIC on each
+peer. The peers then never observe each other's HELLO traffic and
+scouting silently fails — multicast tests at the same group/port
+between the same two hosts pass cleanly with PowerShell `socket`,
+exonerating the network. Pinning `scouting/multicast/interface` to
+the operator-chosen NIC's IPv4 address makes both peers agree on
+the multicast NIC unconditionally.
+
+### Wired via the runner's T9.5 `--variant-arg`
+
+The flag is supplied per-machine through the runner's
+`--variant-arg` passthrough (see `runner/CUSTOM.md` "Per-variant
+CLI overrides (T9.5)"). PowerShell invocation:
+
+```powershell
+# alice (Ethernet 192.168.1.68)
+target\release\runner.exe --name alice `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg zenoh.multicast_interface=192.168.1.68
+
+# bob (Ethernet 192.168.1.102)
+target\release\runner.exe --name bob `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg zenoh.multicast_interface=192.168.1.102
+```
+
+The variant name in the `--variant-arg` key (`zenoh` above) must
+match each `[[variant]].name` post-template-resolution. For
+fixtures whose variant entry is named explicitly (e.g.
+`zenoh-1000x100hz-qos3-repro`), use that full name.
+
+### Validation
+
+- Bare IPv4 only. CIDR (`192.168.1.68/24`), hostnames, and IPv6
+  literals are rejected at variant startup with a clear error.
+- Empty value is treated as missing and the variant falls back to
+  `"auto"`.
+
+### Startup confirmation
+
+On every connect the variant emits exactly one stderr line so the
+operator can confirm the pin took:
+
+```
+[zenoh] multicast interface: 192.168.1.68 (pinned via --multicast-interface)
+```
+
+Or, when unset:
+
+```
+[zenoh] multicast interface: auto
+```
+
+### Out of scope
+
+- Per-NIC interface selection by name (e.g. `eth0`). Zenoh 1.9's
+  config accepts only an IPv4 address string for this key; passing a
+  device name fails Zenoh's parser. If a future Zenoh release accepts
+  names, extend the parser.
+- IPv6. Unsupported by the current implementation; revisit when
+  there's a concrete dual-stack use case.
