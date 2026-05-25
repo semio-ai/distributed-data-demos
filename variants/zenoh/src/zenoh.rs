@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -237,49 +237,6 @@ fn path_to_key(path: &str) -> &str {
     path.strip_prefix('/').unwrap_or(path)
 }
 
-/// T17.8: Key prefix for the **application-level credit/ack side channel**
-/// used to peer-coordinate back-pressure at QoS 3 / QoS 4. Each receiver
-/// publishes the highest `seq` it has decoded per writer to
-/// `bench/__ack__/<receiver>/<writer>` with a single u64 big-endian
-/// payload. Writers subscribe to `bench/__ack__/*/<self>` and gate
-/// outbound QoS 3/4 publishes on the per-peer ack watermark falling
-/// behind by no more than [`QOS_STRICT_WINDOW`].
-///
-/// Wildcard [`SUBSCRIBER_WILDCARD`] (`bench/**`) intersects this prefix,
-/// but ack samples are filtered by a dedicated wildcard subscriber so
-/// the data subscriber path is unaffected (same shape as EOT).
-const ACK_KEY_PREFIX: &str = "bench/__ack__/";
-
-/// Wildcard the per-writer ack subscriber listens on. Matches every key
-/// of the form `bench/__ack__/<receiver>/<self_runner>`. The variant
-/// composes this at `connect` time by substituting the own runner name
-/// for the trailing wildcard segment.
-const ACK_WILDCARD_FOR_SELF_PREFIX: &str = "bench/__ack__/*/";
-
-/// T17.8: Strict-QoS application-level credit window in messages.
-///
-/// On the QoS 3 / QoS 4 publish path the variant tracks
-/// `next_seq - peer_acks[p]` for every known peer `p` and blocks the
-/// caller (per DESIGN.md § 6.5) once any peer falls behind by more than
-/// this many messages. The smaller this value, the tighter the
-/// writer/receiver coupling and the less in-flight tail at end-of-test.
-///
-/// Sized at one tick-batch of the heaviest reproducer (1000 vpt × 10 Hz
-/// = 1000 messages per tick) so the writer always reaches the gate
-/// after roughly one tick of un-acked work, while still being large
-/// enough to absorb a single 50 ms ack-cycle hiccup at the highest
-/// supported workload (100 K msg/s × 0.050 s = 5 000 in-flight). At
-/// localhost-typical sub-millisecond ack latency the gate is normally
-/// a no-op; under saturation it caps in-flight at this value and lets
-/// the receiver catch up before authorising the next batch.
-///
-/// Earlier iteration: 8192 (matched bridge channel capacity). Lowered
-/// to 2048 after the T17.8 local reproducer showed Zenoh's internal
-/// CC=Block back-pressure still landed asymmetric drops when the
-/// application credit window was wide enough that the data publisher
-/// outran the receiver's drain by multiple ticks worth of in-flight.
-const QOS_STRICT_WINDOW: u64 = 2048;
-
 /// T19.X: Per-subscriber FIFO channel capacity (overrides Zenoh's
 /// default of 256). The default subscriber handler (`FifoChannel`)
 /// **blocks the Zenoh routing thread** when full, not drops -- and
@@ -309,334 +266,17 @@ const QOS_STRICT_WINDOW: u64 = 2048;
 ///   ceiling.
 const SUBSCRIBER_FIFO_CAPACITY: usize = 131_072;
 
-/// T17.8: How often the ack emitter task publishes per-writer ack
-/// watermarks. The trade-off: shorter interval = lower steady-state
-/// publish latency (driver thread blocks for at most one interval when
-/// the window is exhausted) but more side-channel traffic. 25 ms is a
-/// 40 Hz heartbeat which keeps the side-channel cost negligible
-/// (2 peers × 40 Hz × ≤2 writers = ≤160 ack-publish/s) while keeping
-/// the gate latency under typical Zenoh data-path RTT on localhost.
-///
-/// Earlier iteration: 50 ms. Halved after the local reproducer showed
-/// gate-induced bursting (writer publishes one ack-cycle's worth then
-/// stalls until the next ack lands) was the dominant latency
-/// contributor at high vpt.
-const ACK_EMIT_INTERVAL: Duration = Duration::from_millis(25);
-
-/// T17.8: Per-iteration condvar timeout for the window gate. The driver
-/// thread parks here while waiting for ack progress. Bounded so the
-/// gate can re-check `peer_acks` even if a notify is somehow missed
-/// (defensive), and so the watchdog's coarse 1 Hz progress sampler can
-/// observe forward motion within one tick of the actual ack arrival.
-const WINDOW_GATE_WAKE_INTERVAL: Duration = Duration::from_millis(100);
-
-/// T17.8: Compose the per-writer ack key the receiver publishes to.
-/// Format: `bench/__ack__/<receiver>/<writer>`.
-fn ack_key_for(receiver: &str, writer: &str) -> String {
-    format!("{}{}/{}", ACK_KEY_PREFIX, receiver, writer)
-}
-
-/// T17.8: Compose the wildcard the writer subscribes to so it sees acks
-/// directed at itself from every peer. Format:
-/// `bench/__ack__/*/<self_runner>`.
-fn ack_wildcard_for_self(self_runner: &str) -> String {
-    format!("{}{}", ACK_WILDCARD_FOR_SELF_PREFIX, self_runner)
-}
-
-/// T17.8: Extract `(receiver, writer)` from an ack key. Returns `None`
-/// if the key does not match the `bench/__ack__/<receiver>/<writer>`
-/// shape (including missing or empty segments).
-fn parse_ack_key(key: &str) -> Option<(&str, &str)> {
-    let suffix = key.strip_prefix(ACK_KEY_PREFIX)?;
-    let (receiver, writer) = suffix.split_once('/')?;
-    if receiver.is_empty() || writer.is_empty() {
-        return None;
-    }
-    // The writer segment must not contain further '/'; the wildcard
-    // shape we use is a single `*` segment, not `**`.
-    if writer.contains('/') {
-        return None;
-    }
-    Some((receiver, writer))
-}
-
-/// T17.8: Encode an ack watermark as 8 big-endian bytes. Mirrors the
-/// EOT payload encoding so the codec choice across both side-channels
-/// is uniform.
-fn encode_ack_payload(max_seq: u64) -> [u8; 8] {
-    max_seq.to_be_bytes()
-}
-
-/// T17.8: Decode an 8-byte big-endian ack payload. Returns `None` on
-/// wrong length so a corrupt or future-format ack is dropped instead
-/// of panicking.
-fn decode_ack_payload(data: &[u8]) -> Option<u64> {
-    if data.len() != 8 {
-        return None;
-    }
-    Some(u64::from_be_bytes(data.try_into().ok()?))
-}
-
-/// T17.8: Shared accounting state used by [`subscriber_task`] (writer
-/// side: increments per-writer max_seq_seen on QoS 3/4 receives) and
-/// [`ack_emitter_task`] (reads the snapshot periodically and publishes
-/// one Zenoh sample per known remote writer).
-///
-/// The map is keyed by remote writer name; the value is the highest
-/// `seq` decoded from a QoS 3 / QoS 4 sample where `writer != self`.
-/// Self-publishes are NEVER recorded -- the loopback case must not
-/// generate self-acks because it would create a spurious "peer" entry
-/// in [`WindowState::peer_acks`] and cause solo runs to gate on their
-/// own progress.
-///
-/// Lock granularity: a single `std::sync::Mutex` is sufficient because
-/// the subscriber_task writes once per QoS 3/4 receive (small critical
-/// section: one HashMap upsert) and the ack_emitter_task reads at most
-/// 20 Hz (one snapshot clone every [`ACK_EMIT_INTERVAL`]). Contention
-/// is dominated by the receiver's write rate, which is bounded by the
-/// receiver-side throughput.
-#[derive(Default)]
-struct RecvAccounting {
-    /// `writer -> highest seq decoded so far at QoS 3 or QoS 4`.
-    /// Best-effort QoS 1/2 receives are NOT tracked here; the strict-
-    /// delivery window contract only applies to reliable QoS.
-    per_writer_max_seq: HashMap<String, u64>,
-}
-
-/// T16.10d: Per-writer receive-side dedup state, owned by
-/// `subscriber_task` (no sharing — strictly task-local). Each remote
-/// writer gets its own [`WriterDedup`] entry; the entries are populated
-/// lazily on first sight of a new writer name.
-///
-/// See [`DEDUP_WINDOW`] for motivation. The dedup is intentionally
-/// applied to ALL QoS tiers, not just reliable: even at QoS 1/2 the
-/// Zenoh multicast-route race can deliver the same sample twice during
-/// the connection-establishment window, which the analyser would then
-/// surface as duplicates on every QoS tier identically.
-struct WriterDedup {
-    /// Highest `seq` ever observed from this writer. Lazily initialised
-    /// on first receive (no value = "no max yet"; treat as 0).
-    max_seq: u64,
-    /// Set of `seq` values seen within `[max_seq - DEDUP_WINDOW, max_seq]`.
-    /// Pruned on every insert that advances `max_seq` past `seq + DEDUP_WINDOW`.
-    /// Bounded size = [`DEDUP_WINDOW`] entries.
-    seen: HashSet<u64>,
-}
-
-impl WriterDedup {
-    fn new() -> Self {
-        Self {
-            max_seq: 0,
-            seen: HashSet::new(),
-        }
-    }
-
-    /// Return `true` if `seq` is a duplicate (already observed) and
-    /// should be dropped; `false` if novel and should be forwarded to
-    /// the variant's recv channel. On a novel seq the state is
-    /// updated: the seq is recorded in `seen`, `max_seq` is advanced
-    /// if larger, and any entries below `max_seq - DEDUP_WINDOW` are
-    /// pruned.
-    fn observe(&mut self, seq: u64) -> bool {
-        // Stale seq beyond our dedup window: we no longer have evidence
-        // either way, but at typical workloads (1000 paths × 100 Hz with
-        // QOS_STRICT_WINDOW = 2048) a seq more than DEDUP_WINDOW = 8192
-        // below max means the writer is ~8 ticks behind our high-water
-        // mark -- which can only happen if it is a true Zenoh-internal
-        // very-late retransmit. Treat as duplicate to keep the dedup
-        // semantics deterministic; the analyser will see a small
-        // delivery-rate dip but never a duplicate row.
-        if self.max_seq > DEDUP_WINDOW && seq + DEDUP_WINDOW < self.max_seq {
-            return true;
-        }
-        if !self.seen.insert(seq) {
-            // Already saw this seq within the window.
-            return true;
-        }
-        if seq > self.max_seq {
-            self.max_seq = seq;
-            // Prune anything that has now fallen out of the window.
-            if self.max_seq > DEDUP_WINDOW {
-                let cutoff = self.max_seq - DEDUP_WINDOW;
-                self.seen.retain(|&s| s >= cutoff);
-            }
-        }
-        false
-    }
-}
-
-/// T17.8: Writer-side state shared between the driver thread (the
-/// strict-QoS publish gate) and the `ack_subscriber_task` (which feeds
-/// new per-peer watermarks in). The condvar wakes the gate whenever a
-/// watermark advances.
-///
-/// The map is keyed by the remote *receiver* name (i.e. the peer that
-/// sent the ack). Each entry records the highest `seq` that peer has
-/// confirmed decoding from us at QoS 3/4. Entries are pre-seeded at
-/// `connect` time from the runner-injected `--peers` list with
-/// watermark 0, so the gate enforces the credit window from the
-/// FIRST publish rather than only after the first real ack arrives.
-/// Without the pre-seed, a fresh spawn could burst-publish thousands
-/// of messages into the bridge before bob's first ack lands, filling
-/// the bridge to overflow when disconnect runs and producing a real
-/// end-of-test tail drop.
-///
-/// **Empty map** means the variant has no known peers (a solo /
-/// loopback configuration); the gate is then a no-op so the writer
-/// is unthrottled.
-#[derive(Default)]
-struct WindowState {
-    /// `receiver -> highest ack watermark received from that peer`.
-    /// Monotonically non-decreasing per peer (the ack subscriber
-    /// drops samples that would regress a peer's watermark, which
-    /// can happen if Zenoh delivers the ack samples out of order).
-    peer_acks: HashMap<String, u64>,
-    /// Set to `true` during `disconnect` so any thread blocked in
-    /// the gate condvar wakes up and bails out instead of waiting
-    /// for a watermark that will never arrive.
-    shutting_down: bool,
-}
-
-/// T17.8: Container co-locating [`WindowState`] and its condvar. Held
-/// behind an `Arc` so the driver thread (sync, calls
-/// [`WindowState::wait_for_window`]) and the ack subscriber task
-/// (async, calls [`WindowState::apply_ack`]) share a single
-/// notification channel.
-struct WindowGate {
-    state: Mutex<WindowState>,
-    cv: Condvar,
-}
-
-impl WindowGate {
-    /// Test-only constructor: no peers known, gate is a no-op. The
-    /// production path always goes through
-    /// [`WindowGate::with_expected_peers`] (the runner-injected
-    /// peer list seeds the gate at watermark 0 from the first
-    /// publish on).
-    #[cfg(test)]
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(WindowState::default()),
-            cv: Condvar::new(),
-        }
-    }
-
-    /// T17.8: Construct with the expected peer set pre-seeded at
-    /// watermark 0. Called from `connect(Multi)` with the
-    /// runner-injected `--peers` list (excluding self). The gate
-    /// then enforces the credit window from the first publish,
-    /// rather than burst-allowing unbounded writes until the first
-    /// real ack from each peer lands.
-    fn with_expected_peers(peers: &[String]) -> Self {
-        let mut state = WindowState::default();
-        for peer in peers {
-            state.peer_acks.insert(peer.clone(), 0);
-        }
-        Self {
-            state: Mutex::new(state),
-            cv: Condvar::new(),
-        }
-    }
-
-    /// Update the watermark for a single peer. No-op if the new value
-    /// would regress the peer's watermark (Zenoh delivers
-    /// CongestionControl::Drop samples in arrival order, but a
-    /// belated ack from before a reconnect could still surface
-    /// stale). Notifies all waiters on any advance because multiple
-    /// publish threads could in principle be waiting on the gate
-    /// (today the variant only has one driver thread, but
-    /// `notify_all` is robust if that changes).
-    fn apply_ack(&self, peer: &str, max_seq: u64) {
-        if let Ok(mut s) = self.state.lock() {
-            let entry = s.peer_acks.entry(peer.to_string()).or_insert(0);
-            if max_seq > *entry {
-                *entry = max_seq;
-                drop(s);
-                self.cv.notify_all();
-            }
-        }
-    }
-
-    /// Signal all waiters to abort. Called from `disconnect` so a
-    /// driver thread parked here unblocks cleanly during teardown.
-    fn shutdown(&self) {
-        if let Ok(mut s) = self.state.lock() {
-            s.shutting_down = true;
-            drop(s);
-            self.cv.notify_all();
-        }
-    }
-
-    /// Block the calling (sync) thread until `next_seq` falls within
-    /// [`QOS_STRICT_WINDOW`] of every known peer's ack watermark, or
-    /// the gate has been shut down.
-    ///
-    /// The first time a peer publishes any ack at all, it joins the
-    /// gated set; until then publishes proceed unthrottled (this is
-    /// the loopback / solo case). If NO peer has ever acked, the gate
-    /// is a no-op.
-    ///
-    /// Returns `Ok(())` once the window has space, or
-    /// `Err` only if the gate is shut down before progress is
-    /// observed. The error variant is `anyhow::Error` so the variant's
-    /// publish method can propagate it.
-    fn wait_for_window(&self, next_seq: u64) -> Result<()> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("window gate mutex poisoned"))?;
-        loop {
-            if guard.shutting_down {
-                anyhow::bail!("window gate: variant disconnecting");
-            }
-            // Compute minimum ack across known peers. An empty map
-            // means "no peer has ever acked" -> no gating; treat as
-            // unbounded credit. This is the loopback / solo run
-            // behaviour and the warm-up phase before the first ack
-            // arrives.
-            let min_ack: Option<u64> = guard.peer_acks.values().min().copied();
-            match min_ack {
-                None => return Ok(()),
-                Some(min_ack) => {
-                    if next_seq <= min_ack + QOS_STRICT_WINDOW {
-                        return Ok(());
-                    }
-                }
-            }
-            // Window exhausted: park with a periodic wake so a missed
-            // notify is recoverable and so the watchdog's 1 Hz sampler
-            // can observe forward motion within one tick of the actual
-            // ack arrival.
-            let (g, _) = self
-                .cv
-                .wait_timeout(guard, WINDOW_GATE_WAKE_INTERVAL)
-                .map_err(|_| anyhow::anyhow!("window gate cv poisoned"))?;
-            guard = g;
-        }
-    }
-}
-
-/// Default capacity for the publish-side bounded channel.
-///
-/// T17.8: bumped from 1024 to 16384 so the application-level credit
-/// window protocol (see [`WindowGate`]) is the **binding** back-
-/// pressure surface at QoS 3 / QoS 4, not the bridge channel. With
-/// the bridge at 1024 (the pre-T17.8 size), the writer would fill
-/// the bridge after one tick at the standard 1000-vpt workload and
-/// park on `blocking_send` long before the credit window engaged,
-/// re-creating the exact failure mode the T17.8 protocol was meant
-/// to eliminate. 16384 is comfortably larger than
-/// [`QOS_STRICT_WINDOW`] so the credit gate parks the driver thread
-/// on the condvar (the controlled back-pressure path) before the
-/// bridge fills.
-///
-/// At QoS 1 / QoS 2 the bridge is still the back-pressure surface
-/// (writer's `try_send` returns `Full` -> `Ok(false)` ->
-/// `backpressure_skipped`). The deeper queue marginally delays the
-/// first `Ok(false)` under a momentary burst but does not break
-/// the contract -- the QoS 1/2 path produces `backpressure_skipped`
-/// as soon as the channel fills, regardless of capacity.
-const PUBLISH_CHANNEL_CAPACITY: usize = 16384;
+/// Default capacity for the publish-side bounded channel. T9.5d: now
+/// the only back-pressure surface on the publish path (the T17.8
+/// application-level credit/ack/dedup wrapper was removed at user
+/// request; the bench measures Zenoh-native QoS only). 4096 leaves
+/// comfortable headroom over one tick of the heaviest 1000-vpt
+/// fixture so a momentary scheduling stall on the publisher_task
+/// does not synchronously back-pressure the driver via
+/// `blocking_send`, while staying small enough that QoS 1/2 traffic
+/// surfaces `backpressure_skipped` promptly when the publisher_task
+/// genuinely cannot keep up.
+const PUBLISH_CHANNEL_CAPACITY: usize = 4096;
 
 /// Recover `--values-per-tick` from the variant process's CLI args.
 ///
@@ -672,39 +312,6 @@ fn values_per_tick_from_env() -> Option<u32> {
 /// the JSONL receive log will simply show fewer matches than writes, which
 /// is exactly what the analysis tool measures.
 const RECEIVE_CHANNEL_CAPACITY: usize = 16384;
-
-/// T16.10d: Receive-side deduplication window. Each writer's `seq` is a
-/// global monotonic counter (one per write across all keys; see
-/// `variant_base/src/seq.rs`). With T17.8's [`QOS_STRICT_WINDOW`] = 2048
-/// in-flight cap, any seq the writer can currently have on the wire is in
-/// `[max_acked_by_us + 1, max_acked_by_us + 2048]`. Anything below
-/// `max_seq_seen - DEDUP_WINDOW` has either already been delivered or is
-/// a "very old" duplicate and we drop it (the analyser-side accounting
-/// then matches the writer-side log exactly).
-///
-/// **Why dedup is necessary in Multi mode**: Zenoh's default
-/// `autoconnect_strategy = "always"` for peer-to-peer briefly races
-/// when two peers in `peer` mode discover each other via multicast
-/// scouting AND gossip simultaneously. Both peers initiate a TCP
-/// connect; for the brief window where two transport sessions co-
-/// exist (before Zenoh's "redundant connection close" path runs)
-/// the same sample is delivered through BOTH routes, producing
-/// ~1.5x receive ratio (148 % delivery), tens of thousands of
-/// out-of-order arrivals (the second route delivers older buffered
-/// samples after the first), and hundreds of thousands of
-/// duplicates at 1 000-path × 100 Hz QoS 3 / QoS 4 workloads.
-/// Setting `autoconnect_strategy = "greater-zid"` in
-/// `build_zenoh_config` reduces but does not eliminate the race
-/// (both peers can still receive each other's multicast HELLO at
-/// roughly the same instant); the receive-side dedup gate closes
-/// the residual window deterministically.
-///
-/// Sized at 4× `QOS_STRICT_WINDOW` (= 8192) so the receiver tolerates
-/// up to 4 unacknowledged ticks of redundancy before treating a
-/// re-delivery as a novel sample. Memory per writer: 8192 × 8 bytes
-/// ≈ 64 KiB; with at most 2 peers per spawn the total receive-side
-/// dedup overhead is ≈ 128 KiB, well within the digest soft ceiling.
-const DEDUP_WINDOW: u64 = 4 * QOS_STRICT_WINDOW;
 
 /// T16.5: maximum number of in-flight `publisher.put(...).await` futures
 /// the publisher task allows to run concurrently. Each pending put holds
@@ -1163,23 +770,6 @@ pub struct ZenohVariant {
     /// dedup-by-writer backstop on its side, but the variant must not
     /// rely on it.
     eot_seen: HashSet<(String, u64)>,
-    /// T17.8: Application-level credit/window gate for QoS 3 / QoS 4.
-    /// Held behind `Arc` so the driver thread (sync, calls
-    /// [`WindowGate::wait_for_window`] from `publish`) and the
-    /// ack subscriber task (async, calls [`WindowGate::apply_ack`])
-    /// share a single notification surface. Constructed in
-    /// `connect(Multi)`; left `None` in Single mode (the REST plugin
-    /// surface has its own back-pressure semantics).
-    window_gate: Option<Arc<WindowGate>>,
-    /// T17.8: Oneshot signalling the ack emitter task to stop. Held
-    /// separately from `shutdown_tx` / `eot_shutdown_tx` so the
-    /// variant's three Zenoh-runtime tasks (data subscriber, EOT
-    /// subscriber, ack subscriber + emitter) wind down independently.
-    ack_shutdown_tx: Option<oneshot::Sender<()>>,
-    /// T17.8: Oneshot signalling the ack subscriber task to stop.
-    /// Each task owns one `oneshot::Receiver` so a single sender per
-    /// task is the minimum-coupling shutdown channel.
-    ack_sub_shutdown_tx: Option<oneshot::Sender<()>>,
     // Diagnostic counters used only when `zenoh_args.debug_trace` is true.
     publish_count: u64,
     publish_total_us: u128,
@@ -1387,9 +977,6 @@ impl ZenohVariant {
             eot_shutdown_tx: None,
             eot_rx: None,
             eot_seen: HashSet::new(),
-            window_gate: None,
-            ack_shutdown_tx: None,
-            ack_sub_shutdown_tx: None,
             publish_count: 0,
             publish_total_us: 0,
             publish_max_us: 0,
@@ -1883,31 +1470,14 @@ async fn publisher_task(
 /// (consumer can't drain fast enough), the sample is dropped — the
 /// benchmark measures end-to-end delivery, so a drop here looks
 /// equivalent to a wire-level loss in the resulting analysis.
-///
-/// T17.8: this task ALSO updates the shared [`RecvAccounting`] map on
-/// every successfully-decoded **QoS 3 / QoS 4** sample from a *non-self*
-/// writer. The ack_emitter_task reads that map on its 50 ms cadence and
-/// publishes the per-writer max_seq back to the writer over the
-/// `bench/__ack__/<self>/<writer>` side-channel. The combination
-/// realises the application-level credit/window protocol that replaces
-/// Zenoh's native `CongestionControl::Block` as the dominant
-/// back-pressure surface (CC=Block is still set on the data publisher
-/// as a last-resort safety net — see CUSTOM.md
-/// "Peer-coordinated back-pressure (T17.8)").
 async fn subscriber_task(
     subscriber: Subscriber<FifoChannelHandler<Sample>>,
     recv_tx: mpsc::Sender<ReceivedUpdate>,
-    recv_accounting: Arc<Mutex<RecvAccounting>>,
     self_runner: String,
     mut shutdown_rx: oneshot::Receiver<()>,
     trace: bool,
 ) {
     let mut dropped = 0u64;
-    // T16.10d: per-writer dedup state. See `WriterDedup` doc + the
-    // `DEDUP_WINDOW` constant for the motivation. Task-local because
-    // only this task reads/writes the map; no Mutex needed.
-    let mut dedup_state: HashMap<String, WriterDedup> = HashMap::new();
-    let mut deduped = 0u64;
     // T16.10c: synthetic subscriber-side back-pressure for testing only.
     // When the env var `ZENOH_TEST_SUB_JITTER_MS` is set to a positive
     // u64, the subscriber yields `tokio::time::sleep(jitter_ms)` on every
@@ -1934,9 +1504,8 @@ async fn subscriber_task(
             _ = &mut shutdown_rx => {
                 if trace {
                     trace_now!(
-                        "subscriber_task: shutdown signal received; dropped_total={} deduped_total={}",
+                        "subscriber_task: shutdown signal received; dropped_total={}",
                         dropped,
-                        deduped,
                     );
                 }
                 break;
@@ -1986,58 +1555,6 @@ async fn subscriber_task(
                                 if update.writer == self_runner {
                                     continue;
                                 }
-                                // T16.10d: drop duplicates introduced by
-                                // Zenoh's multicast-route race window (see
-                                // DEDUP_WINDOW / WriterDedup docs). Even at
-                                // QoS 1/2 the race can deliver the same
-                                // sample twice, so dedup gates all QoS tiers.
-                                // Per-writer state is task-local and lazily
-                                // populated.
-                                let dedup_entry = dedup_state
-                                    .entry(update.writer.clone())
-                                    .or_insert_with(WriterDedup::new);
-                                if dedup_entry.observe(update.seq) {
-                                    deduped += 1;
-                                    if trace && deduped.is_multiple_of(1000) {
-                                        trace_now!(
-                                            "subscriber_task: dedup dropped seq={} writer={} (total deduped={})",
-                                            update.seq,
-                                            update.writer,
-                                            deduped,
-                                        );
-                                    }
-                                    continue;
-                                }
-                                // T17.8: update the ack-emitter's view of
-                                // "highest reliable seq from this writer"
-                                // BEFORE forwarding to the variant. We
-                                // gate on `qos in (ReliableUdp,
-                                // ReliableTcp)` AND `writer != self` so
-                                // (a) QoS 1/2 traffic does not produce
-                                // ack noise (best-effort QoS doesn't
-                                // need the window) and (b) loopback
-                                // (writer == self) does not register
-                                // self-as-peer, which would cause solo
-                                // runs to gate on their own progress.
-                                // The (b) condition is dead post-self-
-                                // filter above; kept as belt-and-braces
-                                // so a future refactor that moves the
-                                // self filter cannot regress ack noise.
-                                let is_strict = matches!(
-                                    update.qos,
-                                    Qos::ReliableUdp | Qos::ReliableTcp,
-                                );
-                                if is_strict && update.writer != self_runner {
-                                    if let Ok(mut acc) = recv_accounting.lock() {
-                                        let entry = acc
-                                            .per_writer_max_seq
-                                            .entry(update.writer.clone())
-                                            .or_insert(0);
-                                        if update.seq > *entry {
-                                            *entry = update.seq;
-                                        }
-                                    }
-                                }
                                 // try_send so a slow consumer (or a backed-up
                                 // channel) doesn't block the subscriber task —
                                 // blocking here would let Zenoh's internal FIFO
@@ -2078,205 +1595,6 @@ async fn subscriber_task(
     if let Err(e) = subscriber.undeclare().await {
         if trace {
             trace_now!("subscriber_task: undeclare failed: {}", e);
-        }
-    }
-}
-
-/// T17.8: Ack emitter task. Periodically snapshots [`RecvAccounting`]
-/// and publishes one `bench/__ack__/<self>/<writer>` sample per known
-/// writer with the highest decoded `seq` payload (8 bytes big-endian).
-/// Runs on the same Zenoh session as the data path so peer discovery /
-/// route resolution is shared (no extra session, no extra runtime).
-///
-/// **Publisher cache**: ack publishers are declared lazily on first
-/// sight of a new writer. Use `CongestionControl::Drop` so an
-/// ack-key route hiccup never blocks this task -- acks are
-/// idempotent (latest watermark replaces previous), so a dropped ack
-/// is recovered on the next 50 ms tick. **Crucially**, this means the
-/// ack channel itself cannot stall, which is what makes the
-/// application-level credit/window protocol robust against the
-/// asymmetric stall the T16.12 data path exhibited under CC=Block.
-///
-/// **Shutdown**: when the shutdown oneshot fires the task drops its
-/// publisher cache (which undeclares via the session close path) and
-/// exits. Failing to undeclare here is non-fatal -- session close
-/// undeclares for us.
-async fn ack_emitter_task(
-    session: zenoh::Session,
-    self_runner: String,
-    recv_accounting: Arc<Mutex<RecvAccounting>>,
-    mut shutdown_rx: oneshot::Receiver<()>,
-    trace: bool,
-) {
-    let mut publishers: HashMap<String, Publisher<'static>> = HashMap::new();
-    let mut interval = tokio::time::interval(ACK_EMIT_INTERVAL);
-    // Skip the first immediate-fire tick so a fresh `connect` doesn't
-    // publish an empty snapshot before the receiver has decoded anything.
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut shutdown_rx => {
-                if trace {
-                    trace_now!("ack_emitter_task: shutdown signal received");
-                }
-                break;
-            }
-            _ = interval.tick() => {
-                // Snapshot under the mutex. Cloning a small HashMap is
-                // cheap and keeps the lock window minimal -- the
-                // subscriber_task can keep updating while we publish.
-                let snapshot: Vec<(String, u64)> = match recv_accounting.lock() {
-                    Ok(acc) => acc
-                        .per_writer_max_seq
-                        .iter()
-                        .map(|(k, v)| (k.clone(), *v))
-                        .collect(),
-                    Err(_) => continue,
-                };
-                for (writer, max_seq) in snapshot {
-                    let key = ack_key_for(&self_runner, &writer);
-                    let publisher = match publishers.get(&key) {
-                        Some(p) => p,
-                        None => {
-                            // Lazy declare; ack keys are bounded by the
-                            // number of distinct *non-self* writers we
-                            // have ever received from (typically 1-2 in
-                            // a two-runner topology, never more than the
-                            // peer count).
-                            match session
-                                .declare_publisher(key.clone())
-                                .congestion_control(CongestionControl::Drop)
-                                .await
-                            {
-                                Ok(p) => {
-                                    publishers.insert(key.clone(), p);
-                                    publishers.get(&key).expect("just inserted")
-                                }
-                                Err(e) => {
-                                    if trace {
-                                        trace_now!(
-                                            "ack_emitter_task: declare_publisher failed key={} err={}",
-                                            key,
-                                            e,
-                                        );
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                    };
-                    let payload = encode_ack_payload(max_seq);
-                    if let Err(e) = publisher.put(payload.to_vec()).await {
-                        if trace {
-                            trace_now!(
-                                "ack_emitter_task: put failed key={} max_seq={} err={}",
-                                key,
-                                max_seq,
-                                e,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Best-effort undeclare loop on shutdown.
-    for (_, publisher) in publishers.drain() {
-        if let Err(e) = publisher.undeclare().await {
-            if trace {
-                trace_now!("ack_emitter_task: undeclare failed: {}", e);
-            }
-        }
-    }
-}
-
-/// T17.8: Ack subscriber task. Listens on the
-/// `bench/__ack__/*/<self_runner>` wildcard and feeds every observed
-/// `(peer, max_seq)` watermark into the [`WindowGate`] so the driver
-/// thread's strict-QoS publish gate can open as soon as the peer
-/// confirms progress.
-///
-/// **Self-ack filter**: in the (theoretical) loopback case where a
-/// receiver and writer share a runner name, the subscriber task
-/// already skips self-publishes when updating [`RecvAccounting`], so
-/// no self-ack ever leaves the local session. As belt-and-braces the
-/// ack subscriber also skips samples whose receiver segment equals
-/// `self_runner`.
-async fn ack_subscriber_task(
-    subscriber: Subscriber<FifoChannelHandler<Sample>>,
-    window_gate: Arc<WindowGate>,
-    self_runner: String,
-    mut shutdown_rx: oneshot::Receiver<()>,
-    trace: bool,
-) {
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut shutdown_rx => {
-                if trace {
-                    trace_now!("ack_subscriber_task: shutdown signal received");
-                }
-                break;
-            }
-            sample_result = subscriber.recv_async() => {
-                match sample_result {
-                    Ok(sample) => {
-                        let key_str = sample.key_expr().as_str().to_string();
-                        let (receiver, writer) = match parse_ack_key(&key_str) {
-                            Some(t) => t,
-                            None => {
-                                if trace {
-                                    trace_now!(
-                                        "ack_subscriber_task: malformed ack key {}",
-                                        key_str,
-                                    );
-                                }
-                                continue;
-                            }
-                        };
-                        // The wildcard `bench/__ack__/*/<self>` should
-                        // already constrain `writer == self_runner` and
-                        // `receiver != self_runner` for non-loopback
-                        // traffic; the explicit checks here defend
-                        // against a misuse / unexpected key shape.
-                        if writer != self_runner {
-                            continue;
-                        }
-                        if receiver == self_runner {
-                            continue;
-                        }
-                        let data: Vec<u8> = sample.payload().to_bytes().to_vec();
-                        let max_seq = match decode_ack_payload(&data) {
-                            Some(s) => s,
-                            None => {
-                                if trace {
-                                    trace_now!(
-                                        "ack_subscriber_task: bad ack payload len={} peer={}",
-                                        data.len(),
-                                        receiver,
-                                    );
-                                }
-                                continue;
-                            }
-                        };
-                        window_gate.apply_ack(receiver, max_seq);
-                    }
-                    Err(_) => {
-                        if trace {
-                            trace_now!("ack_subscriber_task: recv_async returned Err; ending");
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if let Err(e) = subscriber.undeclare().await {
-        if trace {
-            trace_now!("ack_subscriber_task: undeclare failed: {}", e);
         }
     }
 }
@@ -2457,13 +1775,11 @@ impl Variant for ZenohVariant {
         // dozen sequential declares (the runtime now has enough
         // workers to actually parallelise them).
         let pre_declare_count = values_per_tick_from_env().unwrap_or(0);
-        let ack_self_wildcard = ack_wildcard_for_self(&self.runner);
         let t_open = Instant::now();
         let (
             session,
             subscriber,
             eot_subscriber,
-            ack_subscriber,
             predeclared_publishers_drop,
             predeclared_publishers_block,
         ) = runtime
@@ -2481,22 +1797,6 @@ impl Variant for ZenohVariant {
                     .map_err(zenoh_err)?;
                 let eot_subscriber = session
                     .declare_subscriber(EOT_WILDCARD)
-                    .with(FifoChannel::new(SUBSCRIBER_FIFO_CAPACITY))
-                    .await
-                    .map_err(zenoh_err)?;
-                // T17.8: ack subscriber listens on
-                // `bench/__ack__/*/<self_runner>` -- the wildcard
-                // segment matches the *receiver* runner that
-                // published the ack. The data subscriber's
-                // SUBSCRIBER_WILDCARD (`bench/**`) intersects this
-                // prefix too, but ack samples carry a u64 payload
-                // (not a MessageCodec-encoded message), so they
-                // would fail to decode and be dropped silently in
-                // the data path. The dedicated ack subscriber gets
-                // the samples first and parses them with the right
-                // codec.
-                let ack_subscriber = session
-                    .declare_subscriber(ack_self_wildcard.clone())
                     .with(FifoChannel::new(SUBSCRIBER_FIFO_CAPACITY))
                     .await
                     .map_err(zenoh_err)?;
@@ -2569,7 +1869,6 @@ impl Variant for ZenohVariant {
                     session,
                     subscriber,
                     eot_subscriber,
-                    ack_subscriber,
                     publishers_drop,
                     publishers_block,
                 ))
@@ -2591,46 +1890,11 @@ impl Variant for ZenohVariant {
         // Separate shutdown oneshot for the EOT subscriber so each task
         // owns exactly one Receiver (oneshot::Receiver is single-consumer).
         let (eot_shutdown_tx, eot_shutdown_rx) = oneshot::channel::<()>();
-        // T17.8: two more oneshots for the ack subscriber + ack emitter.
-        let (ack_shutdown_tx, ack_shutdown_rx) = oneshot::channel::<()>();
-        let (ack_sub_shutdown_tx, ack_sub_shutdown_rx) = oneshot::channel::<()>();
         // EOT observations channel: small bound is sufficient because the
         // contract is one EOT per peer per spawn. 256 leaves ample
         // headroom for retries / late duplicates without unbounded
         // memory.
         let (eot_tx, eot_rx) = mpsc::channel::<(String, u64)>(256);
-
-        // T17.8: shared state for the application-level credit/window
-        // protocol. `RecvAccounting` is written by `subscriber_task`
-        // (one entry advance per QoS 3/4 receive) and read by
-        // `ack_emitter_task` (one snapshot every 25 ms).
-        // `WindowGate` is written by `ack_subscriber_task` (one
-        // `apply_ack` per ack sample) and read by the variant's
-        // `publish` on the driver thread.
-        //
-        // The gate is **pre-seeded** with the runner-injected peer
-        // set (minus self) at watermark 0. Without the pre-seed, a
-        // fresh spawn would burst-publish thousands of messages
-        // before the peer's first ack landed; the bridge would
-        // overflow with un-drainable in-flight work which then
-        // shows up as an end-of-test tail drop. Solo / loopback
-        // configurations have an empty peer set and the gate is a
-        // no-op (see `WindowGate::wait_for_window`).
-        let expected_peers: Vec<String> = self
-            .peer_name_host_pairs()
-            .into_iter()
-            .map(|(name, _host)| name)
-            .filter(|n| n != &self.runner)
-            .collect();
-        let recv_accounting: Arc<Mutex<RecvAccounting>> =
-            Arc::new(Mutex::new(RecvAccounting::default()));
-        let window_gate = Arc::new(WindowGate::with_expected_peers(&expected_peers));
-
-        // Clone the session for the ack emitter task; `zenoh::Session`
-        // is cheap to clone (it's an Arc-wrapped handle internally) and
-        // sharing the session is the established pattern in this file
-        // (the JoinSet above also clones it for parallel declares).
-        let session_for_ack_emitter = session.clone();
 
         let pub_state = PublisherState {
             session,
@@ -2642,7 +1906,6 @@ impl Variant for ZenohVariant {
         runtime.spawn(subscriber_task(
             subscriber,
             recv_tx,
-            Arc::clone(&recv_accounting),
             self.runner.clone(),
             shutdown_rx,
             trace,
@@ -2652,25 +1915,6 @@ impl Variant for ZenohVariant {
             eot_tx,
             self.runner.clone(),
             eot_shutdown_rx,
-            trace,
-        ));
-        // T17.8: ack publisher (50 ms heartbeat) and ack subscriber
-        // (consumes peer watermarks into the WindowGate). Both run on
-        // the same tokio runtime as the data path; the emitter shares
-        // the data session via clone so peer discovery / route
-        // resolution is paid once.
-        runtime.spawn(ack_emitter_task(
-            session_for_ack_emitter,
-            self.runner.clone(),
-            Arc::clone(&recv_accounting),
-            ack_shutdown_rx,
-            trace,
-        ));
-        runtime.spawn(ack_subscriber_task(
-            ack_subscriber,
-            Arc::clone(&window_gate),
-            self.runner.clone(),
-            ack_sub_shutdown_rx,
             trace,
         ));
 
@@ -2702,9 +1946,6 @@ impl Variant for ZenohVariant {
         self.eot_shutdown_tx = Some(eot_shutdown_tx);
         self.eot_rx = Some(eot_rx);
         self.eot_seen.clear();
-        self.window_gate = Some(window_gate);
-        self.ack_shutdown_tx = Some(ack_shutdown_tx);
-        self.ack_sub_shutdown_tx = Some(ack_sub_shutdown_tx);
         self.connected_mode = Some(ThreadingMode::Multi);
 
         trace_if!(trace, "connect: total {} ms", t0.elapsed().as_millis());
@@ -2726,23 +1967,6 @@ impl Variant for ZenohVariant {
             return publisher.put(&key, encoded.to_vec());
         }
         let trace = self.zenoh_args.debug_trace;
-
-        // T17.8: application-level peer-coordinated back-pressure gate.
-        // For QoS 3 / QoS 4 (the strict-no-skip tiers per DESIGN.md
-        // § 6.5) we block here -- on the driver thread, by design
-        // (see CUSTOM.md "Peer-coordinated back-pressure (T17.8)") --
-        // until every known peer has acknowledged decoding up to
-        // `seq - QOS_STRICT_WINDOW`. The gate is a no-op until the
-        // first ack from at least one peer arrives, so solo / loopback
-        // configurations and the warm-up window of a fresh spawn run
-        // unthrottled. QoS 1/2 (best-effort) traffic bypasses the gate
-        // entirely; the previous bridge-mpsc `try_send` short-circuit
-        // remains the back-pressure surface there.
-        if matches!(qos, Qos::ReliableUdp | Qos::ReliableTcp) {
-            if let Some(gate) = self.window_gate.as_ref() {
-                gate.wait_for_window(seq)?;
-            }
-        }
 
         let send_tx = self
             .send_tx
@@ -3023,26 +2247,6 @@ impl Variant for ZenohVariant {
         if let Some(tx) = self.eot_shutdown_tx.take() {
             let _ = tx.send(());
         }
-        // T17.8: signal the ack subscriber and ack emitter tasks to
-        // stop. Doing this BEFORE waking any thread parked in the
-        // window gate (next call) so a fresh ack cannot land between
-        // wake and gate-shutdown.
-        if let Some(tx) = self.ack_sub_shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        if let Some(tx) = self.ack_shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        // T17.8: wake any driver thread still parked on the strict-QoS
-        // window gate so disconnect doesn't deadlock against a
-        // mid-publish wait. The driver should never call publish
-        // again after disconnect, but `wait_for_window` is robust
-        // against a stale call: it returns an error once
-        // `shutting_down` is set.
-        if let Some(ref gate) = self.window_gate {
-            gate.shutdown();
-        }
-        self.window_gate = None;
 
         // Drop the publish sender — when the publisher task sees the
         // channel closed it will drain its publisher cache and close the
@@ -4399,336 +3603,118 @@ mod tests {
         }
     }
 
-    // ---- T17.8 tests: peer-coordinated back-pressure ----
-
+    /// T9.5d smoke: with the application-level QoS wrapper removed,
+    /// a Multi-mode `ZenohVariant` must still round-trip every QoS
+    /// tier end-to-end via the in-process bridge -- no `__ack__`
+    /// keys, no window gate, no dedup. We drive a foreign-writer
+    /// auxiliary Zenoh session, publish a handful of samples per
+    /// QoS tier, and verify the variant's subscriber decodes and
+    /// delivers them all through `poll_receive`. Mirrors the spirit
+    /// of the deleted T17.8 round-trip tests but exercises only
+    /// Zenoh-native QoS (Reliability + CongestionControl).
+    ///
+    /// Gated `#[ignore]` for the same reason as the existing
+    /// loopback-stress tests: it spins up real Zenoh sessions and
+    /// depends on localhost scouting.
     #[test]
-    fn test_ack_key_round_trip_and_wildcard_intersection() {
-        use zenoh::key_expr::KeyExpr;
+    #[ignore]
+    fn multi_zenoh_qos_round_trip_post_wrapper_removal() {
+        const SAMPLES_PER_QOS: u64 = 32;
+        let mut variant = ZenohVariant::new("t95d-recv", &[]).expect("construct variant");
+        variant
+            .connect(variant_base::ThreadingMode::Multi)
+            .expect("connect");
 
-        // Composed key must parse back to the same `(receiver, writer)`
-        // pair, and the writer's wildcard subscription
-        // `bench/__ack__/*/<self>` must intersect every key targeted
-        // at `self`. Together these are the on-wire contract the ack
-        // emitter (writes) and ack subscriber (reads) implement.
-        for (receiver, writer) in [("bob", "alice"), ("runner-2", "runner-1"), ("c", "d-7")] {
-            let key = ack_key_for(receiver, writer);
-            let (r, w) = parse_ack_key(&key).expect("ack key must round-trip");
-            assert_eq!(r, receiver, "receiver parsed from {key:?}");
-            assert_eq!(w, writer, "writer parsed from {key:?}");
+        let aux_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("aux runtime");
+        let aux_args = ZenohArgs::parse(&[]).expect("default ZenohArgs");
+        let aux_config = build_zenoh_config(&aux_args, &[], "aux").expect("aux config");
+        let aux_session = aux_rt
+            .block_on(async move { zenoh::open(aux_config).await })
+            .expect("open aux session");
 
-            let wildcard = ack_wildcard_for_self(writer);
-            let wildcard_expr =
-                KeyExpr::try_from(wildcard.as_str()).expect("ack wildcard is a valid keyexpr");
-            let key_expr = KeyExpr::try_from(key.as_str()).expect("ack key is a valid keyexpr");
+        // Allow loopback discovery + interest declaration to settle.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Push SAMPLES_PER_QOS samples per QoS tier from the auxiliary
+        // session under a foreign writer name so the self-filter does
+        // not drop them.
+        let qos_tiers = [
+            Qos::BestEffort,
+            Qos::LatestValue,
+            Qos::ReliableUdp,
+            Qos::ReliableTcp,
+        ];
+        aux_rt.block_on(async {
+            for qos in qos_tiers {
+                for seq in 0..SAMPLES_PER_QOS {
+                    let path = format!("/bench/{}", seq % 4);
+                    let key = path_to_key(&path);
+                    let encoded = MessageCodec::encode("t95d-sender", seq, qos, &path, &[0u8; 8]);
+                    let _ = aux_session.put(key, encoded.to_vec()).await;
+                }
+            }
+        });
+
+        // Drain receives with a deadline. The contract is that EVERY
+        // sample from the foreign writer reaches poll_receive (no
+        // wrapper-introduced filtering / gating); we permit a small
+        // delivery shortfall for the BestEffort tier because
+        // CongestionControl::Drop on localhost can drop genuinely.
+        let total_expected = SAMPLES_PER_QOS * (qos_tiers.len() as u64);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut per_qos: HashMap<u8, u64> = HashMap::new();
+        while Instant::now() < deadline {
+            let any = variant.poll_receive().expect("poll_receive");
+            match any {
+                Some(u) => {
+                    if u.writer != "t95d-sender" {
+                        continue;
+                    }
+                    *per_qos.entry(u.qos.as_int()).or_insert(0) += 1;
+                    let total: u64 = per_qos.values().copied().sum();
+                    if total >= total_expected {
+                        break;
+                    }
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        }
+
+        // Tear down before asserting.
+        aux_rt.block_on(async move {
+            let _ = aux_session.close().await;
+        });
+        aux_rt.shutdown_timeout(std::time::Duration::from_secs(2));
+        variant.disconnect().expect("disconnect");
+
+        // QoS 3 / QoS 4 are reliable: every sample must land. QoS 1 /
+        // QoS 2 are best-effort: tolerate up to 25% drop on localhost
+        // (Zenoh's CC=Drop applies).
+        let reliable_floor = SAMPLES_PER_QOS;
+        let best_effort_floor = SAMPLES_PER_QOS * 75 / 100;
+        for qos in [Qos::ReliableUdp, Qos::ReliableTcp] {
+            let got = per_qos.get(&qos.as_int()).copied().unwrap_or(0);
             assert!(
-                wildcard_expr.intersects(&key_expr),
-                "ack wildcard {wildcard:?} must match key {key:?}"
+                got >= reliable_floor,
+                "QoS {:?}: received {}/{} (post-wrapper-removal regression?)",
+                qos,
+                got,
+                SAMPLES_PER_QOS,
             );
         }
-    }
-
-    #[test]
-    fn test_parse_ack_key_rejects_bad_shapes() {
-        // Wrong prefix, missing segments, empty segments, and the
-        // `bench/__eot__/...` family must all yield None so the
-        // ack subscriber can drop them without panicking. (The
-        // dedicated EOT subscriber owns those keys.)
-        assert_eq!(parse_ack_key("bench/0"), None);
-        assert_eq!(parse_ack_key(""), None);
-        assert_eq!(parse_ack_key(ACK_KEY_PREFIX), None);
-        assert_eq!(parse_ack_key("bench/__ack__/alice"), None);
-        assert_eq!(parse_ack_key("bench/__ack__//bob"), None);
-        assert_eq!(parse_ack_key("bench/__ack__/alice/"), None);
-        // Extra path components (writer segment containing '/') are
-        // not part of the contract; reject so a future schema
-        // change doesn't silently produce wrong (peer, writer) pairs.
-        assert_eq!(parse_ack_key("bench/__ack__/alice/bob/extra"), None);
-        assert_eq!(parse_ack_key("bench/__eot__/alice"), None);
-    }
-
-    #[test]
-    fn test_ack_payload_encode_decode_roundtrip() {
-        // 8-byte big-endian per the contract (same encoding as the
-        // EOT payload — the two side-channels share a payload
-        // codec so a future audit only needs to verify one shape).
-        for v in [0u64, 1, 42, u64::MAX, 0x1234_5678_9abc_def0_u64] {
-            let bytes = encode_ack_payload(v);
-            assert_eq!(bytes.len(), 8);
-            assert_eq!(bytes[0], (v >> 56) as u8);
-            assert_eq!(bytes[7], v as u8);
-            assert_eq!(decode_ack_payload(&bytes), Some(v));
-        }
-    }
-
-    #[test]
-    fn test_ack_payload_decode_rejects_wrong_length() {
-        assert_eq!(decode_ack_payload(&[]), None);
-        assert_eq!(decode_ack_payload(&[1, 2, 3]), None);
-        assert_eq!(decode_ack_payload(&[0; 7]), None);
-        assert_eq!(decode_ack_payload(&[0; 9]), None);
-        assert_eq!(decode_ack_payload(&[0; 16]), None);
-    }
-
-    #[test]
-    fn test_writer_dedup_accepts_novel_seqs() {
-        // T16.10d: first sight of a seq is novel -> observe returns
-        // false (not a dup) and the state advances.
-        let mut d = WriterDedup::new();
-        assert!(!d.observe(1));
-        assert!(!d.observe(2));
-        assert!(!d.observe(3));
-        // max_seq tracks the highest observed.
-        assert_eq!(d.max_seq, 3);
-        // Out-of-order but still novel within the window is accepted.
-        assert!(!d.observe(7));
-        assert!(!d.observe(5)); // late arrival, within window
-        assert_eq!(d.max_seq, 7);
-    }
-
-    #[test]
-    fn test_writer_dedup_drops_exact_duplicates() {
-        // T16.10d: re-observing the same seq within the window returns
-        // true (dedup it).
-        let mut d = WriterDedup::new();
-        assert!(!d.observe(42));
-        assert!(d.observe(42), "second sighting must be dedup");
-        assert!(!d.observe(43));
-        assert!(d.observe(43), "second sighting must be dedup");
-        // Out-of-order duplicate also dedup'd.
-        assert!(!d.observe(40));
-        assert!(d.observe(40));
-    }
-
-    #[test]
-    fn test_writer_dedup_drops_too_old_seqs() {
-        // T16.10d: a seq more than DEDUP_WINDOW below max is treated as
-        // duplicate (the dedup set has been pruned past it; we cannot
-        // tell novel from old, so the safe behaviour is "drop"). The
-        // analyser-side cost is at most a tiny delivery-rate dip if a
-        // very late retransmit lands; the win is deterministic dedup
-        // against the multicast-race duplicates.
-        let mut d = WriterDedup::new();
-        let big = DEDUP_WINDOW * 2;
-        // Advance max past 2 * DEDUP_WINDOW.
-        assert!(!d.observe(big));
-        // A seq more than DEDUP_WINDOW below max is dropped.
-        let stale = big - DEDUP_WINDOW - 1;
-        assert!(d.observe(stale));
-        // A seq exactly DEDUP_WINDOW below max is still accepted
-        // (boundary inclusive: max - DEDUP_WINDOW is fresh).
-        let edge = big - DEDUP_WINDOW;
-        assert!(!d.observe(edge));
-    }
-
-    #[test]
-    fn test_writer_dedup_set_is_bounded() {
-        // T16.10d: as max_seq advances, the seen-set is pruned to stay
-        // within DEDUP_WINDOW entries. Pumping a strictly-ascending
-        // stream of seqs must NOT grow the set unboundedly.
-        let mut d = WriterDedup::new();
-        for s in 0..(DEDUP_WINDOW * 4) {
-            assert!(!d.observe(s));
-        }
-        assert!(
-            d.seen.len() as u64 <= DEDUP_WINDOW + 1,
-            "seen set grew past DEDUP_WINDOW: {} > {}",
-            d.seen.len(),
-            DEDUP_WINDOW,
-        );
-    }
-
-    #[test]
-    fn test_window_gate_no_peers_never_blocks() {
-        // T17.8: with no peer acks observed, the window gate is a
-        // no-op. This is the solo / loopback / pre-first-ack
-        // warm-up case. The gate must NOT block here -- if it did,
-        // solo runs would deadlock at the first publish.
-        let gate = WindowGate::new();
-        // Far above QOS_STRICT_WINDOW; would block immediately if
-        // any peer were known with watermark 0.
-        for seq in [0u64, 1, 1_000, QOS_STRICT_WINDOW, QOS_STRICT_WINDOW * 100] {
-            gate.wait_for_window(seq).expect("no peers -> no block");
-        }
-    }
-
-    #[test]
-    fn test_window_gate_within_window_passes() {
-        // T17.8: once a peer has acked, the gate allows
-        // `next_seq <= ack + WINDOW`. Exercise the boundary
-        // exactly (== ack + WINDOW must pass; > ack + WINDOW
-        // must block, which we test separately).
-        let gate = WindowGate::new();
-        gate.apply_ack("alice", 100);
-        // 100 (the ack) up to 100 + WINDOW (inclusive) must pass.
-        gate.wait_for_window(100).expect("at-ack must pass");
-        gate.wait_for_window(100 + QOS_STRICT_WINDOW)
-            .expect("ack + WINDOW boundary must pass");
-        // A lower seq always passes (the writer can publish any
-        // already-acked-or-earlier seq trivially).
-        gate.wait_for_window(50).expect("below ack must pass");
-    }
-
-    #[test]
-    fn test_window_gate_blocks_until_ack_arrives() {
-        // T17.8: when the writer outruns the peer by more than
-        // WINDOW, the gate parks. An ack arriving on another
-        // thread must wake the gate. This test asserts the
-        // wait-then-wake handshake without relying on tokio.
-        let gate = Arc::new(WindowGate::new());
-        gate.apply_ack("alice", 0);
-        // next_seq = WINDOW + 1 puts us 1 over the budget.
-        let target_seq = QOS_STRICT_WINDOW + 1;
-
-        let gate_for_waiter = Arc::clone(&gate);
-        let waiter = std::thread::spawn(move || {
-            gate_for_waiter
-                .wait_for_window(target_seq)
-                .expect("wait_for_window should succeed once ack arrives")
-        });
-        // Give the waiter a moment to park in the condvar. If we
-        // ack instantly the waiter might not yet have grabbed the
-        // mutex; the gate would still wake on the next condvar
-        // check, but the test would be timing-fragile. A short
-        // sleep keeps the order deterministic.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        // Advance the peer's watermark by 1 -- now next_seq is
-        // exactly at the boundary `ack + WINDOW` (1 + WINDOW), so
-        // the gate releases.
-        gate.apply_ack("alice", 1);
-        // The waiter must complete within a wallclock budget
-        // proportional to the condvar wake-interval (100 ms). 2 s
-        // is generous on CI without permitting an actual deadlock
-        // to pass silently.
-        let start = std::time::Instant::now();
-        loop {
-            if waiter.is_finished() {
-                break;
-            }
-            if start.elapsed() > std::time::Duration::from_secs(2) {
-                panic!("window gate did not release within 2 s after ack");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        waiter.join().expect("waiter thread joined");
-    }
-
-    #[test]
-    fn test_window_gate_shutdown_unblocks_waiters() {
-        // T17.8: a parked waiter must exit cleanly on disconnect.
-        // The variant calls `gate.shutdown()` from `disconnect()`;
-        // any thread parked in `wait_for_window` must observe the
-        // shutdown flag and return Err rather than hang forever.
-        let gate = Arc::new(WindowGate::new());
-        gate.apply_ack("alice", 0);
-        let target_seq = QOS_STRICT_WINDOW + 1;
-        let gate_for_waiter = Arc::clone(&gate);
-        let waiter = std::thread::spawn(move || gate_for_waiter.wait_for_window(target_seq));
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        gate.shutdown();
-        let start = std::time::Instant::now();
-        loop {
-            if waiter.is_finished() {
-                break;
-            }
-            if start.elapsed() > std::time::Duration::from_secs(2) {
-                panic!("window gate did not abort on shutdown within 2 s");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let result = waiter.join().expect("waiter thread joined");
-        assert!(
-            result.is_err(),
-            "shutdown path must propagate Err from wait_for_window"
-        );
-    }
-
-    #[test]
-    fn test_window_gate_ack_does_not_regress() {
-        // T17.8: a stale ack (lower than current watermark) must
-        // not roll back the peer's progress. Zenoh delivers Drop
-        // samples in arrival order, but a slow-to-route stale ack
-        // could in principle still surface; if it did and we
-        // honoured it, the gate would slam shut and the publisher
-        // would stall.
-        let gate = WindowGate::new();
-        gate.apply_ack("alice", 1000);
-        gate.apply_ack("alice", 500); // stale; should be ignored
-                                      // 1000 + WINDOW must still pass.
-        gate.wait_for_window(1000 + QOS_STRICT_WINDOW)
-            .expect("stale ack must not regress the watermark");
-    }
-
-    #[test]
-    fn test_window_gate_min_across_peers() {
-        // T17.8: the gate uses the *slowest* peer's watermark.
-        // Otherwise a fast peer could let the writer outrun a
-        // slow peer, which is exactly what the protocol must
-        // prevent.
-        let gate = WindowGate::new();
-        gate.apply_ack("alice", 10_000);
-        gate.apply_ack("bob", 100);
-        // Bob is the binding constraint: window allows up to
-        // 100 + WINDOW; 10_000 + WINDOW would be wrong.
-        gate.wait_for_window(100 + QOS_STRICT_WINDOW)
-            .expect("at bob's boundary must pass");
-        // Construct a parked waiter at 100 + WINDOW + 1; it must
-        // remain blocked while only alice advances.
-        let gate_arc = Arc::new(gate);
-        let waiter_gate = Arc::clone(&gate_arc);
-        let target_seq = 100 + QOS_STRICT_WINDOW + 1;
-        let waiter = std::thread::spawn(move || waiter_gate.wait_for_window(target_seq));
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        // Alice racing ahead must NOT release bob's gate.
-        gate_arc.apply_ack("alice", 1_000_000);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        assert!(
-            !waiter.is_finished(),
-            "min-across-peers gate must not release on a fast peer's progress alone"
-        );
-        // Bob catching up must release the gate.
-        gate_arc.apply_ack("bob", 101);
-        let start = std::time::Instant::now();
-        loop {
-            if waiter.is_finished() {
-                break;
-            }
-            if start.elapsed() > std::time::Duration::from_secs(2) {
-                panic!("gate did not release within 2 s after slow peer advanced");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        waiter
-            .join()
-            .expect("waiter thread joined")
-            .expect("wait_for_window succeeds on bob advance");
-    }
-
-    /// T17.8 contract: at QoS 3/4 `publish` must NEVER return
-    /// `Ok(false)` (it returns `Ok(())`, but the failure mode the
-    /// contract forbids is "skip without delivery"). With no peers
-    /// known, the gate is a no-op so the write reaches the bridge
-    /// channel.
-    #[test]
-    fn test_publish_qos3_no_peers_known_does_not_block() {
-        let mut variant = ZenohVariant::new("solo", &[]).expect("construct variant");
-        let (tx, mut rx) = mpsc::channel::<OutboundMessage>(PUBLISH_CHANNEL_CAPACITY);
-        variant.send_tx = Some(tx);
-        variant.window_gate = Some(Arc::new(WindowGate::new()));
-
-        for seq in 0..16u64 {
-            variant
-                .publish("/bench/0", &[0u8; 8], Qos::ReliableUdp, seq)
-                .expect("publish should succeed");
-        }
-        // Confirm 16 messages landed in the bridge.
-        for _ in 0..16 {
-            let msg = rx.try_recv().expect("message should be enqueued");
-            match msg {
-                OutboundMessage::Data { qos, .. } => {
-                    assert_eq!(qos, Qos::ReliableUdp);
-                }
-                OutboundMessage::Eot { .. } => panic!("unexpected EOT message"),
-            }
+        for qos in [Qos::BestEffort, Qos::LatestValue] {
+            let got = per_qos.get(&qos.as_int()).copied().unwrap_or(0);
+            assert!(
+                got >= best_effort_floor,
+                "QoS {:?}: received {}/{} (below 75% best-effort floor)",
+                qos,
+                got,
+                SAMPLES_PER_QOS,
+            );
         }
     }
 }
