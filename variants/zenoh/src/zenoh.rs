@@ -874,7 +874,19 @@ impl ZenohArgs {
                     // that Zenoh does not need. Treat any unknown `--<name>` as
                     // a `--name value` pair and skip both tokens; otherwise
                     // skip just the token.
-                    if other.starts_with("--") {
+                    //
+                    // T9.5b: bare `--` is the standard end-of-options sentinel
+                    // emitted by the runner between its injected common-args
+                    // and the variant's trailing-arg group. It MUST be treated
+                    // as a single token: do not advance `i` an extra step, or
+                    // we will eat the first token of the trailing group as a
+                    // phantom value (this is what previously hid the
+                    // `--multicast-interface` override from the dedicated
+                    // branch).
+                    if other == "--" {
+                        // single-token sentinel; fall through to the
+                        // outer `i += 1` only.
+                    } else if other.starts_with("--") {
                         i += 1;
                     }
                 }
@@ -3062,6 +3074,87 @@ mod tests {
             Some(std::net::Ipv4Addr::new(192, 168, 1, 68))
         );
         assert_eq!(args.mode, "peer");
+    }
+
+    // -----------------------------------------------------------------
+    // T9.5b: bare `--` end-of-options sentinel must be skipped as a
+    // single token. Previously the lenient `--<name> value` skip ate
+    // its successor (because `"--".starts_with("--")` is true), which
+    // silently dropped the `--multicast-interface` override when the
+    // runner emitted the standard `... -- --multicast-interface IP`
+    // arg shape.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_skips_bare_dashdash_without_eating_successor() {
+        // Exact shape the runner emits: injected common-args, then `--`,
+        // then the variant's trailing-arg group containing the
+        // multicast-interface override.
+        let extra = vec![
+            "--peers".to_string(),
+            "a=1,b=2".to_string(),
+            "--".to_string(),
+            "--multicast-interface".to_string(),
+            "192.168.1.68".to_string(),
+        ];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert_eq!(
+            args.multicast_interface,
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 68)),
+            "the bare -- sentinel must NOT consume --multicast-interface as a phantom value"
+        );
+    }
+
+    #[test]
+    fn parse_recognises_multicast_interface_when_preceded_by_dashdash() {
+        // Minimal form: just `-- --multicast-interface VALUE`.
+        let extra = vec![
+            "--".to_string(),
+            "--multicast-interface".to_string(),
+            "127.0.0.1".to_string(),
+        ];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert_eq!(
+            args.multicast_interface,
+            Some(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn parse_unknown_flag_still_consumes_value_after_dashdash_fix() {
+        // Regression: the `--<name> value` lenient skip semantics must
+        // be preserved for ANY non-sentinel unknown flag. So
+        // `--some-unknown` must still eat `"ignored"`, leaving
+        // `--multicast-interface 127.0.0.1` correctly visible to the
+        // dedicated branch.
+        let extra = vec![
+            "--peers".to_string(),
+            "a=1".to_string(),
+            "--".to_string(),
+            "--some-unknown".to_string(),
+            "ignored".to_string(),
+            "--multicast-interface".to_string(),
+            "127.0.0.1".to_string(),
+        ];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert_eq!(
+            args.multicast_interface,
+            Some(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            "unknown --some-unknown must still eat its value while leaving --multicast-interface intact"
+        );
+    }
+
+    #[test]
+    fn parse_dashdash_as_sole_token_does_not_panic() {
+        // Edge case: `extra = ["--"]` alone. Must not panic / index
+        // out-of-bounds. All parsed-to-Option fields default to None.
+        let extra = vec!["--".to_string()];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert_eq!(args.mode, "peer");
+        assert!(args.listen.is_none());
+        assert!(args.multicast_interface.is_none());
+        assert!(args.sidecar_base_port.is_none());
+        assert!(!args.debug_trace);
     }
 
     #[test]
