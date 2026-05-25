@@ -18923,3 +18923,225 @@ No worker-side blockers; T16.10c is parked pending the user's
 cross-WiFi re-run of the T16.10d binary.
 
 
+
+
+## T9.5 completion report — 2026-05-25 (worker: runner + variants/zenoh)
+
+### Summary
+
+Both repos updated for the new `--variant-arg <variant>.<key>=<value>`
+runner CLI passthrough and its first consumer — the Zenoh variant's
+`--multicast-interface <ipv4>` pin. Localhost two-runner smoke passes
+end-to-end with the new wiring; per-spawn provenance log line and
+runner-side override summary both correct.
+
+### Merge precedence rule chosen
+
+- Match key is the post-template-resolution `[[variant]].name`
+  (pre-array-expansion). Array-expansion suffixes (`-qos3`,
+  `-1000x100hz`, `-multi`) are NOT part of the match, so a single
+  `--variant-arg` flows into every spawn derived from one source
+  entry.
+- CLI value wins over TOML on key conflict; CLI-only keys are
+  appended; the merged specific table is emitted in **lexicographic
+  key order** for log diffability.
+- Empty value (`zenoh.flag=`) is **accepted** and stored as the
+  empty string — documented in the parser's doc-comment. Variants
+  that require a non-empty value reject at parse time.
+
+### Files changed
+
+| File | LOC |
+|---|---|
+| `runner/src/main.rs` | +77 |
+| `runner/src/cli_args.rs` | +518/-8 |
+| `variants/zenoh/src/zenoh.rs` | +189 |
+| `metak-shared/api-contracts/variant-cli.md` | +93 (append only) |
+| `runner/CUSTOM.md` | +41 (append only) |
+| `variants/zenoh/CUSTOM.md` | +73 (append only) |
+
+### Test results
+
+- `cargo build --release --workspace`: clean.
+- `cargo test --release -p runner`: 273 passed, 1 ignored. One flaky
+  parallel-mode failure in
+  `barrier_coord::tests::two_runner_barrier_exchange_round_trips`
+  reproduces on baseline HEAD (pre-T9.5) too; passes cleanly when
+  run in isolation (verified). Not a T9.5 regression.
+- `cargo test --release -p variant-zenoh`: 75 passed, 3 ignored
+  (sidecar smoke + two_runner_regression tests not run in default
+  mode); loopback test passes.
+- `cargo test --release -p variant-zenoh -- --ignored
+  multi_zenoh_qos3_qos4_preserves_per_key_order`: flaky locally
+  (3 fails / 2 passes across 5 runs). Reproduces on baseline HEAD
+  too, so not a T9.5 regression — environmental Zenoh-scouting
+  timing on the test host. The unit-test logic and the serialised
+  publisher_task inline-await path are unchanged by T9.5.
+- `cargo clippy --release --workspace --all-targets -- -D warnings`:
+  clean.
+- `cargo fmt -p runner -- --check`: clean.
+- `cargo fmt -p variant-zenoh -- --check`: clean for files I touched
+  (`variants/zenoh/src/zenoh.rs`); pre-existing fmt drift on
+  `variants/zenoh/tests/two_runner_regression.rs` was reverted to
+  HEAD because that file was outside the T9.5 scope and the drift
+  pre-dates this task.
+
+### Localhost two-runner smoke output
+
+Fixture:
+`variants/zenoh/tests/fixtures/two-runner-zenoh-1000x10hz-qos3-repro.toml`
+(T16.10's reproducer, smaller of the two T16.10d-era post-fix
+fixtures). Both runners launched with
+`--variant-arg zenoh-1000x10hz-qos3-repro.multicast_interface=127.0.0.1`.
+
+Alice (excerpt):
+
+```
+[runner:alice] --variant-arg overrides for 'zenoh-1000x10hz-qos3-repro': multicast_interface=127.0.0.1
+[runner:alice] spawn 'zenoh-1000x10hz-qos3-repro' specific args: multicast_interface=127.0.0.1 (cli), zenoh_mode=peer (toml)
+[runner:alice] spawning 'zenoh-1000x10hz-qos3-repro' (hz=10, vpt=1000, qos=3, timeout: 60s)
+[runner:alice] 'zenoh-1000x10hz-qos3-repro' final progress: phase=done sent=15000 received=1397 eot_sent=true eot_received=true
+[runner:alice] 'zenoh-1000x10hz-qos3-repro' finished: status=success, exit_code=0
+```
+
+Bob (excerpt):
+
+```
+[runner:bob] --variant-arg overrides for 'zenoh-1000x10hz-qos3-repro': multicast_interface=127.0.0.1
+[runner:bob] spawn 'zenoh-1000x10hz-qos3-repro' specific args: multicast_interface=127.0.0.1 (cli), zenoh_mode=peer (toml)
+[runner:bob] 'zenoh-1000x10hz-qos3-repro' final progress: phase=done sent=2000 received=5794 eot_sent=true eot_received=true
+[runner:bob] 'zenoh-1000x10hz-qos3-repro' finished: status=success, exit_code=0
+```
+
+The variant-side `[zenoh] multicast interface: 127.0.0.1 (pinned via
+--multicast-interface)` line is emitted on every connect — verified
+with a direct `variant-zenoh.exe` invocation:
+
+```
+[zenoh] build: 10d4a75+dirty (rustc 1.94.1)
+[zenoh] multicast interface: 127.0.0.1 (pinned via --multicast-interface)
+{"eot_received":false,"eot_sent":false,"event":"progress","phase":"connect",...}
+```
+
+(Note: when the variant is spawned BY the runner, the variant-side
+intermediate eprintln lands in the variant's stderr — but the
+runner's per-spawn stderr capture file sometimes shows only the
+build banner + final digest line, missing intermediate eprintlns.
+This pre-dates T9.5 and reproduces with ANY non-banner / non-digest
+eprintln in the variant. The line is verifiably emitted; only the
+runner-side capture file path drops intermediates. Filed as an
+existing capture-fidelity quirk, not a T9.5 issue. See follow-up
+concerns below.)
+
+### Cross-WiFi acceptance gate — PowerShell incantations for the user
+
+Two scenarios. Paste either block as-is on the appropriate machine.
+The `zenoh.` prefix is the source variant name. If your config uses
+fixture-style entries with longer names (e.g.
+`zenoh-1000x100hz-qos3-repro`), substitute that exact name as the
+`--variant-arg` prefix.
+
+#### A. Sanity re-validation on wired Ethernet (expected: pass)
+
+Re-runs the known-good wired baseline through the new code path to
+confirm `--multicast-interface` does not regress the Ethernet case.
+
+On alice (Ethernet 192.168.1.68):
+
+```powershell
+.\target\release\runner.exe `
+  --name alice `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg zenoh.multicast_interface=192.168.1.68
+```
+
+On bob (Ethernet 192.168.1.102):
+
+```powershell
+.\target\release\runner.exe `
+  --name bob `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg zenoh.multicast_interface=192.168.1.102
+```
+
+#### B. The real cross-WiFi gate (expected: fixes the T16.10b deadlock)
+
+User-owned acceptance from the T9.5 task spec. Both machines on
+WiFi (Ethernet detached or simply selecting WiFi addresses).
+
+On alice (WiFi 192.168.1.80):
+
+```powershell
+.\target\release\runner.exe `
+  --name alice `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg zenoh.multicast_interface=192.168.1.80
+```
+
+On bob (WiFi 192.168.1.77):
+
+```powershell
+.\target\release\runner.exe `
+  --name bob `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg zenoh.multicast_interface=192.168.1.77
+```
+
+Acceptance per the T9.5 task spec: with the per-machine pin in
+place, the previously-failing
+`zenoh-1000x100hz-mixed-qos3-multi` and `-qos4-multi` spawns from
+the cross-WiFi matrix should reach `phase=done` instead of timing
+out at the watchdog. Each runner's stderr should show:
+
+```
+[runner:<name>] spawn '...' specific args: multicast_interface=<this-machine-WiFi-IP> (cli), zenoh_mode=peer (toml)
+```
+
+If the cross-WiFi matrix passes with B and falls back into watchdog
+without the `--variant-arg` flag, that closes T16.10c with "fixed
+by T9.5" (no router-sidecar required).
+
+### Deviations from the task spec
+
+1. **Single combined feat-commit per crate** rather than separate
+   `feat:` + `test:` commits. The tests live inside the existing
+   `mod tests` block of the same source file as the feature
+   (`runner/src/cli_args.rs` and `variants/zenoh/src/zenoh.rs`), and
+   the harness does not permit interactive `git add -p` to split
+   intra-file hunks. Reverting a "tests-only" commit is therefore
+   not meaningfully easier than reverting the combined commit. Other
+   commits in the suggested 8-commit split landed as filed (3 docs
+   commits + this STATUS append). Net commit count: 6 instead of 8.
+2. **Provenance log line wording**: the spec's example was
+   `'X' specific args: a=1 (toml), b=2 (cli-override), c=3 (cli-only)`.
+   The implemented wording uses just `(toml)` and `(cli)` —
+   collapsing "cli-override" and "cli-only" into one tag — because
+   the override-vs-only distinction is implicit in `(toml)`
+   absence/presence on the same key across runs and a single tag
+   keeps the line shorter. The semantically critical thing — which
+   value the variant actually saw — is unambiguous on every line.
+
+### New follow-up concerns
+
+1. **Stderr capture fidelity in the runner spawn path**: the
+   intermediate eprintlns from the variant (specifically the new
+   `[zenoh] multicast interface: ...` line on connect) do not reach
+   the per-spawn `<name>-stderr.txt` capture file under the runner,
+   even though the build banner + digest lines do. The variant
+   process verifiably emits the line (direct invocation shows it).
+   This pre-dates T9.5 and would affect ANY mid-lifecycle eprintln,
+   but it's now annoying because the operator can't confirm the
+   multicast pin took by grep-ing the capture file. Worth filing if
+   nobody's noticed already.
+2. **`barrier_coord::tests::two_runner_barrier_exchange_round_trips`
+   flakiness** in parallel-mode `cargo test --release -p runner`.
+   Passes in isolation, fails ~20-50 % of the time in parallel mode.
+   Reproduces on baseline HEAD too. Probably TCP port contention
+   between parallel test instances on the same machine. Out of T9.5
+   scope; flagged for the next pass at test-isolation hygiene.
+3. **`multi_zenoh_qos3_qos4_preserves_per_key_order` ignored test
+   flakiness** on the developer host: 0/200 samples received in
+   ~50 % of runs even on baseline HEAD. The test depends on Zenoh
+   loopback scouting completing in < 500 ms and the aux subscriber
+   declaring before the publish burst — both timing-sensitive on a
+   contended Windows host. Out of T9.5 scope.
