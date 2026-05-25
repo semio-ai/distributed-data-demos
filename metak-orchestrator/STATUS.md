@@ -19476,3 +19476,92 @@ tried to send, not what the subprocess parsed. For variant CLI
 plumbing changes, the actual gate is the captured variant stderr OR
 a `--debug-trace`-style echo of parsed values. I will own this as
 orchestrator and tighten future T9.x worker briefs accordingly.
+
+## 2026-05-25 — T9.5b: completion report
+
+**Status**: done. Fix landed, regression tests green, localhost
+end-to-end smoke shows the multicast pin took on the captured
+variant stderr for every spawn (the gate T9.5a left open).
+
+### Files touched
+
+- `variants/zenoh/src/zenoh.rs` — one-line lenient-branch fix +
+  four new regression tests in `mod tests` pinning the `--`
+  sentinel semantics.
+
+(No `CUSTOM.md` edit — the `--` semantics are sufficiently captured
+by the test names and inline comment; not worth a separate doc note.)
+
+### Commits
+
+- `c4030a0` `fix(variant-zenoh): skip bare -- sentinel in lenient
+  arg parser` — fix + four tests.
+
+### Unit-test delta
+
+`cargo test --release -p variant-zenoh`: **79 passed** (75 baseline
++ 4 new), 3 ignored (stress / sidecar / two-runner regression — the
+same set as before), 0 failed.
+
+The four new tests:
+
+- `parse_skips_bare_dashdash_without_eating_successor` — exact
+  runner emission shape `[--peers, a=1,b=2, --, --multicast-interface,
+  192.168.1.68]`; asserts `multicast_interface = Some(192.168.1.68)`.
+- `parse_recognises_multicast_interface_when_preceded_by_dashdash`
+  — minimal `[--, --multicast-interface, 127.0.0.1]` form.
+- `parse_unknown_flag_still_consumes_value_after_dashdash_fix` —
+  regression: lenient `--name value` skip semantics preserved for
+  non-sentinel unknowns; `--some-unknown` still eats `"ignored"`
+  while `--multicast-interface 127.0.0.1` is correctly seen.
+- `parse_dashdash_as_sole_token_does_not_panic` — edge case
+  `extra = ["--"]`; defaults all parsed-to-Option fields, no
+  index-out-of-bounds.
+
+`cargo clippy --release --workspace --all-targets -- -D warnings` —
+clean.
+
+### Smoke procedure used
+
+Two-runner localhost smoke per the task spec (preferred path, not
+the fallback).
+
+- Scratch config `configs/_t9_5b_smoke.toml` was a trimmed copy of
+  `configs/two-runner-zenoh-all.toml`: full `zenoh-base`
+  `variant_template`, one `[[variant]]` (`zenoh-10x100hz-scalar`),
+  `stabilize_secs=1 operate_secs=2 silent_secs=1`,
+  `default_timeout_secs=60`, `runners=["alice","bob"]`.
+- Built with `cargo build --release -p variant-zenoh -p runner`.
+- Launched alice and bob in parallel from this orchestrator's
+  shell (background processes via the worker harness):
+  - `./target/release/runner.exe --name alice --config configs/_t9_5b_smoke.toml --variant-arg 'zenoh-*.multicast_interface=127.0.0.1'`
+  - `./target/release/runner.exe --name bob   --config configs/_t9_5b_smoke.toml --variant-arg 'zenoh-*.multicast_interface=127.0.0.1'`
+- Both runners ran to completion (4 spawns each: qos1-multi,
+  qos2-multi, qos3-multi, qos4-multi). All 8 spawn instances
+  reported `status=success, exit_code=0`.
+- Scratch config deleted post-smoke; `git status` clean under
+  `configs/` before commit.
+
+### The actual gate — captured variant stderr
+
+`logs/t9_5b_smoke-20260525_125007/<spawn>-<runner>-stderr.txt`,
+line 2, for all 8 spawn instances (qos1..qos4 × alice/bob):
+
+```
+[zenoh] multicast interface: 127.0.0.1 (pinned via --multicast-interface)
+```
+
+NOT `auto`. The dedicated `--multicast-interface` branch is now
+reached. This is the gate that T9.5 / T9.5a had left open and that
+T9.5b was filed to close.
+
+### Deviations from the task spec
+
+- The task spec suggested `zenoh-10x10hz-scalar` (or similar) for
+  the trimmed config; the closest existing low-rate variant in
+  `configs/two-runner-zenoh-all.toml` is `zenoh-10x100hz-scalar`,
+  so I used that. Functionally equivalent for this gate (the
+  multicast-interface init line is independent of tick rate).
+- No `CUSTOM.md` note (the task marked this optional). The
+  inline comment in `zenoh.rs::ZenohArgs::parse` plus the test
+  names sufficiently document the `--` sentinel contract.
