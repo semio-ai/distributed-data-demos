@@ -240,3 +240,96 @@ phase event) when:
 
 Existing profiles (`scalar-flood`, `max-throughput`) ignore all new
 args.
+
+---
+
+## T9.5 additions: runner CLI passthrough — `--variant-arg`
+
+Approved 2026-05-25 (filed by the orchestrator after the user's
+cross-WiFi-deadlock investigation pinned Zenoh's `scouting.multicast.interface
+= "auto"` picking inconsistent NICs across peers on multi-NIC Windows
+hosts). The runner gains a per-variant CLI passthrough so per-machine
+specific values can be supplied at the command line without splitting
+the shared TOML config.
+
+### Syntax
+
+```
+runner.exe --name <runner> --config <toml> \
+  --variant-arg <variant>.<key>=<value>  [--variant-arg ...]
+```
+
+The flag is **repeatable**. Each entry is split on:
+- the **first** `.` (between the variant name and the key), and
+- the **first** `=` (between the key and the value).
+
+Keys and values are forwarded verbatim through the `snake_case →
+--kebab-case` conversion the runner already applies to
+`[variants.<variant>.specific]` TOML keys. Examples:
+
+```
+--variant-arg zenoh.multicast_interface=192.168.1.68
+--variant-arg quic.cert_path=/etc/quic.pem
+--variant-arg hybrid.tcp_sndbuf=8388608
+```
+
+The variant name **must match** the `[[variant]].name` (post-
+`[[variant_template]]` resolution, pre-array-expansion). Expansion
+suffixes (`-qos3`, `-1000x100hz`, `-multi`, …) are **not** part of the
+match key — the override applies to every spawn derived from the
+named source entry.
+
+### Empty value
+
+`<variant>.<key>=` (empty value) is **accepted**: the override is
+stored as the empty string. Some flags are flag-only (boolean
+presence semantics); variants that require a non-empty value should
+reject the empty value themselves at parse time.
+
+### Precedence vs. TOML `[variants.<variant>.specific]`
+
+For the matching variant the runner merges:
+
+| TOML has key | CLI has key | Effective value |
+|---|---|---|
+| yes | no | TOML value (no change) |
+| no | yes | CLI value (key appended) |
+| yes | yes | **CLI value wins** |
+
+CLI-only keys are appended to the existing specific block. The merged
+table is emitted in **lexicographic key order** for log diffability.
+
+### Flow on the wire
+
+Merged keys are emitted as trailing `--`-separated args to the variant
+exactly as if they had been TOML `[variants.<variant>.specific]`
+entries. The variant sees a unified specific block; it cannot
+distinguish a TOML-sourced value from a CLI-sourced one. Variants
+own validation of their own arg values — the runner forwards blindly.
+
+### Per-spawn provenance log line
+
+The runner emits one stderr line per spawn naming the effective
+specific args and where each value came from (`toml` or `cli`):
+
+```
+[runner:alice] spawn 'zenoh-1000x10hz-qos3-repro' specific args: \
+  multicast_interface=192.168.1.68 (cli), zenoh_mode=peer (toml)
+```
+
+Suppressed entirely when there are no specific args at all (no
+`[variants.<variant>.specific]` table and no `--variant-arg` overrides
+for the variant).
+
+### First consumer: Zenoh `--multicast-interface <ipv4>`
+
+Filed alongside T9.5. The Zenoh variant adds `--multicast-interface`
+to its `extra` args. When set the variant pins
+`scouting/multicast/interface` to the supplied IPv4 address (avoiding
+Zenoh's default `"auto"` which can pick different NICs across peers
+on multi-NIC Windows hosts). One-line operator invocation example:
+
+```
+runner.exe --name alice --config configs/two-runner-zenoh-all.toml \
+  --variant-arg zenoh.multicast_interface=192.168.1.68
+```
