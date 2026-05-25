@@ -773,6 +773,7 @@ const PUBLISH_INFLIGHT_LIMIT: usize = 4096;
 const CONNECT_PROPAGATION_SETTLE_MS: u64 = 500;
 
 /// Zenoh-specific CLI arguments parsed from the `extra` pass-through args.
+#[derive(Debug)]
 pub struct ZenohArgs {
     pub mode: String,
     pub listen: Option<String>,
@@ -791,15 +792,27 @@ pub struct ZenohArgs {
     /// "spawn variant-zenoh --threading-mode single" path works
     /// without per-spawn TOML wiring.
     pub sidecar_base_port: Option<u16>,
+    /// T9.5: pin Zenoh's multicast scouting to a specific local NIC by
+    /// its IPv4 address (the value flows into
+    /// `scouting/multicast/interface`). When `None`, Zenoh's default
+    /// `"auto"` selection runs — which is the failure mode the user
+    /// hit on multi-NIC Windows hosts (Ethernet + WiFi on the same
+    /// 192.168.1.0/24 subnet), where peers can pick inconsistent NICs
+    /// and HELLO/scouting traffic never crosses. Pinning the IPv4 of
+    /// the NIC the operator wants Zenoh to scout on makes peers agree.
+    pub multicast_interface: Option<std::net::Ipv4Addr>,
 }
 
 impl ZenohArgs {
     /// Parse Zenoh-specific arguments from the extra CLI args.
     pub fn parse(extra: &[String]) -> Result<Self> {
+        use std::str::FromStr;
+
         let mut mode = String::from("peer");
         let mut listen = None;
         let mut debug_trace = false;
         let mut sidecar_base_port: Option<u16> = None;
+        let mut multicast_interface: Option<std::net::Ipv4Addr> = None;
 
         let mut i = 0;
         while i < extra.len() {
@@ -830,6 +843,28 @@ impl ZenohArgs {
                     })?;
                     sidecar_base_port = Some(port);
                 }
+                "--multicast-interface" => {
+                    // T9.5: pin Zenoh's multicast scouting to a specific
+                    // local IPv4 interface. Forwarded into
+                    // `scouting/multicast/interface` by build_zenoh_config.
+                    // IPv4-only by design (Zenoh's "auto" picks an IPv4 NIC
+                    // in practice and the operator-side incantation hands
+                    // the local IPv4 address); CIDR / IPv6 / hostnames are
+                    // rejected with a clear error so a typo doesn't
+                    // silently fall back to the broken "auto" behaviour.
+                    i += 1;
+                    anyhow::ensure!(
+                        i < extra.len(),
+                        "--multicast-interface requires an IPv4 address value"
+                    );
+                    let raw = &extra[i];
+                    let ip = std::net::Ipv4Addr::from_str(raw).with_context(|| {
+                        format!(
+                            "invalid --multicast-interface value '{raw}': expected a bare IPv4 address (e.g. 192.168.1.68), not a CIDR / hostname / IPv6"
+                        )
+                    })?;
+                    multicast_interface = Some(ip);
+                }
                 "--debug-trace" => {
                     // Boolean flag: no value follows.
                     debug_trace = true;
@@ -852,6 +887,7 @@ impl ZenohArgs {
             listen,
             debug_trace,
             sidecar_base_port,
+            multicast_interface,
         })
     }
 }
@@ -1335,6 +1371,26 @@ fn build_zenoh_config(args: &ZenohArgs) -> Result<zenoh::Config> {
     config
         .insert_json5("scouting/gossip/autoconnect_strategy", "\"greater-zid\"")
         .map_err(zenoh_err)?;
+
+    // T9.5: pin the multicast scouting interface when the operator
+    // supplied `--multicast-interface <ip>`. Zenoh 1.9's config key is
+    // `scouting/multicast/interface` (string-typed; default `"auto"` —
+    // see `DEFAULT_CONFIG.json5` line 144). Passing the IPv4 address
+    // as a JSON5 string makes Zenoh bind its multicast socket to that
+    // NIC explicitly, avoiding the "auto" pick that picks inconsistent
+    // NICs across peers on multi-NIC Windows hosts (the cross-WiFi
+    // deadlock root cause investigated by the user pre-T9.5).
+    //
+    // Verified API against zenoh-1.9.0's DEFAULT_CONFIG.json5 schema.
+    if let Some(ip) = args.multicast_interface {
+        let ip_string = ip.to_string();
+        config
+            .insert_json5("scouting/multicast/interface", &format!("\"{ip_string}\""))
+            .map_err(zenoh_err)?;
+        eprintln!("[zenoh] multicast interface: {ip_string} (pinned via --multicast-interface)");
+    } else {
+        eprintln!("[zenoh] multicast interface: auto");
+    }
 
     Ok(config)
 }
@@ -2922,6 +2978,139 @@ mod tests {
         let args = ZenohArgs::parse(&extra).unwrap();
         assert_eq!(args.mode, "peer");
         assert!(args.listen.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // T9.5: --multicast-interface CLI flag.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_zenoh_args_multicast_interface_parses_ipv4() {
+        let extra = vec![
+            "--multicast-interface".to_string(),
+            "192.168.1.68".to_string(),
+        ];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert_eq!(
+            args.multicast_interface,
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 68))
+        );
+    }
+
+    #[test]
+    fn test_zenoh_args_multicast_interface_default_is_none() {
+        let args = ZenohArgs::parse(&[]).unwrap();
+        assert!(args.multicast_interface.is_none());
+    }
+
+    #[test]
+    fn test_zenoh_args_multicast_interface_rejects_non_ip() {
+        let extra = vec!["--multicast-interface".to_string(), "not-an-ip".to_string()];
+        let err = ZenohArgs::parse(&extra).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--multicast-interface")
+                && (msg.contains("'not-an-ip'") || msg.contains("not-an-ip"))
+                && msg.contains("IPv4"),
+            "error must name the flag, the bad value, and mention IPv4: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_zenoh_args_multicast_interface_rejects_cidr() {
+        // CIDR notation is explicitly rejected; the operator hands a bare
+        // IPv4 address (the OS resolves the matching interface).
+        let extra = vec![
+            "--multicast-interface".to_string(),
+            "192.168.1.68/24".to_string(),
+        ];
+        let err = ZenohArgs::parse(&extra).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--multicast-interface") && msg.contains("IPv4"),
+            "CIDR must be rejected with a clear error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_zenoh_args_multicast_interface_rejects_ipv6() {
+        // IPv6 is explicitly rejected (Ipv4Addr::from_str does not parse
+        // IPv6 strings) so the operator gets a clean error rather than a
+        // silent fall-through to "auto".
+        let extra = vec!["--multicast-interface".to_string(), "::1".to_string()];
+        let err = ZenohArgs::parse(&extra).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--multicast-interface"), "{msg}");
+    }
+
+    #[test]
+    fn test_zenoh_args_multicast_interface_alongside_unknown_args() {
+        // T9.4a leniency must hold even with the new flag adjacent: the
+        // runner-injected `--peers` and similar unknown args must still
+        // pass through cleanly.
+        let extra = vec![
+            "--peers".to_string(),
+            "alice=127.0.0.1,bob=192.168.1.10".to_string(),
+            "--multicast-interface".to_string(),
+            "192.168.1.68".to_string(),
+            "--some-future-unknown".to_string(),
+            "future-value".to_string(),
+        ];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert_eq!(
+            args.multicast_interface,
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 68))
+        );
+        assert_eq!(args.mode, "peer");
+    }
+
+    #[test]
+    fn test_build_zenoh_config_with_multicast_interface_set() {
+        // Verify the IP flows into Zenoh's scouting/multicast/interface
+        // key. We confirm by checking the JSON5 serialization of the
+        // built Config contains the pinned IP string.
+        let args = ZenohArgs {
+            mode: "peer".into(),
+            listen: None,
+            debug_trace: false,
+            sidecar_base_port: None,
+            multicast_interface: Some(std::net::Ipv4Addr::new(192, 168, 1, 68)),
+        };
+        let cfg = build_zenoh_config(&args).expect("config builds");
+        // serde_json::to_string on a zenoh::Config goes through Zenoh's
+        // serde impl which renders config keys verbatim.
+        let json = serde_json::to_string(&cfg).expect("config serializes");
+        assert!(
+            json.contains("\"interface\":\"192.168.1.68\""),
+            "expected scouting/multicast/interface = '192.168.1.68' in: {json}"
+        );
+    }
+
+    #[test]
+    fn test_build_zenoh_config_with_multicast_interface_unset_is_auto() {
+        // When unset, build_zenoh_config does not touch the key — Zenoh
+        // keeps the field at `null` in its serialised form, which the
+        // runtime then resolves to its DEFAULT_CONFIG.json5 default of
+        // `"auto"`. We assert the key is null (i.e. not pinned by us)
+        // and verify it differs from the pinned-case test above.
+        let args = ZenohArgs {
+            mode: "peer".into(),
+            listen: None,
+            debug_trace: false,
+            sidecar_base_port: None,
+            multicast_interface: None,
+        };
+        let cfg = build_zenoh_config(&args).expect("config builds");
+        let json = serde_json::to_string(&cfg).expect("config serializes");
+        assert!(
+            json.contains("\"interface\":null"),
+            "expected scouting/multicast/interface = null (unset; Zenoh defaults to 'auto' at runtime) in: {json}"
+        );
+        // And critically: no pinned-IP leak.
+        assert!(
+            !json.contains("\"interface\":\"192.168."),
+            "unset must not leak a pinned IP into the config"
+        );
     }
 
     #[test]
