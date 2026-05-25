@@ -10153,3 +10153,158 @@ under `## 2026-05-25 — T9.5c: completion report`:
 - [ ] `cargo clippy` and `cargo fmt --check` clean.
 - [ ] CUSTOM.md updated, append-only.
 - [ ] STATUS.md completion report appended.
+
+
+### T9.5d — variants/zenoh: remove the application-level QoS credit/ack/dedup wrapper; rely solely on Zenoh-native QoS 3/4 settings [high] — user-requested simplification
+
+**Repo**: `variants/zenoh/`.
+**Status**: filed 2026-05-25 by orchestrator. User explicit request:
+"remove any application-level qos from zenoh and leave only zenoh's
+own qos 3 and 4 settings, that is really what we want to test, not
+our custom implementation."
+
+**Motivation**: T17.8 added a custom application-level credit/ack
+side channel layered ON TOP of Zenoh's transport. The bench was
+measuring the wrapper as much as Zenoh itself. User wants the
+benchmark to exercise Zenoh's NATIVE QoS only (the `Reliability` +
+`CongestionControl` knobs already in `build_publisher_*`).
+
+#### Scope
+
+Remove from `variants/zenoh/src/zenoh.rs`:
+
+1. **`QOS_STRICT_WINDOW`** constant (line 281) and ALL uses.
+2. **`ACK_KEY_PREFIX`**, **`ACK_WILDCARD_FOR_SELF_PREFIX`** constants
+   (lines 251-257) and the ack-key encode/decode helpers around
+   lines 334-347.
+3. **`WriterDedup`** struct (line ~408) and `DEDUP_WINDOW`
+   (line 707). Per-writer dedup state map in the subscriber task
+   (`dedup_state: HashMap<String, WriterDedup>` ~line 1909). Dedup
+   filtering inside the receive loop.
+4. **The credit-window gate** in the publish path (`if next_seq <=
+   min_ack + QOS_STRICT_WINDOW` ~line 601) and all the watermark
+   tracking it depends on.
+5. **`ack_subscriber_task`** and the publish-side ack accounting.
+   The `bench/__ack__/<receiver>/<writer>` side channel — gone.
+6. **Subscriber-side ack publishing** — when receiving a data
+   sample, the variant currently publishes back to
+   `bench/__ack__/<self>/<writer>`. Remove this entirely.
+7. **The wildcard subscriber filter** must stop expecting/handling
+   `__ack__` keys. EOT keys (`bench/__eot__/**`) STAY — those are
+   the variant-base end-of-test protocol, not part of the
+   application QoS wrapper.
+8. **Channel sizes / buffer constants** that were sized as
+   multiples of `QOS_STRICT_WINDOW` — fold any literal `2048` /
+   `8192` / `16384` that came from the strict-window math back to
+   sensible plain constants. Don't introduce new tuning; pick a
+   simple value the worker thinks reasonable and document why in
+   a one-line comment.
+
+What STAYS untouched:
+
+- **QoS-to-(Reliability, CongestionControl) mapping** in
+  `build_publisher_*` (~line 1430+). The user EXPLICITLY wants
+  this — it's Zenoh's native QoS.
+- **EOT protocol** (`bench/__eot__/**`, `signal_end_of_test`,
+  `poll_peer_eots`). This is the runner/variant-base contract,
+  not an application QoS wrapper.
+- **Explicit peering** (T9.5c), **`--multicast-interface`**
+  (T9.5), **`--zenoh-mode`**, etc. None of these are QoS-related.
+- **`autoconnect_strategy = "greater-zid"`** (T16.10d). Routing
+  determinism, not QoS.
+- **Transport buffer tuning** (`transport/link/tx/queue/size/*`
+  and `transport/link/rx/buffer_size`). Already in
+  `build_zenoh_config`.
+- **`build_zenoh_config`** itself (T9.5 + T9.5c additions).
+
+#### Tests
+
+Many existing tests will fail because they exercise the credit
+window, the ack channel, the dedup, etc. Strategy:
+
+- DELETE tests that assert behaviour of the removed mechanisms
+  (any test mentioning `QOS_STRICT_WINDOW`, `WriterDedup`,
+  `ACK_KEY_PREFIX`, `parse_ack_key`, `__ack__`, etc.). Don't keep
+  zombie tests behind `#[ignore]`.
+- KEEP tests for `ZenohArgs::parse`, `build_zenoh_config`, the
+  explicit-peering helper, the QoS-to-CC mapping, the EOT path.
+- ADD: a small smoke test verifying a multi-mode QoS 4 publish
+  round-trips end-to-end WITHOUT any ack-channel infra
+  (loopback-only is fine; use the existing `multi_zenoh_*`
+  fixture as a template).
+
+#### Localhost smoke (gate)
+
+Trimmed `configs/_t9_5d_smoke.toml` with the `zenoh-base` template
+plus ONE zenoh variant. Run two runners locally. Verify:
+
+- All four QoS levels reach `phase=done` with `received > 0`.
+- No `bench/__ack__/...` keys appear in the JSONL logs (grep the
+  log subfolder for `__ack__`).
+- QoS 3/4 multi spawn at the bench rate (100 hz × 1000 vpt) no
+  longer pre-sent=2048-watchdogs (since the credit window is the
+  thing that produced that signature). It may now fail in some
+  OTHER way (overrun, drops, etc.) — that's expected and IS what
+  the user wants to measure. Just verify it reaches `phase=done`
+  cleanly OR fails in a way that's clearly Zenoh-native, not
+  app-level-credit-related.
+
+Delete the scratch config after.
+
+#### Read-then-append rule (memory 2026-05-24)
+
+NEVER `git checkout`, `git restore`, `git stash`, or otherwise
+discard uncommitted changes to orchestrator-owned files
+(STATUS.md, TASKS.md, EPICS.md, DECISIONS.md, contracts). Read
+first, append only your own additions. `git status` before each
+`git add`; never `git add -A` / `git add .`.
+
+#### Files
+
+- `variants/zenoh/src/zenoh.rs` — the big delete.
+- `variants/zenoh/CUSTOM.md` — append a paragraph noting the
+  T17.8 wrapper was removed at user request; benchmark now
+  measures Zenoh-native QoS only.
+
+May NOT touch outside `variants/zenoh/` except for the STATUS.md
+completion-report append at the end.
+
+#### Validation
+
+- `cargo test --release -p variant-zenoh` clean (count will DROP
+  from 94 — that's expected, deletions).
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  clean.
+- `cargo fmt -p variant-zenoh -- --check` clean.
+- Localhost smoke per above.
+
+#### Commits
+
+1. `refactor(variant-zenoh): remove application-level QoS credit/
+   ack/dedup wrapper (T9.5d)` — the main delete + test deletes +
+   the new minimal smoke test.
+2. `docs(variant-zenoh): CUSTOM.md note on T17.8 wrapper removal`.
+3. `status(T9.5d): completion report`.
+
+HEREDOC messages. `Co-Authored-By: Claude Opus 4.7 (1M context)
+<noreply@anthropic.com>`.
+
+#### Completion report
+
+Append to STATUS.md under `## 2026-05-25 — T9.5d: completion
+report`:
+
+- Lines deleted (rough count).
+- Test count delta.
+- Localhost smoke results across all four QoS levels.
+- Any deviations.
+
+#### Acceptance
+
+- [ ] All eight items in "Scope" removed.
+- [ ] QoS→(Reliability, CongestionControl) mapping intact.
+- [ ] EOT protocol intact.
+- [ ] Tests for removed mechanisms deleted; remaining tests pass.
+- [ ] Localhost smoke shows all 4 QoS levels reach phase=done.
+- [ ] No `__ack__` keys in JSONL.
+- [ ] clippy + fmt clean.
