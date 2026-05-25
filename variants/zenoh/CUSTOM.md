@@ -1230,3 +1230,123 @@ PowerShell incantation in this section (`zenoh.multicast_interface=...`)
 would silently apply to nothing on this config because no variant is
 literally named `zenoh` post-template expansion. Keep the unquoted-literal
 form only for configs whose `[[variant]].name` is exactly `zenoh`.
+
+## T9.5c — explicit Multi-mode peering via `--zenoh-peer-tcp-base-port`
+
+Multi mode now derives explicit Zenoh `listen/endpoints` +
+`connect/endpoints` from the runner-injected `--peers` map, so the
+data plane no longer depends on multicast scouting being functional.
+T16.20's diagnostic smoke proved empirically that on the user's
+two-Windows-host WiFi setup, Zenoh's multicast scouting **silently
+fails** (peers' `session.info().peers_zid()` stays empty for the full
+session) — even with `scouting.multicast.interface` pinned via the
+T9.5 flag, even though the raw UDP multicast frames at
+`224.0.0.224:7446` traverse the link cleanly per the PowerShell
+multicast sanity test. The probable root cause is Windows multi-NIC
+multicast group-join asymmetry (the kernel only delivers inbound
+multicast on the exact interface the socket joined the group from,
+which on a multi-NIC Windows host is often different from the
+outbound interface the auto-pick chooses). Pinning the multicast
+interface helped T9.5 in some setups but did not close the case for
+this user's hardware, so T9.5c bypasses scouting for the data plane
+entirely.
+
+### The flag
+
+`--zenoh-peer-tcp-base-port <u16>` on `ZenohArgs`. Default 7447
+(Zenoh's standard TCP port). Operator override via the runner's T9.5a
+glob channel:
+
+```powershell
+target\release\runner.exe --name alice `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg 'zenoh-*.zenoh_peer_tcp_base_port=9000'
+```
+
+Zero is rejected at parse time. The non-zero range is `1..=65535`;
+`base_port + index > u16::MAX` errors out with a clear
+"pick a lower base port" message rather than silently clamping
+(clamping would produce same-port collisions across peers).
+
+### Derivation rule
+
+Identical convention to the existing Single-mode sidecar peering
+(`zenoh.rs::Variant::connect` lines 1124-1160), but applied to the
+in-process Multi-mode session:
+
+- `self_index` = position of `runner_name` in the alphabetically
+  sorted `--peers` name list (matches `derive_runner_index`).
+- `self_port = base_port + self_index`.
+- For each peer `(name, host)` where `name != runner_name`:
+  `peer_port = base_port + peer_index` (peer's position in the same
+  sorted list).
+- `listen/endpoints = ["tcp/0.0.0.0:<self_port>"]` — applied when the
+  operator did NOT pass `--zenoh-listen` (operator override wins).
+- `connect/endpoints = ["tcp/<peer_host>:<peer_port>", ...]` —
+  applied unconditionally (independent of the listen override).
+
+Both peers compute the same map from the same sorted `--peers` list,
+so the `(listen, connect)` ports match symmetrically without any
+extra coordination.
+
+### Solo runs
+
+`peer_pairs` empty OR the only entry is self → no derived listen,
+no connect endpoints. The unit test `loopback_full_protocol` and the
+`zenoh_bridge_stress_10000_messages` ignored test both exercise this
+path; multicast scouting handles same-process loopback unchanged.
+
+### Multicast scouting stays enabled
+
+T9.5c does **not** disable `scouting/multicast/enabled` or
+`scouting/gossip/enabled`. The whole point is ADDITIVE explicit
+peering: when scouting works it's harmless redundancy; when it
+doesn't (the user's WiFi case) the explicit endpoints carry data.
+The T16.10d `autoconnect_strategy = "greater-zid"` setting is
+preserved verbatim and explicitly regression-tested.
+
+### Startup confirmation
+
+`build_zenoh_config` emits exactly one stderr line per session open,
+analogous to T9.5's `[zenoh] multicast interface: ...`:
+
+```
+[zenoh] explicit peering: listen=tcp/0.0.0.0:7447 connect=[tcp/127.0.0.1:7448]
+```
+
+…or when solo:
+
+```
+[zenoh] explicit peering: solo (no --peers entries beyond self)
+```
+
+Operators grep for this in captured variant stderr to confirm the
+feature took.
+
+### What the user runs on the cross-machine WiFi setup
+
+No `--variant-arg` needed at all — the default `base_port = 7447`
+is the path of least surprise on a fresh setup:
+
+```powershell
+# alice (192.168.1.68)
+target\release\runner.exe --name alice `
+  --config configs\two-runner-zenoh-all.toml
+
+# bob (192.168.1.102)
+target\release\runner.exe --name bob `
+  --config configs\two-runner-zenoh-all.toml
+```
+
+If TCP/7447-7448 are reserved by other infrastructure, override per
+the T9.5a glob:
+
+```powershell
+target\release\runner.exe --name alice `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg 'zenoh-*.zenoh_peer_tcp_base_port=20447'
+```
+
+Closes T16.10c (the cross-WiFi data-plane failure mode) by sidestepping
+the multicast-scouting layer entirely. Single-mode peering (T14.9b)
+is unchanged; it already had its own explicit peer mesh.
