@@ -19394,3 +19394,85 @@ the brief.
   `'qix-*.X=Y'` that hits no variant is silently dropped. The brief
   put this out of scope; flag for a future polish task if operator
   reports come in.
+
+
+## 2026-05-25 — T9.5b filed: variant-zenoh `--` sentinel bug uncovered during T9.5a smoke
+
+### Discovery
+
+T9.5a's worker landed the runner-side glob fix cleanly. The
+smoke's three acceptance signals split:
+
+- [PASS] Startup banner names the selector verbatim.
+- [PASS] Per-spawn provenance line shows `(cli: zenoh-*)`.
+- [FAIL] Captured variant stderr shows `[zenoh] multicast interface:
+  auto`, NOT `127.0.0.1`.
+
+The worker (correctly) did not chase this; the brief authorised
+filing a flag-back. Reading `variants/zenoh/src/zenoh.rs` against the
+runner's actual emission shape confirmed the bug:
+
+```rust
+other => {
+    if other.starts_with("--") {
+        i += 1;  // consume next token as the value
+    }
+}
+```
+
+`"--".starts_with("--")` returns `true`. When the runner emits the
+standard spawn-arg shape `... --peers a=1,b=2 -- --multicast-interface
+127.0.0.1 ...`, the `--` end-of-options sentinel is matched by this
+lenient branch and consumes `--multicast-interface` as its phantom
+value. The dedicated `--multicast-interface` branch is therefore
+never reached.
+
+### Implication for prior failures
+
+This bug pre-dates T9.5a. T9.5's cross-WiFi gate failure (and the
+user's most recent run that prompted this whole chain) was almost
+certainly caused by this variant-side parser bug, NOT solely by the
+runner-side glob lookup bug T9.5a fixed. Both fixes are required:
+
+- T9.5a (runner-side glob): so the user's natural `zenoh-*.X=Y`
+  selector matches the 22 variants in the config.
+- T9.5b (variant-side `--` skip): so the override actually reaches
+  `ZenohArgs::parse` once the runner emits it.
+
+T9.5's localhost smoke (the one I observed during T9.5's
+implementation review) appeared to succeed because the provenance
+line showed the right values — but that line is the runner reporting
+what it EMITTED, not what the variant CONSUMED. I never inspected
+the captured variant stderr file. The T9.5a worker DID inspect it,
+and that's how the second bug surfaced.
+
+### Action — T9.5b filed
+
+Filed `T9.5b — variants/zenoh: lenient extra-arg parser must skip
+the -- sentinel without eating its successor [high]` in TASKS.md.
+Scope is one-line fix in `ZenohArgs::parse` plus four regression
+tests pinning the `--` semantics. Then a fresh smoke against a
+trimmed `configs/two-runner-zenoh-all.toml` that this time MUST show
+`[zenoh] multicast interface: 127.0.0.1` in the captured variant
+stderr.
+
+### T16.10c remains open
+
+Still pending. Sequencing:
+
+1. T9.5b lands.
+2. User re-runs the cross-WiFi gate on alice + bob WiFi machines
+   with `--variant-arg 'zenoh-*.multicast_interface=<this-host-WiFi-IP>'`.
+3. If QoS 3/4 spawns reach `phase=done`: T16.10c closes "fixed
+   by T9.5 + T9.5a + T9.5b".
+4. If failure persists: re-open the router-sidecar discussion.
+
+### Memory note (worth promoting)
+
+Lesson worth saving once the dust settles: **provenance lines on
+the emitting side are not a substitute for inspecting the consuming
+side**. The runner's "specific args: X=Y (cli)" tells you what it
+tried to send, not what the subprocess parsed. For variant CLI
+plumbing changes, the actual gate is the captured variant stderr OR
+a `--debug-trace`-style echo of parsed values. I will own this as
+orchestrator and tighten future T9.x worker briefs accordingly.

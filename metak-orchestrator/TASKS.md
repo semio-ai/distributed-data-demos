@@ -1858,6 +1858,145 @@ only stages files you yourself modified.
 - [ ] All `cargo` gates clean.
 
 
+### T9.5b — variants/zenoh: lenient `extra`-arg parser must skip the `--` sentinel without eating its successor [high] — bug uncovered during T9.5a smoke
+
+**Repo**: `variants/zenoh/`.
+**Status**: filed 2026-05-25 by orchestrator.
+
+**Motivation**: T9.5a's worker smoke surfaced this — the runner-side
+glob fix is correct, but the captured variant stderr STILL showed
+`[zenoh] multicast interface: auto`, not `127.0.0.1`. Root cause is
+in `variants/zenoh/src/zenoh.rs::ZenohArgs::parse` lenient
+fallthrough:
+
+```rust
+other => {
+    if other.starts_with("--") {
+        i += 1;  // skip next token as the "value"
+    }
+}
+```
+
+`"--".starts_with("--")` returns `true`. So when the spawn args
+contain the standard runner emission shape:
+
+```
+... --peers alice=127.0.0.1,bob=192.168.1.77 -- --multicast-interface 127.0.0.1 ...
+```
+
+the parser sees `--peers` (unknown → skips `alice=127.0.0.1,...`),
+then sees `--` (matches `starts_with("--")`) and treats it as a
+`--<name> value` pair, consuming the NEXT token (`--multicast-interface`)
+as its phantom value. The actual `--multicast-interface` token is
+therefore never seen by the dedicated branch — the override is
+silently dropped.
+
+**This is most likely the real reason T9.5's cross-WiFi gate
+failed.** Even with the user's chosen IP for `--variant-arg
+zenoh.multicast_interface=192.168.1.80`, the variant parser was
+eating the flag. T9.5a's runner-side fix is necessary (so the
+selector matches the family) but on its own is not sufficient
+(because the `--` sentinel still gets eaten downstream).
+
+#### Scope
+
+In `variants/zenoh/src/zenoh.rs::ZenohArgs::parse` lenient branch
+(lines ~872-880), special-case the bare `--` sentinel: skip it as a
+single token, do NOT advance `i` an extra step. Any other unknown
+`--<name>` continues to consume the following token as a value
+(unchanged behaviour from T9.4a leniency).
+
+Suggested edit:
+
+```rust
+other => {
+    if other == "--" {
+        // Standard end-of-options sentinel from the runner. Advance
+        // past it as a single token; the following token is the FIRST
+        // arg of the trailing-arg group, not a value belonging to `--`.
+    } else if other.starts_with("--") {
+        // Unknown --name: assume `--name value` pair and skip both.
+        i += 1;
+    }
+}
+```
+
+#### Tests
+
+In `variants/zenoh/src/zenoh.rs::tests`:
+
+- `parse_skips_bare_dashdash_without_eating_successor`: feed
+  `extra = ["--peers", "a=1,b=2", "--", "--multicast-interface",
+  "192.168.1.68"]`. Assert `multicast_interface == Some(Ipv4Addr::new(
+  192, 168, 1, 68))`.
+- `parse_recognises_multicast_interface_when_preceded_by_dashdash`:
+  shorter form covering just `extra = ["--", "--multicast-interface",
+  "127.0.0.1"]`. Same assertion.
+- `parse_unknown_flag_still_consumes_value_after_dashdash_fix`:
+  regression — feed `extra = ["--peers", "a=1", "--",
+  "--some-unknown", "ignored", "--multicast-interface", "127.0.0.1"]`.
+  Assert `--some-unknown` still eats `"ignored"` AND
+  `multicast_interface` is correctly set.
+- `parse_dashdash_as_sole_token_does_not_panic`: edge case —
+  `extra = ["--"]` alone. Defaults all parsed-to-`None` fields,
+  doesn't error, doesn't index-out-of-bounds.
+
+These tests pin the contract: `--` is a single-token end-of-options
+sentinel; anything else starting with `--` is a `--name value` pair
+under the lenient skip.
+
+#### Validation gates
+
+- `cargo test --release -p variant-zenoh` — current baseline is
+  75 passed; should grow by 4 to 79.
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  — clean.
+- **End-to-end localhost smoke** (after the fix lands): re-do
+  T9.5a's smoke (trim `configs/two-runner-zenoh-all.toml` to one
+  zenoh variant), and this time the captured variant stderr file
+  (`logs/<run>-<ts>/<spawn>-<runner>-stderr.txt`) MUST show
+  `[zenoh] multicast interface: 127.0.0.1`, NOT `auto`. This is
+  the gate T9.5a left open.
+
+#### Read-then-append rule (memory of 2026-05-24 incident)
+
+MANDATORY. Workers must NEVER `git checkout`, `git restore`,
+`git stash`, or otherwise discard uncommitted changes to
+orchestrator-owned files (`metak-orchestrator/STATUS.md`,
+`metak-orchestrator/TASKS.md`, `metak-orchestrator/EPICS.md`,
+`metak-orchestrator/DECISIONS.md`, `metak-shared/api-contracts/*`).
+Read those files first, then append/edit only your own additions.
+Before each `git add` / `git commit`, run `git status` and verify
+your `git add` only stages files you yourself modified. Never
+`git add -A` or `git add .`.
+
+#### Out of scope
+
+- Adding more lenient-parser hardening (e.g. recognising
+  `--name=value` form, escaping quotes). The current contract is
+  "`--name value` or bare `--`"; this task fixes the latter only.
+- Refactoring the parser to use `clap`. The lenient skip-unknown
+  semantics are intentional (T9.4a) to let the runner inject
+  arbitrary common-args without the variant having to know about
+  them. Stay with the hand-rolled loop.
+- Anything in `runner/` or any other variant. T9.5b is
+  variants/zenoh/-only.
+
+#### Acceptance criteria
+
+- [ ] Fix in `ZenohArgs::parse` lenient branch handling bare `--`.
+- [ ] All four new unit tests land and pass.
+- [ ] Existing `variant-zenoh` tests still pass (75 → 79).
+- [ ] Localhost end-to-end smoke against a trimmed
+      `configs/two-runner-zenoh-all.toml` (one zenoh variant) shows
+      `[zenoh] multicast interface: 127.0.0.1` in the captured
+      stderr — the actual T9.5 end-to-end gate that has not yet
+      been crossed.
+- [ ] `cargo clippy` clean.
+- [ ] Completion report appended to STATUS.md under
+      `## 2026-05-25 — T9.5b: completion report`.
+
+
 ---
 
 ## Current Sprint — E10: Variant Robustness Under Load
