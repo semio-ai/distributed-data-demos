@@ -9661,3 +9661,240 @@ no longer shows `array`.
 - Mixed-types pivot row no longer displays a single dominant shape.
 - Tests pass.
 - Smoke check confirms.
+
+
+### T16.20 — Minimal Zenoh pub/sub cross-machine smoke binary [medium] — diagnostic for QoS 1/2 silent-loss + QoS 3/4 watchdog
+
+**Repo**: `variants/zenoh/` (new `examples/` target).
+**Status**: filed 2026-05-25 by orchestrator.
+
+**Motivation**: T9.5 + T9.5a + T9.5b are landed. The runner-side
+override flow and the variant-side `--multicast-interface`
+consumption are both verified by the captured variant stderr line
+`[zenoh] multicast interface: 192.168.1.80 (pinned via
+--multicast-interface)`. Despite that, the user's cross-WiFi run
+still failed on `configs/two-runner-zenoh-all.toml`:
+
+- **QoS 1 multi** `phase=done sent=3001000 received=0
+  eot_sent=true eot_received=true`. Peers DO bridge (EOT
+  publish/subscribe round-trips both ways), but the data plane
+  delivers zero of 3 million sends.
+- **QoS 3/4 multi** still `phase=operate sent=2048 received=0
+  eot_sent=false eot_received=false`. The T17.8 strict-window
+  watchdog. Peers do NOT bridge at all for high-rate Block-CC
+  traffic.
+
+These are **two distinct failure modes** that I previously conflated.
+T9.5 targeted only the discovery layer; the data-plane loss is
+something else entirely. Same-machine runs of the same config work
+(see `same-machine-all-variants-01-20260521_210958`). Cross-machine
+WiFi between two Windows 11 hosts on the same AP fails.
+
+This task builds an isolated diagnostic binary so we can bisect
+*where* the failure is — bench plumbing vs Zenoh itself vs the
+WiFi network.
+
+#### Scope
+
+Create `variants/zenoh/examples/cross_machine_smoke.rs` — a
+standalone Zenoh pub/sub binary with no benchmark plumbing.
+Re-uses the variant crate's existing `zenoh` dependency (so the
+crate version is identical to the bench's).
+
+CLI (clap derive struct or manual; small enough for either):
+
+- `--mode {pub|sub|both}` — required. `both` opens one publisher
+  AND one subscriber in the same session for round-trip testing on
+  a single machine (sanity gate).
+- `--peer-mode {peer|client}` — default `peer` (matches the bench
+  default).
+- `--multicast-interface <ip>` — same semantics as the variant's
+  flag. Wires `scouting.multicast.interface = <ip>`. When unset,
+  Zenoh default (`"auto"`).
+- `--qos {1|2|3|4}` — default 1. Maps to:
+  - 1: Reliability::BestEffort, CongestionControl::Drop
+  - 2: Reliability::BestEffort, CongestionControl::Block
+  - 3: Reliability::Reliable,  CongestionControl::Drop
+  - 4: Reliability::Reliable,  CongestionControl::Block
+  Verify mapping against `variants/zenoh/src/zenoh.rs` —
+  particularly the build-publisher-cache logic around lines
+  ~1439-1449. If the variant uses a different mapping, use the
+  same mapping the variant uses.
+- `--key <expr>` — default `smoke/test`. Worker should use a key
+  prefix DIFFERENT from `bench/` so the smoke can be run in
+  parallel with a bench matrix without key-namespace collisions.
+- `--rate-hz <u32>` — publisher rate. Default 100 (matches the
+  failing bench config's rate). 0 means "publish as fast as
+  possible".
+- `--values-per-tick <u32>` — default 1000 (matches the failing
+  bench config). The publisher emits `rate_hz * values_per_tick`
+  messages per second across keys `<key>/0`..`<key>/N-1`.
+- `--duration-secs <u32>` — default 30 (matches the bench).
+- `--payload-size-bytes <usize>` — default 16 (small scalar). The
+  variant uses MessagePack-encoded scalars; for the diagnostic, raw
+  bytes of the requested size are fine.
+- `--connect <endpoint>` — repeating. Optional list of explicit
+  TCP/UDP endpoints to connect to (`tcp/192.168.1.77:7447` shape).
+  When set, bypasses multicast scouting entirely. Useful for
+  bisecting "is multicast the failing layer?".
+- `--listen <endpoint>` — repeating. Optional. Default: let Zenoh
+  pick.
+
+Per-mode behaviour:
+
+- **`pub` mode**: open session, declare publishers for each
+  `<key>/i` (i ∈ [0, values_per_tick)), publish at the configured
+  rate for the configured duration, print every 5s a tally line
+  `pub: total=<n> last5s=<m> rate=<n/5> hz`. On exit, print final
+  totals + session stats from `session.info().await`.
+- **`sub` mode**: open session, declare ONE subscriber on
+  `<key>/**` (wildcard to match all per-key publishers), count
+  receives, print every 5s `sub: total=<n> last5s=<m>
+  unique_keys=<k>`. On exit, print final totals.
+- **`both` mode**: do both in the same session. The publisher's
+  receives are subtracted out only if the worker can; otherwise
+  count loopback as legitimate.
+
+Startup output (both modes) should print:
+
+- Configured peer-mode, qos, key, rate, vpt, duration, multicast
+  interface, connect/listen endpoints.
+- Zenoh build version (`zenoh::version()` or similar).
+- The session's zid once it's open.
+- A scouting-found-peer line per peer detected (subscribe to
+  `LivelinessToken` admin or use `session.info()` polling — worker
+  picks whichever is least invasive).
+
+Use plain `eprintln!` for diagnostics. No JSONL, no log file
+machinery. Operators read this on the terminal.
+
+#### Validation gates (worker localhost)
+
+1. `cargo build --release -p variant-zenoh --example
+   cross_machine_smoke` — clean.
+2. `cargo clippy --release -p variant-zenoh --example
+   cross_machine_smoke --all-targets -- -D warnings` — clean.
+3. Localhost two-process smoke: terminal 1 runs `sub` mode,
+   terminal 2 runs `pub` mode, both with the same key and same
+   QoS. Expected: `sub: total ≈ pub: total` within reason
+   (allow drops for QoS 1 Drop CC). Run for each QoS (1, 2, 3, 4)
+   at low rate (10 hz, 10 vpt, 5 s duration → 500 sends, no
+   network saturation). Receives MUST be ≥ 95% of sends on
+   localhost across all four QoS levels — if not, the binary
+   itself is broken, do NOT hand off to user.
+4. Localhost `both` mode round-trip sanity at the same low rate.
+
+#### User-owned validation (write the script, don't run it)
+
+The worker writes a PowerShell script + a Markdown procedure doc
+(`variants/zenoh/examples/CROSS_MACHINE_SMOKE.md`) that the user
+runs on the two-WiFi-machine setup. The procedure:
+
+1. Build on both machines.
+2. **Test 1: bare multicast pub/sub at QoS 1 BestEffort/Drop, low
+   rate.** Pub on alice, sub on bob. Then swap. Then both with
+   `--multicast-interface <this-host-WiFi-IP>`. Expected: receives
+   close to publishes. If FAILS: Zenoh's multicast-discovered TCP
+   transport on WiFi is broken for our keys — points at firewall
+   suppression on the data port, or AP isolation between the two
+   WiFi clients.
+3. **Test 2: same as 1 but at QoS 4 Reliable/Block.** Same
+   expected. If 1 passes and 2 fails at low rate, T17.8's strict
+   credit window is implicated even in the minimal case.
+4. **Test 3: matrix-rate (100 hz × 1000 vpt) at QoS 1.** Same
+   expected (with some drops allowed). If this fails the same way
+   the bench did (receives=0), we've reproduced the bench's
+   failure in a 200-line binary — much easier to bisect from
+   there.
+5. **Test 4: explicit `--connect tcp/<peer-WiFi-IP>:7447` (no
+   multicast).** If THIS works but the multicast variants don't,
+   then the WiFi AP is suppressing the multicast announcement OR
+   the multicast-discovered TCP endpoint is not reachable from the
+   peer.
+6. User runs all four tests on the WiFi setup AND the wired
+   LS105G switch setup; reports back the receives/sends ratios.
+
+#### Read-then-append rule (memory of 2026-05-24 incident)
+
+MANDATORY. Worker must NEVER `git checkout`, `git restore`,
+`git stash`, or otherwise discard uncommitted changes to
+orchestrator-owned files (`metak-orchestrator/STATUS.md`,
+`metak-orchestrator/TASKS.md`, `metak-orchestrator/EPICS.md`,
+`metak-orchestrator/DECISIONS.md`, `metak-shared/api-contracts/*`).
+Read those files first, append/edit only your own additions.
+Before each `git add` / `git commit`: `git status` and verify
+your `git add` only stages files you yourself modified. Never
+`git add -A` or `git add .`.
+
+#### Files the worker may touch
+
+- `variants/zenoh/examples/cross_machine_smoke.rs` (new).
+- `variants/zenoh/examples/CROSS_MACHINE_SMOKE.md` (new — user
+  procedure).
+- `variants/zenoh/examples/run_cross_machine_smoke.ps1` (new — the
+  PowerShell wrapper; takes one positional arg = local WiFi IP and
+  runs the four-test sequence).
+- `variants/zenoh/Cargo.toml` ONLY if a new `[[example]]` block or
+  `[dev-dependencies]` addition is strictly required. Avoid if
+  possible — the example should compile against the crate's
+  existing deps.
+
+May NOT touch:
+
+- Anything outside `variants/zenoh/examples/` and the optional
+  Cargo.toml line.
+- `metak-orchestrator/*` except the STATUS.md completion-report
+  append at the end.
+
+#### Commit strategy
+
+Two commits:
+
+1. `feat(variant-zenoh): cross_machine_smoke example + procedure
+   doc + powershell wrapper` — the three new files.
+2. `status(T16.20): completion report` — worker append to
+   STATUS.md.
+
+HEREDOC commit messages. Include
+`Co-Authored-By: Claude Opus 4.7 (1M context)
+<noreply@anthropic.com>`.
+
+#### Completion report
+
+Append to `metak-orchestrator/STATUS.md` (read first, append-only)
+under `## 2026-05-25 — T16.20: completion report`:
+
+- Files added, commit shas.
+- Localhost gate numbers (receives/sends ratio for each QoS at the
+  low-rate sanity).
+- One sentence per design choice the worker made that wasn't in
+  the spec (e.g. how scouting peers were detected, what the QoS
+  mapping ended up looking like).
+- The PowerShell incantation block ready for the user to paste.
+
+#### Out of scope
+
+- Fixing the actual data-plane bug. This is a DIAGNOSTIC; finding
+  the bug is the next task once the user reports the numbers.
+- Adding the smoke binary to the workspace's CI / cargo-test
+  workflow. It's a manual tool, not a regression gate.
+- Any change to the bench variant itself. The variant is the
+  thing being diagnosed; touching it would muddy the bisection.
+- Wireshark / packet capture instructions. The smoke is the right
+  abstraction layer to start at; pcap is the next layer down if
+  the smoke also fails.
+
+#### Acceptance criteria
+
+- [ ] `cargo build --release -p variant-zenoh --example
+      cross_machine_smoke` builds clean.
+- [ ] `cargo clippy ... --example cross_machine_smoke -- -D
+      warnings` clean.
+- [ ] Localhost two-process smoke at low rate (10 hz × 10 vpt × 5
+      s) shows ≥ 95% receive ratio across all four QoS levels.
+- [ ] `CROSS_MACHINE_SMOKE.md` exists with the four-test procedure
+      the user can follow.
+- [ ] PowerShell wrapper exists and accepts one positional arg
+      (the local WiFi IP).
+- [ ] STATUS.md completion report appended with the localhost
+      numbers and the user-facing incantation.
