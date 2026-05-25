@@ -801,7 +801,24 @@ pub struct ZenohArgs {
     /// and HELLO/scouting traffic never crosses. Pinning the IPv4 of
     /// the NIC the operator wants Zenoh to scout on makes peers agree.
     pub multicast_interface: Option<std::net::Ipv4Addr>,
+    /// T9.5c: base TCP port for Multi-mode explicit peering. The
+    /// per-runner listen port is `base + self_index` (with
+    /// `self_index` = position of `runner_name` in the
+    /// alphabetically-sorted `--peers` map). Each peer's connect port
+    /// is derived symmetrically from its index in the same sorted
+    /// list, so all runners compute identical (listen,connect) ports
+    /// without any extra coordination. Optional: Multi mode falls back
+    /// to [`DEFAULT_ZENOH_PEER_TCP_BASE_PORT`] when unset. Single mode
+    /// has its own sidecar peering (T14.9b) and ignores this arg.
+    pub peer_tcp_base_port: Option<u16>,
 }
+
+/// T9.5c: default base TCP port for Multi-mode explicit peering when
+/// `--zenoh-peer-tcp-base-port` is not supplied. 7447 is Zenoh's
+/// standard TCP port and is reused here for symmetry with the
+/// Zenoh-doc default; operators with port conflicts override via
+/// `--variant-arg 'zenoh-*.zenoh_peer_tcp_base_port=<n>'`.
+pub const DEFAULT_ZENOH_PEER_TCP_BASE_PORT: u16 = 7447;
 
 impl ZenohArgs {
     /// Parse Zenoh-specific arguments from the extra CLI args.
@@ -813,6 +830,7 @@ impl ZenohArgs {
         let mut debug_trace = false;
         let mut sidecar_base_port: Option<u16> = None;
         let mut multicast_interface: Option<std::net::Ipv4Addr> = None;
+        let mut peer_tcp_base_port: Option<u16> = None;
 
         let mut i = 0;
         while i < extra.len() {
@@ -842,6 +860,32 @@ impl ZenohArgs {
                         format!("invalid --zenoh-sidecar-base-port value '{raw}': expected u16")
                     })?;
                     sidecar_base_port = Some(port);
+                }
+                "--zenoh-peer-tcp-base-port" => {
+                    // T9.5c: base TCP port for Multi-mode explicit
+                    // peering. The per-runner listen port is
+                    // `base + self_index_in_sorted_peers`; each peer's
+                    // connect port is derived symmetrically. Defaults
+                    // to DEFAULT_ZENOH_PEER_TCP_BASE_PORT (7447) when
+                    // omitted. Zero is rejected so operators get a
+                    // clear error if a misconfigured `--variant-arg`
+                    // glob fed in a non-numeric or zero value.
+                    i += 1;
+                    anyhow::ensure!(
+                        i < extra.len(),
+                        "--zenoh-peer-tcp-base-port requires a value"
+                    );
+                    let raw = &extra[i];
+                    let port: u16 = raw.parse().with_context(|| {
+                        format!(
+                            "invalid --zenoh-peer-tcp-base-port value '{raw}': expected u16 in 1..=65535"
+                        )
+                    })?;
+                    anyhow::ensure!(
+                        port != 0,
+                        "--zenoh-peer-tcp-base-port must be non-zero (got '{raw}')"
+                    );
+                    peer_tcp_base_port = Some(port);
                 }
                 "--multicast-interface" => {
                     // T9.5: pin Zenoh's multicast scouting to a specific
@@ -900,8 +944,81 @@ impl ZenohArgs {
             debug_trace,
             sidecar_base_port,
             multicast_interface,
+            peer_tcp_base_port,
         })
     }
+}
+
+/// T9.5c: derive Multi-mode explicit Zenoh peering endpoints from the
+/// runner-injected `--peers` map. Returns
+/// `(listen_endpoint, connect_endpoints)` where:
+///
+/// - `listen_endpoint`: `Some("tcp/0.0.0.0:<self_port>")` when this
+///   runner has a position in the sorted peer-names list; `None` for
+///   the genuinely-solo case (`peer_pairs` empty OR `runner_name` not
+///   present). Solo runs leave the listen side to Zenoh's defaults so
+///   single-process tests still discover same-process loopback via
+///   multicast scouting.
+/// - `connect_endpoints`: one `"tcp/<host>:<peer_port>"` entry per
+///   peer in the sorted list whose name differs from `runner_name`.
+///   Empty when there are no remote peers.
+///
+/// `self_port = base_port + self_index` and
+/// `peer_port = base_port + peer_index`. Both sides use the same
+/// alphabetically-sorted list, so each peer derives the same map and
+/// the connect/listen ports match symmetrically without coordination.
+///
+/// Errors when `base_port + index` would overflow `u16::MAX` — a clear
+/// signal that the operator supplied a base port too high for the
+/// declared peer list size. Clamping silently to 65535 would produce
+/// port collisions; an explicit error is the safer contract.
+fn derive_peering_endpoints(
+    peer_pairs: &[(String, String)],
+    runner_name: &str,
+    base_port: u16,
+) -> Result<(Option<String>, Vec<String>)> {
+    if peer_pairs.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    // Peer-pairs are already alphabetically sorted by `peer_name_host_pairs`,
+    // but we re-confirm the invariant locally so callers that construct
+    // the slice by hand (tests) cannot accidentally break the symmetry
+    // between the listen-side derivation and the connect-side derivation.
+    let mut sorted: Vec<(String, String)> = peer_pairs.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let self_index = sorted.iter().position(|(n, _)| n == runner_name);
+    let listen = match self_index {
+        Some(idx) => Some(format!(
+            "tcp/0.0.0.0:{}",
+            derive_peer_tcp_port(base_port, idx, runner_name)?
+        )),
+        None => None,
+    };
+
+    let mut connect = Vec::new();
+    for (idx, (name, host)) in sorted.iter().enumerate() {
+        if name == runner_name {
+            continue;
+        }
+        let port = derive_peer_tcp_port(base_port, idx, name)?;
+        connect.push(format!("tcp/{}:{}", host, port));
+    }
+    Ok((listen, connect))
+}
+
+/// T9.5c: u16-safe port arithmetic. Errors on overflow rather than
+/// clamping so an operator-provided base port that cannot accommodate
+/// the declared peer list size surfaces immediately at connect time
+/// instead of producing port collisions later.
+fn derive_peer_tcp_port(base_port: u16, index: usize, who: &str) -> Result<u16> {
+    let sum = (base_port as u32) + (index as u32);
+    if sum > u16::MAX as u32 {
+        anyhow::bail!(
+            "zenoh peer TCP port overflow for '{who}': base_port={base_port} + index={index} exceeds u16::MAX (65535) — pick a lower --zenoh-peer-tcp-base-port",
+        );
+    }
+    Ok(sum as u16)
 }
 
 /// Outbound publish request shuttled from the variant's main thread to the
@@ -1302,7 +1419,11 @@ impl ZenohVariant {
 /// `transport/link/tx/queue/size/*` is enforced by Zenoh itself and
 /// values outside `[1, 16]` cause `zenoh::open` to error. See
 /// `variants/zenoh/CUSTOM.md` for the full rationale.
-fn build_zenoh_config(args: &ZenohArgs) -> Result<zenoh::Config> {
+fn build_zenoh_config(
+    args: &ZenohArgs,
+    peer_pairs: &[(String, String)],
+    runner_name: &str,
+) -> Result<zenoh::Config> {
     let mut config = zenoh::Config::default();
 
     match args.mode.as_str() {
@@ -1313,10 +1434,64 @@ fn build_zenoh_config(args: &ZenohArgs) -> Result<zenoh::Config> {
         .insert_json5("mode", &format!("\"{}\"", args.mode))
         .map_err(zenoh_err)?;
 
-    if let Some(ref listen) = args.listen {
+    // T9.5c: derive explicit Multi-mode peering endpoints from the
+    // runner-injected `--peers` map. Multicast scouting stays enabled
+    // as a no-op fallback (the user's two-Windows-WiFi setup shows
+    // scouting silently failing; explicit `connect/endpoints`
+    // delivers the data plane). See CUSTOM.md "T9.5c — explicit
+    // Multi-mode peering" for the full rationale.
+    let base_port = args
+        .peer_tcp_base_port
+        .unwrap_or(DEFAULT_ZENOH_PEER_TCP_BASE_PORT);
+    let (derived_listen, derived_connect) =
+        derive_peering_endpoints(peer_pairs, runner_name, base_port)?;
+
+    // Operator override on `--zenoh-listen` wins on the listen side.
+    // The connect side is independent of the listen flag, so we still
+    // apply derived connect endpoints when listen is overridden.
+    let listen_for_log: Option<String> = if let Some(ref listen) = args.listen {
         config
             .insert_json5("listen/endpoints", &format!("[\"{}\"]", listen))
             .map_err(zenoh_err)?;
+        Some(listen.clone())
+    } else if let Some(ref listen) = derived_listen {
+        config
+            .insert_json5("listen/endpoints", &format!("[\"{}\"]", listen))
+            .map_err(zenoh_err)?;
+        Some(listen.clone())
+    } else {
+        None
+    };
+
+    if !derived_connect.is_empty() {
+        let quoted = derived_connect
+            .iter()
+            .map(|e| format!("\"{e}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        config
+            .insert_json5("connect/endpoints", &format!("[{}]", quoted))
+            .map_err(zenoh_err)?;
+    }
+
+    // Single explicit-peering startup log line, analogous to the T9.5
+    // `[zenoh] multicast interface: ...` confirmation. Operators grep
+    // for this in captured stderr to confirm the feature took. "Solo"
+    // covers two equivalent shapes: no --peers at all, or a --peers
+    // map whose only entry is self (no remote peers AND no derived
+    // listen on this side either).
+    let solo = peer_pairs.is_empty() || (derived_connect.is_empty() && listen_for_log.is_none());
+    if solo {
+        eprintln!("[zenoh] explicit peering: solo (no --peers entries beyond self)");
+    } else {
+        let listen_disp = listen_for_log
+            .as_deref()
+            .unwrap_or("<none; --zenoh-listen unset and runner not in --peers>");
+        eprintln!(
+            "[zenoh] explicit peering: listen={} connect=[{}]",
+            listen_disp,
+            derived_connect.join(", "),
+        );
     }
 
     // Raise each priority queue's batch count to the schema maximum (16),
@@ -2234,7 +2409,13 @@ impl Variant for ZenohVariant {
             self.zenoh_args.listen,
         );
 
-        let config = build_zenoh_config(&self.zenoh_args)?;
+        // T9.5c: pass the runner-injected peer map + this runner's
+        // name into the config builder so it can emit explicit
+        // Multi-mode TCP listen/connect endpoints (Zenoh's multicast
+        // scouting silently fails on the user's two-Windows-host WiFi
+        // setup; explicit peering is the reliable data plane).
+        let peer_pairs = self.peer_name_host_pairs();
+        let config = build_zenoh_config(&self.zenoh_args, &peer_pairs, &self.runner)?;
 
         // Multi-thread runtime sized to the host so the publisher task,
         // both subscriber tasks, and zenoh's internal driver tasks
@@ -3157,6 +3338,281 @@ mod tests {
         assert!(!args.debug_trace);
     }
 
+    // -----------------------------------------------------------------
+    // T9.5c: --zenoh-peer-tcp-base-port flag + Multi-mode explicit
+    // peering endpoints derived from --peers.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn peer_tcp_base_port_default_is_7447() {
+        // When unset, [`DEFAULT_ZENOH_PEER_TCP_BASE_PORT`] applies. The
+        // constant value is part of the public-ish contract so we pin it.
+        assert_eq!(DEFAULT_ZENOH_PEER_TCP_BASE_PORT, 7447);
+        let args = ZenohArgs::parse(&[]).unwrap();
+        assert!(args.peer_tcp_base_port.is_none());
+    }
+
+    #[test]
+    fn peer_tcp_base_port_accepts_override() {
+        let extra = vec!["--zenoh-peer-tcp-base-port".to_string(), "9000".to_string()];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert_eq!(args.peer_tcp_base_port, Some(9000));
+    }
+
+    #[test]
+    fn peer_tcp_base_port_rejects_zero() {
+        let extra = vec!["--zenoh-peer-tcp-base-port".to_string(), "0".to_string()];
+        let err = ZenohArgs::parse(&extra).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--zenoh-peer-tcp-base-port") && msg.contains("non-zero"),
+            "zero must be rejected with a clear error: {msg}"
+        );
+    }
+
+    #[test]
+    fn peer_tcp_base_port_rejects_non_numeric() {
+        let extra = vec!["--zenoh-peer-tcp-base-port".to_string(), "abc".to_string()];
+        let err = ZenohArgs::parse(&extra).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--zenoh-peer-tcp-base-port") && msg.contains("'abc'"),
+            "non-numeric must surface a clear error: {msg}"
+        );
+    }
+
+    #[test]
+    fn derive_peering_endpoints_two_peers_runner_alice() {
+        // alice=127.0.0.1, bob=192.168.1.77 with runner=alice and
+        // base=7447. Alphabetically alice is index 0, bob index 1.
+        let pairs = vec![
+            ("alice".to_string(), "127.0.0.1".to_string()),
+            ("bob".to_string(), "192.168.1.77".to_string()),
+        ];
+        let (listen, connect) = derive_peering_endpoints(&pairs, "alice", 7447).unwrap();
+        assert_eq!(listen.as_deref(), Some("tcp/0.0.0.0:7447"));
+        assert_eq!(connect, vec!["tcp/192.168.1.77:7448".to_string()]);
+    }
+
+    #[test]
+    fn derive_peering_endpoints_two_peers_runner_bob() {
+        let pairs = vec![
+            ("alice".to_string(), "127.0.0.1".to_string()),
+            ("bob".to_string(), "192.168.1.77".to_string()),
+        ];
+        let (listen, connect) = derive_peering_endpoints(&pairs, "bob", 7447).unwrap();
+        assert_eq!(listen.as_deref(), Some("tcp/0.0.0.0:7448"));
+        assert_eq!(connect, vec!["tcp/127.0.0.1:7447".to_string()]);
+    }
+
+    #[test]
+    fn derive_peering_endpoints_three_peers_alphabetical_indices() {
+        // alice=127.0.0.1, bob=192.168.1.77, charlie=192.168.1.78 with
+        // runner=bob (index 1). Connect endpoints emitted in
+        // alphabetical order of the SORTED list, minus self.
+        let pairs = vec![
+            ("alice".to_string(), "127.0.0.1".to_string()),
+            ("bob".to_string(), "192.168.1.77".to_string()),
+            ("charlie".to_string(), "192.168.1.78".to_string()),
+        ];
+        let (listen, connect) = derive_peering_endpoints(&pairs, "bob", 7447).unwrap();
+        assert_eq!(listen.as_deref(), Some("tcp/0.0.0.0:7448"));
+        assert_eq!(
+            connect,
+            vec![
+                "tcp/127.0.0.1:7447".to_string(),
+                "tcp/192.168.1.78:7449".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_peering_endpoints_sorts_unordered_input() {
+        // Defensive: even if a caller hands a pre-unsorted list, the
+        // function re-sorts before computing indices so both peers
+        // always agree on the port map.
+        let pairs = vec![
+            ("charlie".to_string(), "192.168.1.78".to_string()),
+            ("alice".to_string(), "127.0.0.1".to_string()),
+            ("bob".to_string(), "192.168.1.77".to_string()),
+        ];
+        let (listen, connect) = derive_peering_endpoints(&pairs, "alice", 7447).unwrap();
+        assert_eq!(listen.as_deref(), Some("tcp/0.0.0.0:7447"));
+        assert_eq!(
+            connect,
+            vec![
+                "tcp/192.168.1.77:7448".to_string(),
+                "tcp/192.168.1.78:7449".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_peering_endpoints_solo_emits_nothing() {
+        let (listen, connect) = derive_peering_endpoints(&[], "alice", 7447).unwrap();
+        assert!(listen.is_none());
+        assert!(connect.is_empty());
+    }
+
+    #[test]
+    fn derive_peering_endpoints_overflow_errors() {
+        // base + index > u16::MAX must error rather than clamp. With
+        // base=65535 and a second peer (index 1) the listen for that
+        // peer would overflow. Either side (listen-or-connect) hitting
+        // the overflow is sufficient to fail-fast.
+        let pairs = vec![
+            ("alice".to_string(), "127.0.0.1".to_string()),
+            ("bob".to_string(), "127.0.0.1".to_string()),
+        ];
+        let err = derive_peering_endpoints(&pairs, "alice", 65535).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("overflow") && msg.contains("u16::MAX"),
+            "overflow must produce a clear actionable error: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_config_emits_listen_and_connect_for_two_peers() {
+        // End-to-end: synthetic ZenohArgs + peer pairs + runner_name
+        // must materialise both `listen/endpoints` and
+        // `connect/endpoints` into the built config. We assert via the
+        // JSON serialisation that Zenoh round-trips.
+        let args = ZenohArgs {
+            mode: "peer".into(),
+            listen: None,
+            debug_trace: false,
+            sidecar_base_port: None,
+            multicast_interface: None,
+            peer_tcp_base_port: Some(7447),
+        };
+        let pairs = vec![
+            ("alice".to_string(), "127.0.0.1".to_string()),
+            ("bob".to_string(), "192.168.1.77".to_string()),
+        ];
+        let cfg = build_zenoh_config(&args, &pairs, "alice").expect("config builds");
+        let json = serde_json::to_string(&cfg).expect("config serializes");
+        assert!(
+            json.contains("\"tcp/0.0.0.0:7447\""),
+            "expected listen endpoint tcp/0.0.0.0:7447 in: {json}"
+        );
+        assert!(
+            json.contains("\"tcp/192.168.1.77:7448\""),
+            "expected connect endpoint tcp/192.168.1.77:7448 in: {json}"
+        );
+    }
+
+    #[test]
+    fn build_config_swaps_listen_and_connect_for_other_peer() {
+        // Same peer map, runner=bob -> listen on bob's port, connect
+        // to alice's.
+        let args = ZenohArgs {
+            mode: "peer".into(),
+            listen: None,
+            debug_trace: false,
+            sidecar_base_port: None,
+            multicast_interface: None,
+            peer_tcp_base_port: Some(7447),
+        };
+        let pairs = vec![
+            ("alice".to_string(), "127.0.0.1".to_string()),
+            ("bob".to_string(), "192.168.1.77".to_string()),
+        ];
+        let cfg = build_zenoh_config(&args, &pairs, "bob").expect("config builds");
+        let json = serde_json::to_string(&cfg).expect("config serializes");
+        assert!(
+            json.contains("\"tcp/0.0.0.0:7448\""),
+            "expected listen endpoint tcp/0.0.0.0:7448 in: {json}"
+        );
+        assert!(
+            json.contains("\"tcp/127.0.0.1:7447\""),
+            "expected connect endpoint tcp/127.0.0.1:7447 in: {json}"
+        );
+    }
+
+    #[test]
+    fn build_config_solo_emits_no_connect_endpoints() {
+        // No --peers -> no connect endpoints; listen falls back to
+        // whatever the operator set on --zenoh-listen (or nothing).
+        let args = ZenohArgs {
+            mode: "peer".into(),
+            listen: None,
+            debug_trace: false,
+            sidecar_base_port: None,
+            multicast_interface: None,
+            peer_tcp_base_port: None,
+        };
+        let cfg = build_zenoh_config(&args, &[], "alice").expect("config builds");
+        let json = serde_json::to_string(&cfg).expect("config serializes");
+        // No derived endpoints. Zenoh's serialised default for both
+        // lists is `[]` so the check is "no tcp/0.0.0.0 line present".
+        assert!(
+            !json.contains("\"tcp/0.0.0.0:7447\""),
+            "solo run must not emit a derived listen endpoint: {json}"
+        );
+    }
+
+    #[test]
+    fn build_config_user_listen_override_wins_but_connect_still_derived() {
+        // Operator passed --zenoh-listen explicitly. The derived
+        // per-index listen is suppressed; connect endpoints are
+        // independent and still applied.
+        let args = ZenohArgs {
+            mode: "peer".into(),
+            listen: Some("tcp/0.0.0.0:9999".to_string()),
+            debug_trace: false,
+            sidecar_base_port: None,
+            multicast_interface: None,
+            peer_tcp_base_port: Some(7447),
+        };
+        let pairs = vec![
+            ("alice".to_string(), "127.0.0.1".to_string()),
+            ("bob".to_string(), "192.168.1.77".to_string()),
+        ];
+        let cfg = build_zenoh_config(&args, &pairs, "alice").expect("config builds");
+        let json = serde_json::to_string(&cfg).expect("config serializes");
+        // Operator listen present.
+        assert!(
+            json.contains("\"tcp/0.0.0.0:9999\""),
+            "operator --zenoh-listen override must win on the listen side: {json}"
+        );
+        // Derived listen NOT present.
+        assert!(
+            !json.contains("\"tcp/0.0.0.0:7447\""),
+            "derived per-index listen must be suppressed when --zenoh-listen is set: {json}"
+        );
+        // Connect derivation IS applied.
+        assert!(
+            json.contains("\"tcp/192.168.1.77:7448\""),
+            "connect endpoints must still be derived even when listen is overridden: {json}"
+        );
+    }
+
+    #[test]
+    fn build_config_explicit_peering_does_not_disable_multicast_scouting() {
+        // T9.5c sits *alongside* the existing T16.10d
+        // `scouting/multicast/autoconnect_strategy = "greater-zid"`
+        // setting. We must not have inadvertently turned scouting off.
+        let args = ZenohArgs {
+            mode: "peer".into(),
+            listen: None,
+            debug_trace: false,
+            sidecar_base_port: None,
+            multicast_interface: None,
+            peer_tcp_base_port: Some(7447),
+        };
+        let pairs = vec![
+            ("alice".to_string(), "127.0.0.1".to_string()),
+            ("bob".to_string(), "127.0.0.1".to_string()),
+        ];
+        let cfg = build_zenoh_config(&args, &pairs, "alice").expect("config builds");
+        let json = serde_json::to_string(&cfg).expect("config serializes");
+        assert!(
+            json.contains("\"greater-zid\""),
+            "explicit peering must not regress the T16.10d greater-zid autoconnect strategy: {json}"
+        );
+    }
+
     #[test]
     fn test_build_zenoh_config_with_multicast_interface_set() {
         // Verify the IP flows into Zenoh's scouting/multicast/interface
@@ -3168,8 +3624,9 @@ mod tests {
             debug_trace: false,
             sidecar_base_port: None,
             multicast_interface: Some(std::net::Ipv4Addr::new(192, 168, 1, 68)),
+            peer_tcp_base_port: None,
         };
-        let cfg = build_zenoh_config(&args).expect("config builds");
+        let cfg = build_zenoh_config(&args, &[], "alice").expect("config builds");
         // serde_json::to_string on a zenoh::Config goes through Zenoh's
         // serde impl which renders config keys verbatim.
         let json = serde_json::to_string(&cfg).expect("config serializes");
@@ -3192,8 +3649,9 @@ mod tests {
             debug_trace: false,
             sidecar_base_port: None,
             multicast_interface: None,
+            peer_tcp_base_port: None,
         };
-        let cfg = build_zenoh_config(&args).expect("config builds");
+        let cfg = build_zenoh_config(&args, &[], "alice").expect("config builds");
         let json = serde_json::to_string(&cfg).expect("config serializes");
         assert!(
             json.contains("\"interface\":null"),
@@ -3445,7 +3903,7 @@ mod tests {
             .build()
             .expect("aux runtime");
         let aux_args = ZenohArgs::parse(&[]).expect("default ZenohArgs");
-        let aux_config = build_zenoh_config(&aux_args).expect("aux config");
+        let aux_config = build_zenoh_config(&aux_args, &[], "aux").expect("aux config");
         let aux_session = aux_rt
             .block_on(async move { zenoh::open(aux_config).await })
             .expect("open aux session");
@@ -3559,7 +4017,7 @@ mod tests {
             .build()
             .expect("aux runtime");
         let aux_args = ZenohArgs::parse(&[]).expect("default ZenohArgs");
-        let aux_config = build_zenoh_config(&aux_args).expect("aux config");
+        let aux_config = build_zenoh_config(&aux_args, &[], "aux").expect("aux config");
         let aux_session = aux_rt
             .block_on(async move { zenoh::open(aux_config).await })
             .expect("open aux session");
@@ -3667,7 +4125,7 @@ mod tests {
             .build()
             .expect("aux runtime");
         let aux_args = ZenohArgs::parse(&[]).expect("default ZenohArgs");
-        let aux_config = build_zenoh_config(&aux_args).expect("aux config");
+        let aux_config = build_zenoh_config(&aux_args, &[], "aux").expect("aux config");
         let (aux_session, aux_subscriber) = aux_rt.block_on(async move {
             let session = zenoh::open(aux_config).await.expect("open aux session");
             let subscriber = session
