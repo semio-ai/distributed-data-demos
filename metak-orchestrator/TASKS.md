@@ -7469,13 +7469,38 @@ Relevant artefacts inside that directory:
 fix; the two run in parallel.
 
 
-### T16.10c — Zenoh: break publisher↔peer-subscriber coupling for WiFi resilience [high]
+### T16.10c — Zenoh: break publisher↔peer-subscriber coupling for WiFi resilience [high] — investigation done 2026-05-25, awaiting user cross-WiFi re-validation
 
 **Repo**: `variants/zenoh/` (primary); `runner/` (if a sidecar router is
 spawned alongside the variant); docs in `metak-shared/`.
 **Status**: filed 2026-05-24 by orchestrator after the T16.10b worker
 named the failure as WiFi-specific symmetric deadlock and recommended
 this direction. See STATUS.md "T16.10b completion report — 2026-05-24".
+
+**2026-05-25 update — investigation phase complete (commits `b9ffcfc`,
+`1669577`, `1d0a928`)**:
+- Wired-LAN baseline on current main (post-T16.10d) is clean — no
+  regression.
+- Localhost synthetic subscriber-jitter (env-var gated) **does**
+  reproduce the cross-WiFi deadlock signature: one peer
+  `sent=N received=0`, other runner-idle-terminates. New reusable
+  diagnostic tool: `ZENOH_TEST_SUB_JITTER_MS` / `_EVERY`.
+- All Option B (FIFO/ack-window/gate-fail-safe) variants either
+  regressed the wired-LAN baseline or sat downstream of the actual
+  deadlock (which lives at the bridge mpsc / `publisher.put().await`
+  CC=Block chain).
+- Aggressive synthetic burst (500 ms / 50) deadlocks; mild burst
+  (50 ms / 1000, ~5 %) passes at 98 %. Real WiFi may sit in the
+  middle.
+- Worker stopped at the `runner/` boundary as instructed. Option A
+  (router sidecar) is not implemented.
+
+**Open decision** — needs user-driven cross-WiFi re-run on current
+main (binary at HEAD ≥ `1d0a928`) using the PowerShell incantation
+in STATUS.md "T16.10c worker completion summary". Two outcomes:
+- 12/12 cross-WiFi spawns clean-exit → close T16.10c with no Option A.
+- Same T16.10b deadlock signature → authorise Option A (router
+  sidecar in `runner/`).
 
 **Problem** (one paragraph, from T16.10b's analysis):
 
