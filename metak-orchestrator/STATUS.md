@@ -19982,3 +19982,111 @@ Expected proof in `logs/<run>-<ts>/<spawn>-<runner>-stderr.txt`:
 
 …with `received > 0` on the QoS 1 multi spawn's final progress.
 
+
+## 2026-05-25 — T9.5d: completion report
+
+Worker for `variants/zenoh/`.
+
+### What landed
+
+Removed the entire T17.8 application-level QoS wrapper from
+`variants/zenoh/src/zenoh.rs` per direct user request. The
+benchmark now exercises Zenoh-native QoS only — the
+`Reliability` + `CongestionControl` mapping in
+`build_publisher_*`, plus the in-process bridge mpsc + EOT
+protocol. Nothing else sits on top of the Zenoh wire.
+
+Three commits (matching the task spec's commit split):
+
+1. `refactor(variant-zenoh): remove application-level QoS credit/
+   ack/dedup wrapper (T9.5d)` — `0776715`
+2. `docs(variant-zenoh): CUSTOM.md note on T17.8 wrapper removal`
+   — `7955e42`
+3. `status(T9.5d): completion report` — this entry.
+
+### Code delta
+
+- `variants/zenoh/src/zenoh.rs`: 1242 lines changed, net -1180.
+- `variants/zenoh/tests/two_runner_regression.rs`: 191 lines
+  changed, net -184 (deleted `two_runner_regression_t17_8_qos3_100pct_delivery`
+  and the now-orphan `CompactSpawn::total_receives_from` helper).
+- Total lines: 1433 changed, net -1364 across these two files.
+- `variants/zenoh/CUSTOM.md`: replaced the "Peer-coordinated
+  back-pressure (T17.8)" section with a "T17.8 removed in T9.5d"
+  note. +77 -167 = net -90.
+
+### Test count delta
+
+Unit tests in `src/zenoh.rs`: 68 → 54 (delta -14). Integration
+tests in `tests/two_runner_regression.rs`: 6 → 5 (delta -1). Total
+**-15 tests**, exactly the wrapper-coverage tests deleted (no
+collateral test deletions).
+
+Tests removed:
+- `test_ack_key_round_trip_and_wildcard_intersection`
+- `test_parse_ack_key_rejects_bad_shapes`
+- `test_ack_payload_encode_decode_roundtrip`
+- `test_ack_payload_decode_rejects_wrong_length`
+- `test_writer_dedup_accepts_novel_seqs`
+- `test_writer_dedup_drops_exact_duplicates`
+- `test_writer_dedup_drops_too_old_seqs`
+- `test_writer_dedup_set_is_bounded`
+- `test_window_gate_no_peers_never_blocks`
+- `test_window_gate_within_window_passes`
+- `test_window_gate_blocks_until_ack_arrives`
+- `test_window_gate_shutdown_unblocks_waiters`
+- `test_window_gate_ack_does_not_regress`
+- `test_window_gate_min_across_peers`
+- `test_publish_qos3_no_peers_known_does_not_block`
+- (integration) `two_runner_regression_t17_8_qos3_100pct_delivery`
+
+Test added: `multi_zenoh_qos_round_trip_post_wrapper_removal`
+(`#[ignore]`) — drives a Multi-mode QoS 1..=4 round-trip via a
+foreign-writer aux Zenoh session, asserts reliable tiers (QoS
+3/4) deliver every sample and best-effort tiers (QoS 1/2) clear
+a 75% floor on localhost. Exercises the post-wrapper hot path
+end-to-end without any ack/dedup/gate infra.
+
+### Localhost smoke gate
+
+Scratch `configs/_t9_5d_smoke.toml` (one variant, scalar-flood
+4vpt × 10hz × 4s operate × 2s silent on a `zenoh-base` template
+trimmed to one Multi-mode entry). Both runners locally,
+`./target/release/runner.exe --name alice --config
+configs/_t9_5d_smoke.toml` and similar for bob.
+
+All four QoS levels reached `phase=done` with 100% per-direction
+delivery and clean (exit 0) shutdown on both peers:
+
+```
+[runner:alice] 'zenoh-smoke-qos1' final progress: phase=done sent=164 received=164 eot_sent=true eot_received=true
+[runner:alice] 'zenoh-smoke-qos2' final progress: phase=done sent=164 received=164 eot_sent=true eot_received=true
+[runner:alice] 'zenoh-smoke-qos3' final progress: phase=done sent=164 received=164 eot_sent=true eot_received=true
+[runner:alice] 'zenoh-smoke-qos4' final progress: phase=done sent=164 received=164 eot_sent=true eot_received=true
+```
+
+(Bob's lines are identical: 164/164 across all four spawns.)
+
+`grep __ack__ logs/t9-5d-smoke-20260525_170351/` returned zero
+matches — confirms the side-channel topic is gone from the wire.
+Scratch config deleted after the smoke. `git status` clean before
+each commit.
+
+### Deviations
+
+None. Stayed strictly within `variants/zenoh/` for the code +
+CUSTOM.md changes; the STATUS.md append is the only file touched
+outside the variant directory (which is the orchestrator-owned
+file the task spec explicitly authorises for the completion
+report).
+
+The smoke result is a "happy path" outcome: the trimmed 4vpt × 10hz
+workload is far below the regime where Zenoh-native QoS 3/4 is
+expected to stall (T16.12's ~50K msg/s asymmetric-stall threshold),
+so this smoke gate does not exercise the failure mode the wrapper
+used to mask. That is in-scope per the task brief — the spec's
+acceptance criterion is "reaches phase=done OR fails in a way
+that's clearly Zenoh-native, not app-level-credit-related". A
+heavier workload that reaches 50K+ msg/s reliable load may now fail
+via watchdog self-kill or low cross-peer delivery; that is the
+data point the user wanted exposed.
