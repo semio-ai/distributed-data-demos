@@ -265,3 +265,126 @@ Presence of that line + clean JSONL terminus at the `operate` phase
 event = the known structural stall, not new damage. Absence of the
 line + truncated JSONL = a genuinely new failure mode and worth
 investigating.
+
+
+## Multi-NIC Windows: Zenoh's `scouting.multicast.interface = "auto"` is unreliable
+
+**Symptom**: Cross-machine Zenoh runs deadlock symmetrically — both peers
+freeze identically after operate-entry, T15.5 watchdog fires identically
+on both sides, no compact-parquet emitted. On reliable QoS the publisher
+wedges at exactly `sent = QOS_STRICT_WINDOW = 2048` (T17.8's
+application-layer credit window cap). On best-effort QoS, the spawn
+completes but `received = 0` on every direction.
+
+**Diagnosis** (this session, 2026-05-25):
+- Pure UDP multicast at `224.0.0.224:7446` between the two machines works
+  cleanly in both directions on both Ethernet and WiFi (via the LS105G
+  unmanaged switch and the WiFi AP respectively). PowerShell test scripts
+  below.
+- Both machines have Ethernet AND WiFi active on the same `192.168.1.0/24`
+  subnet, which is the normal Windows setup but a multicast risk factor.
+- Zenoh's default `scouting.multicast.interface = "auto"` defers the
+  pick to Windows's routing-table lowest-metric default, which is
+  non-deterministic across peers when both NICs are up: alice may bind
+  multicast to Ethernet while bob binds to WiFi (or vice versa). On
+  Windows, the IGMP membership filter is per-interface — a packet
+  arriving on the wrong NIC is silently dropped at the kernel even if
+  the physical bytes were deliverable.
+
+**Fix shape**: pin `scouting.multicast.interface` explicitly to the
+local IP that's on the same subnet as the peer, via the runner's
+generic `--variant-arg` passthrough (T9.5). Auto-derive from `--peers`
+is also possible but not chosen — explicit pinning preserves real-world
+Zenoh scouting behaviour and scales cleanly to N>2 runners.
+
+### Reusable diagnostic — confirm whether multicast actually works between two Windows hosts
+
+These two PowerShell scripts test exactly the Zenoh scouting path with
+no Zenoh in the picture. If multicast fails, no variant config will
+make Zenoh work; if multicast passes, the failure is in Zenoh's
+configuration (interface auto-pick, firewall app-rule, etc.).
+
+**Pre-step**: identify each machine's IP on the shared subnet:
+
+```powershell
+Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp,Manual |
+    Where-Object {
+        $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and
+        $_.InterfaceAlias -notmatch '(vEthernet|WSL|Loopback|VMware|VirtualBox|Bluetooth|Tunnel)'
+    } |
+    Select-Object IPAddress, InterfaceAlias, InterfaceIndex
+```
+
+**Listener (machine B)** — paste B's real IP into `$localIp`:
+
+```powershell
+$localIp = "<B-IP>"
+$port    = 7446
+$group   = "224.0.0.224"
+if ($localIp -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "STOP" }
+$client = New-Object System.Net.Sockets.UdpClient
+$client.ExclusiveAddressUse = $false
+$client.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket,
+                               [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+$client.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $port))
+$client.JoinMulticastGroup([System.Net.IPAddress]::Parse($group),
+                           [System.Net.IPAddress]::Parse($localIp))
+Write-Host "OK -- joined $group on $localIp port $port. Ctrl-C to stop." -ForegroundColor Green
+$ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+while ($true) {
+    $bytes = $client.Receive([ref]$ep)
+    $msg = [System.Text.Encoding]::UTF8.GetString($bytes)
+    Write-Host "[$(Get-Date -Format HH:mm:ss.fff)] RX from $ep : $msg"
+}
+```
+
+**Sender (machine A)** — paste A's real IP into `$localIp`:
+
+```powershell
+$localIp = "<A-IP>"
+$port    = 7446
+$group   = "224.0.0.224"
+if ($localIp -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "STOP" }
+$client = New-Object System.Net.Sockets.UdpClient
+$client.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($localIp), 0))
+$ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($group), $port)
+Write-Host "OK -- sending from $localIp to $group`:$port" -ForegroundColor Green
+1..10 | ForEach-Object {
+    $msg = "ping $_ from $localIp at $(Get-Date -Format HH:mm:ss.fff)"
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($msg)
+    $null = $client.Send($bytes, $bytes.Length, $ep)
+    Write-Host "[$(Get-Date -Format HH:mm:ss.fff)] TX: $msg"
+    Start-Sleep -Milliseconds 500
+}
+$client.Close()
+```
+
+**Interpretation**:
+- B receives 10/10 → multicast path is fine; if Zenoh still fails, it's
+  the `interface = "auto"` pathology (or app-level firewall, or a
+  variant-config issue).
+- B receives 0/10 → multicast itself is blocked. Likely AP filtering,
+  Windows Firewall on "Public" profile (check `Get-NetConnectionProfile`),
+  or `JoinMulticastGroup` binding to a different NIC than intended.
+- B receives 0/10 on WiFi only, 10/10 on Ethernet → AP-side filtering /
+  IGMP-snooping-without-querier / WMM-driven drop. Try a different AP
+  or switch to wired for that benchmark.
+
+The placeholders MUST be substituted with real IPs before running —
+PowerShell continues past `Parse` errors silently and the script will
+appear to work while producing garbage. The `throw "STOP"` guards in
+the snippets above catch this. If those didn't fire, the substitution
+happened.
+
+### Background — why `auto` is non-deterministic
+
+Windows resolves an unbound multicast socket's interface via the
+routing-table metric. Default metrics are roughly:
+- Ethernet: 25
+- WiFi: 35-50
+
+Anything that nudges metrics (driver update, profile reset, "metered
+connection" toggling, DHCP renew, Hyper-V vSwitch insertion, WSL
+networking, OpenVPN, Docker Desktop) can flip the pick on one machine
+without flipping it on the other. The behaviour is observable but not
+trustworthy across reboots or sessions.
