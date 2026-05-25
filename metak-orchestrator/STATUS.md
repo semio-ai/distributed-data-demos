@@ -19145,3 +19145,95 @@ by T9.5" (no router-sidecar required).
    loopback scouting completing in < 500 ms and the aux subscriber
    declaring before the publish burst — both timing-sensitive on a
    contended Windows host. Out of T9.5 scope.
+
+
+## 2026-05-25 — T9.5 post-implementation bug + design decision (T9.5a filed)
+
+### Bug discovered on user's cross-WiFi gate run
+
+User ran the alice runner with `--variant-arg
+zenoh.multicast_interface=192.168.1.80` on the actual `configs/
+two-runner-zenoh-all.toml`. The selector parsed correctly (startup
+banner showed `--variant-arg overrides for 'zenoh':
+multicast_interface=192.168.1.80`) but at spawn time the override
+was silently dropped:
+
+```
+[runner:alice] spawn 'zenoh-1000x100hz-scalar-qos1-multi' specific args: zenoh_mode=peer (toml)
+[zenoh] multicast interface: auto
+```
+
+Root cause: `cli_overrides_for_spawn =
+variant_arg_overrides.get(&variant.name)` does a **literal** lookup
+against `variant.name`. The user typed `zenoh` as the selector but
+the config has no variant literally named `zenoh` — they're all
+`zenoh-1000x100hz-scalar`, `zenoh-1000x100hz-block`, …, `zenoh-max`
+(22 distinct names, all sharing the `zenoh-base` template). The
+literal lookup misses on all of them.
+
+The QoS 3/4 spawns then hit the existing `sent=2048 received=0`
+internal-stall watchdog signature, identical to the pre-T9.5
+failure mode — because the multicast-interface pin never reached
+the variant.
+
+### Why this slipped past the worker's gates
+
+My T9.5 brief specified localhost smoke against a hand-rolled
+synthetic config whose single variant was literally named `zenoh`.
+That config exercises the parser + merger + spawn-arg emission
+end-to-end, but it does NOT exercise the per-variant lookup against
+a config where the user's intended "selector" diverges from
+`variant.name`. The unit tests in `cli_args.rs` similarly use
+synthetic configs. The bug only surfaces when (a) the config uses
+templates to define a variant family, and (b) the user's natural
+mental anchor for the family ("zenoh") is not literally one of the
+variant names.
+
+Owning the miss: my smoke gate was the wrong shape. The worker's
+report was correct on its own terms; I didn't ask for a smoke that
+would have caught this class of failure.
+
+### User-chosen resolution (AskUserQuestion 2026-05-25)
+
+Four options were laid out:
+1. Glob match on variant name (e.g. `zenoh-*.X=Y`).
+2. Template-name fallback (literal-then-template).
+3. Binary-basename fallback (`target/release/variant-zenoh.exe` → `zenoh`).
+4. Glob + template-name fallback (combined).
+
+User picked **Option 1: Glob on variant name**. Rationale (mine, not
+user-stated): explicit selector semantics, no implicit magic, no
+extra config knowledge required, scales cleanly to the upcoming
+4-machine runs where selectors may need to be more specific.
+
+### Action — T9.5a filed
+
+Filed `T9.5a — runner: widen --variant-arg selector to glob-match
+variant names [high]` in TASKS.md. Scope:
+
+- Parser returns CLI-order-preserving `Vec<VariantArgEntry>` instead
+  of `HashMap<String, HashMap<...>>`.
+- Glob matcher (`*` and `?` only, no character classes, no `glob`
+  crate — inline implementation).
+- Per-spawn resolver that scans entries in CLI order; last-matching
+  entry wins on key conflicts.
+- Provenance line gets the selector annotation: `multicast_interface
+  =192.168.1.80 (cli: zenoh-*)`.
+- Documentation + clap help text rewrite.
+- Localhost smoke must use the **actual** user-facing config
+  `configs/two-runner-zenoh-all.toml` (or a trimmed two-variant
+  copy) — not a synthetic fixture — to exercise the family-match
+  semantics.
+
+### T16.10c remains open
+
+T9.5's intended cross-WiFi gate has not actually been run yet,
+because the override never reached the variant. T16.10c stays open
+pending T9.5a + user re-run.
+
+### Memory updated
+
+The "workers must never discard orchestrator changes" rule
+(2026-05-24) was the only memory file relevant to T9.5; it
+remains accurate. The "Windows-runnable commands" rule was applied
+(PowerShell-quoted glob examples in the T9.5a spec).

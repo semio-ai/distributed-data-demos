@@ -1613,6 +1613,251 @@ beyond split-and-forward.
   spawns reach `phase=done`."
 
 
+### T9.5a — runner: widen `--variant-arg` selector to glob-match variant names [high] — bug in T9.5
+
+**Repo**: `runner/`.
+**Status**: filed 2026-05-25 by orchestrator. User-authorised
+runner-touch (continuation of T9.5).
+
+**Motivation**: T9.5 shipped `--variant-arg <selector>.<key>=<value>`
+with **literal** selector matching (`variant_arg_overrides.get(&variant.name)`).
+On the user's cross-WiFi gate run, the typed selector `zenoh` failed
+to apply because the variants in `configs/two-runner-zenoh-all.toml`
+are named `zenoh-1000x100hz-scalar`, `zenoh-1000x100hz-block`, …,
+`zenoh-max` — there is **no variant literally named `zenoh`**. The
+override was parsed (startup log confirmed) but silently dropped at
+spawn time; the per-spawn provenance line showed `zenoh_mode=peer
+(toml)` only, and `[zenoh] multicast interface: auto` confirmed the
+pin never reached the variant. Forcing the user to spell out all 22
+variant names would defeat the whole point of the feature
+(per-machine NIC pins across the matrix).
+
+User-chosen resolution (see decision log in STATUS.md "T9.5
+post-implementation bug + design decision"): **glob match on variant
+name**. The user types `--variant-arg 'zenoh-*.multicast_interface=X'`
+to hit every zenoh variant; `--variant-arg '*.key=val'` is the
+"apply to all variants" escape hatch.
+
+#### Scope — runner side
+
+1. **Parser** (`runner/src/cli_args.rs::parse_variant_arg_overrides`):
+   - Replace the return type. Today it returns
+     `HashMap<String, HashMap<String, toml::Value>>` keyed by literal
+     variant name. Replace with `Vec<VariantArgEntry>` (a flat,
+     CLI-order-preserving list), where each entry carries
+     `{ selector: String, key: String, value: toml::Value }`. The
+     `selector` is the raw user-supplied pattern; no validation of
+     glob syntax at parse time beyond the existing empty-selector /
+     empty-key / missing-`.` / missing-`=` checks.
+   - The selector preserves the user's literal string. Glob
+     interpretation is a matcher-level concern, not a parser concern.
+2. **Glob matcher** (new helper in `cli_args.rs`):
+   - `fn glob_match(pattern: &str, candidate: &str) -> bool`. Support
+     **only** `*` (zero-or-more of any char) and `?` (exactly one
+     char). No character classes (`[abc]`), no escaping, no `**`
+     (the whole namespace is flat). Implement directly — under 30
+     lines, no new crate dep. Recursive backtrack on `*` is fine; the
+     selector strings are short.
+   - A pattern with NO `*` or `?` is a literal — must match by exact
+     string equality. (Backward compatibility for the T9.5 contract:
+     `zenoh.X=Y` still matches a literal `zenoh` if such a variant
+     exists.)
+3. **Per-spawn resolver** (new in `cli_args.rs`):
+   - `fn resolve_for_variant(entries: &[VariantArgEntry], variant_name:
+     &str) -> HashMap<String, (toml::Value, String)>`. The tuple's
+     second element is the selector that contributed this key, used by
+     the provenance log line.
+   - Iterate entries in CLI order. For each entry whose selector
+     glob-matches `variant_name`, insert/overwrite `(key, (value,
+     selector))` in the result. **Last-CLI-position wins on key
+     conflict** — this lets the user write
+     `--variant-arg '*.X=default' --variant-arg 'zenoh-*.X=override'`
+     and get the override on zenoh-* spawns, the default elsewhere.
+     Document that ordering matters; no implicit "literal beats glob"
+     specificity ranking.
+4. **`build_variant_args`**:
+   - Signature stays the same shape: take `Option<&HashMap<String,
+     toml::Value>>`. The caller builds the resolved map first by
+     calling `resolve_for_variant`, drops the per-selector provenance
+     into a separate variable, and passes the plain
+     `HashMap<key, value>` here.
+   - Existing TOML-vs-CLI merge logic in `merge_specific_with_overrides`
+     stays unchanged — that layer still treats CLI as one bag, no
+     selector knowledge needed.
+5. **`specific_arg_provenance`**:
+   - Extend the third tuple element. Today it's
+     `(String /* key */, String /* value */, SpecificArgProvenance)`.
+     Change to `(String, String, SpecificArgProvenance, Option<String>
+     /* selector */)`. The selector field is `Some(...)` when
+     provenance is `Cli`, `None` for `Toml`.
+6. **Spawn-time call sites** (`runner/src/main.rs` around line 1016
+   and the startup-log block around line 343):
+   - Replace `variant_arg_overrides.get(&variant.name)` with the new
+     resolver pipeline.
+   - Update the per-spawn provenance log line to mention the selector
+     when CLI: `multicast_interface=192.168.1.80 (cli: zenoh-*)`.
+     Keep `(toml)` unchanged.
+   - Update the startup log line. Today it groups by literal variant:
+     `--variant-arg overrides for 'zenoh': multicast_interface=192.168.1.80`.
+     Change to one line per CLI entry, preserving CLI order:
+     `--variant-arg selector 'zenoh-*': multicast_interface=192.168.1.80`.
+     The line should make it crystal-clear that this is a *selector
+     pattern*, not a literal name — past behaviour was a UX trap.
+7. **clap help text** for `--variant-arg` in `runner/src/main.rs`:
+   - Rewrite the doc comment. Lead with "selector is glob-matched
+     against variant.name (`*` and `?` supported)". Give an example
+     showing `zenoh-*.X=Y` and `*.X=Y`. Drop the example that uses
+     a literal `zenoh.` selector — it would mislead on configs whose
+     variants don't literally include that name.
+
+#### Tests
+
+All in `runner/src/cli_args.rs::tests`:
+- `glob_match_literal`: `glob_match("zenoh", "zenoh")` true;
+  `glob_match("zenoh", "zenoh-x")` false.
+- `glob_match_star`: `glob_match("zenoh-*", "zenoh-1000x100hz-scalar")`
+  true; `glob_match("zenoh-*", "quic-x")` false;
+  `glob_match("*", "anything")` true; `glob_match("*", "")` true.
+- `glob_match_question`: `glob_match("v?", "v1")` true;
+  `glob_match("v?", "v")` false; `glob_match("v?", "v12")` false.
+- `glob_match_star_at_both_ends`: `glob_match("*zenoh*", "x-zenoh-y")`
+  true.
+- `parse_variant_arg_preserves_cli_order`: two entries with the same
+  selector and same key but different values — the second wins after
+  resolve.
+- `resolve_for_variant_glob_hits_family`: parser sees
+  `zenoh-*.multicast_interface=X`; resolve called with
+  variant_name `zenoh-1000x100hz-scalar` returns the override.
+- `resolve_for_variant_literal_still_works`: backward compat —
+  `quic.cert=X` resolves only for variant `quic`, not `quic-base`.
+- `resolve_for_variant_later_overrides_earlier_with_different_selectors`:
+  CLI order `*.X=a` then `zenoh-*.X=b`; for variant `zenoh-y` the
+  resolved value is `b`. Reverse order — value is `a`. Document this
+  in the doc comment on `resolve_for_variant`.
+- `resolve_for_variant_no_match_returns_empty`: glob that matches
+  nothing returns an empty map; downstream emits no `--` separator,
+  no provenance line.
+- `build_args_glob_override_propagates_to_specific_args`: end-to-end —
+  parse `zenoh-*.multicast_interface=192.168.1.80`, resolve for
+  variant `zenoh-1000x100hz-scalar`, call `build_variant_args`,
+  assert the trailing args contain `--multicast-interface
+  192.168.1.80`.
+- `specific_arg_provenance_includes_selector`: provenance entry for a
+  CLI key carries `Some("zenoh-*")` in the new selector field;
+  TOML-sourced entries carry `None`.
+
+#### Localhost smoke (this is the gate I missed last time)
+
+Use **the actual user-facing config** `configs/two-runner-zenoh-all.toml`,
+not a synthetic fixture, because the bug only surfaces on configs whose
+variant names aren't literal `zenoh`:
+
+```powershell
+.\target\release\runner.exe --name alice --config configs\two-runner-zenoh-all.toml `
+  --variant-arg 'zenoh-*.multicast_interface=127.0.0.1'
+# (in another terminal)
+.\target\release\runner.exe --name bob   --config configs\two-runner-zenoh-all.toml `
+  --variant-arg 'zenoh-*.multicast_interface=127.0.0.1'
+```
+
+The matrix is large (88 spawns at 30s/spawn ≈ 45 minutes). Worker may
+narrow the smoke by trimming `configs/two-runner-zenoh-all.toml` into
+a scratch copy `configs/_t9_5a_smoke.toml` containing just two zenoh
+variants (e.g. `zenoh-10x10hz-scalar` × QoS 1 only — should take
+under a minute). The point is to exercise the glob match against
+real config variant names; one or two real names suffice.
+
+Acceptance signal: every zenoh-* spawn shows
+`multicast_interface=127.0.0.1 (cli: zenoh-*)` on its provenance line.
+The startup banner shows `--variant-arg selector 'zenoh-*':
+multicast_interface=127.0.0.1`. The captured stderr (the
+`<spawn-name>-<runner>-stderr.txt` file under the run's log
+subfolder) shows `[zenoh] multicast interface: 127.0.0.1`. If the
+captured stderr does NOT show the line, that is the pre-existing
+stderr-capture fidelity gap flagged under "New follow-up concerns"
+in T9.5's STATUS report — note it in the completion report but do
+not chase it; direct invocation of the variant binary is sufficient
+proof the override is wired.
+
+#### Documentation
+
+- **`metak-shared/api-contracts/variant-cli.md`** — read the file
+  first, then **append-only** to the T9.5 section a sub-heading
+  "T9.5a (2026-05-25): selector is a glob" that documents:
+  - `*` and `?` semantics, no character classes, no escape.
+  - CLI-order precedence (last entry wins on key conflict).
+  - Backward compat: a selector with no glob chars is still a literal
+    match.
+  - Why: incident the user hit on `configs/two-runner-zenoh-all.toml`
+    where the literal-name lookup silently dropped overrides.
+- **`runner/CUSTOM.md`** — read first, append a paragraph noting the
+  selector is now a glob with an example.
+- **`variants/zenoh/CUSTOM.md`** — read first, update the example
+  PowerShell incantation in the existing T9.5 paragraph to use
+  `'zenoh-*.multicast_interface=...'` (quoted, for PowerShell's
+  globbing).
+
+#### Validation gates
+
+- `cargo test --release -p runner` — clean (273 + new tests).
+- `cargo test --release -p variant-zenoh` — clean (unchanged; the
+  variant side has no work in this task).
+- `cargo clippy --release --workspace --all-targets -- -D warnings` —
+  clean.
+- Localhost smoke per above.
+
+#### Out of scope
+
+- Per-selector precedence ranking (literal beats glob). User picked
+  CLI-order precedence explicitly to keep the model simple. Multiple
+  matches resolve by CLI position, full stop.
+- Glob escaping or character classes.
+- Validation that a selector actually matches any variant in the
+  loaded config. If the user types a selector that matches nothing,
+  the runner silently does nothing. We could emit a warning, but
+  that's polish — out of T9.5a scope.
+- Migrating the existing T9.5 doc-comment example to use a literal
+  selector instead of glob. The doc-comment rewrite IS in scope
+  (item #7 above) but is "rewrite for clarity", not "migrate
+  examples".
+
+#### Read-then-append rule (memory of 2026-05-24 incident)
+
+**MANDATORY**: Workers must NEVER `git checkout`, `git restore`,
+`git stash`, or otherwise discard uncommitted changes to
+orchestrator-owned files (`metak-orchestrator/STATUS.md`,
+`metak-orchestrator/TASKS.md`, `metak-orchestrator/EPICS.md`,
+`metak-orchestrator/DECISIONS.md`, `metak-shared/api-contracts/*`).
+Always read those files first, then append/edit your own additions
+only. Other content in those files is the orchestrator's running log
+— it may or may not be in HEAD yet, and that is intentional. If you
+think you need to "clean" or "stash" working-tree changes before
+your work, that is a flag-back to the orchestrator, not a freelance
+action. Before committing, `git status` and verify your `git add`
+only stages files you yourself modified.
+
+#### Acceptance criteria
+
+- [ ] `glob_match`, `VariantArgEntry`, and `resolve_for_variant`
+      land in `cli_args.rs` per the contract above.
+- [ ] Existing `parse_variant_arg_*`, `merge_specific_with_overrides`,
+      and `specific_arg_provenance` tests still pass after the
+      type-signature reshape (adapt the assertions, don't delete the
+      tests).
+- [ ] All new tests under "Tests" above pass.
+- [ ] Spawn-time provenance log line shows `(cli: <selector>)` for
+      CLI-sourced keys.
+- [ ] Startup log line names each selector verbatim.
+- [ ] clap help text on `--variant-arg` rewritten with the new
+      example using `'zenoh-*.X=Y'`.
+- [ ] Localhost smoke against either `configs/two-runner-zenoh-all.toml`
+      or a trimmed two-variant copy succeeds with the glob selector.
+- [ ] Contracts + CUSTOM.md docs updated, append-only.
+- [ ] STATUS.md gets a worker completion report appended under
+      "T9.5a: …".
+- [ ] All `cargo` gates clean.
+
+
 ---
 
 ## Current Sprint — E10: Variant Robustness Under Load
