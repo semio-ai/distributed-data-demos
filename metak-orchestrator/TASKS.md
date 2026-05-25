@@ -1469,7 +1469,7 @@ Acceptance criteria:
 
 ---
 
-### T9.5 — runner: `--variant-arg` CLI passthrough + Zenoh `--multicast-interface` first consumer [medium]
+### T9.5 — runner: `--variant-arg` CLI passthrough + Zenoh `--multicast-interface` first consumer [medium] — implementation done 2026-05-25, awaiting user cross-WiFi gate
 
 **Repos**: `runner/` (new feature), `variants/zenoh/` (first consumer),
 `metak-shared/api-contracts/variant-cli.md` (contract note).
