@@ -19697,3 +19697,84 @@ multicast-discovery vs raw TCP).
 Both flag-backs are observations, not fixes; the smoke is the
 diagnostic, and finding the bug is the next task.
 
+
+## 2026-05-25 — T16.20 smoke results from user + T9.5c filed
+
+### Smoke results (cross-WiFi, alice 192.168.1.80 / bob 192.168.1.77)
+
+- **Test 1** (QoS 1 low rate, multicast scouting with
+  `--multicast-interface <local-WiFi-IP>` pinned): **FAILED**. User
+  reports "peers never seen" — the smoke binary's session never
+  printed a single `peer found zid=...` line and `session.info()
+  .peers_zid()` stayed empty throughout.
+- **Test 4** (QoS 1 low rate, explicit `--connect tcp/<peer>:7447`,
+  multicast disabled implicitly): **PASSED**. 100 % delivery, peers
+  connect immediately.
+
+### What this rules in and out
+
+Ruled in: Zenoh's data plane works fine cross-WiFi when given an
+explicit TCP endpoint to connect to. The transport layer, the
+subscription handlers, the QoS plumbing — all functional.
+
+Ruled out: any framing-level bug in Zenoh's data path under WiFi.
+The bench's silent-loss is NOT a data-plane bug; it's a
+discovery-only failure.
+
+Ruled in: Zenoh's multicast scouting on Windows multi-NIC hosts is
+the broken layer. Even with `scouting/multicast/interface` pinned
+to the WiFi IP, scout packets either don't transmit on the right
+interface or don't survive the kernel's per-interface multicast
+group-join filtering on inbound. (Raw UDP multicast at the same
+group/port worked in the earlier PowerShell test — but that test
+explicitly bound both join-interface and bind-interface on both
+ends, which Zenoh's internal socket setup apparently doesn't
+mirror.) `session.info().links()` and similar per-link diagnostics
+are behind the `unstable` feature flag the variant doesn't enable,
+so cheap further bisection is blocked.
+
+### Design decision (AskUserQuestion 2026-05-25)
+
+User chose "Ship the explicit-connect fix" over (a) digging into
+multicast further, (b) documenting as benchmark limitation,
+(c) running the remaining smoke tests first. Rationale: smoke
+test 4 already proved the fix works empirically; further multicast
+diagnostics could take hours with no guaranteed root cause.
+
+The bench will now exercise Zenoh under operator-configured
+explicit peering rather than multicast-scouting auto-discovery.
+This IS a real Zenoh deployment pattern (the docs recommend it for
+production), and matches Single-mode (zenohd sidecar)'s existing
+T14.9b peering convention.
+
+### Action — T9.5c filed
+
+Filed `T9.5c — variants/zenoh: derive explicit Zenoh
+connect/endpoints from --peers (Multi mode) [high]` in TASKS.md.
+Scope is Multi-mode-only (Single-mode already has this since
+T14.9b). Uses the existing `derive_runner_index` +
+`peer_name_host_pairs` machinery already in the file. New CLI
+flag `--zenoh-peer-tcp-base-port` (default 7447), exposed through
+the T9.5a `--variant-arg` glob channel. Multicast scouting stays
+on as a no-op fallback.
+
+### T16.10c will close on T9.5c smoke pass
+
+Once T9.5c lands and the user re-runs the cross-WiFi gate
+(no `--variant-arg zenoh-*.multicast_interface=...` needed any
+more — explicit peering should make the bench work standalone),
+T16.10c closes with "fixed by T9.5 + T9.5a + T9.5b + T9.5c". The
+chain of fixes:
+
+- T9.5: opened the `--variant-arg` channel and added
+  `--multicast-interface` to the variant.
+- T9.5a: widened the runner-side selector to glob-match variant
+  family names.
+- T9.5b: fixed the variant's lenient parser eating `--` as a flag.
+- T9.5c: bypassed multicast scouting with explicit peering derived
+  from `--peers`.
+
+Only T9.5c is strictly necessary to fix the user's hardware —
+but T9.5/a/b are durable improvements (the `--variant-arg` channel
+is genuinely useful for the upcoming 4-machine runs).
+

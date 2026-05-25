@@ -9898,3 +9898,258 @@ under `## 2026-05-25 — T16.20: completion report`:
       (the local WiFi IP).
 - [ ] STATUS.md completion report appended with the localhost
       numbers and the user-facing incantation.
+
+
+### T9.5c — variants/zenoh: derive explicit Zenoh `connect/endpoints` from `--peers` (Multi mode) [high] — fixes cross-WiFi data plane via explicit peering
+
+**Repo**: `variants/zenoh/`.
+**Status**: filed 2026-05-25 by orchestrator. Closes T16.10c on
+the user's hardware once smoke confirms.
+
+**Motivation**: T16.20's smoke binary proved empirically that on
+the user's two-Windows-host WiFi setup:
+
+- Zenoh's multicast scouting in peer mode **does not discover the
+  remote peer** (smoke test 1: "peers never seen" — even with
+  `--multicast-interface <local-WiFi-IP>` pinned, even though the
+  raw UDP multicast frames at 224.0.0.224:7446 traverse the link
+  cleanly per the PowerShell test).
+- Explicit `connect tcp/<peer-IP>:7447` works (smoke test 4: 100 %
+  delivery at low rate). The data plane is fine; only Zenoh's
+  multicast-scouting-on-Windows discovery is broken.
+
+The probable root cause is Windows multi-NIC multicast group-join
+asymmetry: Zenoh's socket joins the multicast group bound to the
+pinned interface, but the kernel only delivers inbound packets
+that arrived on that exact interface — and on a multi-NIC host
+(Ethernet + WiFi + Hyper-V + IPv6 link-local) the inbound packets
+arrive on a different interface than the pinned one. We could
+spend hours bisecting this with Wireshark / `session.info().links()`
+(behind the `unstable` feature flag), but the pragmatic exit is
+to bypass scouting entirely: the runner already injects a
+`--peers <name>=<ip>,...` map that contains exactly the
+information needed to build `connect/endpoints`.
+
+Single-mode (zenohd sidecar) **already does this** — see
+`zenoh.rs::Variant::connect` around lines 1124-1160: derives a
+per-peer TCP port from `base_port + index_in_sorted_peers`, builds
+listen=`127.0.0.1:<self_port>`, connect=`<peer_host>:<peer_port>`.
+We just need the same pattern for Multi mode (in-process Zenoh
+session, configured via `build_zenoh_config`).
+
+User chose this fix over (a) "dig into multicast first" and
+(b) "document as benchmark limitation" via AskUserQuestion. Trade-off
+explicitly accepted: the bench now exercises Zenoh under
+"operator-configured explicit peering" rather than
+"multicast-scouting auto-discovery". Multicast scouting remains
+enabled as a no-op fallback — when it works, it works; when it
+doesn't, the explicit endpoints carry the day.
+
+#### Scope
+
+Multi-mode-only. Single-mode already has its own sidecar peering
+logic — leave it alone.
+
+1. **New CLI flag**:
+   `--zenoh-peer-tcp-base-port <port>` on `ZenohArgs`.
+   Default `7447` (Zenoh's standard TCP port). Operator override
+   via `--variant-arg 'zenoh-*.zenoh_peer_tcp_base_port=...'` (the
+   T9.5a glob channel that's already live). Validation: 1-65535.
+
+2. **Plumb peer-host info into `build_zenoh_config`**:
+   Today the function takes `&ZenohArgs` only. Either pass an
+   additional `peer_pairs: &[(String, String)]` argument plus
+   `runner_name: &str`, OR plumb the peer info through `ZenohArgs`.
+   Worker picks whichever is cleaner — both work. The Multi-mode
+   call site at `zenoh.rs:2237` already has access to `self.runner`
+   and can call `self.peer_name_host_pairs()`.
+
+3. **Derive deterministic listen + connect ports**:
+   In `build_zenoh_config` (or a helper it calls):
+   - Compute `self_index` = position of `runner_name` in the
+     sorted peer-names list (identical convention to
+     `derive_runner_index`, already in the file).
+   - Compute `self_port = base_port + self_index` (u16 saturating
+     check — error if overflow).
+   - For each peer `(name, host)` where `name != runner_name`:
+     compute `peer_index` (position in the sorted list) and
+     `peer_port = base_port + peer_index`.
+   - Set `listen/endpoints = ["tcp/0.0.0.0:<self_port>"]` via
+     `insert_json5`. **Skip** the listen-set if the user already
+     passed `--zenoh-listen` (operator override wins).
+   - Set `connect/endpoints = ["tcp/<host>:<peer_port>", ...]` via
+     `insert_json5`.
+   - Single-peer (solo) runs: peer_pairs has only self → no
+     connect endpoints emitted. Multicast scouting handles the
+     "really alone" case unchanged.
+
+4. **Keep multicast scouting enabled**:
+   Do NOT disable `scouting/multicast/enabled` or
+   `scouting/gossip/enabled`. The whole point is to ADD explicit
+   peering, not replace scouting. When scouting works, it's
+   harmless redundancy; when it doesn't (the user's WiFi case),
+   the explicit endpoints carry data.
+
+5. **Startup log line**:
+   Add a line analogous to T9.5b's `[zenoh] multicast interface:
+   ...`:
+   `[zenoh] explicit peering: listen=tcp/0.0.0.0:<n>
+   connect=[tcp/<peer1>:<n1>, tcp/<peer2>:<n2>, ...]` when the
+   feature kicks in. When solo (no peers): print
+   `[zenoh] explicit peering: solo (no --peers entries beyond self)`.
+
+#### Tests (in `variants/zenoh/src/zenoh.rs::tests`)
+
+- `peer_tcp_base_port_default_is_7447`.
+- `peer_tcp_base_port_accepts_override`: parse
+  `--zenoh-peer-tcp-base-port 9000` and assert round-trip.
+- `peer_tcp_base_port_rejects_zero`: invalid; clear error.
+- `build_config_emits_listen_and_connect_for_two_peers`:
+  synthetic extra args containing `--peers
+  alice=127.0.0.1,bob=192.168.1.77`, runner_name=`alice`,
+  base_port=7447. Assert the resulting `zenoh::Config` has
+  `listen/endpoints = ["tcp/0.0.0.0:7447"]` and
+  `connect/endpoints = ["tcp/192.168.1.77:7448"]`. (Bob is index
+  1 alphabetically.)
+- `build_config_swaps_listen_and_connect_for_other_peer`: same
+  inputs, runner_name=`bob`. Listen `tcp/0.0.0.0:7448`, connect
+  `["tcp/127.0.0.1:7447"]`.
+- `build_config_solo_emits_no_connect_endpoints`: no `--peers`,
+  no connect entries; listen falls back to whatever `--zenoh-listen`
+  set OR nothing (matches existing behaviour for solo).
+- `build_config_user_listen_override_wins`: user passed
+  `--zenoh-listen tcp/0.0.0.0:9999`; assert the derived
+  per-index listen is NOT applied, but connect endpoints ARE.
+  (Connect derivation is independent of the listen override.)
+- `build_config_three_peers_alphabetical_indices`:
+  `alice=127.0.0.1, bob=192.168.1.77, charlie=192.168.1.78`,
+  runner=`bob`, base=7447. Listen=`tcp/0.0.0.0:7448`, connect
+  in alphabetical order:
+  `["tcp/127.0.0.1:7447", "tcp/192.168.1.78:7449"]`.
+
+Reading the config back out of `zenoh::Config` for assertion:
+the existing test patterns in the file use `config.get_json("...")
+.unwrap()` or similar. Worker mirrors the existing convention; if
+the API isn't trivially round-trippable, exposing a tiny
+`derive_peering_endpoints(...) -> (Option<String>, Vec<String>)`
+helper and asserting on its outputs is acceptable.
+
+#### Localhost smoke (this is the gate)
+
+Repeat T9.5b's pattern. Trimmed scratch config `configs/
+_t9_5c_smoke.toml` carrying the `zenoh-base` template plus one
+zenoh variant. Run alice + bob locally with multicast scouting
+default (no `--variant-arg` for multicast_interface — we're
+testing that the explicit peering ALONE is sufficient). Verify in
+the captured variant stderr:
+
+- `[zenoh] explicit peering: listen=tcp/0.0.0.0:7447
+  connect=[tcp/127.0.0.1:7448]` (alice's line, indices may swap
+  alphabetically — match what the code emits).
+- The QoS 1 multi spawn reaches `phase=done` with
+  `received > 0` and ideally `received ≈ sent` (allowing for
+  CC=Drop tolerance).
+- Delete `_t9_5c_smoke.toml` after.
+
+Then ALSO run the existing `multi_zenoh_qos3_qos4_preserves_per_key_order`
+ignored test if it's been stable for the worker on prior task
+runs — to confirm in-process Zenoh sessions still work for the
+loopback case (which uses no --peers).
+
+#### Read-then-append rule (memory of 2026-05-24 incident)
+
+MANDATORY. Worker must NEVER `git checkout`, `git restore`,
+`git stash`, or otherwise discard uncommitted changes to
+orchestrator-owned files (`metak-orchestrator/STATUS.md`,
+`metak-orchestrator/TASKS.md`, `metak-orchestrator/EPICS.md`,
+`metak-orchestrator/DECISIONS.md`, `metak-shared/api-contracts/*`).
+Read those files first, append/edit only your own additions.
+Before each `git add` / `git commit`: `git status` and verify
+your `git add` only stages files you yourself modified. Never
+`git add -A` or `git add .`.
+
+#### Files the worker may touch
+
+- `variants/zenoh/src/zenoh.rs` — the parser flag, the
+  `build_zenoh_config` extension, the new helper function, the
+  new tests, the call-site update.
+- `variants/zenoh/CUSTOM.md` — read first, then **append-only** a
+  paragraph documenting the explicit-peering behaviour, the
+  `--zenoh-peer-tcp-base-port` flag, and the rationale (Windows
+  multi-NIC multicast pathology). Don't restructure.
+- (only if strictly necessary) `variants/zenoh/Cargo.toml` — no
+  new deps expected.
+
+May NOT touch:
+
+- Anything outside `variants/zenoh/`.
+- `metak-shared/` (read-only).
+- `metak-orchestrator/` except STATUS.md append at the very end.
+
+#### Validation gates
+
+- `cargo test --release -p variant-zenoh` — current baseline
+  post-T9.5b is 79 passed; should grow by the new tests added
+  here.
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  — clean.
+- `cargo fmt -p variant-zenoh -- --check` — clean.
+- Localhost smoke per above.
+
+#### Commit strategy
+
+Three commits:
+
+1. `feat(variant-zenoh): --zenoh-peer-tcp-base-port + explicit
+   connect/endpoints from --peers (T9.5c)` — the parser, the
+   helper, the build_zenoh_config extension, the call-site update.
+2. `test(variant-zenoh): explicit-peering tests (T9.5c)` — only
+   if the worker prefers the split; otherwise fold into #1.
+3. `docs(variant-zenoh): CUSTOM.md note on explicit peering` —
+   the CUSTOM.md append.
+4. `status(T9.5c): completion report` — the STATUS.md append.
+
+HEREDOC commit messages. Include
+`Co-Authored-By: Claude Opus 4.7 (1M context)
+<noreply@anthropic.com>`.
+
+#### Completion report
+
+Append to `metak-orchestrator/STATUS.md` (read first, append-only)
+under `## 2026-05-25 — T9.5c: completion report`:
+
+- Files touched, commit shas.
+- Test count delta.
+- Smoke output lines that prove the explicit-peering log line
+  appears AND received > 0.
+- Any deviations from the spec.
+- The PowerShell incantation the user runs on their two-WiFi-host
+  setup to validate (NO `--variant-arg zenoh-*.multicast_interface=...`
+  needed any more — the explicit peering should make the bench
+  work standalone).
+
+#### Out of scope
+
+- Single-mode (zenohd sidecar). It already has its own explicit
+  peering since T14.9b.
+- Disabling multicast scouting. Keep it on as a fallback.
+- IPv6 peers. The runner emits `--peers <name>=<v4-or-host>`;
+  hostnames or IPv6 would need their own handling. Out of scope.
+- Configurable port-collision policy. The base+index scheme is
+  deterministic and matches the existing Single-mode convention.
+
+#### Acceptance criteria
+
+- [ ] `--zenoh-peer-tcp-base-port` flag added, default 7447,
+      validates non-zero.
+- [ ] `build_zenoh_config` (or a helper it calls) derives
+      `listen/endpoints` and `connect/endpoints` from `--peers`
+      for Multi mode.
+- [ ] Multicast scouting remains enabled.
+- [ ] Startup log line `[zenoh] explicit peering: ...` appears.
+- [ ] All new unit tests pass.
+- [ ] Localhost smoke shows the log line AND `received > 0` on
+      QoS 1 multi spawn.
+- [ ] `cargo clippy` and `cargo fmt --check` clean.
+- [ ] CUSTOM.md updated, append-only.
+- [ ] STATUS.md completion report appended.
