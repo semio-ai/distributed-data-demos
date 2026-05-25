@@ -907,3 +907,44 @@ the fix is obvious.
 When a future variant-base release removes another forwarded key, add
 it to the rejection list in `validate_no_removed_keys` (with a clear
 message) and a row to the table above.
+
+## Per-variant CLI overrides (T9.5): `--variant-arg`
+
+Repeating CLI flag that flows per-machine specific values into a
+spawn's `[variants.<variant>.specific]` block without splitting the
+shared TOML config across machines. Syntax:
+
+```
+runner.exe --name alice --config configs/two-runner-zenoh-all.toml \
+  --variant-arg zenoh.multicast_interface=192.168.1.68 \
+  --variant-arg zenoh.zenoh_listen=tcp/0.0.0.0:7447
+```
+
+Each entry is `<variant>.<key>=<value>` (split on the first `.` and
+first `=`). The runner parses up-front (so a malformed entry aborts
+before discovery), groups by variant name, and merges into the matching
+TOML specific block at spawn time. **CLI values win over TOML values
+on key conflicts**; CLI-only keys are appended; the merged table is
+emitted in lexicographic key order for log diffability.
+
+The match key is the `[[variant]].name` (post-template-resolution,
+pre-array-expansion) — array-expansion suffixes (`-qos3`,
+`-1000x100hz`, `-multi`) are NOT part of the match, so a single
+`--variant-arg` applies to every spawn derived from one source entry.
+
+Per-spawn the runner emits one stderr line naming the effective
+specific args with provenance, suppressed only when both the TOML
+specific block and the CLI overrides for that variant are empty:
+
+```
+[runner:alice] spawn 'zenoh-1000x10hz-qos3-repro' specific args: \
+  multicast_interface=192.168.1.68 (cli), zenoh_mode=peer (toml)
+```
+
+Validation is the variant's responsibility — the runner forwards
+keys/values blindly (it does NOT interpret the keys beyond the
+split-and-forward).
+
+Filed as T9.5. First consumer is the Zenoh variant's
+`--multicast-interface` flag (see `variants/zenoh/CUSTOM.md`).
+Full contract in `metak-shared/api-contracts/variant-cli.md` § T9.5.
