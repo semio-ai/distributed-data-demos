@@ -1,9 +1,66 @@
 use crate::config::{ThreadingMode, VariantConfig};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
 /// Convert a snake_case key to --kebab-case CLI argument.
 fn to_kebab_flag(key: &str) -> String {
     format!("--{}", key.replace('_', "-"))
+}
+
+/// Parse raw `--variant-arg <variant>.<key>=<value>` entries into a nested
+/// map keyed by variant name (T9.5).
+///
+/// Each entry is split on:
+///   - the **first** `.` to separate the variant name from the rest, and
+///   - the **first** `=` in the rest to separate the key from the value.
+///
+/// Empty value (e.g. `foo.bar=`) is **accepted**: the override is stored
+/// as the empty string. This makes `--variant-arg` viable for flags whose
+/// value is empty/optional. Variants that require a non-empty value should
+/// reject empty values themselves at parse time.
+///
+/// Multiple entries for the same variant accumulate into one inner map.
+/// Within a single variant, later occurrences of the same key overwrite
+/// earlier ones (CLI-level "last one wins" — useful for shell wrappers
+/// that append a default and then an override).
+///
+/// Returns `Err` for malformed input naming the offending entry.
+pub fn parse_variant_arg_overrides(
+    raw: &[String],
+) -> Result<HashMap<String, HashMap<String, toml::Value>>> {
+    let mut out: HashMap<String, HashMap<String, toml::Value>> = HashMap::new();
+    for entry in raw {
+        // Split off the variant name on the first `.`.
+        let (variant, rest) = entry.split_once('.').ok_or_else(|| {
+            anyhow!(
+                "malformed --variant-arg '{}': expected '<variant>.<key>=<value>' (missing '.')",
+                entry
+            )
+        })?;
+        if variant.is_empty() {
+            return Err(anyhow!(
+                "malformed --variant-arg '{}': variant name (before the first '.') is empty",
+                entry
+            ));
+        }
+        // Split key from value on the first `=`.
+        let (key, value) = rest.split_once('=').ok_or_else(|| {
+            anyhow!(
+                "malformed --variant-arg '{}': expected '<variant>.<key>=<value>' (missing '=')",
+                entry
+            )
+        })?;
+        if key.is_empty() {
+            return Err(anyhow!(
+                "malformed --variant-arg '{}': key (between '.' and '=') is empty",
+                entry
+            ));
+        }
+        out.entry(variant.to_string())
+            .or_default()
+            .insert(key.to_string(), toml::Value::String(value.to_string()));
+    }
+    Ok(out)
 }
 
 /// Format a TOML value as a CLI argument string.
@@ -43,6 +100,12 @@ pub fn format_peers_arg(peer_hosts: &HashMap<String, String>) -> String {
 /// `peer_hosts` is the discovery-time map of runner names to host strings
 /// (with same-host peers collapsed to `127.0.0.1`). Always emitted, even
 /// in single-runner mode (the map will contain only this runner).
+///
+/// `cli_specific_overrides` (T9.5) is the parsed `--variant-arg` overrides
+/// **for this spawn's variant** (i.e. caller has already looked up the
+/// right inner map). When `Some`, CLI keys win over TOML keys on conflict
+/// and CLI-only keys are appended. The merged keys are emitted in
+/// lexicographic order for log diffability.
 #[allow(clippy::too_many_arguments)]
 pub fn build_variant_args(
     variant: &VariantConfig,
@@ -57,6 +120,7 @@ pub fn build_variant_args(
     effective_threading_mode: ThreadingMode,
     effective_recv_buffer_kb: u32,
     peer_hosts: &HashMap<String, String>,
+    cli_specific_overrides: Option<&HashMap<String, toml::Value>>,
 ) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -116,19 +180,86 @@ pub fn build_variant_args(
     args.push("--peers".to_string());
     args.push(format_peers_arg(peer_hosts));
 
-    // Specific args from [variant.specific] table (if present).
+    // Specific args from [variant.specific] table merged with the T9.5
+    // CLI `--variant-arg` overrides. Precedence: CLI value wins over TOML
+    // value on key conflicts; CLI-only keys are appended. Emitted in
+    // lexicographic key order for log diffability.
+    //
     // Separated by `--` so clap treats them as trailing/extra args.
-    if let Some(ref specific) = variant.specific {
-        if !specific.is_empty() {
-            args.push("--".to_string());
-            for (key, val) in specific {
-                args.push(to_kebab_flag(key));
-                args.push(toml_value_to_string(val));
-            }
+    let merged = merge_specific_with_overrides(variant.specific.as_ref(), cli_specific_overrides);
+    if !merged.is_empty() {
+        args.push("--".to_string());
+        for (key, val) in &merged {
+            args.push(to_kebab_flag(key));
+            args.push(toml_value_to_string(val));
         }
     }
 
     args
+}
+
+/// Merge the variant's `[variant.specific]` TOML table with the T9.5 CLI
+/// `--variant-arg` overrides for this variant. CLI wins on key conflicts;
+/// CLI-only keys are appended. Result is sorted lexicographically by key
+/// so spawn-log lines diff cleanly across runs.
+fn merge_specific_with_overrides(
+    toml_specific: Option<&toml::value::Table>,
+    cli_overrides: Option<&HashMap<String, toml::Value>>,
+) -> Vec<(String, toml::Value)> {
+    let mut merged: HashMap<String, toml::Value> = HashMap::new();
+    if let Some(specific) = toml_specific {
+        for (key, val) in specific {
+            merged.insert(key.clone(), val.clone());
+        }
+    }
+    if let Some(overrides) = cli_overrides {
+        for (key, val) in overrides {
+            // CLI wins on conflict.
+            merged.insert(key.clone(), val.clone());
+        }
+    }
+    let mut entries: Vec<(String, toml::Value)> = merged.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+/// Provenance of a single effective specific arg, used for the spawn-time
+/// provenance log line (T9.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecificArgProvenance {
+    Toml,
+    Cli,
+}
+
+/// Return the per-spawn effective `[variant.specific]` keys plus where
+/// each value came from (`toml`, `cli`). Used by `main.rs` to emit the
+/// provenance log line. Result is sorted lexicographically by key.
+///
+/// `cli_overrides` is the inner map for **this spawn's variant** only
+/// (caller looked up the right entry already).
+pub fn specific_arg_provenance(
+    toml_specific: Option<&toml::value::Table>,
+    cli_overrides: Option<&HashMap<String, toml::Value>>,
+) -> Vec<(String, String, SpecificArgProvenance)> {
+    let mut entries: HashMap<String, (toml::Value, SpecificArgProvenance)> = HashMap::new();
+    if let Some(specific) = toml_specific {
+        for (key, val) in specific {
+            entries.insert(key.clone(), (val.clone(), SpecificArgProvenance::Toml));
+        }
+    }
+    if let Some(overrides) = cli_overrides {
+        for (key, val) in overrides {
+            // CLI wins; tag as CLI regardless of whether it was a new key
+            // or an override of a TOML key.
+            entries.insert(key.clone(), (val.clone(), SpecificArgProvenance::Cli));
+        }
+    }
+    let mut out: Vec<(String, String, SpecificArgProvenance)> = entries
+        .into_iter()
+        .map(|(k, (v, p))| (k, toml_value_to_string(&v), p))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 #[cfg(test)]
@@ -207,6 +338,7 @@ timeout_secs = 30
             ThreadingMode::Single,
             crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
+            None,
         );
 
         // Common args should be present as --kebab-case.
@@ -269,6 +401,7 @@ timeout_secs = 30
             ThreadingMode::Single,
             crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
+            None,
         );
 
         // --log-dir should use the override value, not the config value.
@@ -310,6 +443,7 @@ binary = "./simple"
             ThreadingMode::Single,
             crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
+            None,
         );
 
         // Should still have common args and injected args, no specific section.
@@ -343,6 +477,7 @@ binary = "./simple"
             ThreadingMode::Single,
             crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
+            None,
         );
 
         let variant_idx = args.iter().position(|a| a == "--variant").unwrap();
@@ -395,6 +530,7 @@ binary = "./x"
             ThreadingMode::Single,
             crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
+            None,
         );
 
         let hz_indices: Vec<usize> = args
@@ -453,6 +589,7 @@ binary = "./x"
             ThreadingMode::Single,
             crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
+            None,
         );
         let peers_idx = args.iter().position(|a| a == "--peers").unwrap();
         assert_eq!(args[peers_idx + 1], "alpha=127.0.0.1,zeta=192.168.1.20");
@@ -501,6 +638,7 @@ binary = "./x"
             ThreadingMode::Multi,
             8192,
             &peers,
+            None,
         );
 
         let mode_idx = args
@@ -552,6 +690,7 @@ binary = "./x"
             ThreadingMode::Single,
             16384,
             &peers,
+            None,
         );
 
         // The raw common-section keys must NOT leak as CLI args.
@@ -622,6 +761,7 @@ binary = "./x"
             ThreadingMode::Single,
             crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
+            None,
         )
     }
 
@@ -733,6 +873,7 @@ name = "v"
             ThreadingMode::Single,
             crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
+            None,
         );
         assert_kebab_flag(&args, "--blob-size", "250");
         // The template's workload value also propagated.
@@ -781,7 +922,376 @@ name = "v"
             ThreadingMode::Single,
             crate::config::DEFAULT_RECV_BUFFER_KB,
             &peers,
+            None,
         );
         assert_kebab_flag(&args, "--blob-size", "500");
+    }
+
+    // -----------------------------------------------------------------
+    // T9.5: --variant-arg passthrough — parser + merge tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_variant_arg_rejects_entry_with_no_dot_or_equals() {
+        let raw = vec!["foo".to_string()];
+        let err = parse_variant_arg_overrides(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("'foo'"),
+            "error must name the bad entry: {msg}"
+        );
+        assert!(
+            msg.contains("missing '.'"),
+            "error must mention missing '.': {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_variant_arg_rejects_entry_with_no_equals() {
+        let raw = vec!["foo.bar".to_string()];
+        let err = parse_variant_arg_overrides(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("'foo.bar'"), "{msg}");
+        assert!(msg.contains("missing '='"), "{msg}");
+    }
+
+    #[test]
+    fn parse_variant_arg_rejects_empty_variant() {
+        let raw = vec!["=bar".to_string()];
+        let err = parse_variant_arg_overrides(&raw).unwrap_err();
+        let msg = format!("{err}");
+        // `=bar` -> split_once('.') returns None -> "missing '.'" error.
+        // That's acceptable; the entry IS malformed and the offending text
+        // appears in the message.
+        assert!(msg.contains("'=bar'"), "{msg}");
+    }
+
+    #[test]
+    fn parse_variant_arg_rejects_dotless_after_first_eq() {
+        // `=bar` — variant is empty before the first `.`, but split_once('.')
+        // returns None first. To exercise the empty-variant guard we need an
+        // entry that has a `.` but starts with it.
+        let raw = vec![".key=value".to_string()];
+        let err = parse_variant_arg_overrides(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("variant name") && msg.contains("empty"),
+            "expected empty-variant-name error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_variant_arg_rejects_empty_key() {
+        // variant present, but key (between '.' and '=') is empty.
+        let raw = vec!["zenoh.=value".to_string()];
+        let err = parse_variant_arg_overrides(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("key") && msg.contains("empty"),
+            "expected empty-key error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_variant_arg_accepts_empty_value() {
+        // Per the parser doc, empty value is accepted (some flags are
+        // flag-only / take an empty value).
+        let raw = vec!["zenoh.flag=".to_string()];
+        let out = parse_variant_arg_overrides(&raw).unwrap();
+        let zenoh = out.get("zenoh").unwrap();
+        assert_eq!(
+            zenoh.get("flag").unwrap(),
+            &toml::Value::String(String::new())
+        );
+    }
+
+    #[test]
+    fn parse_variant_arg_groups_multiple_entries_for_same_variant() {
+        let raw = vec![
+            "zenoh.multicast_interface=192.168.1.68".to_string(),
+            "zenoh.zenoh_mode=peer".to_string(),
+        ];
+        let out = parse_variant_arg_overrides(&raw).unwrap();
+        assert_eq!(out.len(), 1, "exactly one variant expected: {out:?}");
+        let zenoh = out.get("zenoh").unwrap();
+        assert_eq!(zenoh.len(), 2);
+        assert_eq!(
+            zenoh.get("multicast_interface").unwrap(),
+            &toml::Value::String("192.168.1.68".to_string())
+        );
+        assert_eq!(
+            zenoh.get("zenoh_mode").unwrap(),
+            &toml::Value::String("peer".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_variant_arg_groups_by_variant_when_multiple_variants() {
+        let raw = vec![
+            "zenoh.multicast_interface=192.168.1.68".to_string(),
+            "quic.cert_path=/etc/quic.pem".to_string(),
+        ];
+        let out = parse_variant_arg_overrides(&raw).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.contains_key("zenoh"));
+        assert!(out.contains_key("quic"));
+    }
+
+    #[test]
+    fn parse_variant_arg_value_with_equals_in_value() {
+        // The value half can itself contain `=`; we split on the FIRST `=`.
+        let raw = vec!["zenoh.connection_string=key=value;other=stuff".to_string()];
+        let out = parse_variant_arg_overrides(&raw).unwrap();
+        let zenoh = out.get("zenoh").unwrap();
+        assert_eq!(
+            zenoh.get("connection_string").unwrap(),
+            &toml::Value::String("key=value;other=stuff".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_variant_arg_value_with_dot_in_value() {
+        // The value half can also contain `.` (IP addresses, paths). We
+        // split on the FIRST `.` so dotted values after the first split
+        // survive intact.
+        let raw = vec!["zenoh.multicast_interface=192.168.1.68".to_string()];
+        let out = parse_variant_arg_overrides(&raw).unwrap();
+        let zenoh = out.get("zenoh").unwrap();
+        assert_eq!(
+            zenoh.get("multicast_interface").unwrap(),
+            &toml::Value::String("192.168.1.68".to_string())
+        );
+    }
+
+    #[test]
+    fn build_args_merges_cli_overrides_with_toml_specific() {
+        // TOML has a=1, b=2. CLI has b=3, c=4. Merged: a=1 (toml), b=3
+        // (cli wins), c=4 (cli-only). Emit order lexicographic: a, b, c.
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1
+  qos = 1
+  [variant.specific]
+  a = "1"
+  b = "2"
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+
+        let mut overrides: HashMap<String, toml::Value> = HashMap::new();
+        overrides.insert("b".to_string(), toml::Value::String("3".to_string()));
+        overrides.insert("c".to_string(), toml::Value::String("4".to_string()));
+
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v",
+            1,
+            100,
+            1,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
+            &peers,
+            Some(&overrides),
+        );
+
+        // Find the `--` separator that introduces the specific block.
+        let sep_idx = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("specific section must be present");
+        let specific = &args[sep_idx + 1..];
+
+        // Expected emission order (lexicographic): --a 1 --b 3 --c 4
+        assert_eq!(
+            specific,
+            &[
+                "--a".to_string(),
+                "1".to_string(),
+                "--b".to_string(),
+                "3".to_string(),
+                "--c".to_string(),
+                "4".to_string(),
+            ],
+            "merged specific args mismatch (TOML a=1,b=2 + CLI b=3,c=4)"
+        );
+    }
+
+    #[test]
+    fn build_args_cli_only_specific_no_toml() {
+        // No `[variant.specific]` table at all; CLI provides one override.
+        // The `--` separator + the override must be emitted.
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1
+  qos = 1
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+
+        let mut overrides: HashMap<String, toml::Value> = HashMap::new();
+        overrides.insert(
+            "multicast_interface".to_string(),
+            toml::Value::String("192.168.1.68".to_string()),
+        );
+
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v",
+            1,
+            100,
+            1,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
+            &peers,
+            Some(&overrides),
+        );
+
+        let sep_idx = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("specific section must be present (CLI-only override)");
+        assert_eq!(args[sep_idx + 1], "--multicast-interface");
+        assert_eq!(args[sep_idx + 2], "192.168.1.68");
+    }
+
+    #[test]
+    fn build_args_no_specific_and_no_overrides_emits_no_separator() {
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "v"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1
+  qos = 1
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "v",
+            1,
+            100,
+            1,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
+            &peers,
+            None,
+        );
+        // No `--` separator since there are no specific args at all.
+        assert!(
+            !args.iter().any(|a| a == "--"),
+            "no `--` separator expected, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_cli_overrides_for_other_variant_do_not_leak() {
+        // The caller is responsible for passing only the overrides for
+        // THIS spawn's variant. Verify build_variant_args applies
+        // exactly what was passed in: no implicit lookup, no leak.
+        let toml_str = r#"
+run = "run01"
+runners = ["a"]
+default_timeout_secs = 60
+
+[[variant]]
+name = "y"
+binary = "./x"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1
+  qos = 1
+  [variant.specific]
+  k = "from-toml"
+"#;
+        let config: BenchConfig = toml::from_str(toml_str).unwrap();
+        let v = &config.variant[0];
+        let peers = empty_peers();
+        // The caller (main.rs) would have looked up `variant_arg_overrides
+        // .get(&variant.name)` and would not have found "y" — so it
+        // passes None here. The build must emit ONLY the TOML value.
+        let args = build_variant_args(
+            v,
+            "run01",
+            "a",
+            "2025-01-01T00:00:00Z",
+            None,
+            "y",
+            1,
+            100,
+            1,
+            ThreadingMode::Single,
+            crate::config::DEFAULT_RECV_BUFFER_KB,
+            &peers,
+            None,
+        );
+        let sep_idx = args.iter().position(|a| a == "--").unwrap();
+        let specific = &args[sep_idx + 1..];
+        assert_eq!(
+            specific,
+            &["--k".to_string(), "from-toml".to_string()],
+            "specific args should reflect TOML only (no leak from another variant)"
+        );
+    }
+
+    #[test]
+    fn specific_arg_provenance_tags_correctly() {
+        // TOML: a=1, b=2. CLI: b=3, c=4.
+        // Expected provenance: a=1 (toml), b=3 (cli), c=4 (cli).
+        let mut toml_table = toml::value::Table::new();
+        toml_table.insert("a".into(), toml::Value::String("1".into()));
+        toml_table.insert("b".into(), toml::Value::String("2".into()));
+
+        let mut overrides: HashMap<String, toml::Value> = HashMap::new();
+        overrides.insert("b".to_string(), toml::Value::String("3".to_string()));
+        overrides.insert("c".to_string(), toml::Value::String("4".to_string()));
+
+        let prov = specific_arg_provenance(Some(&toml_table), Some(&overrides));
+        let by_key: HashMap<String, (String, SpecificArgProvenance)> = prov
+            .iter()
+            .map(|(k, v, p)| (k.clone(), (v.clone(), *p)))
+            .collect();
+        assert_eq!(by_key["a"], ("1".to_string(), SpecificArgProvenance::Toml));
+        assert_eq!(by_key["b"], ("3".to_string(), SpecificArgProvenance::Cli));
+        assert_eq!(by_key["c"], ("4".to_string(), SpecificArgProvenance::Cli));
+        // Lexicographic emit order.
+        let keys: Vec<&String> = prov.iter().map(|(k, _, _)| k).collect();
+        assert_eq!(keys, vec!["a", "b", "c"]);
     }
 }

@@ -186,6 +186,27 @@ struct Cli {
     /// not a hard failure — the benchmark already succeeded.
     #[arg(long, default_value_t = false)]
     analyze_full: bool,
+
+    /// Variant-specific arg passthrough: `--variant-arg <variant>.<key>=<value>` (T9.5).
+    ///
+    /// Repeatable. Each entry is split on the first `.` (variant name) and
+    /// the first `=` (key/value boundary). At spawn time the parsed
+    /// overrides for the matching variant are merged into the existing
+    /// `[variants.<variant>.specific]` table: CLI keys win over TOML keys
+    /// on conflict, CLI-only keys are appended. The runner forwards the
+    /// merged values verbatim through the variant CLI -- it does NOT
+    /// interpret the key names beyond split-and-forward. Variants validate
+    /// their own arg values.
+    ///
+    /// Example:
+    ///   --variant-arg zenoh.multicast_interface=192.168.1.68 \
+    ///   --variant-arg zenoh.zenoh_listen=tcp/0.0.0.0:7447 \
+    ///   --variant-arg quic.cert_path=/etc/quic.pem
+    ///
+    /// Filed as T9.5 to support per-machine specific values without
+    /// splitting the shared TOML config (e.g. per-machine NIC pins).
+    #[arg(long, action = clap::ArgAction::Append)]
+    variant_arg: Vec<String>,
 }
 
 /// Exit code returned to the OS when a coordination barrier hits its timeout.
@@ -315,6 +336,29 @@ fn run(cli: &Cli) -> Result<()> {
         "[runner:{}] barrier timeout: {}s",
         cli.name, cli.barrier_timeout_secs
     );
+
+    // T9.5: parse the per-variant `--variant-arg <variant>.<key>=<value>`
+    // overrides up front so a malformed entry aborts before discovery.
+    // Returns an empty map when no flags were given (the typical case).
+    let variant_arg_overrides = cli_args::parse_variant_arg_overrides(&cli.variant_arg)?;
+    if !variant_arg_overrides.is_empty() {
+        let mut variants_sorted: Vec<&String> = variant_arg_overrides.keys().collect();
+        variants_sorted.sort();
+        for v in variants_sorted {
+            let inner = &variant_arg_overrides[v];
+            let mut keys_sorted: Vec<&String> = inner.keys().collect();
+            keys_sorted.sort();
+            let summary = keys_sorted
+                .iter()
+                .map(|k| format!("{}={}", k, cli_args::toml_value_to_string(&inner[*k])))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "[runner:{}] --variant-arg overrides for '{}': {}",
+                cli.name, v, summary
+            );
+        }
+    }
 
     // Load and validate config.
     let (bench_config, config_hash) = config::BenchConfig::from_file(&cli.config)?;
@@ -964,6 +1008,13 @@ fn run(cli: &Cli) -> Result<()> {
             })
         };
 
+        // T9.5: look up the per-variant `--variant-arg` overrides for
+        // this spawn. The lookup key is the source `variant.name`
+        // (post-template-resolution, pre-array-expansion), NOT the
+        // effective_name which carries `-qos<N>` / `-<vpt>x<hz>hz`
+        // suffixes -- the CLI flag is variant-typed, not spawn-typed.
+        let cli_overrides_for_spawn = variant_arg_overrides.get(&variant.name);
+
         let args = cli_args::build_variant_args(
             variant,
             &bench_config.run,
@@ -977,7 +1028,33 @@ fn run(cli: &Cli) -> Result<()> {
             job.threading_mode,
             job.recv_buffer_kb,
             &peer_hosts,
+            cli_overrides_for_spawn,
         );
+
+        // T9.5: provenance log line so operators see exactly which
+        // specific args were effective for this spawn and where each
+        // value came from. Suppressed when there are no specific args
+        // at all (don't be noisy on variants without `[variant.specific]`
+        // and no `--variant-arg` for them).
+        let provenance =
+            cli_args::specific_arg_provenance(variant.specific.as_ref(), cli_overrides_for_spawn);
+        if !provenance.is_empty() {
+            let rendered = provenance
+                .iter()
+                .map(|(k, v, p)| {
+                    let tag = match p {
+                        cli_args::SpecificArgProvenance::Toml => "toml",
+                        cli_args::SpecificArgProvenance::Cli => "cli",
+                    };
+                    format!("{}={} ({})", k, v, tag)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "[runner:{}] spawn '{}' specific args: {}",
+                cli.name, job.effective_name, rendered
+            );
+        }
 
         eprintln!(
             "[runner:{}] spawning '{}' (hz={}, vpt={}, qos={}, timeout: {}s)",
