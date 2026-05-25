@@ -1665,6 +1665,26 @@ async fn subscriber_task(
     // only this task reads/writes the map; no Mutex needed.
     let mut dedup_state: HashMap<String, WriterDedup> = HashMap::new();
     let mut deduped = 0u64;
+    // T16.10c: synthetic subscriber-side back-pressure for testing only.
+    // When the env var `ZENOH_TEST_SUB_JITTER_MS` is set to a positive
+    // u64, the subscriber yields `tokio::time::sleep(jitter_ms)` on every
+    // 1-in-N sample (N = `ZENOH_TEST_SUB_JITTER_EVERY`, default 100).
+    // This approximates the receive-side routing-thread parking that a
+    // WiFi link-layer retransmit burst or AP airtime-contention event
+    // produces on the real network, and exercises the publisher-side
+    // back-pressure path under symmetric stall conditions. Production
+    // runs never set this env var so the hot path stays the unit-tested
+    // T16.10d path.
+    let sub_jitter_ms: u64 = std::env::var("ZENOH_TEST_SUB_JITTER_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let sub_jitter_every: u64 = std::env::var("ZENOH_TEST_SUB_JITTER_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(100);
+    let mut sample_count: u64 = 0;
     loop {
         tokio::select! {
             biased;
@@ -1681,6 +1701,20 @@ async fn subscriber_task(
             sample_result = subscriber.recv_async() => {
                 match sample_result {
                     Ok(sample) => {
+                        // T16.10c: synthetic subscriber-side back-pressure for
+                        // testing the cross-WiFi deadlock failure mode on
+                        // localhost. See `sub_jitter_ms` / `sub_jitter_every`
+                        // above. The sleep is inside the recv branch so it
+                        // applies upstream of the recv_tx try_send, modelling
+                        // the routing-thread stall the cross-WiFi T16.10b
+                        // evidence pointed at. Production runs do not set
+                        // the env vars; the branch is a no-op then.
+                        if sub_jitter_ms > 0 {
+                            sample_count = sample_count.wrapping_add(1);
+                            if sample_count.is_multiple_of(sub_jitter_every) {
+                                tokio::time::sleep(Duration::from_millis(sub_jitter_ms)).await;
+                            }
+                        }
                         let data: Vec<u8> = sample.payload().to_bytes().to_vec();
                         match MessageCodec::decode(&data) {
                             Ok(update) => {
