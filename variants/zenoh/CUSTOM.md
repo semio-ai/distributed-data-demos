@@ -1074,3 +1074,57 @@ per-spawn overrides. Operators tuning kernel buffers for Zenoh need
 to use OS-level sysctl knobs outside the benchmark, or wait for the
 T14.9 router-sidecar topology which exposes the router's TCP/UDP
 listeners directly.
+
+## T16.10c -- synthetic subscriber-jitter env-var hooks
+
+Two env vars in `subscriber_task` simulate cross-WiFi-style receiver
+back-pressure on localhost so the publisher-side stall path can be
+exercised without a real two-machine WiFi setup. Off by default --
+production runs unset both vars and the hot path stays identical to
+the T16.10d-verified flow.
+
+- `ZENOH_TEST_SUB_JITTER_MS` (u64, default 0) -- when set to a positive
+  value, the subscriber `tokio::time::sleep(jitter_ms).await`s on every
+  Nth recv'd sample (see below). 0 disables the jitter completely
+  (production).
+- `ZENOH_TEST_SUB_JITTER_EVERY` (u64, default 100) -- N: jitter applies
+  to 1-in-N samples. Default keeps the cost negligible at moderate
+  jitter values; lower values widen the stall fraction.
+
+**Reproducing the cross-WiFi deadlock signature on localhost**:
+
+```powershell
+$env:ZENOH_TEST_SUB_JITTER_MS = "500"
+$env:ZENOH_TEST_SUB_JITTER_EVERY = "50"
+# Then run the standard two-runner reproducer in two terminals; both
+# peers' subscriber tasks will sleep 500 ms every 50 samples, parking
+# Zenoh's RX routing thread, parking the peer's CC=Block publisher,
+# and reproducing the symmetric-stall signature T16.10b catalogued
+# on cross-WiFi.
+target\release\runner.exe --name alice --config variants\zenoh\tests\fixtures\two-runner-zenoh-1000x100hz-qos3-repro.toml
+# (in a second terminal)
+target\release\runner.exe --name bob   --config variants\zenoh\tests\fixtures\two-runner-zenoh-1000x100hz-qos3-repro.toml
+```
+
+Expected result with current main (T16.10d + this commit, no further
+fix): one peer self-kills via T15.5 watchdog OR `variant_self_killed_idle`,
+the other completes via runner-idle-termination. With Option A (out-of-
+process router sidecar, decoupling the publisher from the peer's
+subscriber routing thread) this synthetic test should pass cleanly.
+
+**Why the jitter is in the subscriber task and not in the publisher**:
+The cross-WiFi T16.10b evidence pointed at the receive-side routing
+thread parking (Zenoh's inbound buffer fills before the subscriber
+drains it, then `publisher.put().await` on the remote peer's CC=Block
+publisher parks waiting for the receiver to make space). Subscriber-side
+jitter directly reproduces that chain. Publisher-side jitter would
+simulate a different failure mode (writer-thread stall) that the gate
+already absorbs cleanly.
+
+**Limitations**: the synthetic test is intentionally more aggressive
+than realistic WiFi (full subscriber-task sleeps stall ALL recv
+processing whereas real WiFi loss adds 10-100 ms link retransmits
+without halting the routing thread entirely). A passing wired-LAN
+re-run of the cross-WiFi matrix on the T16.10d binary is the
+authoritative cross-WiFi check; this synthetic test is for designing
+and validating fixes BEFORE that real-network re-run.
