@@ -1,71 +1,266 @@
 run = "zenoh-all"
 runners = ["alice", "bob"]
-default_timeout_secs = 60
+default_timeout_secs = 120
 
-[[variant]]
-name = "zenoh-1000x100hz"
+# ─── Zenoh ───────────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "zenoh-base"
 binary = "target/release/variant-zenoh.exe"
-
-  [variant.common]
-  tick_rate_hz = 100
-  stabilize_secs = 2
-  operate_secs = 10
-  silent_secs = 2
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
   workload = "scalar-flood"
-  values_per_tick = 1000
-  qos = 2
   log_dir = "./logs"
-
-  [variant.specific]
+  threading_modes = ["single", "multi"]
+  [variant_template.specific]
   zenoh_mode = "peer"
 
+# --- 1000 vpt x 100 hz ---
 [[variant]]
-name = "zenoh-100x100hz"
-binary = "target/release/variant-zenoh.exe"
-
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-1000x100hz-scalar"
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 2
-  operate_secs = 10
-  silent_secs = 2
-  workload = "scalar-flood"
+  values_per_tick = 1000
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-1000x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-1000x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# --- 1000 vpt x 10 hz ---
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-1000x10hz-scalar"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-1000x10hz-block"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-1000x10hz-mixed"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# --- 100 vpt x 1000 hz ---
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
   values_per_tick = 100
-  qos = 2
-  log_dir = "./logs"
-
-  [variant.specific]
-  zenoh_mode = "peer"
 
 [[variant]]
-name = "zenoh-10x100hz"
-binary = "target/release/variant-zenoh.exe"
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
 
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 2
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# --- 100 vpt x 100 hz ---
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x100hz-scalar"
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 2
-  operate_secs = 10
-  silent_secs = 2
-  workload = "scalar-flood"
+  values_per_tick = 100
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x100hz-block"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 2
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# --- 100 vpt x 10 hz ---
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x10hz-scalar"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 100
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x10hz-block"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x10hz-mixed"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 2
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# --- 10 vpt x 100 hz ---
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-10x100hz-scalar"
+  [variant.common]
+  tick_rate_hz = 100
   values_per_tick = 10
-  qos = 2
-  log_dir = "./logs"
-
-  [variant.specific]
-  zenoh_mode = "peer"
 
 [[variant]]
-name = "zenoh-max"
-binary = "target/release/variant-zenoh.exe"
-
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-10x100hz-block"
   [variant.common]
   tick_rate_hz = 100
-  stabilize_secs = 2
-  operate_secs = 10
-  silent_secs = 2
-  workload = "max-throughput"
-  values_per_tick = 1000
-  qos = 2
-  log_dir = "./logs"
+  values_per_tick = 10
+  workload = "block-flood"
+  blob_size = 1
 
-  [variant.specific]
-  zenoh_mode = "peer"
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-10x100hz-mixed"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 10
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 2
+  mixed_arrays_min = 2
+  mixed_arrays_max = 6
+  mixed_dict_split_max = 2
+  workload_seed = 12345
+
+# --- 10 vpt x 1000 hz ---
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-10x1000hz-scalar"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-10x1000hz-block"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "block-flood"
+  blob_size = 1
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-10x1000hz-mixed"
+  [variant.common]
+  tick_rate_hz = 1000
+  values_per_tick = 10
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 2
+  mixed_arrays_min = 2
+  mixed_arrays_max = 6
+  mixed_dict_split_max = 2
+  workload_seed = 12345
+
+# --- max-throughput stress ---
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-max"
+  [variant.common]
+  tick_rate_hz = 100
+  values_per_tick = 1000
+  workload = "max-throughput"
