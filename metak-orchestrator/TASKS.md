@@ -1469,6 +1469,152 @@ Acceptance criteria:
 
 ---
 
+### T9.5 — runner: `--variant-arg` CLI passthrough + Zenoh `--multicast-interface` first consumer [medium]
+
+**Repos**: `runner/` (new feature), `variants/zenoh/` (first consumer),
+`metak-shared/api-contracts/variant-cli.md` (contract note).
+**Status**: filed 2026-05-25 by orchestrator. User-authorised
+runner-touch on this task (overrides the default "workers don't write
+runner/" boundary).
+
+**Motivation**: Variant-specific args today flow only via
+`[variants.<name>.specific]` in the shared TOML config. Both runners
+read the same file, so per-machine specific values aren't expressible
+without splitting the config — fine for two machines, brittle at 4+.
+The user has explicitly asked for the generic passthrough rather than
+auto-derived behaviour because (a) it preserves Zenoh's multicast
+scouting model (real-world-faithful) and (b) the upcoming 4-machine
+runs will want this passthrough anyway, e.g. for per-machine NIC pins,
+cert paths, base ports, etc.
+
+The first consumer is `--multicast-interface <ip>` on the Zenoh
+variant. The investigation in this conversation pinned the cross-WiFi
+deadlock on Zenoh's `scouting.multicast.interface = "auto"` picking
+inconsistent NICs across peers on multi-NIC Windows hosts; PowerShell
+multicast tests at the same group/port between the same two machines
+work cleanly, so the network is not the issue.
+
+**Scope — runner side**:
+
+1. New CLI flag in the runner's `Cli` struct (`runner/src/main.rs`):
+   `--variant-arg <variant>.<key>=<value>`. Repeating. clap's
+   `action = clap::ArgAction::Append` or a `Vec<String>` with manual
+   parse.
+2. Parser in `runner/src/cli_args.rs`: split each value on the first
+   `.` (variant name) and the first `=` (key/value). Reject malformed
+   input with a clear error message. Build a
+   `HashMap<String, HashMap<String, String>>` — variant name -> spec
+   overrides.
+3. Inside `build_variant_args`, after the existing
+   `[variants.<name>.specific]` walk (lines 119-129), merge the CLI
+   overrides for the matching variant. CLI value wins over TOML value
+   on key conflicts; CLI-only keys are appended. Maintain stable
+   ordering for log diffability.
+4. Log line on each spawn (stderr) reporting effective specific args
+   with provenance: `[runner:NAME] spawn 'X' specific args: a=1 (toml),
+   b=2 (cli-override), c=3 (cli-only)` or similar. Don't be noisy on
+   the empty case.
+5. Unit tests in `cli_args.rs` for:
+   - parse rejects `foo` (missing `.` and `=`).
+   - parse rejects `foo.bar` (missing `=`).
+   - parse rejects `=bar` (missing variant).
+   - parse accepts multiple `--variant-arg` and groups by variant.
+   - merge: CLI key absent in TOML is appended.
+   - merge: CLI key present in TOML overrides TOML value.
+   - merge: CLI value for a different variant doesn't leak into this
+     spawn.
+
+**Scope — Zenoh variant side**:
+
+1. Add `multicast_interface: Option<String>` to `ZenohArgs`.
+2. Parse `--multicast-interface <ip>` in `ZenohArgs::parse`. Validate
+   as IPv4 address (parse via `std::net::Ipv4Addr::from_str`); reject
+   non-IPv4 with a clear error.
+3. In `build_zenoh_config`, when `multicast_interface` is `Some(ip)`,
+   call the Zenoh config setter for `scouting.multicast.interface` with
+   that IP (string form — verify the exact API against the installed
+   zenoh crate version). When `None`, leave the default
+   (`"auto"`) behaviour.
+4. Print a startup stderr line: `[zenoh] multicast interface: <ip>` (or
+   `auto` when unset) so the operator can confirm the pin took.
+5. Unit test: `ZenohArgs::parse` accepts and round-trips
+   `--multicast-interface 192.168.1.68`; rejects
+   `--multicast-interface not-an-ip`; existing leniency on unknown args
+   still holds (T9.4a).
+
+**Scope — contract note**:
+
+Append a short section to `metak-shared/api-contracts/variant-cli.md`
+documenting the `--variant-arg` channel: syntax, precedence vs TOML,
+appearance in the spawn args (as trailing args after `--`), and the
+fact that it's pass-through — the runner doesn't interpret the keys
+beyond split-and-forward.
+
+**Scope — docs**:
+
+- `runner/CUSTOM.md`: paragraph on the new `--variant-arg` channel
+  with one example.
+- `variants/zenoh/CUSTOM.md`: paragraph on `--multicast-interface`,
+  rationale (multi-NIC Windows pathology), and the PowerShell
+  invocation pattern.
+
+**Out of scope**:
+
+- Auto-derive of the multicast interface from `--peers` (Path 2 in the
+  prior discussion). User explicitly chose CLI override.
+- Other variants consuming `--variant-arg`. That happens organically
+  as needs arise; this task just opens the channel.
+- TOML schema changes. `[variants.<name>.specific]` is unchanged; CLI
+  supplements/overrides.
+- Validation of arg values inside the runner — the runner forwards
+  blindly; variants own validation of their own args.
+- Acceptance on real WiFi cross-machine — user-owned validation.
+  Worker validates on localhost two-runner only.
+
+**Acceptance**:
+
+- `runner.exe --name alice --config <toml> --variant-arg zenoh.multicast_interface=192.168.1.68`
+  spawns the Zenoh variant with `--multicast-interface 192.168.1.68`
+  in its CLI, visibly logged on stderr by both the runner and the
+  variant.
+- Repeating `--variant-arg` is accepted and groups correctly by
+  variant.
+- CLI override wins over TOML for the same key.
+- Localhost two-runner regression suite still passes: T16.10d's qos3
+  + qos4 multi reproducers, T16.10's 10 Hz fixtures, T17.8 qos3,
+  default-set `cargo test --release -p variant-zenoh` and
+  `cargo test --release -p runner`.
+- `cargo clippy --release --workspace --all-targets -- -D warnings`
+  clean.
+- The user-owned cross-WiFi acceptance gate: with explicit
+  `multicast_interface` pinned per machine, the previously-failing
+  `zenoh-1000x100hz-mixed-qos3-multi` and `-qos4-multi` spawns from
+  build `1d0a928` (or HEAD post-T9.5) reach `phase=done` instead of
+  watchdog. Worker writes the PowerShell incantation; user runs it.
+
+**Dependencies**:
+
+- E9 done (T9.4a/b/c). The `--peers` injection isn't required by T9.5
+  but the runner's `build_variant_args` shape is shaped by E9 and T9.5
+  builds on it.
+- No dependency on T16.10c (which is still open awaiting user's
+  cross-WiFi re-run). T9.5 supersedes the diagnostic motivation behind
+  T16.10c — if T9.5's pin-the-interface fix resolves cross-WiFi
+  cleanly, T16.10c closes with "fixed by T9.5" and no router-sidecar
+  is needed.
+
+**Validation strategy**:
+
+- Worker drives all localhost + unit-test gates.
+- User-owned: re-run the failing `configs/two-runner-zenoh-all.toml`
+  on the actual two-machine setup, passing the per-machine
+  `--variant-arg zenoh.multicast_interface=<this-machine's-Ethernet-IP>`
+  on each runner.exe invocation. Acceptance is "QoS 3 and QoS 4 multi
+  spawns reach `phase=done`."
+
+
+---
+
 ## Current Sprint — E10: Variant Robustness Under Load
 
 Variant-specific fixes for failures uncovered by the user's first
