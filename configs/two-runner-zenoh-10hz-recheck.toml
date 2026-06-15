@@ -1,0 +1,139 @@
+# Targeted re-check: Zenoh low-tick-rate (10 Hz) latency anomaly
+# =============================================================================
+# WHY THIS EXISTS
+# The two-machine WiFi run (dataset two-machines-wifi24g-all-variants-01-
+# 20260523_083845) shows Zenoh's *median* latency at the 10 Hz rates sitting at
+# ~one full tick (e.g. zenoh-100x10hz-scalar p50 = 100 ms) while Custom-UDP at
+# the same rate has p50 = 4.4 ms (only its tail hits one tick). The Zenoh
+# publisher is declared WITHOUT `.express()` (default batching) and with
+# enlarged TX queues, which is consistent with small low-rate messages waiting
+# for a batch flush. This config re-runs ONLY those 10 Hz Zenoh cases so the
+# numbers can be confirmed (or refuted) and the affected files replaced.
+#
+# DROP-IN REPLACEMENT
+# `run = "zenoh-all"` and the [[variant]] names below are copied verbatim from
+# configs/two-runner-zenoh-all.toml, so this run produces files named exactly:
+#     zenoh-<rate>-<shape>-qos<N>-multi-<runner>-zenoh-all.jsonl
+#     zenoh-<rate>-<shape>-qos<N>-multi-<runner>-zenoh-all.compact.parquet
+#     zenoh-<rate>-<shape>-qos<N>-multi-<runner>-stderr.txt
+# for rate in {100x10hz, 1000x10hz}, shape in {scalar, block, mixed},
+# N in 1..4, runner in {alice, bob}  =  24 spawns x 2 runners.
+# These match the existing files in the dataset folder one-for-one.
+#
+# HOW TO RUN (two machines) — mirror your ORIGINAL two-machine zenoh-all launch,
+# just point --config at this file. On each machine, from the repo root, e.g.:
+#     # machine "alice":
+#     target/release/runner.exe --name alice `
+#       --config configs/two-runner-zenoh-10hz-recheck.toml `
+#       --variant-arg 'zenoh-*.zenoh_peer_tcp_base_port=<same port you used>'
+#     # machine "bob": same command with --name bob
+# (Use whatever explicit-peering / --peers / --variant-arg flags you used for
+# the original WiFi zenoh-all run — the discovery setup is unchanged here.)
+#
+# AFTER THE RUN — copy back into the dataset folder:
+#   C:\repo\shared\ddd\two-machines-wifi24g-all-variants-01-20260523_083845\
+# From the new ./logs/<this-run-timestamp>/ folder, copy every file matching
+#     zenoh-100x10hz-*   and   zenoh-1000x10hz-*
+# (the .jsonl, .compact.parquet and -stderr.txt for both runners) over the
+# existing ones, then re-run the analyzer:
+#     python analysis/analyze.py <dataset-folder> --summary --dump --diagrams `
+#       --output <dataset-folder>/analysis --clear
+#
+# CLOCK-SYNC CAVEAT (two-machine only)
+# Cross-machine latency is corrected using the per-run clock-sync files
+# (alice/bob-clock-sync-zenoh-all.jsonl). This run regenerates them. For the
+# *re-run* cells to be corrected with their own offsets, also copy the new
+# alice/bob-clock-sync-zenoh-all.jsonl over the old ones. NOTE this means the
+# OTHER (not-re-run) zenoh-all spawns left in the folder would then be corrected
+# with the new run's offsets — a small inconsistency. The 10 Hz effect (~50-100
+# ms) dwarfs typical inter-run clock drift (a few ms), so it does not change the
+# conclusion; if you want it fully clean, re-run the complete
+# configs/two-runner-zenoh-all.toml instead and replace all zenoh-* files.
+# =============================================================================
+
+run = "zenoh-all"
+runners = ["alice", "bob"]
+default_timeout_secs = 120
+
+# ─── Zenoh ───────────────────────────────────────────────────────────────────
+
+[[variant_template]]
+name = "zenoh-base"
+binary = "target/release/variant-zenoh.exe"
+  [variant_template.common]
+  stabilize_secs = 3
+  operate_secs = 30
+  silent_secs = 3
+  workload = "scalar-flood"
+  log_dir = "./logs"
+  threading_modes = ["single", "multi"]
+  [variant_template.specific]
+  zenoh_mode = "peer"
+
+# --- 1000 vpt x 10 hz ---
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-1000x10hz-scalar"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-1000x10hz-block"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "block-flood"
+  blob_size = 100
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-1000x10hz-mixed"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 1000
+  workload = "mixed-types"
+  mixed_scalars_min = 5
+  mixed_scalars_max = 20
+  mixed_arrays_min = 200
+  mixed_arrays_max = 600
+  mixed_dict_split_max = 4
+  workload_seed = 12345
+
+# --- 100 vpt x 10 hz ---
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x10hz-scalar"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 100
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x10hz-block"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 100
+  workload = "block-flood"
+  blob_size = 10
+
+[[variant]]
+template = "zenoh-base"
+supported_modes = ["multi"]
+name = "zenoh-100x10hz-mixed"
+  [variant.common]
+  tick_rate_hz = 10
+  values_per_tick = 100
+  workload = "mixed-types"
+  mixed_scalars_min = 1
+  mixed_scalars_max = 2
+  mixed_arrays_min = 20
+  mixed_arrays_max = 60
+  mixed_dict_split_max = 4
+  workload_seed = 12345

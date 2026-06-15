@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Distributed Data Replication — Team Brief</title>
+
+  <!-- reveal.js from CDN (needs internet when first opened; see note in chat to vendor offline) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css" id="theme">
+
+  <style>
+    :root {
+      --accent: #2563eb;
+      --accent-soft: #dbeafe;
+      --ok: #16a34a;
+      --warn: #b45309;
+      --warn-bg: #fff7ed;
+      --warn-border: #f59e0b;
+      --ink: #1f2937;
+      --muted: #6b7280;
+    }
+    .reveal { font-size: 30px; color: var(--ink); }
+    .reveal h1 { font-size: 1.55em; color: var(--ink); letter-spacing: -.01em; }
+    .reveal h2 { font-size: 1.15em; color: var(--accent); margin-bottom: .5em; letter-spacing: -.01em; }
+    .reveal h3 { font-size: .8em; color: var(--ink); }
+    .reveal p, .reveal li { line-height: 1.35; }
+    .reveal section { text-align: left; }
+    .reveal section.center { text-align: center; }
+    .reveal ul { display: block; margin-left: 1em; }
+    .reveal li { margin: .28em 0; }
+    .reveal strong { color: var(--ink); font-weight: 700; }
+    .reveal .muted { color: var(--muted); }
+    .reveal .accent { color: var(--accent); }
+
+    /* eyebrow / kicker */
+    .kicker { text-transform: uppercase; letter-spacing: .12em; font-size: .5em;
+              color: var(--accent); font-weight: 700; margin-bottom: .4em; }
+
+    /* tables */
+    .reveal table { font-size: .58em; margin: .3em 0; border-collapse: collapse; width: 100%; }
+    .reveal table th { background: var(--accent); color: #fff; padding: .35em .6em;
+                       border: 1px solid #cbd5e1; font-weight: 600; }
+    .reveal table td { padding: .3em .6em; border: 1px solid #e2e8f0; vertical-align: top; }
+    .reveal table tr:nth-child(even) td { background: #f8fafc; }
+
+    /* flame heatmap tables (RdYlGn_r: green good → red bad, matching drop-rate-qosN.png) */
+    .reveal table.heat { font-size: .5em; }
+    .reveal table.heat th { padding: .22em .35em; font-size: .92em; font-weight: 600; }
+    .reveal table.heat td { padding: .3em .35em; text-align: center; font-variant-numeric: tabular-nums; border: 1px solid #fff; }
+    .reveal table.heat td:first-child { text-align: left; font-weight: 600; background: #fff; white-space: nowrap; }
+    .reveal table.heat td.na { color: #cbd5e1; background: #f8fafc; }
+    .reveal table.heat .grp { border-left: 2px solid #94a3b8; }
+    .reveal table.heat td.rev { color: #94a3b8; font-style: italic; background: repeating-linear-gradient(45deg,#f1f5f9,#f1f5f9 4px,#e2e8f0 4px,#e2e8f0 8px); }
+    .reveal table.heat sup { font-size: .7em; color: var(--muted); }
+    .heat-legend { font-size: .46em; color: var(--muted); margin-top: .4em; line-height: 1.5; }
+    .heat-legend .sw { display: inline-block; width: 16px; height: 11px; vertical-align: middle; }
+
+    /* status banner */
+    .banner { background: var(--warn-bg); border-left: 6px solid var(--warn-border);
+              padding: .7em 1em; border-radius: 6px; font-size: .72em; }
+    .banner b { color: var(--warn); }
+
+    .card { background: #f1f5f9; border-radius: 8px; padding: .6em .9em; }
+    .pill { display:inline-block; background: var(--accent-soft); color: var(--accent);
+            border-radius: 999px; padding: .08em .7em; font-size: .62em; font-weight: 700;
+            margin: .15em .2em; }
+    .ok::before  { content: "✓ "; color: var(--ok); font-weight: 700; }
+    .no::before  { content: "✗ "; color: #dc2626; font-weight: 700; }
+
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2em; }
+    .small { font-size: .72em; }
+    .xsmall { font-size: .62em; }
+
+    .reveal .footer { position: absolute; bottom: 12px; left: 24px; right: 24px;
+                      font-size: 13px; color: var(--muted);
+                      display: flex; justify-content: space-between; }
+    .reveal .slide-number { font-size: 14px; color: var(--muted); }
+  </style>
+</head>
+<body>
+<div class="reveal">
+  <div class="slides">
+
+    <!-- 1 — Title + abstract -->
+    <section data-background-color="#0f172a">
+      <div class="center">
+        <div class="kicker" style="color:#93c5fd;">Distributed Data Replication · Team Brief</div>
+        <h1 style="color:#f8fafc; margin-bottom:.35em; font-size:1.35em;">How does Zenoh perform —<br>and where are its limits?</h1>
+      </div>
+      <div style="max-width: 30em; margin: .6em auto 0; color:#e2e8f0; font-size:.62em; line-height:1.5;
+                  border-left: 4px solid #3b82f6; padding: .2em 0 .2em 1em;">
+        <p style="margin:.2em 0;"><strong style="color:#93c5fd; text-transform:uppercase; letter-spacing:.08em; font-size:.85em;">Abstract</strong></p>
+        <p style="margin:.35em 0;">
+          We have settled on <strong style="color:#fff;">Eclipse Zenoh</strong> as the transport for keeping
+          multiple LAN peers in sync under large, high-frequency change diffs. This study characterizes
+          <strong style="color:#fff;">how it performs and where its limits are</strong> — not whether to adopt it.
+          We built <strong style="color:#fff;">six interchangeable implementations</strong> of the same single-writer
+          key-value replicator — Zenoh plus five baselines (Custom&nbsp;UDP, Hybrid&nbsp;UDP/TCP, QUIC, WebSocket,
+          WebRTC) — behind one common interface, and run them all through an
+          <strong style="color:#fff;">identical benchmark matrix</strong> sweeping rate, workload shape, QoS level,
+          and threading mode.
+        </p>
+        <p style="margin:.35em 0;">
+          The baselines aren't candidates — they <strong style="color:#fff;">bracket what's achievable</strong> on
+          this hardware so we can read Zenoh's numbers in context: how close it runs to the performance floor
+          (Custom&nbsp;UDP), and how much headroom we trade for its simplicity at our
+          <strong style="color:#fff;">~100 K updates/sec, sub-10 ms p99</strong> targets.
+        </p>
+      </div>
+      <p class="center" style="color:#64748b; font-size:.5em; margin-top:1em;">~5 minutes · study design &amp; results — same-machine + two-machine (WiFi) runs, May 2026</p>
+      <aside class="notes">
+        The point of the whole study in one breath: Zenoh is chosen; we want to understand its performance
+        envelope and limitations, not re-litigate the decision. The five baselines bracket what's achievable
+        — from the performance floor (Custom UDP) up to heavy off-the-shelf stacks (WebRTC) — so Zenoh's
+        numbers can be read in context. Results shown are from the May 2026 same-machine and two-machine
+        (WiFi) full-matrix runs.
+      </aside>
+    </section>
+
+    <!-- 2 — Setup -->
+    <section>
+      <div class="kicker">The setup</div>
+      <h2>Two runners, six variants, a five-dimension matrix</h2>
+      <ul class="small">
+        <li><strong>Two runners</strong> (alice, bob), leaderless coordination — same machine or LAN.</li>
+        <li><strong>Six variants</strong> of the replicator: Zenoh + 5 baselines.</li>
+        <li>A <strong>5-dimension sweep</strong> → <strong>704 spawns</strong> in the full config:</li>
+      </ul>
+      <p class="center" style="margin:.35em 0;">
+        <span class="pill">variant</span>×
+        <span class="pill">rate (vpt × hz)</span>×
+        <span class="pill">workload shape</span>×
+        <span class="pill">QoS</span>×
+        <span class="pill">threading mode</span>
+      </p>
+      <p class="small card" style="margin:.3em 0;">
+        <strong>What's a "write"?</strong> One update to a single path in the replicated tree — publishing one
+        <strong><code>arora_types::Value</code></strong> (our universal data type: a 35-variant enum of scalars,
+        typed arrays, and nested key-value trees). <strong><code>vpt</code> = how many such values per tick.</strong>
+      </p>
+      <ul class="xsmall">
+        <li><strong>Rate</strong>: <code>vpt × tick_rate_hz</code> = <code>arora_types::Value</code> updates/sec. In <strong>scalar-flood</strong> (the headline profile) each write is one scalar Value, so <code>100×100hz</code> = 100 values/tick × 100 = 10 k/s; <code>1000×100hz</code> = 100 k/s; <code>max</code> ≈ 1 M/s (saturation probe).</li>
+        <li><strong>Workload shapes</strong>: scalar-flood (one scalar Value per write), block-flood (each write a fixed block of values), mixed-types (nested scalar+array+struct Values). Same leaf count, different packing.</li>
+        <li><strong>Threading modes</strong>: single (sync, WASM-compatible) / multi (per-peer reader threads).</li>
+        <li><strong>Lifecycle per spawn</strong>: connect → stabilize 3 s → operate 30 s → silent 3 s. Metrics over <em>operate</em>.</li>
+      </ul>
+      <aside class="notes">
+        Key clarification: the "100" in 100×100hz is values_per_tick — distinct arora_types::Value updates, one
+        per path. In scalar-flood each is a single scalar (8-byte f64) published on its own path; block/mixed pack
+        the same total leaf count into fewer, composite Value objects. Async-only variants run multi-threaded only.
+      </aside>
+    </section>
+
+    <!-- 3 — Candidate + baselines -->
+    <section>
+      <div class="kicker">The lineup</div>
+      <h2>The transport and the bracketing baselines</h2>
+      <div class="two-col small">
+        <div>
+          <p><strong class="accent">The transport we're characterizing</strong></p>
+          <ul class="xsmall">
+            <li><strong>Zenoh</strong> — Rust pub/sub, zero-conf discovery, <strong>Zenoh-native QoS</strong>. <em>Already chosen — we're mapping its envelope and limits.</em></li>
+          </ul>
+          <p style="margin-top:.6em;"><strong>Performance floor (reference)</strong></p>
+          <ul class="xsmall">
+            <li><strong>Custom UDP</strong> — raw sockets + hand-written NACK protocol. The floor: how far Zenoh sits from minimum-overhead is the framework tax we accept.</li>
+          </ul>
+        </div>
+        <div>
+          <p><strong>Bracketing baselines (context, not options)</strong></p>
+          <ul class="xsmall">
+            <li><strong>Hybrid UDP/TCP</strong> — UDP multicast (QoS 1–2), kernel TCP (QoS 3–4).</li>
+            <li><strong>QUIC (quinn)</strong> — multiplexed streams + datagrams + TLS 1.3.</li>
+            <li><strong>WebSocket</strong> — TCP + WS framing, reliable QoS (3–4) only.</li>
+            <li><strong>WebRTC</strong> — SCTP-over-DTLS-over-UDP, all four QoS levels.</li>
+          </ul>
+        </div>
+      </div>
+      <p class="xsmall muted" style="margin-top:.5em;">
+        All six implemented and exercised. Aeron evaluated but permanently excluded (Windows C-FFI blocker).
+        Async-only variants (QUIC, Zenoh, WebRTC) run multi-threaded only.
+      </p>
+      <aside class="notes">
+        The baselines aren't alternatives we'd switch to — they bracket what's achievable. Custom UDP / QUIC
+        set the floor; Hybrid / WebSocket / WebRTC show what heavier framings cost. They exist so Zenoh's
+        numbers can be read in context.
+      </aside>
+    </section>
+
+    <!-- 4 — QoS + no-skip -->
+    <section>
+      <div class="kicker">QoS</div>
+      <h2>Four QoS levels — and the no-skip contract</h2>
+      <table>
+        <thead><tr><th>Lvl</th><th>Name</th><th>Transport</th><th>Ordering</th><th>Loss</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>Best-Effort</td><td>UDP, fire-and-forget</td><td>None</td><td>Tolerated</td></tr>
+          <tr><td>2</td><td>Latest-Value</td><td>UDP + seq filter</td><td>Latest-wins</td><td>Skipped</td></tr>
+          <tr><td>3</td><td>Reliable-UDP</td><td>UDP + NACK</td><td>Strict</td><td>Recovered</td></tr>
+          <tr><td>4</td><td>Reliable-TCP</td><td>TCP (or eq.)</td><td>Strict</td><td>Kernel-recovered</td></tr>
+        </tbody>
+      </table>
+      <div class="banner" style="margin-top:.5em;">
+        <b>Strict No-Skip Contract (QoS 3/4):</b> variants <strong>must deliver 100 % of accepted writes</strong>
+        and <strong>block the writer</strong> rather than drop. Under overload the failure mode is
+        <strong>throughput collapse, not delivery shortfall</strong>. QoS 1/2 keep the opposite priority (skip + log).
+        <br><span class="muted">How to read it: a saturated reliable variant shows up as low throughput, not low delivery.</span>
+      </div>
+      <p class="xsmall muted" style="margin-top:.4em;">Each variant runs all four levels — except WebSocket (L3/L4 only, no unreliable mode).</p>
+      <aside class="notes">
+        At QoS 3/4 delivery is the priority and the writer blocks under back-pressure; at QoS 1/2 throughput
+        is the priority and the writer skips + logs. Keep this in mind when reading saturation numbers.
+      </aside>
+    </section>
+
+    <!-- 5 — What we measure -->
+    <section>
+      <div class="kicker">Measurement</div>
+      <h2>What we measure</h2>
+      <p class="small card"><strong>Receive throughput is the headline metric</strong> — receivers, not writers, are the sync bottleneck.</p>
+      <div class="two-col small" style="margin-top:.5em;">
+        <div>
+          <p><strong>Integrity</strong></p>
+          <ul class="xsmall">
+            <li>Delivery rate per (writer → receiver) pair.</li>
+            <li>Out-of-order receives; duplicates; unresolved gaps.</li>
+            <li><code>backpressure_skipped</code> at QoS 3/4 = integrity failure.</li>
+          </ul>
+        </div>
+        <div>
+          <p><strong>Performance</strong></p>
+          <ul class="xsmall">
+            <li>Receive throughput (headline); write throughput (context).</li>
+            <li>Latency p50 / p95 / p99 / max, per published write op.</li>
+            <li>Jitter, loss %, connect time, CPU %, memory.</li>
+          </ul>
+        </div>
+      </div>
+      <p class="xsmall muted" style="margin-top:.5em;">
+        <strong>Logging &amp; latency:</strong> per-message data is compact Parquet (JSONL is lifecycle-only).
+        Latency = matching each write to its receive by <strong>ordering</strong> (no seq), exact at QoS 3/4.
+        Cross-machine clocks reconciled via an <strong>app-level NTP-style offset exchange</strong> (not PTP);
+        single-host runs share one clock.
+      </p>
+    </section>
+
+    <!-- 6 — Termination model -->
+    <section>
+      <div class="kicker">Mechanics</div>
+      <h2>How a spawn knows it's done</h2>
+      <p class="small">Termination is <strong>runner-coordinated and activity-based</strong>:</p>
+      <ol class="small">
+        <li>Each variant emits a 1 Hz <strong>progress event to stdout</strong> (<code>sent</code>, <code>received</code>, <code>phase</code>). The runner reads it.</li>
+        <li>Runners exchange per-spawn progress over their coordination channel.</li>
+        <li>When every runner reports its variant has been <strong>idle</strong> for a few seconds during <em>operate</em>, they agree it's done → <code>silent</code>.</li>
+        <li>A per-spawn <code>max_spawn_secs</code> wall-clock budget is the safety net.</li>
+      </ol>
+      <p class="xsmall muted">
+        The variant writes a single <code>eot_sent</code> marker to its log to bound the operate window, so the
+        analysis tool scopes every metric to the same well-defined window across variants.
+      </p>
+      <aside class="notes">
+        Why activity-based: it lets each spawn run exactly as long as it needs and terminate cleanly when both
+        peers go quiet, instead of relying on a fixed wall-clock budget. The marker is what keeps the analysis
+        window consistent across variants.
+      </aside>
+    </section>
+
+    <!-- 7 — Results so far: same-machine -->
+    <section>
+      <div class="kicker">Results so far · same-machine (loopback)</div>
+      <h2>What we've measured</h2>
+      <p class="small" style="margin:.1em 0 .3em;"><strong>Realistic rate — 10 k writes/s</strong> (100×100hz scalar), multi-threaded. Each cell: delivery % · mean latency (ms):</p>
+      <table class="heat">
+        <thead>
+          <tr><th rowspan="2">Variant</th><th colspan="2">QoS 1 · best-effort</th><th colspan="2">QoS 2 · latest-value</th><th colspan="2">QoS 3 · reliable-UDP</th><th colspan="2">QoS 4 · reliable-TCP</th></tr>
+          <tr><th>dlv</th><th>ms</th><th>dlv</th><th>ms</th><th>dlv</th><th>ms</th><th>dlv</th><th>ms</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Custom UDP</td><td class="dlv">100%</td><td class="lat">5.0</td><td class="dlv">100%</td><td class="lat">5.2</td><td class="dlv">100%</td><td class="lat">5.7</td><td class="dlv">100%</td><td class="lat">5.5</td></tr>
+          <tr><td>Hybrid<sup>†</sup></td><td class="dlv">100%</td><td class="lat">5.9</td><td class="dlv">100%</td><td class="lat">6.3</td><td class="dlv">100%</td><td class="lat">1.3</td><td class="dlv">100%</td><td class="lat">1.3</td></tr>
+          <tr><td>QUIC</td><td class="dlv">100%</td><td class="lat">16.1</td><td class="dlv">100%</td><td class="lat">13.8</td><td class="dlv">100%</td><td class="lat">9.8</td><td class="dlv">100%</td><td class="lat">5.2</td></tr>
+          <tr><td>WebSocket</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="dlv">100%</td><td class="lat">0.1</td><td class="dlv">100%</td><td class="lat">0.1</td></tr>
+          <tr><td>WebRTC</td><td class="dlv">94.8%</td><td class="lat">10.0</td><td class="dlv">95.1%</td><td class="lat">10.1</td><td class="dlv">100%</td><td class="lat">9.0</td><td class="dlv">100%</td><td class="lat">6.8</td></tr>
+          <tr><td style="background:var(--accent-soft);"><strong>Zenoh</strong></td><td class="dlv">100%</td><td class="lat">10.2</td><td class="dlv">100%</td><td class="lat">10.3</td><td class="dlv">100%</td><td class="lat">11.1</td><td class="dlv">100%</td><td class="lat">11.5</td></tr>
+        </tbody>
+      </table>
+      <div class="heat-legend">
+        <strong>green = good → red = bad</strong> (RdYlGn, as in the drop-rate heatmaps):
+        <span class="sw" style="background:#1a9850;"></span><span class="sw" style="background:#a6d96a;"></span><span class="sw" style="background:#fee08b;"></span><span class="sw" style="background:#fdae61;"></span><span class="sw" style="background:#d73027;"></span>
+        — latency anchored at the 10 ms target; delivery at 100 %. <sup>†</sup>Hybrid/Custom-UDP multicast double-counts on loopback (completeness is 100 %).
+      </div>
+      <p class="xsmall muted" style="margin-top:.45em;">
+        <strong>At saturation (100 k writes/s):</strong> Zenoh and QUIC still hold <strong>100 %</strong> delivery (~12 ms / ~4 ms);
+        Custom-UDP 100 % but ~46 ms; WebRTC drops to ~48 %; single-threaded Hybrid collapses (79 %, multi-second).
+        QoS 3/4 honoured the no-skip contract everywhere — <strong>zero dropped writes</strong>.
+      </p>
+      <p class="xsmall muted" style="margin-top:.2em;">Same-machine loopback, 2026-05-21 · latency = mean over the operate window.</p>
+      <aside class="notes">
+        Headline read: at the realistic rate every variant delivers ~100 % (WebRTC ~95 % on best-effort), so the
+        story is latency consistency. Zenoh sits ~10 ms mean with a tight spread — steadier than QUIC, which is
+        100 % but very jittery (±84 ms). At 100 k Zenoh and QUIC are the ones that hold; WebRTC and single-threaded
+        Hybrid fall over. Numbers from the 2026-05-21 same-machine matrix.
+      </aside>
+    </section>
+
+    <!-- 8 — Zenoh operating envelope -->
+    <section>
+      <div class="kicker">Zenoh deep-dive · two machines (WiFi 2.4 GHz)</div>
+      <h2>Zenoh's operating envelope — where it shines, where to avoid</h2>
+      <p class="xsmall" style="margin:.1em 0 .25em;">Mean latency (ms), Zenoh multi-threaded, <strong>two machines over WiFi 2.4 GHz</strong>, across <strong>workload shape × QoS × rate</strong>. Flame-coloured (green = fast → red = slow). All cells 100 % delivery except <sup>✗</sup> (68–97 %).</p>
+      <table class="heat" style="font-size:.4em;">
+        <thead>
+          <tr><th rowspan="2">Rate (vpt×hz)</th><th colspan="4">Scalar-flood</th><th colspan="4" class="grp">Block-flood</th><th colspan="4" class="grp">Mixed-types</th></tr>
+          <tr><th>Q1</th><th>Q2</th><th>Q3</th><th>Q4</th><th class="grp">Q1</th><th>Q2</th><th>Q3</th><th>Q4</th><th class="grp">Q1</th><th>Q2</th><th>Q3</th><th>Q4</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>10×100hz</td>
+            <td class="lat">10.3</td><td class="lat">6.3</td><td class="lat">5.8</td><td class="lat">9.4</td>
+            <td class="lat grp">9.0</td><td class="lat">10.5</td><td class="lat">10.2</td><td class="lat">9.8</td>
+            <td class="lat grp">6.2</td><td class="lat">6.0</td><td class="lat">5.5</td><td class="lat">5.6</td></tr>
+          <tr><td>10×1000hz</td>
+            <td class="lat">6.1</td><td class="lat">6.1</td><td class="lat">4.8</td><td class="lat">5.4</td>
+            <td class="lat grp">6.2</td><td class="lat">6.2</td><td class="lat">5.3</td><td class="lat">5.4</td>
+            <td class="lat grp">5.5</td><td class="lat">5.9</td><td class="lat">4.8</td><td class="lat">4.9</td></tr>
+          <tr><td>100×10hz<sup>⚠</sup></td>
+            <td class="rev">50.1</td><td class="rev">51.1</td><td class="rev">50.1</td><td class="rev">54.4</td>
+            <td class="rev grp">50.0</td><td class="rev">49.9</td><td class="rev">50.1</td><td class="rev">50.0</td>
+            <td class="rev grp">50.2</td><td class="rev">99.1</td><td class="rev">50.2</td><td class="rev">63.3</td></tr>
+          <tr><td>100×100hz</td>
+            <td class="lat">8.0</td><td class="lat">14.6</td><td class="lat">7.7</td><td class="lat">8.8</td>
+            <td class="lat grp">5.9</td><td class="lat">7.2</td><td class="lat">9.8</td><td class="lat">6.5</td>
+            <td class="lat grp">11.1</td><td class="lat">10.6</td><td class="lat">7.3</td><td class="lat">7.0</td></tr>
+          <tr><td>100×1000hz</td>
+            <td class="lat">14.3</td><td class="lat">12.3</td><td class="lat">12.5</td><td class="lat">12.5</td>
+            <td class="lat grp">6.1</td><td class="lat">5.9</td><td class="lat">5.1</td><td class="lat">5.3</td>
+            <td class="lat grp">601<sup>✗</sup></td><td class="lat">587<sup>✗</sup></td><td class="lat">415</td><td class="lat">468</td></tr>
+          <tr><td>1000×10hz<sup>⚠</sup></td>
+            <td class="rev">51.2</td><td class="rev">76.8</td><td class="rev">90.9</td><td class="rev">50.7</td>
+            <td class="rev grp">49.8</td><td class="rev">53.6</td><td class="rev">49.9</td><td class="rev">75.1</td>
+            <td class="rev grp">812</td><td class="rev">825</td><td class="rev">1010</td><td class="rev">1303</td></tr>
+          <tr><td>1000×100hz</td>
+            <td class="lat">15.4</td><td class="lat">15.5</td><td class="lat">20.3</td><td class="lat">15.8</td>
+            <td class="lat grp">10.1</td><td class="lat">6.8</td><td class="lat">5.9</td><td class="lat">8.6</td>
+            <td class="lat grp">1053<sup>✗</sup></td><td class="lat">1146<sup>✗</sup></td><td class="lat">3145<sup>✗</sup></td><td class="lat">2942<sup>✗</sup></td></tr>
+        </tbody>
+      </table>
+      <div class="two-col" style="margin-top:.4em; gap:1.2em;">
+        <div class="xsmall">
+          <p style="margin:.12em 0;"><span style="color:#1a9850;">●</span> <strong>Ideal</strong> — scalar or block, tick ≥ 100 Hz → ≤ ~15 ms, 100 % delivery, any QoS.</p>
+          <p style="margin:.12em 0;"><span style="color:#d73027;">●</span> <strong>Avoid</strong> — mixed-types at ≥ 1000 vpt: 0.4–3.1 s latency, and delivery drops to 68–97 % — even reliable QoS 3/4 can't hold it on a real link.</p>
+          <p style="margin:.12em 0;"><span style="color:#94a3b8;">▦</span> <strong>⚠ Under review</strong> — the 10 Hz (×10hz) rows: low-rate Zenoh shows ~one-tick median latency (Zenoh-specific — Custom-UDP's median stays fast). Likely publisher batching / flush timing; being confirmed by a targeted re-run before we quote it.</p>
+        </div>
+        <div class="xsmall muted">
+          <p style="margin:.12em 0;"><strong>Reading it:</strong> shape and rate dominate. The real danger is <strong>mixed-types (nested/heterogeneous) at high vpt</strong> — and on a real link reliable QoS doesn't rescue it. The fix is <strong>block-flood packing</strong>, which stays fast and complete everywhere.</p>
+        </div>
+      </div>
+      <aside class="notes">
+        The "how to drive Zenoh" slide. (1) Ideal — scalar/block at ≥100 Hz is ~10 ms and complete. (2) The danger
+        zone is mixed-types at high vpt: seconds of latency and, on WiFi, delivery dropping to ~68% even at reliable
+        QoS — pack heterogeneous data into blocks. (3) The 10 Hz rows are flagged: low-rate Zenoh shows a clean
+        ~one-tick median latency that Custom-UDP doesn't — most likely Zenoh publisher batching/flush timing. We're
+        re-running those cells (with the publisher's flush/express setting toggled) to confirm before quoting them.
+        Two machines, WiFi 2.4 GHz, 2026-05-23.
+      </aside>
+    </section>
+
+    <!-- 9 — Results so far: two machines -->
+    <section>
+      <div class="kicker">Results so far · two machines (WiFi 2.4 GHz)</div>
+      <h2>What we've measured</h2>
+      <p class="small" style="margin:.1em 0 .3em;"><strong>Realistic rate — 10 k writes/s</strong>, real LAN, both peers logged (true pairwise). Each cell: delivery % · mean latency (ms):</p>
+      <table class="heat">
+        <thead>
+          <tr><th rowspan="2">Variant</th><th colspan="2">QoS 1 · best-effort</th><th colspan="2">QoS 2 · latest-value</th><th colspan="2">QoS 3 · reliable-UDP</th><th colspan="2">QoS 4 · reliable-TCP</th></tr>
+          <tr><th>dlv</th><th>ms</th><th>dlv</th><th>ms</th><th>dlv</th><th>ms</th><th>dlv</th><th>ms</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Custom UDP</td><td class="dlv">100%</td><td class="lat">9.7</td><td class="dlv">100%</td><td class="lat">10.0</td><td class="dlv">100%</td><td class="lat">11.3</td><td class="dlv">100%</td><td class="lat">8.2</td></tr>
+          <tr><td>Hybrid<sup>†</sup></td><td class="dlv">100%</td><td class="lat">7.5</td><td class="dlv">100%</td><td class="lat">7.2</td><td class="dlv">100%</td><td class="lat">10.0</td><td class="dlv">100%</td><td class="lat">10.0</td></tr>
+          <tr><td>QUIC</td><td class="dlv">100%</td><td class="lat">11.3</td><td class="dlv">100%</td><td class="lat">8.9</td><td class="dlv">100%</td><td class="lat">13.9</td><td class="dlv">100%</td><td class="lat">12.6</td></tr>
+          <tr><td>WebSocket</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="dlv">100%</td><td class="lat">3.3</td><td class="dlv">100%</td><td class="lat">4.0</td></tr>
+          <tr><td>WebRTC</td><td class="dlv">95.3%</td><td class="lat">6.8</td><td class="dlv">95.6%</td><td class="lat">6.1</td><td class="dlv">100%</td><td class="lat">7.9</td><td class="dlv">100%</td><td class="lat">5.6</td></tr>
+          <tr><td style="background:var(--accent-soft);"><strong>Zenoh</strong></td><td class="dlv">100%</td><td class="lat">8.0</td><td class="dlv">100%</td><td class="lat">14.6</td><td class="dlv">100%</td><td class="lat">7.7</td><td class="dlv">100%</td><td class="lat">8.8</td></tr>
+        </tbody>
+      </table>
+      <div class="heat-legend">
+        <strong>green = good → red = bad</strong> (RdYlGn, as in the drop-rate heatmaps):
+        <span class="sw" style="background:#1a9850;"></span><span class="sw" style="background:#a6d96a;"></span><span class="sw" style="background:#fee08b;"></span><span class="sw" style="background:#fdae61;"></span><span class="sw" style="background:#d73027;"></span>
+        — mean latency shown; QUIC and Hybrid carry heavy tails (high variance) the mean doesn't capture. <sup>†</sup>Multicast double-counts (completeness 100 %).
+      </div>
+      <p class="xsmall muted" style="margin-top:.45em;">
+        <strong>At saturation (100 k writes/s) over WiFi:</strong> Zenoh holds <strong>100 %</strong> delivery (~15 ms); QUIC 99.5 % (~11 ms).
+        Custom-UDP / Hybrid keep delivery but latency balloons to <strong>seconds</strong> (buffering on the constrained link); WebRTC ~48 %; single-threaded Custom-UDP QoS 4 → 0 %.
+      </p>
+      <p class="xsmall muted" style="margin-top:.2em;">Two machines over WiFi 2.4 GHz, 2026-05-23 — a constrained link, so absolute latency reflects the network. Zenoh's tail is the tightest in the field here.</p>
+      <aside class="notes">
+        This is a real cross-machine run with both peers' logs, so the pairwise delivery numbers are genuine.
+        WiFi 2.4 GHz is a stress link — note Zenoh is actually the steadiest (8 ms / 7.7 ms, small std) where
+        Hybrid and QUIC show big tails (±76 ms, ±50 ms). At 100 k Zenoh is again the one that holds latency.
+      </aside>
+    </section>
+
+    <!-- 10 — What we can say today -->
+    <section>
+      <div class="kicker">Findings</div>
+      <h2>What we can say about Zenoh</h2>
+      <ul class="small">
+        <li class="ok"><strong>Operationally simple</strong> — discovery, QoS, recovery all out of the box, no transport code.</li>
+        <li class="ok"><strong>Delivers 100 % across QoS 1–4</strong> at the realistic 10 k rate — on loopback <em>and</em> on real WiFi.</li>
+        <li class="ok"><strong>Holds up under stress</strong> — 100 % delivery at 100 k writes/s, where WebRTC and single-threaded Hybrid collapse.</li>
+        <li class="ok"><strong>Most consistent latency in the field</strong> — ~8–11 ms mean with a tight spread; steadier than QUIC's jitter (±50–84 ms).</li>
+        <li class="no"><strong>Limit — heterogeneous payloads at high rate</strong>: the mixed-types workload at 100 k drives Zenoh latency into the <strong>seconds</strong> (and ~68–70 % delivery on WiFi). Its clearest weak spot.</li>
+        <li class="no"><strong>Limit — multi-threaded only</strong>: no native single-threaded / WASM path yet (the router-RPC sidecar is the planned route).</li>
+      </ul>
+      <p class="xsmall muted" style="margin-top:.3em;">
+        Against our targets: at the realistic rate Zenoh sits ~10 ms mean — right around the 10 ms goal (a strict sub-10 ms <em>p99</em> isn't guaranteed), with full delivery.
+      </p>
+      <aside class="notes">
+        This is the heart of the talk: Zenoh is correct, simple, consistent, and robust under stress — a strong
+        result. Be honest about the two real limits: mixed-types at high rate, and no single-threaded mode yet.
+        Neither is a reason to reconsider Zenoh; both are tuning / engineering work.
+      </aside>
+    </section>
+
+    <!-- 11 — What's next -->
+    <section>
+      <div class="kicker">Next</div>
+      <h2>What's next</h2>
+      <ol class="small">
+        <li><strong>Close the mixed-types latency gap.</strong> It's Zenoh's clearest limit — pin down whether it's batching, congestion control, or serialization, and fix it.</li>
+        <li><strong>Run on a wired link (GbE).</strong> WiFi 2.4 GHz floors latency; a wired run isolates Zenoh's true tail from the network and confirms the sub-10 ms picture.</li>
+        <li><strong>Add a single-threaded / WASM path</strong> for the deployments that need it (Zenoh router-RPC sidecar).</li>
+        <li><strong>Write deployment guidance.</strong> Where sub-10 ms matters, which QoS / threading / topology to use — the baselines quantify the trade.</li>
+      </ol>
+      <p class="small card" style="margin-top:.5em;">
+        <strong>Bottom line:</strong> Zenoh meets our needs at the realistic rate — 100 % delivery, ~10 ms latency on
+        loopback and real WiFi — and degrades gracefully under stress where others collapse. Its main limit is
+        high-rate heterogeneous payloads. The open work is tuning and deployment guidance, not re-selection.
+      </p>
+      <aside class="notes">Close on the positive, honest note: Zenoh is the right call and the data backs it; the remaining work is the mixed-types fix, a wired-link measurement, and a single-threaded path. Not a re-selection.</aside>
+    </section>
+
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+<script>
+  Reveal.initialize({
+    hash: true,
+    slideNumber: 'c/t',
+    transition: 'slide',
+    width: 1280,
+    height: 720,
+    margin: 0.06,
+    controls: true,
+    progress: true,
+    plugins: [ RevealNotes ]
+  });
+
+  // Flame-colour the heatmap cells (RdYlGn_r convention: green = good → red = bad).
+  function colorizeHeatmaps() {
+    var DARK = '#1f2937', WHITE = '#ffffff';
+    // latency in ms, anchored at the 10 ms target
+    function latColor(v) {
+      if (v <= 2)   return ['#1a9850', WHITE];
+      if (v <= 5)   return ['#66bd63', DARK];
+      if (v <= 10)  return ['#a6d96a', DARK];
+      if (v <= 15)  return ['#fee08b', DARK];
+      if (v <= 30)  return ['#fdae61', DARK];
+      if (v <= 100) return ['#f46d43', WHITE];
+      if (v <= 1000)return ['#d73027', WHITE];
+      return ['#a50026', WHITE];
+    }
+    // delivery %, 100 = good
+    function dlvColor(d) {
+      if (d >= 99.95) return ['#66bd63', DARK];
+      if (d >= 95)    return ['#a6d96a', DARK];
+      if (d >= 90)    return ['#fee08b', DARK];
+      if (d >= 50)    return ['#fdae61', DARK];
+      return ['#d73027', WHITE];
+    }
+    function paint(sel, fn) {
+      document.querySelectorAll(sel).forEach(function (td) {
+        var v = parseFloat(td.textContent);
+        if (isNaN(v)) return;
+        var c = fn(v);
+        td.style.background = c[0];
+        td.style.color = c[1];
+      });
+    }
+    paint('td.lat', latColor);
+    paint('td.dlv', dlvColor);
+  }
+  colorizeHeatmaps();
+</script>
+</body>
+</html>

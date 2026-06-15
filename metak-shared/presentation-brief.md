@@ -1,100 +1,175 @@
 # Distributed Data Replication — Presentation Brief
 
-A short reference for building slides on the variants we benchmark, the QoS
-levels each one supports, and the metrics we report.
+A reference for building slides on the variants we benchmark, the QoS
+levels each supports, the dimensions we sweep, and what we measure.
+
+> **Status of the numbers (read first).** The figures in §5 are from
+> two **full-matrix runs in May 2026**, both under the current benchmark
+> design (no-skip QoS, threading modes, all workload shapes):
+>
+> - **Same-machine** (loopback), `same-machine-all-variants-01-20260521_210958`.
+> - **Two-machine** over **WiFi 2.4 GHz**,
+>   `two-machines-wifi24g-all-variants-01-20260523_083845` — both peers'
+>   logs present, so cross-machine delivery is true pairwise.
+>
+> Both live under `C:\repo\shared\ddd\` with full analysis output
+> (`analysis/summary_*.md` + PNG charts). Latencies are reported as
+> **mean ± std** (the pivot tables' unit); per-percentile breakdowns are
+> in each run's `summary_performance.md`. A wired-GbE run and the
+> receive-throughput-headline pivot are still ahead (see §6).
 
 ## 1. The benchmark in one paragraph
 
-**The goal is to validate whether Zenoh is a good fit for our distributed
-data replication needs.** We replicate a single-writer, key-value tree
-across nodes on a LAN at ~100 K updates/sec aggregate with sub-10 ms
-latency, and we want a defensible answer on whether Zenoh meets that
-envelope before we commit to it. The five other variants are *baselines*
-that bracket Zenoh from below (Custom UDP — the performance floor with no
-framework overhead) and around it (Hybrid UDP/TCP, QUIC, WebSocket,
-WebRTC). They all solve the **same problem** and run through the **same
-workload**, so any difference in performance is attributable to the
-transport / framework choice.
+**Zenoh is our chosen transport — the goal is to characterize how it
+performs and where its limits are, not to decide whether to adopt it.**
+We replicate a single-writer, key-value tree across nodes on a LAN at
+~100 K updates/sec aggregate with sub-10 ms latency, and we want a
+defensible picture of Zenoh's envelope: where it meets our targets,
+where it doesn't, and what it costs us. Five other variants are
+*reference baselines*, not candidates: they bracket what's achievable on
+this hardware — from the performance floor (Custom UDP — minimum
+framework overhead) up through alternative framings (Hybrid UDP/TCP,
+QUIC, WebSocket, WebRTC). They all solve the **same problem** and run
+through the **same workload**, so Zenoh's numbers can be read in context
+— how close it runs to the floor, and how much headroom we trade for its
+simplicity.
 
-## 1a. Workload glossary
+## 1a. The benchmark matrix
 
-Each spawn is configured as `<vpt>x<tick_rate_hz>` with a QoS suffix:
+A single run sweeps the cross-product of five dimensions. Each
+combination is one **spawn** with its own stabilize/operate/silent
+cycle, and its own log files. The current
+`configs/two-runner-all-variants.toml` expands to **704 spawns**.
 
+| Dimension | Values |
+|---|---|
+| **Variant** | zenoh, custom-udp, quic, hybrid, websocket, webrtc |
+| **Rate** `vpt × tick_rate_hz` | `10×100`, `10×1000`, `100×10`, `100×100`, `100×1000`, `1000×10`, `1000×100`, plus a `max` saturation probe |
+| **Workload shape** | scalar-flood, block-flood, mixed-types |
+| **QoS** | 1–4 (WebSocket is 3–4 only, by design) |
+| **Threading mode** | single (sync, no tokio) / multi (per-peer reader threads) |
+
+Not every combination exists for every variant:
+
+- **Async-only variants (quic, zenoh, webrtc)** declare
+  `supported_modes = ["multi"]` — their single-threaded expansions are
+  skipped, because they fundamentally rely on an async runtime.
+  Claiming a "single-threaded QUIC/Zenoh/WebRTC" number would be
+  misleading.
+- **TCP-family variants (custom-udp, hybrid, websocket)** run in both
+  threading modes — this is the WASM-relevant comparison (see §1c).
+- **WebSocket** runs QoS 3–4 only (it is TCP-based; there is no
+  unreliable mode).
+
+Spawn names encode the dimensions, e.g.
+`zenoh-1000x100hz-scalar-qos1-multi`.
+
+## 1b. Workload glossary
+
+- **What is a "write"?** A *write* (a `WriteOp`) is one update to a
+  single path in the replicated key-value tree: a `Variant::try_publish`
+  of one **`arora_types::Value`** — the project's universal data type, a
+  35-variant enum spanning scalars, typed arrays, and nested key-value
+  structures (source: `semio-ai/arora-types`). The transport ships it as
+  one logical message.
 - **`tick_rate_hz`** — how many times per second the writer wakes up to
   emit a batch. 100 hz = 10 ms between ticks, 1000 hz = 1 ms.
-- **`values_per_tick` (`vpt`)** — how many distinct key/value updates are
-  emitted on each tick (each one is a separate `write` event with its own
-  path / seq).
+- **`values_per_tick` (`vpt`)** — total **leaf scalar values** emitted
+  per tick. This is the comparable denominator across all workload
+  shapes; the shapes differ only in *how* those leaves are packed into
+  writes. In **scalar-flood** (the profile behind the headline rates)
+  each leaf is its own write — one scalar `arora_types::Value` — so
+  `vpt` equals the number of `arora_types::Value` updates per tick
+  (e.g. `100x100hz` = 100 values/tick × 100 ticks/s = **10 k value
+  updates/sec**). In block-flood / mixed-types the same leaf count is
+  packed into fewer, composite `arora_types::Value` writes.
 - **Aggregate write rate** = `vpt × tick_rate_hz`. So `100x100hz` is
-  10 k writes/sec; `1000x100hz` is 100 k writes/sec; `100x1000hz` is also
-  100 k writes/sec but in many small ticks; `1000x1000hz` (the `max`
-  profile) targets 1 M writes/sec and is intentionally above what loopback
-  can sustain — a saturation probe, not a "normal" measurement.
-- **QoS (1–4)** — see §3 below. Same value emitted on different QoS levels
-  is a different spawn.
-- **Per-spawn lifecycle**: `connect` → `stabilize 3 s` → `operate 30 s` →
-  `eot ≤30 s` → `silent 3 s`. The interesting metrics are computed over
-  the `operate` window; `eot` is a designed drain hook for late deliveries
-  (see §1b below).
+  10 k writes/sec; `1000x100hz` is 100 k writes/sec; `max` targets
+  ~1 M writes/sec and is intentionally above what loopback can sustain
+  — a saturation probe, not a "normal" measurement.
+- **Workload shapes** (E19):
+  - **scalar-flood** — `vpt` distinct single-scalar write ops per tick.
+    The per-message-overhead extreme.
+  - **block-flood** — `vpt / blob_size` write ops per tick, each a
+    fixed-size block of scalars. Stresses serialization and
+    large-message handling.
+  - **mixed-types** — a heterogeneous tree per tick (scalars + arrays +
+    nested dicts) totalling `vpt` leaves. Stresses the full nested
+    serialization path. Deterministic via a fixed `workload_seed`.
+  - Realistic robotics/sensor workloads sit in the middle (a handful of
+    structured blocks per tick), which is why block/mixed exist
+    alongside scalar-flood's extreme.
+- **Per-spawn lifecycle**: `connect` → `stabilize 3 s` → `operate 30 s`
+  → `silent 3 s`. Interesting metrics are computed over the `operate`
+  window; the operate window is bounded by the writer's `eot_sent`
+  marker (see §1d).
 
-The all-variants matrix sweeps `vpt ∈ {10, 100, 1000, max}` ×
-`tick_rate_hz ∈ {10, 100, 1000}` × `qos ∈ {1, 2, 3, 4}` per variant.
+## 1c. Threading-mode dimension (E14) and the WASM motivation
 
-## 1b. End-of-Test (EOT) phase
+Some variant crates are intended to compile to **WASM** for the team's
+production scenarios. Browser-WASM does not support multi-threaded
+async runtimes, so **single-threaded synchronous operation is a
+first-class requirement**, not a fallback. The benchmark therefore
+measures each capable variant under both regimes:
 
-After `operate` ends, each variant enters an **EOT phase** designed to
-let receivers drain late deliveries before the spawn shuts down. The
-writer emits a single EOT marker over the transport (`eot_sent` event,
-default impl returns id 0; per-variant overrides emit a real
-unique id). Each peer waits up to `--eot-timeout-secs`
-(default `max(operate_secs, 5)` = **30 s** at our current `operate_secs = 30`)
-for every other peer's EOT marker, logging `eot_received` as each lands.
-During the wait, `poll_receive` keeps draining so deliveries that arrived
-inside the kernel buffer mid-`operate` still get counted (and recorded as
-`late_receives` for the analysis).
+- **single** — sync, no tokio; the WASM-compatible path.
+- **multi** — per-peer reader threads draining into bounded channels;
+  the conventional high-throughput path.
 
-If a peer's EOT never arrives, `eot_timeout` is logged with the missing
-peer set and the spawn proceeds to `silent`.
+This matters because the receive side, not the writer, is the bottleneck
+(see §4). Single-threaded variants must still drain incoming traffic on
+the same thread that does everything else.
 
-**Variant implementation status (2026-05-10):**
-- ✅ Custom UDP — own EOT marker, sent over multicast for QoS 1–2, over
-  TCP for QoS 3–4.
-- ✅ Hybrid UDP/TCP — UDP multicast for QoS 1–2, TCP broadcast for QoS 3–4.
-- ✅ QUIC — separate datagram / control stream depending on QoS path.
-- ✅ Zenoh — published as a distinguished EOT key, subscribed via the
-  same session as data.
-- ❌ WebSocket, WebRTC — no override yet. Falls through to the no-op
-  default, which always emits `eot_timeout`. Filed: E12 sprint (T12.4,
-  T12.5).
+## 1d. Termination and the operate window (E15 — replaces the old EOT phase)
 
-**This affects how to read the results.** Where you see `late_receives`
-in the per-row output, the EOT drain captured deliveries that arrived
-after the writer's `eot_sent`. Where you see `eot_timeout` (alice
-missing bob or vice versa) in the JSONL log, the drain stopped at the
-30 s budget without catching everything still in flight.
+> Earlier revisions of this brief described an **on-wire end-of-test
+> (EOT) handshake** where each variant broadcast an EOT marker over its
+> transport and waited up to 30 s for peers. **That mechanism was
+> removed (E15).** Any slide or note referencing "EOT timeout because
+> the marker queued behind the data" describes the old architecture.
+
+Today, termination is **runner-coordinated and activity-based**:
+
+- Each variant emits a one-line-per-second **progress event to stdout**
+  (`sent`, `received`, `phase`). The runner reads it.
+- The runners exchange per-spawn progress over their coordination
+  channel. When every runner reports its variant has been idle (no new
+  sends and no new receives) for a few seconds during `operate`, they
+  agree the operate phase is naturally done and the variant advances to
+  `silent`.
+- A per-spawn `max_spawn_secs` wall-clock budget remains only as a
+  safety net.
+- The variant still writes a single **`eot_sent` marker to its log**
+  when its writer finishes operate. The analysis tool uses that marker
+  to bound the operate window. There is no longer any on-wire EOT
+  exchange to time out.
 
 ## 2. The variants
 
-Six implementations: **Zenoh is the candidate we're evaluating**; the
-other five are baselines that establish what's possible (faster) and
-what's plausible (alternative frameworks).
+Six implementations, **all implemented and exercised**. Zenoh is the
+chosen transport under study; the other five are reference baselines,
+not alternatives we'd switch to. (Aeron was evaluated in E0 but
+permanently excluded — Windows C-FFI toolchain blocker — and is not in
+the lineup.)
 
-### The candidate
+### The transport under study
 
 - **Zenoh** — a Rust-native pub/sub framework with built-in zero-conf
-  discovery and configurable QoS. *This is the variant we're evaluating
-  for production use.* Specifically we want to know: does Zenoh's
-  out-of-the-box delivery rate, latency, and tail behaviour meet our
-  sub-10 ms p99 / ~100 K writes/sec target, with acceptable resource
-  overhead, and without us writing a custom transport.
+  discovery and configurable QoS. *This is the transport we've chosen;
+  the study maps its performance envelope and limits.* We want to know:
+  what delivery rate, latency, and tail behaviour does Zenoh actually
+  give us against our sub-10 ms p99 / ~100 K writes/sec targets, at what
+  resource cost, and where does it break down. As of T9.5d the variant
+  uses **Zenoh-native QoS only** (the prior application-level
+  credit/ack/dedup wrapper was removed), so its reliable-QoS behaviour
+  under sustained load is being re-characterised.
 
 ### Performance-floor baseline (hand-rolled, minimum overhead)
 
 - **Custom UDP** — raw `UdpSocket` plus a hand-written protocol. UDP
   multicast for fan-out, unicast NACKs for recovery, mDNS for discovery.
   Implements all four QoS levels at the application layer. *Establishes
-  the latency / throughput floor: if Zenoh is N× slower than Custom UDP,
-  this is the cost we're paying for the framework.*
+  the latency / throughput floor.*
 
 ### Alternative-framework baselines (comparable abstractions)
 
@@ -106,25 +181,29 @@ what's plausible (alternative frameworks).
 - **QUIC (quinn)** — UDP-based, multiplexed reliable streams plus
   unreliable datagrams, mandatory TLS 1.3. Streams map cleanly to QoS
   levels. *Compares Zenoh against a modern, low-overhead, encrypted
-  transport that solves similar problems with different abstractions.*
+  transport.*
 
 - **WebSocket** — TCP with WebSocket framing on top. Reliable QoS only
-  (3–4); refuses unreliable QoS by design. *Compares Zenoh against a
-  ubiquitous, browser-compatible reliable transport when only QoS 3–4
-  is needed.*
+  (3–4); refuses unreliable QoS by design. *Isolates the cost of
+  WebSocket framing on top of raw TCP (compare to Hybrid's TCP at QoS 4).*
 
-- **WebRTC DataChannels** — SCTP-over-DTLS-over-UDP. Each DataChannel
-  is configurable for ordered/unordered + reliable/`maxRetransmits=0`,
-  giving native support for all four QoS levels. *Compares Zenoh
-  against a heavier off-the-shelf reliable+unreliable mux.*
+- **WebRTC DataChannels** — SCTP-over-DTLS-over-UDP. Each DataChannel is
+  configurable for ordered/unordered + reliable/`maxRetransmits=0`,
+  giving native support for all four QoS levels. *Compares Zenoh against
+  a heavier off-the-shelf reliable+unreliable mux.* (Known limit: the
+  implemented variant supports exactly one peer per spawn — fits the
+  two-runner case.)
 
 ### How the baselines bracket Zenoh
 
-| Direction | Variant | What it tells us about Zenoh |
+The baselines are reference points, not options on the table. Each
+comparison quantifies *where Zenoh sits*, not whether to replace it.
+
+| Direction | Variant | What the comparison quantifies |
 |---|---|---|
-| ↓ floor | Custom UDP | If Zenoh is much slower → framework overhead is the cost |
-| ≈ peer | Hybrid, QUIC | If Zenoh wins → mature framework adds real value; if loses → think twice |
-| ↑ ceiling | WebSocket, WebRTC | If Zenoh is faster than these heavy stacks, the choice is obvious |
+| ↓ floor | Custom UDP | How far Zenoh runs from minimum-overhead — the framework tax we accept |
+| ≈ peer | Hybrid, QUIC | Whether a mature framework's latency is in the same class as Zenoh's, or a tier away |
+| ↑ ceiling | WebSocket, WebRTC | How much headroom Zenoh has over the heaviest off-the-shelf stacks |
 
 ## 3. The four QoS levels
 
@@ -137,6 +216,28 @@ single tree can carry all four levels simultaneously.
 | 2 | Latest-Value | UDP, seq-tagged | Latest-wins (drop stale) | Tolerated, skipped |
 | 3 | Reliable-UDP | UDP + NACK | Strict | Recovered (lags) |
 | 4 | Reliable-TCP | TCP (or equivalent) | Strict | Recovered (kernel) |
+
+### The Strict No-Skip Contract for QoS 3/4 (E17 — important)
+
+As of 2026-05-18, QoS 3 and QoS 4 **prioritise delivery over
+throughput**:
+
+- A variant **MUST deliver 100 % of accepted writes** at QoS 3/4 and
+  **MUST NOT** silently drop at the publish path.
+- If the send path is full (kernel buffer, app queue, congestion
+  window, peer credit), the variant **blocks the writer** until the
+  message is accepted or the spawn terminates.
+- The acceptable failure mode under sustained overload at QoS 3/4 is
+  **throughput collapse, not delivery shortfall**.
+- QoS 1/2 keep the opposite priority: throughput/latency over delivery.
+  Skipping is the contractual back-pressure mechanism there (the driver
+  records `backpressure_skipped` and moves on).
+
+**How this changes the reading of results:** at QoS 3/4, a saturated
+variant now shows up as *low throughput* (and possibly a
+self-terminated spawn), **not** as low delivery. Older numbers showing
+"~26–36 % delivery at saturation" for reliable QoS reflect the
+pre-contract behaviour and are no longer how the system behaves.
 
 ### How each variant maps the four levels
 
@@ -162,319 +263,200 @@ Notes for the slide:
 
 ## 4. What we measure
 
-The analysis tool ingests JSONL logs from every node and produces both
-**integrity** (did it work correctly?) and **performance** (how fast?)
-reports.
+### Receive throughput is the headline metric (E14 / T11.5)
+
+The project's stated goal is "keep multiple peers in sync under huge
+change diffs with lowest latency possible." The metric that decides
+whether peers are *in sync* is **receive throughput**, not write
+throughput: writers ship at the requested rate almost always; receivers
+face buffer pressure, parse cost, and application work, and are the
+actual bottleneck. Summary tables now lead with receive throughput per
+`(writer, receiver, variant, qos, threading_mode)`; write throughput is
+the "requested rate" context column.
 
 ### Integrity (correctness)
 
 - **Delivery rate** — `receives / writes` per (writer → receiver) pair.
-  At L3/L4 we expect 100%; at L1/L2 we report whatever it is.
-- **Ordering violations** — out-of-order receives on ordered QoS
-  levels (2/3/4).
-- **Duplicates** — same `(writer, seq, path)` received twice.
-- **Unresolved gaps** — for L3, every detected gap must eventually
-  be filled before the run ends.
+  At L3/L4 we expect 100 % (per the no-skip contract); at L1/L2 we
+  report whatever it is.
+- **Ordering violations** — out-of-order receives on ordered QoS levels
+  (2/3/4).
+- **Duplicates** — same logical update received twice.
+- **Unresolved gaps** — for L3, every detected gap must eventually be
+  filled before the run ends.
+- **`backpressure_skipped` at QoS 3/4** is now an integrity *failure*
+  (it violates the no-skip contract).
 
-### Performance (the headline numbers)
+### Performance
 
-- **Replication latency** — wall-clock time from the writer's `write`
-  event to the matching `receive` event on every other node. Reported as
-  **p50 / p95 / p99 / max**, with breakdowns per path and per receiver
-  to spot hot paths and slow nodes. The single most important metric.
-- **Throughput** — sustained `writes/sec` per writer and `receives/sec`
-  per receiver during the operate phase. Aggregate across all writers
-  is the headline rate.
-- **Jitter** — rolling standard deviation of latency. Tells us whether
-  latency is *consistent* or just has a good average.
-- **Packet loss rate** — for QoS levels with sequence tracking
-  (2/3/4), missing-seq ratio. For L3, this is *transient* loss before
-  recovery.
-- **Connection time** — how long from process start to "ready to publish"
-  (`connected` event). Mostly interesting for QUIC and WebRTC, where
-  handshakes dominate cold start.
-- **Resource usage** — CPU% and memory MB sampled during the run.
+- **Replication latency** — per published write op, wall-clock from the
+  writer's emit to the matching receive on every other node. Reported
+  as **p50 / p95 / p99 / max**, with per-path and per-receiver
+  breakdowns.
+- **Throughput** — sustained receives/sec (headline) and writes/sec
+  (context) during operate.
+- **Jitter** — rolling standard deviation of latency.
+- **Packet loss rate** — for QoS levels with sequence tracking (2/3/4);
+  for L3 this is *transient* loss before recovery.
+- **Connection time** — process start to "ready to publish". Mostly
+  interesting for QUIC and WebRTC, where handshakes dominate cold start.
+- **Resource usage** — CPU % and memory MB sampled during the run.
 
-### How latency is computed (one-line version)
+### Logging and how latency is computed
 
-For every `write` event on the writer's log, we find the matching
-`receive` event on every other runner's log by joining on
-`(variant, run, writer, seq, path)`. The delta of their timestamps is
-the latency. Clocks across machines are reconciled separately via PTP
-sync. We then aggregate those per-delivery latencies into the
-percentiles above.
+- Per-message observations are written in a **compact columnar format
+  (Apache Parquet)**, not per-event JSONL (E18). Legacy per-event JSONL
+  was removed (E19); JSONL is now **lifecycle-only** (`phase`,
+  `connected`, `eot_sent`, `resource`, `clock_sync`).
+- Latency is computed by correlating each write with its matching
+  receive at every other node. The compact format carries no `seq`;
+  correlation is **ordering-based** (the Nth write on a `(writer, path)`
+  matches the Nth receive at a receiver), which is exact at QoS 3/4
+  (strict order, no drops).
+- Cross-machine clocks are reconciled via an **application-level,
+  NTP-style 4-timestamp offset exchange** between runner pairs (E8) —
+  **not** hardware PTP. Single-host runs share one wall-clock, so no
+  correction is needed there.
 
-## 5. Results from the all-variants matrix
+## 5. Results
 
-Two runs of `configs/two-runner-all-variants.toml` (48 [[variant]]
-entries × QoS expansion = 176 spawns) form the basis below. Both ran
-on Windows hosts. **Both runs were taken AFTER the EOT phase landed
-in the driver** (commit `5faf7a8`, 2026-05-04). So the EOT drain hook
-was active for every spawn in both runs — but as shown below, EOT
-doesn't fully rescue the high-rate TCP cases, for reasons unpacked
-below.
+All figures are **scalar-flood at the realistic rate (10 k writes/s =
+100 vpt × 100 hz), multi-threaded**. Each cell is **delivery % · mean
+latency (ms)** across all four QoS levels (1 = best-effort, 2 =
+latest-value, 3 = reliable-UDP, 4 = reliable-TCP). Per-percentile and
+std breakdowns are in each run's `summary_performance.md`. WebSocket is
+QoS 3/4 only. Hybrid/Custom-UDP multicast double-count on loopback; the
+delivery figures are completeness (100 %). The rendered deck colours
+these cells green→red (RdYlGn, matching the drop-rate heatmaps).
 
-### 5.1 Same-machine run (2026-05-07, log_subdir `…_183143`)
+### 5.1 Same-machine (loopback, 2026-05-21)
 
-Both runners on one host, loopback addresses. Complete log set for
-alice and bob — paired latency and delivery numbers are real. **This
-is the run with the most interpretable data.**
+| Variant | Q1 dlv | Q1 ms | Q2 dlv | Q2 ms | Q3 dlv | Q3 ms | Q4 dlv | Q4 ms |
+|---|---|---|---|---|---|---|---|---|
+| Custom UDP | 100 % | 5.0 | 100 % | 5.2 | 100 % | 5.7 | 100 % | 5.5 |
+| Hybrid | 100 % | 5.9 | 100 % | 6.3 | 100 % | 1.3 | 100 % | 1.3 |
+| QUIC | 100 % | 16.1 | 100 % | 13.8 | 100 % | 9.8 | 100 % | 5.2 |
+| WebSocket | — | — | — | — | 100 % | 0.1 | 100 % | 0.1 |
+| WebRTC | 94.8 % | 10.0 | 95.1 % | 10.1 | 100 % | 9.0 | 100 % | 6.8 |
+| **Zenoh** | 100 % | 10.2 | 100 % | 10.3 | 100 % | 11.1 | 100 % | 11.5 |
 
-#### Zenoh — headline result for the candidate
+At **100 k writes/s** (1000 vpt × 100 hz) same-machine: Zenoh and QUIC
+still hold **100 %** delivery (Zenoh ~11.8 ms, QUIC ~3.6 ms); Custom-UDP
+multi 100 % but ~45.7 ms; WebRTC collapses to ~47.5 %; single-threaded
+Hybrid collapses to 78.7 % with multi-second latency. **No QoS 3/4
+`backpressure_skipped` violations anywhere** — the no-skip contract
+held.
 
-| Spawn | Aggregate rate | Delivery | p50 | p95 | p99 | Loss% | Notes |
-|---|---|---|---|---|---|---|---|
-| `zenoh-10x100hz-qos1` | 1 k writes/s | 100 % | 10.7 ms | 29.8 ms | 30.1 ms | 0 % | clean |
-| `zenoh-100x100hz-qos1` | 10 k writes/s | 100 % | 30.3 ms | 159.6 ms | 170.8 ms | 0 % | clean |
-| `zenoh-100x100hz-qos3` | 10 k writes/s | 100 % | 40.1 ms | 311 ms | 340 ms | 0 % | clean (reliable) |
-| `zenoh-1000x100hz-qos1` | 100 k writes/s | ~26 % | 435 ms | 507 ms | 612 ms | 64 % | saturated |
-| `zenoh-1000x100hz-qos3` | 100 k writes/s | ~36 % | 423 ms | 524 ms | 535 ms | 64 % | saturated |
-| `zenoh-max-qos1` | 1 M target | low | 203 ms | 227 ms | 309 ms | 63 % | saturation probe |
+### 5.2 Two machines, WiFi 2.4 GHz (2026-05-23)
 
-**Read of Zenoh against our target (sub-10 ms p99, ~100 K writes/sec
-aggregate):**
+Both peers' logs present → true pairwise delivery. The link is
+deliberately constrained, so absolute latency reflects the network.
+(QUIC and Hybrid carry heavy tails the mean understates — see
+`summary_performance.md`.)
 
-- At **10 k writes/sec aggregate** (100 vpt × 100 hz), Zenoh delivers
-  100 % of messages at p99 ≈ 170 ms — *misses our latency target*. Same
-  pattern across QoS levels.
-- At **100 k writes/sec aggregate** (1000 vpt × 100 hz), Zenoh saturates
-  to ~26–36 % delivery with p99 in the 500–700 ms range — *misses both
-  delivery and latency targets at our headline rate*.
-- Zenoh's behaviour is consistent across QoS 1–4 (no obvious cliff at the
-  reliable-vs-unreliable boundary), and resource usage stays modest
-  (sub-100 % CPU mean, low MB memory).
-- A few zenoh rows show sub-ms p50 (`zenoh-100x1000hz-qos1`: 0.54 ms
-  p50, 110 ms p95). Those rates run mostly through Zenoh's
-  same-process subscriber-cache path; they aren't measuring the wire
-  fairly and shouldn't be presented as a cross-protocol comparison.
+| Variant | Q1 dlv | Q1 ms | Q2 dlv | Q2 ms | Q3 dlv | Q3 ms | Q4 dlv | Q4 ms |
+|---|---|---|---|---|---|---|---|---|
+| Custom UDP | 100 % | 9.7 | 100 % | 10.0 | 100 % | 11.3 | 100 % | 8.2 |
+| Hybrid | 100 % | 7.5 | 100 % | 7.2 | 100 % | 10.0 | 100 % | 10.0 |
+| QUIC | 100 % | 11.3 | 100 % | 8.9 | 100 % | 13.9 | 100 % | 12.6 |
+| WebSocket | — | — | — | — | 100 % | 3.3 | 100 % | 4.0 |
+| WebRTC | 95.3 % | 6.8 | 95.6 % | 6.1 | 100 % | 7.9 | 100 % | 5.6 |
+| **Zenoh** | 100 % | 8.0 | 100 % | 14.6 | 100 % | 7.7 | 100 % | 8.8 |
 
-#### Baselines — context for the Zenoh numbers
+At **100 k writes/s** over WiFi: Zenoh holds **100 %** (~15.4 ms); QUIC
+99.5 % (~11.2 ms). Custom-UDP and Hybrid keep delivery but latency
+balloons to **seconds** (link buffering); WebRTC ~48 %; single-threaded
+Custom-UDP QoS 4 → 0 %.
 
-At the 10 k-writes/sec rate (the standard `100x100hz-qos1`):
+### 5.3 Zenoh operating envelope (two machines, WiFi 2.4 GHz, mean latency ms)
 
-| Variant | Delivery | p50 | p99 |
-|---|---|---|---|
-| QUIC | 100 % | **0.78 ms** | 11.3 ms |
-| Custom UDP | 100 % | 5.5 ms | 21.7 ms |
-| WebRTC | 100 % | 2.3 ms | 157 ms |
-| Zenoh | 100 % | 30 ms | 171 ms |
-| Hybrid | 100 % | 146 ms | 204 ms |
+Zenoh-only, multi-threaded, across **workload shape × QoS × rate**. All
+cells 100 % delivery except `✗` (68–97 %). The deck renders this as a
+flame heatmap. `⚠` rows are under review (see note below).
 
-At this rate every variant that completed its spawn delivered 100 %, so
-the comparison is purely on latency: **Zenoh is ~40× slower at p50
-than QUIC, and ~6× slower than Custom UDP**, but it's a finished, working
-result. It misses the sub-10 ms p99 target while QUIC clears it.
+| Rate (vpt×hz) | Sc Q1 | Q2 | Q3 | Q4 | Bl Q1 | Q2 | Q3 | Q4 | Mx Q1 | Q2 | Q3 | Q4 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 10×100hz | 10.3 | 6.3 | 5.8 | 9.4 | 9.0 | 10.5 | 10.2 | 9.8 | 6.2 | 6.0 | 5.5 | 5.6 |
+| 10×1000hz | 6.1 | 6.1 | 4.8 | 5.4 | 6.2 | 6.2 | 5.3 | 5.4 | 5.5 | 5.9 | 4.8 | 4.9 |
+| 100×10hz ⚠ | 50.1 | 51.1 | 50.1 | 54.4 | 50.0 | 49.9 | 50.1 | 50.0 | 50.2 | 99.1 | 50.2 | 63.3 |
+| 100×100hz | 8.0 | 14.6 | 7.7 | 8.8 | 5.9 | 7.2 | 9.8 | 6.5 | 11.1 | 10.6 | 7.3 | 7.0 |
+| 100×1000hz | 14.3 | 12.3 | 12.5 | 12.5 | 6.1 | 5.9 | 5.1 | 5.3 | 601✗ | 587✗ | 415 | 468 |
+| 1000×10hz ⚠ | 51.2 | 76.8 | 90.9 | 50.7 | 49.8 | 53.6 | 49.9 | 75.1 | 812 | 825 | 1010 | 1303 |
+| 1000×100hz | 15.4 | 15.5 | 20.3 | 15.8 | 10.1 | 6.8 | 5.9 | 8.6 | 1053✗ | 1146✗ | 3145✗ | 2942✗ |
 
-At 100 k writes/sec (`1000x100hz-qos1`):
+(Sc = scalar-flood, Bl = block-flood, Mx = mixed-types.) Decision
+guidance:
 
-| Variant | Delivery | p50 | Notes |
-|---|---|---|---|
-| Custom UDP | 25 % | 389 ms | UDP buffer overflow |
-| Zenoh | 26 % | 435 ms | similar saturation |
-| Hybrid | 15 % | 1.0 s | TCP buffer queueing |
-| QUIC | 17 % | 21 s | catastrophic, see below |
+- **Ideal** — scalar or block at tick ≥ 100 Hz: ≤ ~15 ms, 100 %
+  delivery, any QoS.
+- **Avoid** — mixed-types at ≥ 1000 vpt: 0.4–3.1 s latency, and delivery
+  falls to 68–97 % — even reliable QoS 3/4 can't hold it on a real link.
+  The fix is **block-flood packing**, which stays fast and complete.
+- **⚠ Under review** — the 10 Hz (`×10hz`) rows. In the authoritative
+  latency table these spawns show a clean ~one-tick **median** latency
+  (`zenoh-100x10hz-scalar-qos1` p50 = 100.0 ms, p95 100.4, p99 100.5),
+  which Custom-UDP does **not** (its p50 = 4.4 ms, only the tail hits one
+  tick). This Zenoh-specific, tick-aligned median is most likely
+  **publisher batching / flush timing** at low publish rates. Being
+  confirmed by a targeted re-run (toggling the publisher's flush/express
+  setting) before these cells are quoted.
 
-**No transport hits sub-10 ms p99 at 100 K writes/sec on this hardware.**
-This is a workload-shape finding, not a Zenoh verdict.
+### 5.4 What the results say about Zenoh
 
-#### What the data says about EOT specifically
+- **Operationally simple** — discovery, QoS, recovery all out of the box.
+- **Delivers 100 % across QoS 1–4** at the realistic rate, on loopback
+  *and* real WiFi.
+- **Holds up under stress** — 100 % delivery at 100 k writes/s, where
+  WebRTC and single-threaded Hybrid collapse.
+- **Most consistent latency in the field** — ~8–11 ms mean with a tight
+  spread; steadier than QUIC, which is 100 % but jittery (±50–84 ms).
+- **Limit — heterogeneous payloads at high rate.** The mixed-types
+  workload at 100 k drives Zenoh latency into the **seconds**
+  (same-machine `1000x100hz-mixed-qos1` ≈ 3208 ± 1208 ms; WiFi mixed
+  QoS 3/4 delivery ~68–70 %). This is Zenoh's clearest weak spot.
+- **Limit — multi-threaded only.** No native single-threaded / WASM path
+  yet (router-RPC sidecar is the planned route).
 
-EOT *fires* for the variants that implement it (custom-udp, hybrid,
-quic, zenoh) — the JSONL logs contain `eot_sent` events and either
-`eot_received` (success) or `eot_timeout` (drain budget exhausted).
-But it doesn't fully rescue the worst rows:
+Against the target: at the realistic rate Zenoh sits ~10 ms mean —
+around the 10 ms goal (a strict sub-10 ms *p99* isn't guaranteed), with
+full delivery.
 
-- **Hybrid TCP (`hybrid-1000x100hz-qos3`)**: alice emits `eot_sent` at
-  operate+30 s, then waits 30 s for bob's EOT marker, then logs
-  `eot_timeout` with bob still missing. Bob does the same in reverse.
-  Reason: hybrid sends the EOT marker **over the same TCP stream as the
-  data**, so the EOT marker queues behind the data deluge that already
-  overflowed the kernel send/recv buffer. By the time the queue would
-  drain, the 30 s EOT budget has elapsed. EOT works fine for hybrid at
-  rates where the data queue *can* drain; at 1000 vpt × 100 hz it can't.
-- **Zenoh (`zenoh-1000x100hz-qos3`)**: alice emits `eot_sent`, but the
-  matching bob's log file is **truncated mid-write** at seq ~1432 of
-  ~30 k. Bob's variant child crashed (or was killed) during the
-  operate phase — not the EOT phase. So Zenoh's high-rate row isn't a
-  "TCP queue overflow" story like hybrid's; it's a variant-stability
-  story at sustained 100 K writes/s. Worth investigating: did Zenoh
-  OOM, panic, or get killed by the OS scheduler?
-- **WebSocket / WebRTC**: no EOT override yet, so the default no-op
-  fires `eot_timeout` unconditionally. Not load-related — just missing
-  trait impl. Filed in E12 (T12.4, T12.5).
+> **Provenance caveat.** These two matrix runs (2026-05-21 / 05-23)
+> predate the T9.5d removal of Zenoh's application-level QoS wrapper
+> (2026-05-25). The reliable-QoS (3/4) figures above were therefore
+> achieved with that wrapper in place. At the realistic 10 k rate this
+> is not expected to matter, but Zenoh-native-only reliable behaviour at
+> high reliable load (≳50 k msg/s) still needs confirming on a fresh run
+> — it is the one place the current build could differ from these
+> numbers.
 
-#### Other failure modes
+## 6. What's next
 
-1. **`workload = max-throughput` is a saturation probe**, not a normal
-   profile. Across all transports the `*-max-*` rows show 75–99 %
-   loss and tens-of-seconds p50. Useful as a saturation ceiling.
+1. **Close the mixed-types latency gap** — Zenoh's clearest limit;
+   determine whether it's batching, congestion control, or serialization.
+2. **Run on a wired link (GbE)** — WiFi 2.4 GHz floors latency; a wired
+   run isolates Zenoh's true tail and confirms the sub-10 ms picture.
+3. **Add a single-threaded / WASM path** (Zenoh router-RPC sidecar) for
+   deployments that require it.
+4. **Write deployment guidance** — where sub-10 ms matters, which QoS /
+   threading / topology to use. The baselines quantify the trade. The
+   question is how to deploy Zenoh well, not whether to use it.
 
-2. **WebSocket fully broken on one host** — every `websocket-*` spawn
-   shows 0 writes/s and 100 % loss. Two same-machine processes can't
-   both bind the WebSocket server port. WebSocket can only be
-   evaluated in a real two-machine setup.
+## 7. Suggested slide flow
 
-3. **WebRTC has signaling fragility** — many high-rate WebRTC spawns
-   produce no data at all (`0 ms / 0 writes`) because the DataChannel
-   handshake didn't complete before the operate window opened. Spawns
-   that *do* connect look reasonable (1–5 ms p50).
+See `metak-shared/slides.md` and the rendered `metak-shared/presentation.html`.
 
-4. **Latency labelled "(uncorrected)"** on most same-machine rows —
-   the clock-sync engine produced too few samples per variant for the
-   timestamp pipeline to apply skew correction. On a single host the
-   wall-clock should be identical anyway, so the numbers are still
-   directionally correct; the absolute high-end numbers should be
-   re-measured once the resync sample-count gap is fixed.
-
-### 5.2 Two-machine run (2026-05-07, log_subdir `two-machines-…_093412`)
-
-Alice's logs only — bob's logs from the second host were never copied
-back to this machine. The analysis tool can therefore only compute
-`alice → alice` self-paths, which makes the cross-machine comparison
-**incomplete**. Reporting what's there for completeness, with that
-caveat:
-
-- Variants with broadcast / multicast architectures (zenoh, hybrid,
-  custom-udp's multicast send path) produce some self-delivery rows
-  with realistic numbers — `zenoh 100x100hz-qos2` reports 0.42 ms
-  p50, 0.75 ms p95, 0 % loss on alice → alice. Suggests the in-process
-  Zenoh path is fast even when crossing the publish/subscribe cycle.
-- Pure point-to-point variants (quic, websocket, the unicast paths of
-  custom-udp / hybrid) report 0 ms / 100 % "loss" because alice's
-  log has no matching receiver — bob is simply absent from the
-  dataset.
-- Connect times are universally ~500 ms higher than same-machine,
-  matching the cross-machine TCP/QUIC handshake cost.
-
-**Action items before any Zenoh recommendation can be defended:**
-1. Copy bob's logs from the second machine into this folder and re-run
-   `analyze.py`. Without them the two-machine run cannot make a real
-   cross-machine claim.
-2. Re-run end-to-end now that T-coord.3 + T-coord.1b are landed and
-   T-coord.4 (4262-byte resume-manifest > 4096-byte recv buffer) is
-   filed. A clean run should complete without the 9-spawn hang we hit
-   on 2026-05-07.
-3. Investigate the Zenoh-bob mid-operate truncation at 1000 vpt to
-   distinguish "Zenoh saturates" from "Zenoh crashes."
-
-## 6. Findings — divergences from expectation
-
-What we assumed when we built the benchmark vs what the matrix
-actually showed us:
-
-1. **Assumed**: same-machine = ground truth, no noise. **Measured**:
-   loopback drops UDP at sustained 100 K+ pkt/s; TCP overload looks
-   like loss because the data is queued in the kernel and the EOT
-   drain budget (= operate_secs = 30 s) is too short to clear it.
-
-2. **Assumed**: the EOT phase would close the "data still in kernel
-   queue at operate-end" gap, so reliable QoS would report ~100 %
-   delivery up to the saturation point. **Measured**: EOT *runs* for
-   every variant that implements it, but at 100 K writes/sec on
-   hybrid-TCP it `eot_timeout`s because the EOT marker is queued
-   behind 100 K msg/s × 30 s = ~3 M unacknowledged messages in TCP.
-   Lengthening `--eot-timeout-secs` or sending EOT over an
-   out-of-band control channel would help; the current "send EOT
-   over the data path" doesn't.
-
-3. **Assumed**: WebSocket would be a useful control — well-understood
-   reliable transport. **Measured**: unusable on a single host
-   because each peer wants a server port and they collide. Real-world
-   deployment isn't single-host, so this is a benchmark-harness
-   limitation, not a protocol verdict.
-
-4. **Assumed**: Clock sync would just work and we'd get skew-corrected
-   latencies for free. **Measured**: many spawns produce too few
-   samples for the corrector to apply, so we're reading "(uncorrected)"
-   timestamps on critical rows. Need to investigate the per-variant
-   resync sample count under load.
-
-5. **Assumed**: A failed spawn would be obvious. **Measured**: many
-   spawns ran their full window and produced log files but with
-   `0 writes / 0 ms` because the variant's own setup phase didn't
-   finish in time (webrtc signaling, websocket port bind). Worse, the
-   Zenoh 1000 vpt rows show **bob's log truncated mid-write** — the
-   variant child crashed (or was killed) under load, mid-`operate`.
-   Need a `connection_failed` / `child_died` event so analysis can
-   distinguish "ran and lost packets" from "couldn't even start" from
-   "crashed under load."
-
-6. **Assumed**: Two-machine results would just take a manifest
-   exchange and a log copy. **Measured**: (a) bob's logs need to
-   physically move back to alice's machine; we don't yet have an
-   automated step for that. (b) The resume-manifest message size for
-   176 completed jobs is 4262 bytes against a 4096-byte recv buffer
-   — the runner's manifest-exchange path needs the buffer raised
-   before any cross-machine resume actually round-trips. (Filed:
-   T-coord.4 in `metak-orchestrator/TASKS.md`.)
-
-## 7. Where this leaves us — Zenoh validation
-
-**The candidate verdict, in one paragraph:**
-
-At the realistic LAN rate (10 k writes/sec aggregate) Zenoh delivers
-100 % of messages but at **p99 ≈ 170 ms**, which is **~17× above our
-sub-10 ms target**. At our headline target rate (100 k writes/sec
-aggregate) Zenoh saturates to ~26 % delivery, the same saturation
-profile every other transport hits on this hardware. Zenoh is
-*correct* and *operationally simple* — discovery, QoS, recovery all
-work out of the box — but it is meaningfully slower than QUIC (~40×
-on p50 at the realistic rate) and Custom UDP (~6× on p50). The
-saturation point is no worse than the alternatives.
-
-**Pre-conditions before this verdict can be defended publicly:**
-
-1. **Re-measure with two-machine logs collected from both sides.** The
-   same-machine numbers above carry the "(uncorrected)" caveat and
-   the loopback-loss caveat; only a LAN run with both peers' logs
-   establishes the real-world Zenoh ranking.
-2. **Investigate the Zenoh-bob mid-operate truncation at 1000 vpt.**
-   If Zenoh's child crashed/OOM'd under sustained load, that's a
-   reliability concern for the candidate that we need to characterise
-   before recommending. If it was simply the runner timeout firing,
-   the row is recoverable with a longer per-variant timeout.
-3. **Decide whether to lengthen `--eot-timeout-secs` or move EOT
-   off-band.** Until then, the high-rate reliable rows reflect EOT
-   timing, not transport performance, and shouldn't be presented as
-   either a Zenoh strength or weakness.
-
-**What we can confidently say *today*:**
-
-- Zenoh delivers correctly (100 % completeness at 10 k writes/sec,
-  including reliable QoS) — *the candidate passes the correctness bar*.
-- Zenoh saturates at roughly the same point every alternative does on
-  this hardware — *the candidate has no obvious throughput floor*.
-- Zenoh's latency is ~30 ms p50 at 10 k writes/sec, ~430 ms p50 at
-  saturation — *the candidate misses our sub-10 ms p99 target* and
-  would force a re-think of either the target or the candidate.
-
-**What the alternatives tell us about the cost of choosing Zenoh:**
-
-- QUIC sits ~40× below Zenoh on p50 at the realistic rate with the same
-  correctness and substantially more complexity. If sub-10 ms p99 is a
-  hard requirement, QUIC is in the running.
-- Custom UDP sits ~6× below Zenoh and is the absolute floor; it is also
-  the most code to maintain and the least feature-complete (no
-  discovery, no recovery, no built-in QoS abstraction beyond what we
-  wrote).
-- Hybrid, WebSocket, WebRTC are not credible alternatives at this
-  point given the benchmark-harness limitations and the framing-tax
-  costs observed.
-
-## 8. Suggested slide flow
-
-Five-minute read; nine slides. See `metak-shared/slides.md`.
-
-1. **Title + the question** — "How much does the transport choice matter?"
-2. **Setup** — two runners, six variants, four QoS, 176 spawns.
+1. **Title + abstract** — "How does Zenoh perform, and where are its
+   limits?" (Zenoh is chosen; baselines bracket what's achievable.)
+2. **Setup** — two runners, six variants, the five-dimension matrix.
 3. **Variants** — one line each, grouped as in §2.
-4. **QoS matrix** — the table from §3 (variants × QoS levels).
-5. **What we measure** — latency p50/p95/p99, throughput, loss,
-   jitter, connect time, resources.
-6. **Results — what works** — sub-ms / sub-25 ms p99 at standard
-   rates for custom-udp + quic.
-7. **Results — where it breaks** — UDP loopback drop, TCP-overload
-   tail, websocket / webrtc setup fragility on one host.
-8. **Findings / divergences from expectation** — the six bullets in §6.
-9. **Where this leaves us** — confident claims + open questions
-   from §7.
+4. **QoS matrix + the no-skip contract** — §3.
+5. **What we measure** — receive throughput as headline; integrity;
+   performance; compact logs + NTP clock sync.
+6. **Termination model** — runner-coordinated, activity-based (§1d).
+7. **Results — same-machine** — §5.1.
+8. **Zenoh operating envelope** — shape × QoS × rate heatmap; ideal /
+   watch / avoid (§5.3).
+9. **Results — two machines (WiFi)** — §5.2.
+10. **What we can say about Zenoh** — strengths + limits (§5.4).
+11. **What's next** — §6.

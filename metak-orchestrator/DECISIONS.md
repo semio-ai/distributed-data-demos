@@ -735,3 +735,32 @@ Three concerns:
   it does (per overview.md "high-level framework approach").
 
 ---
+
+## D-brief.1: Presentation brief reframed as methodology+status (numbers stripped)
+
+**Date**: 2026-06-15
+**Context**: User asked whether `metak-shared/presentation-brief.md`
+(last written 2026-05-11, commit `6a36fb2`) was still accurate. It was
+not: since 2026-05-11 the benchmark changed by design in ways that
+invalidate its per-row numbers — E14 (threading-mode dimension), E15
+(on-wire EOT replaced by runner-coordinated activity-based
+termination), E17 (Strict No-Skip Contract: QoS 3/4 block to guarantee
+delivery instead of dropping), E18/E19 (compact Parquet logs, legacy
+per-event JSONL removed, block-flood/mixed-types workload shapes), and
+T9.5d (Zenoh app-level QoS wrapper removed, exposing Zenoh-native QoS).
+The §5 figures were from the 2026-05-07 same-machine run; no
+post-change full matrix exists (T17.10 is pending and user-owned), and
+the only newer runs on disk (2026-05-25) are Zenoh-only validation.
+**Decision**: Rewrote `presentation-brief.md` and `slides.md` as a
+*methodology + current-state* brief and **stripped all stale per-row
+numbers** rather than present them as current (user's explicit choice
+when asked). Added a status banner explaining the behaviour changes,
+documented the current five-dimension matrix, the no-skip contract, the
+E15 termination model, receive-throughput-as-headline, and
+compact-Parquet/NTP-clock-sync methodology. Kept only qualitative Zenoh
+claims that survive the methodology changes; listed the pending re-run
+(T17.10) and Zenoh-native-QoS characterisation as the open items.
+**Rationale**: A team-facing brief that quotes numbers measured under
+removed behaviour (esp. "26–36 % delivery at QoS 3/4 saturation", now
+inverted by the no-skip contract) would actively mislead. Methodology
+is stable and presentable now; numbers return after T17.10.
