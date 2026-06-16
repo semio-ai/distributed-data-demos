@@ -20090,3 +20090,70 @@ that's clearly Zenoh-native, not app-level-credit-related". A
 heavier workload that reaches 50K+ msg/s reliable load may now fail
 via watchdog self-kill or low cross-peer delivery; that is the
 data point the user wanted exposed.
+
+---
+
+## T9.5e — configurable `zenoh_express` publisher flag (2026-06-15) — COMPLETE
+
+**Worker**: variants/zenoh
+
+**Goal**: add an opt-in `zenoh_express` arg that sets Zenoh publishers
+to express (immediate send, no batching) to collapse the low-rate
+(10 Hz) latency the benchmark saw rise to ~50–90 ms while Custom-UDP
+held ~4.4 ms. Express is a latency/throughput tradeoff, so it must be
+configurable and **default false** (no change to existing numbers).
+
+### Changes (all within `variants/zenoh/`)
+
+- `src/zenoh.rs`:
+  - `ZenohArgs`: new `pub express: bool` field (default false).
+  - `ZenohArgs::parse`: new `--zenoh-express <true|false>` branch in
+    the hand-rolled arg loop, mirroring the existing value-token style.
+    The runner forwards `--variant-arg 'zenoh-*.zenoh_express=true'` as
+    the tokens `--zenoh-express true`. Missing value or a non-bool
+    value is a clear parse error; absent flag → false.
+  - `PublisherState`: new `express: bool` field so the lazy-declare
+    fallback uses the same policy as the pre-declared publishers.
+  - Both `declare_publisher` builder chains now add `.express(express)`
+    next to `.congestion_control(cc)`:
+    1. `connect` pre-declare `JoinSet` (`bench/0..N-1`, both Drop+Block).
+    2. `publisher_task` lazy-declare fallback (first-sight keys).
+  - 7 existing test `ZenohArgs { .. }` literals updated with
+    `express: false`.
+  - 6 new unit tests: parses true / parses false / defaults false /
+    requires-value / rejects-non-bool / alongside-unknown-args.
+
+- `CUSTOM.md`: new "T9.5e — `--zenoh-express`" section documenting the
+  arg, default false, what express does (immediate send, disables
+  batching → lower latency at low rates), the throughput tradeoff, the
+  two declare sites, the exact zenoh 1.9.0 API, and the operator
+  `--variant-arg 'zenoh-*.zenoh_express=true'` invocation.
+
+### Exact API
+
+zenoh 1.9.0 `PublisherBuilder::express(is_express: bool) -> Self` from
+`QoSBuilderTrait` (same trait as `congestion_control`, already in
+scope). Confirmed in the crate source
+(`zenoh-1.9.0/src/api/builders/publisher.rs:133`). It is a
+publisher-builder method, **not** a per-`put()` option — the policy is
+fixed at declare time. `express(false)` preserves Zenoh's default
+batching, so default behaviour is unchanged.
+
+### Verification
+
+- `cargo build --release -p variant-zenoh`: OK.
+- `cargo test --release -p variant-zenoh`: 85 unit tests pass (incl. 6
+  new express tests), 1 loopback integration test passes; ignored
+  tests unchanged.
+- `cargo clippy --release -p variant-zenoh -- -D warnings`: clean.
+- `cargo fmt -p variant-zenoh -- --check`: clean.
+- Functional: `target/release/variant-zenoh.exe ... -- --zenoh-express true`
+  (solo 1 vpt × 10 Hz × 1 s) accepts the arg and reaches `phase=done`.
+
+### Constraints honoured
+
+- Default false; existing configs/results reproducible.
+- No files modified outside `variants/zenoh/` (this STATUS append is
+  the authorised completion report). Runner passthrough is already
+  generic — no runner change needed.
+- STATUS.md updated by read-then-append only.
