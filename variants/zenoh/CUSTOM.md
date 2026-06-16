@@ -1260,3 +1260,70 @@ target\release\runner.exe --name alice `
 Closes T16.10c (the cross-WiFi data-plane failure mode) by sidestepping
 the multicast-scouting layer entirely. Single-mode peering (T14.9b)
 is unchanged; it already had its own explicit peer mesh.
+
+## T9.5e — `--zenoh-express <true|false>` (publisher express / immediate send)
+
+A configurable boolean arg on `ZenohArgs`, **default `false`**. When
+`true`, every publisher the variant declares is built with Zenoh's
+*express* policy — `PublisherBuilder::express(true)` — alongside the
+existing `.congestion_control(cc)`. When `false` (the default) the
+builder is left at Zenoh's default batching behaviour, so existing
+configs and benchmark numbers are byte-for-byte reproducible.
+
+### What express does
+
+Zenoh batches small outgoing samples by default and flushes the batch
+on a timer / size threshold. At **low publish rates** with small
+messages (e.g. the 10 Hz scalar/block fixtures), a partial batch sits
+waiting for the next sample, adding tens of milliseconds of latency
+before the bytes leave the host. Setting `express(true)` tells Zenoh to
+send each sample **immediately** (no batching), which collapses that
+low-rate latency. The benchmark observed Zenoh latency rising to
+~50–90 ms (scalar/block) at 10 Hz with batching on, vs ~4.4 ms for the
+Custom-UDP variant; express is the targeted fix for that gap.
+
+### Tradeoff (why it is opt-in, not forced on)
+
+Express is a latency/throughput tradeoff. Disabling batching can **cost
+aggregate throughput at very high publish rates** (more, smaller
+network writes instead of fewer, fuller batches). It therefore defaults
+off; operators enable it only for the low-rate scenarios where the
+batch-flush latency dominates.
+
+### Where it is applied
+
+Both publisher-declare sites in `src/zenoh.rs` apply the flag:
+
+1. The `connect` **pre-declare** path (the `JoinSet` that declares
+   `bench/0..values_per_tick-1` for both `Drop` and `Block`
+   congestion-control caches) — `.congestion_control(cc).express(express)`.
+2. The `publisher_task` **lazy-declare fallback** (first-sight declare
+   for keys outside the pre-declared set) — same builder chain. The
+   flag is carried on `PublisherState.express` so the lazy path matches
+   the pre-declared publishers.
+
+Exact API (zenoh 1.9.0): `PublisherBuilder::express(is_express: bool)`
+from the `QoSBuilderTrait` (the same trait that provides
+`congestion_control`), returning the builder for chaining. It is a
+publisher-builder method, not a per-`put()` option, so the policy is
+fixed once at declare time for every sample on that publisher.
+
+### How the operator enables it
+
+Through the runner's T9.5a `--variant-arg` glob passthrough (the runner
+forwards `zenoh_express=true` as the two tokens `--zenoh-express true`):
+
+```powershell
+# both peers — enable express across the whole zenoh-* family
+target\release\runner.exe --name alice `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg 'zenoh-*.zenoh_express=true'
+
+target\release\runner.exe --name bob `
+  --config configs\two-runner-zenoh-all.toml `
+  --variant-arg 'zenoh-*.zenoh_express=true'
+```
+
+Single-quote the `zenoh-*` selector so PowerShell does not expand `*`
+against the filesystem. Omit the `--variant-arg` entirely to keep the
+default (batching on, today's behaviour).

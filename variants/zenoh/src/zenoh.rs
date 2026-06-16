@@ -418,6 +418,17 @@ pub struct ZenohArgs {
     /// to [`DEFAULT_ZENOH_PEER_TCP_BASE_PORT`] when unset. Single mode
     /// has its own sidecar peering (T14.9b) and ignores this arg.
     pub peer_tcp_base_port: Option<u16>,
+    /// T9.5e: when true, declare publishers with Zenoh's *express*
+    /// policy (`PublisherBuilder::express(true)`), which sends each
+    /// sample immediately rather than waiting for Zenoh's default
+    /// batch flush. At low publish rates (e.g. 10 Hz tick with small
+    /// scalar/block messages) batching adds tens of milliseconds of
+    /// latency while a partial batch waits to fill; express collapses
+    /// that. It is a latency/throughput tradeoff (express can cost
+    /// aggregate throughput at very high rates), so it is **off by
+    /// default** to preserve today's reproducible benchmark numbers.
+    /// Operator override via `--variant-arg 'zenoh-*.zenoh_express=true'`.
+    pub express: bool,
 }
 
 /// T9.5c: default base TCP port for Multi-mode explicit peering when
@@ -438,6 +449,7 @@ impl ZenohArgs {
         let mut sidecar_base_port: Option<u16> = None;
         let mut multicast_interface: Option<std::net::Ipv4Addr> = None;
         let mut peer_tcp_base_port: Option<u16> = None;
+        let mut express = false;
 
         let mut i = 0;
         while i < extra.len() {
@@ -516,6 +528,30 @@ impl ZenohArgs {
                     })?;
                     multicast_interface = Some(ip);
                 }
+                "--zenoh-express" => {
+                    // T9.5e: configurable publisher express policy. The
+                    // runner forwards `--variant-arg
+                    // 'zenoh-*.zenoh_express=true'` as the two tokens
+                    // `--zenoh-express true`, so parse a following
+                    // `true`/`false` value token (mirroring the
+                    // value-parsing style of the other Zenoh args).
+                    // Default is false (set above); an explicit value of
+                    // `false` is therefore a no-op that still consumes
+                    // its value token to keep the parser in sync.
+                    i += 1;
+                    anyhow::ensure!(
+                        i < extra.len(),
+                        "--zenoh-express requires a value (true|false)"
+                    );
+                    let raw = &extra[i];
+                    express = match raw.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        other => anyhow::bail!(
+                            "invalid --zenoh-express value '{other}': expected 'true' or 'false'"
+                        ),
+                    };
+                }
                 "--debug-trace" => {
                     // Boolean flag: no value follows.
                     debug_trace = true;
@@ -552,6 +588,7 @@ impl ZenohArgs {
             sidecar_base_port,
             multicast_interface,
             peer_tcp_base_port,
+            express,
         })
     }
 }
@@ -699,6 +736,11 @@ struct PublisherState {
     session: zenoh::Session,
     publishers_drop: HashMap<String, Arc<Publisher<'static>>>,
     publishers_block: HashMap<String, Arc<Publisher<'static>>>,
+    /// T9.5e: Zenoh *express* policy applied to every publisher this
+    /// task lazily declares. Mirrors the value passed to the pre-declare
+    /// JoinSet in `connect` so a key outside the pre-declared
+    /// `bench/0..N-1` set gets the same express setting on first sight.
+    express: bool,
 }
 
 /// Zenoh variant implementing the `Variant` trait.
@@ -1202,6 +1244,11 @@ async fn publisher_task(
                 // back-pressures inside Zenoh's queue, so the reliable
                 // path never produces a seq gap).
                 let reliable = matches!(qos, Qos::ReliableUdp | Qos::ReliableTcp);
+                // T9.5e: capture the express policy before borrowing the
+                // cache so the lazy-declare fallback below can apply it
+                // without aliasing the mutable `cache` borrow of
+                // `state.publishers_*`.
+                let express = state.express;
                 let (cache, cc_label) = if reliable {
                     (&mut state.publishers_block, "block")
                 } else {
@@ -1318,6 +1365,7 @@ async fn publisher_task(
                         .session
                         .declare_publisher(key.clone())
                         .congestion_control(cc)
+                        .express(express)
                         .await
                     {
                         Ok(publisher) => {
@@ -1775,6 +1823,12 @@ impl Variant for ZenohVariant {
         // dozen sequential declares (the runtime now has enough
         // workers to actually parallelise them).
         let pre_declare_count = values_per_tick_from_env().unwrap_or(0);
+        // T9.5e: Zenoh express policy for every pre-declared publisher.
+        // Copied out of `self.zenoh_args` into a plain `bool` so it can
+        // be moved into the per-key JoinSet tasks below (and stored on
+        // `PublisherState` for the lazy-declare fallback). Default false
+        // preserves Zenoh's batching behaviour and today's numbers.
+        let express = self.zenoh_args.express;
         let t_open = Instant::now();
         let (
             session,
@@ -1834,6 +1888,7 @@ impl Variant for ZenohVariant {
                                 let res = session_clone
                                     .declare_publisher(key_for_task.clone())
                                     .congestion_control(cc)
+                                    .express(express)
                                     .await;
                                 (key_for_task, cc, res)
                             });
@@ -1900,6 +1955,7 @@ impl Variant for ZenohVariant {
             session,
             publishers_drop: predeclared_publishers_drop,
             publishers_block: predeclared_publishers_block,
+            express,
         };
 
         runtime.spawn(publisher_task(pub_state, send_rx, trace));
@@ -2462,6 +2518,74 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // T9.5e: `--zenoh-express <true|false>` publisher express policy.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_zenoh_args_zenoh_express_parses_true() {
+        let extra = vec!["--zenoh-express".to_string(), "true".to_string()];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert!(args.express, "expected express=true when value is 'true'");
+    }
+
+    #[test]
+    fn test_zenoh_args_zenoh_express_parses_false() {
+        let extra = vec!["--zenoh-express".to_string(), "false".to_string()];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert!(
+            !args.express,
+            "expected express=false when value is explicitly 'false'"
+        );
+    }
+
+    #[test]
+    fn test_zenoh_args_zenoh_express_default_is_false() {
+        let args = ZenohArgs::parse(&[]).unwrap();
+        assert!(
+            !args.express,
+            "express must default to false when the flag is absent"
+        );
+    }
+
+    #[test]
+    fn test_zenoh_args_zenoh_express_requires_value() {
+        // Trailing `--zenoh-express` with no value token is an error
+        // rather than a silent default, mirroring the other value args.
+        let extra = vec!["--zenoh-express".to_string()];
+        let err = ZenohArgs::parse(&extra).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--zenoh-express"), "{msg}");
+    }
+
+    #[test]
+    fn test_zenoh_args_zenoh_express_rejects_non_bool() {
+        let extra = vec!["--zenoh-express".to_string(), "yes".to_string()];
+        let err = ZenohArgs::parse(&extra).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--zenoh-express") && msg.contains("'yes'"),
+            "error must name the flag and the bad value: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_zenoh_args_zenoh_express_alongside_unknown_args() {
+        // Leniency must hold: runner-injected unknown args (e.g. --peers)
+        // pass through and the express flag is still parsed.
+        let extra = vec![
+            "--peers".to_string(),
+            "alice=127.0.0.1,bob=192.168.1.10".to_string(),
+            "--zenoh-express".to_string(),
+            "true".to_string(),
+            "--some-future-unknown".to_string(),
+            "future-value".to_string(),
+        ];
+        let args = ZenohArgs::parse(&extra).unwrap();
+        assert!(args.express);
+        assert_eq!(args.mode, "peer");
+    }
+
+    // -----------------------------------------------------------------
     // T9.5b: bare `--` end-of-options sentinel must be skipped as a
     // single token. Previously the lenient `--<name> value` skip ate
     // its successor (because `"--".starts_with("--")` is true), which
@@ -2689,6 +2813,7 @@ mod tests {
             sidecar_base_port: None,
             multicast_interface: None,
             peer_tcp_base_port: Some(7447),
+            express: false,
         };
         let pairs = vec![
             ("alice".to_string(), "127.0.0.1".to_string()),
@@ -2717,6 +2842,7 @@ mod tests {
             sidecar_base_port: None,
             multicast_interface: None,
             peer_tcp_base_port: Some(7447),
+            express: false,
         };
         let pairs = vec![
             ("alice".to_string(), "127.0.0.1".to_string()),
@@ -2745,6 +2871,7 @@ mod tests {
             sidecar_base_port: None,
             multicast_interface: None,
             peer_tcp_base_port: None,
+            express: false,
         };
         let cfg = build_zenoh_config(&args, &[], "alice").expect("config builds");
         let json = serde_json::to_string(&cfg).expect("config serializes");
@@ -2768,6 +2895,7 @@ mod tests {
             sidecar_base_port: None,
             multicast_interface: None,
             peer_tcp_base_port: Some(7447),
+            express: false,
         };
         let pairs = vec![
             ("alice".to_string(), "127.0.0.1".to_string()),
@@ -2804,6 +2932,7 @@ mod tests {
             sidecar_base_port: None,
             multicast_interface: None,
             peer_tcp_base_port: Some(7447),
+            express: false,
         };
         let pairs = vec![
             ("alice".to_string(), "127.0.0.1".to_string()),
@@ -2829,6 +2958,7 @@ mod tests {
             sidecar_base_port: None,
             multicast_interface: Some(std::net::Ipv4Addr::new(192, 168, 1, 68)),
             peer_tcp_base_port: None,
+            express: false,
         };
         let cfg = build_zenoh_config(&args, &[], "alice").expect("config builds");
         // serde_json::to_string on a zenoh::Config goes through Zenoh's
@@ -2854,6 +2984,7 @@ mod tests {
             sidecar_base_port: None,
             multicast_interface: None,
             peer_tcp_base_port: None,
+            express: false,
         };
         let cfg = build_zenoh_config(&args, &[], "alice").expect("config builds");
         let json = serde_json::to_string(&cfg).expect("config serializes");
