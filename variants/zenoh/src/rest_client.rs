@@ -25,8 +25,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -34,16 +33,20 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
 
+use variant_base::logger::LoggerHandle;
 use variant_base::types::ReceivedUpdate;
 
-/// Bounded capacity for the SSE reader -> variant main thread channel.
-///
-/// 4096 mirrors the established log-from-reader / progress_coord
-/// convention (T14.10 / T15.3): a few seconds of headroom at the
-/// modest 1K msg/s workload T14.9b targets, drop-on-full beyond that.
-/// Drops show up as JSONL receive gaps in the analysis, identical to
-/// the Multi-mode bridge's drop semantics.
-pub const RECEIVE_CHANNEL_CAPACITY: usize = 4096;
+/// Late-bindable logger shared between `connect_single` and the SSE
+/// reader thread (T9.5f). Identical role to `zenoh::SharedLogger`: the
+/// driver attaches the logger only after `connect` returns, but the SSE
+/// reader thread is spawned inside `connect_single`, so the thread reads
+/// the logger out of this holder once it becomes `Some`.
+pub type SharedLogger = Arc<Mutex<Option<LoggerHandle>>>;
+
+// T9.5f: the SSE-reader -> variant-main-thread channel (and its
+// `RECEIVE_CHANNEL_CAPACITY` constant) was removed. The reader thread now
+// records each receive directly via the shared `LoggerHandle` at arrival
+// time rather than enqueueing for the driver's per-tick drain.
 
 /// Wildcard key expression the Single-mode SSE subscriber listens on.
 /// Must match the same set the Multi-mode subscriber covers
@@ -190,11 +193,18 @@ impl HttpPublisher {
     }
 }
 
-/// Background SSE reader thread + its bounded mpsc to the variant
-/// main thread. Created by `SseReader::start`, drained by the
-/// variant's `poll_receive`, and torn down by `SseReader::stop`.
+/// Background SSE reader thread. Created by `SseReader::start` and torn
+/// down by `SseReader::stop`.
+///
+/// T9.5f: the reader thread no longer pushes decoded updates onto an
+/// mpsc for the driver to drain per-tick. Instead it stamps arrival time
+/// and records each receive directly via the shared [`LoggerHandle`] the
+/// instant a sample is decoded (`record_receive` captures
+/// `receive_ts = Utc::now()` itself). This removes the ~half-tick
+/// (~50 ms at 10 Hz) timestamp-at-drain measurement artifact and mirrors
+/// the Multi-mode `subscriber_task` fix and the websocket Multi-mode
+/// reader thread.
 pub struct SseReader {
-    rx: Receiver<ReceivedUpdate>,
     stop_flag: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     /// Held so `stop` can interrupt a blocked read on the SSE socket
@@ -213,43 +223,33 @@ impl SseReader {
     ///
     /// `self_runner` is the variant's own runner name; samples whose
     /// decoded `writer` field equals `self_runner` are dropped at the
-    /// reader BEFORE they reach the recv channel (per
-    /// `compact-log-schema.md` event kind 1 / `receive`). Zenoh's
-    /// wildcard `bench/**` subscription matches the variant's own
-    /// publishes, so this filter is required to prevent self-echo
-    /// inflation in the variant's `inc_received` counter.
-    pub fn start(rest_port: u16, self_runner: String, decode: SseDecodeFn) -> Self {
-        let (tx, rx) = sync_channel::<ReceivedUpdate>(RECEIVE_CHANNEL_CAPACITY);
+    /// reader BEFORE they are recorded (per `compact-log-schema.md`
+    /// event kind 1 / `receive`). Zenoh's wildcard `bench/**`
+    /// subscription matches the variant's own publishes, so this filter
+    /// is required to prevent self-echo inflation in the receive metric.
+    ///
+    /// `logger` is the late-bindable shared holder the variant fills in
+    /// from `attach_logger`; the reader thread caches the handle locally
+    /// once it observes `Some` and stamps + records every subsequent
+    /// receive on its own thread (T9.5f).
+    pub fn start(
+        rest_port: u16,
+        self_runner: String,
+        decode: SseDecodeFn,
+        logger: SharedLogger,
+    ) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = stop_flag.clone();
         let handle = std::thread::Builder::new()
             .name(format!("zenoh-sse-{}", rest_port))
             .spawn(move || {
-                sse_reader_loop(rest_port, tx, stop_flag_clone, self_runner, decode);
+                sse_reader_loop(rest_port, logger, stop_flag_clone, self_runner, decode);
             })
             .expect("spawn zenoh SSE reader thread");
         Self {
-            rx,
             stop_flag,
             handle: Some(handle),
             rest_port,
-        }
-    }
-
-    /// Non-blocking drain of one decoded update, mirroring
-    /// `mpsc::Receiver::try_recv` semantics: `Ok(None)` when the
-    /// channel is empty or the reader thread has exited cleanly.
-    pub fn try_recv(&self) -> Result<Option<ReceivedUpdate>> {
-        match self.rx.try_recv() {
-            Ok(update) => Ok(Some(update)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => {
-                // Reader thread exited (clean shutdown or sidecar
-                // crash). Surface as no-data so the driver can keep
-                // ticking until disconnect; the JSONL log will just
-                // show fewer receives.
-                Ok(None)
-            }
         }
     }
 
@@ -328,7 +328,7 @@ pub fn extract_payload_from_sse_data(data: &str) -> Result<Vec<u8>> {
 /// inbound traffic, even though the connection is healthy.
 fn sse_reader_loop(
     rest_port: u16,
-    tx: SyncSender<ReceivedUpdate>,
+    logger: SharedLogger,
     stop_flag: Arc<AtomicBool>,
     self_runner: String,
     decode: SseDecodeFn,
@@ -337,6 +337,11 @@ fn sse_reader_loop(
     let addr: SocketAddr = format!("{host}:{rest_port}")
         .parse()
         .expect("static localhost addr is valid");
+    // Local cache of the shared logger so the hot path locks the holder
+    // at most once (until the driver attaches the logger via
+    // `attach_logger`). After the first `Some` observation we never
+    // touch the mutex again.
+    let mut cached_logger: Option<LoggerHandle> = None;
 
     while !stop_flag.load(Ordering::Acquire) {
         let stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
@@ -462,11 +467,37 @@ fn sse_reader_loop(
                             if update.writer == self_runner {
                                 continue;
                             }
-                            // Drop-on-full: same semantics as the
-                            // Multi-mode bridge. A blocked consumer
-                            // is preferable to unbounded memory
-                            // growth on a sustained burst.
-                            let _ = tx.try_send(update);
+                            // T9.5f: stamp arrival + record the receive
+                            // HERE, on the SSE reader thread, the instant
+                            // the sample is decoded. `record_receive`
+                            // captures `receive_ts = Utc::now()` and
+                            // pushes into the shared compact buffer, so
+                            // the latency the analysis computes
+                            // (receive_ts - write_ts) reflects true
+                            // arrival time rather than the driver's next
+                            // per-tick drain. Previously the update was
+                            // pushed onto an mpsc and stamped only when
+                            // the driver drained it once per tick,
+                            // inflating every Single-mode latency sample
+                            // by up to ~half a tick. Lazily resolve the
+                            // logger from the shared holder and cache it.
+                            if cached_logger.is_none() {
+                                if let Ok(guard) = logger.lock() {
+                                    cached_logger = guard.clone();
+                                }
+                            }
+                            if let Some(handle) = cached_logger.as_ref() {
+                                let _ = handle.record_receive(
+                                    &update.writer,
+                                    update.seq,
+                                    &update.path,
+                                    update.qos,
+                                    update.payload.len(),
+                                );
+                            }
+                            // else: logger not attached yet (pre-operate
+                            // window). Drop the receive log, same as the
+                            // Multi-mode subscriber_task and websocket.
                         }
                     }
                 }
@@ -970,7 +1001,8 @@ mod tests {
     fn sse_reader_stop_is_idempotent() {
         // Point the reader at a bogus port -- it will fail to connect
         // and back off. `stop` must still terminate the thread cleanly.
-        let mut r = SseReader::start(1, "test-runner".to_string(), fixed_decode);
+        let logger: SharedLogger = Arc::new(Mutex::new(None));
+        let mut r = SseReader::start(1, "test-runner".to_string(), fixed_decode, logger);
         // Give the loop a chance to spin once.
         std::thread::sleep(Duration::from_millis(60));
         r.stop();

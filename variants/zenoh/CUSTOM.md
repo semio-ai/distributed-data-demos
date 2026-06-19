@@ -1327,3 +1327,93 @@ target\release\runner.exe --name bob `
 Single-quote the `zenoh-*` selector so PowerShell does not expand `*`
 against the filesystem. Omit the `--variant-arg` entirely to keep the
 default (batching on, today's behaviour).
+
+## T9.5f — receive timestamp stamped on arrival (latency-artifact fix)
+
+### The artifact
+
+The benchmark computes latency as `receive_ts − write_ts`. Before this
+change the Zenoh receive path decoded each incoming sample into a
+`ReceivedUpdate` and pushed it onto an mpsc channel; the driver's
+operate loop drained that channel **once per tick** and only then called
+`variant_base`'s receive sink, which stamps `receive_ts = Utc::now()` at
+**drain time**. A sample that arrived mid-tick was therefore not
+timestamped until the next per-tick drain, adding up to ~half a tick of
+pure measurement artifact to every latency sample (~50 ms at 10 Hz).
+
+**Measured proof (100 vpt × 10 Hz × 10 s, Multi mode, two-runner
+localhost, QoS 1):**
+
+| Metric        | Before (drain-time stamp) | After (arrival stamp) |
+| ------------- | ------------------------- | --------------------- |
+| Latency p50   | 50.07 ms                  | 0.400 ms              |
+| Latency mean  | 54.7 ± 42.1 ms            | 2.8 ± 4.7 ms          |
+| p95 / p99     | 60.24 / 260.5 ms          | 14.88 / 16.66 ms      |
+| Delivery      | 100 %                     | 100 %                 |
+
+The before-p50 sitting at ~50 ms (exactly half the 100 ms tick) is the
+signature of the artifact; arrival-stamping recovers the true
+sub-millisecond loopback latency.
+
+### The fix (mirrors the proven websocket Multi-mode pattern)
+
+Receives are now stamped + recorded **on the receive task/thread the
+instant a sample is decoded**, never on the driver's per-tick drain.
+This copies exactly what `variants/websocket/src/websocket.rs` does in
+Multi mode (`reader_thread_main` calls `LoggerHandle::record_receive`
+directly; its mpsc is lifecycle-only and `poll_receive` carries no
+data).
+
+Concretely:
+
+1. **Shared late-bindable logger.** `ZenohVariant` holds a
+   `SharedLogger = Arc<Mutex<Option<LoggerHandle>>>` and implements
+   `Variant::attach_logger` to fill it. The driver calls `attach_logger`
+   *after* `connect` returns, but the Zenoh receive tasks are spawned
+   *inside* `connect`; the holder bridges that ordering gap. Each
+   receive task reads the holder once and caches the `LoggerHandle`
+   clone locally, so the steady-state path never locks.
+2. **Multi mode** (`subscriber_task`, `src/zenoh.rs`): on each decoded
+   foreign sample it calls `logger.record_receive(writer, seq, path,
+   qos, bytes)` (which captures `receive_ts = Utc::now()` internally and
+   pushes into the shared compact buffer) instead of forwarding the
+   update over the old `recv_tx` bridge channel. The self-writer filter
+   is unchanged (self-echoes still dropped before recording).
+3. **Single mode** (`SseReader` thread, `src/rest_client.rs`): identical
+   treatment — the SSE reader thread records each decoded sample via the
+   shared logger at arrival instead of enqueueing for the driver drain.
+4. **`poll_receive` is lifecycle-only for data in BOTH modes** — it now
+   always returns `Ok(None)`. The data receive channel
+   (`recv_tx`/`recv_rx`) and its `RECEIVE_CHANNEL_CAPACITY` constant were
+   removed in both files. The EOT lifecycle channel (`eot_rx` /
+   `poll_peer_eots`) is separate and untouched.
+
+### Why nothing in `variant_base` had to change
+
+The fix uses only the existing public `LoggerHandle` API
+(`attach_logger` + `record_receive`) — the exact surface websocket
+already uses. `record_receive` writes solely to the shared compact
+`EventBuffer` (no JSONL byproduct post-T19.10).
+
+### Interaction with the idle / stall watchdogs
+
+`poll_receive` returning `None` means `progress.received` no longer
+advances via the driver. This is safe and identical to websocket Multi
+mode: during operate the local `sent` counter advances every tick, and
+both the T15.5 idle detector and the T15.11 watchdog only trip when
+**both** `sent` AND `received` are flat (see
+`variant-base/src/watchdog.rs`). Operate still ends on the `operate_secs`
+budget. The visible side effect is that the per-spawn stdout progress
+line now shows `received=0` (receives live in compact-Parquet, not the
+progress counter) — expected, not a regression.
+
+### Test adjustments
+
+The two `#[ignore]`d real-Zenoh integration tests
+(`zenoh_bridge_stress_10000_messages`,
+`multi_zenoh_subscriber_filters_self_writer`) used to drain receives via
+`poll_receive`. They now attach a `LoggerHandle` backed by a test
+`CompactSink` (helper `test_logger_with_sink`) and assert on the
+recorded receives in that sink (writer counts via
+`CompactBuffers::peers`/`peer_idx`). The self-filter contract is still
+pinned: no recorded receive may have `writer == self_runner`.

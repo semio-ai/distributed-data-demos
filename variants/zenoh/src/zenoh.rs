@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -14,8 +14,39 @@ use zenoh::pubsub::{Publisher, Subscriber};
 use zenoh::qos::CongestionControl;
 use zenoh::sample::Sample;
 
+use variant_base::logger::LoggerHandle;
 use variant_base::types::{Qos, ReceivedUpdate, ThreadingMode};
 use variant_base::variant_trait::Variant;
+
+/// Shared, late-bindable handle to the driver's JSONL/compact logger.
+///
+/// ## Why a shared holder rather than a plain field
+///
+/// The driver calls `Variant::attach_logger` only AFTER `connect`
+/// returns (see `variant-base/src/driver.rs`: `connect` -> `attach_logger`
+/// -> `start_reader_threads`). But the Zenoh variant spawns its
+/// background receive tasks (`subscriber_task`, and in Single mode the
+/// `SseReader` OS thread) *inside* `connect`, so those tasks are already
+/// running by the time the logger arrives. To hand the logger to a
+/// task that outlives the `attach_logger` call, `connect` shares this
+/// `Arc<Mutex<Option<LoggerHandle>>>` with every receive task it
+/// spawns; `attach_logger` later fills it in. Each receive task reads
+/// the holder once (cheaply caching the `LoggerHandle` clone the first
+/// time it is `Some`) and from then on stamps `receive_ts` and records
+/// the receive directly on its own thread — never on the driver's
+/// per-tick drain.
+///
+/// ## The bug this fixes (T9.5f)
+///
+/// Before this change the receive path decoded a sample, pushed it onto
+/// an mpsc channel, and the driver's operate loop stamped `receive_ts =
+/// Utc::now()` only when it drained that channel **once per tick**. A
+/// sample that arrived mid-tick was therefore timestamped up to ~half a
+/// tick late (~50 ms at 10 Hz), inflating every measured latency by a
+/// pure measurement artifact. Stamping at arrival on the receive task
+/// (exactly the proven websocket Multi-mode pattern) removes the
+/// artifact.
+pub(crate) type SharedLogger = Arc<Mutex<Option<LoggerHandle>>>;
 
 /// Internal record of an observed peer EOT marker (T15.8 historical).
 ///
@@ -305,13 +336,12 @@ fn values_per_tick_from_env() -> Option<u32> {
     None
 }
 
-/// Default capacity for the receive-side bounded channel. Sized for the
-/// same heavy-fanout workload; samples that don't fit (channel full) are
-/// dropped from the bridge layer with a periodic stderr warning when
-/// `--debug-trace` is on. Dropping is acceptable for benchmark purposes —
-/// the JSONL receive log will simply show fewer matches than writes, which
-/// is exactly what the analysis tool measures.
-const RECEIVE_CHANNEL_CAPACITY: usize = 16384;
+// T9.5f: the receive-side bridge channel (and its `RECEIVE_CHANNEL_CAPACITY`
+// constant) was removed. The Multi-mode `subscriber_task` now records each
+// receive directly via the shared `LoggerHandle` the instant a sample is
+// decoded, stamping `receive_ts` at arrival rather than at the driver's
+// per-tick drain. There is no longer any bounded channel to size between
+// the subscriber task and the variant's main thread.
 
 /// T16.5: maximum number of in-flight `publisher.put(...).await` futures
 /// the publisher task allows to run concurrently. Each pending put holds
@@ -791,7 +821,16 @@ pub struct ZenohVariant {
     connected_mode: Option<ThreadingMode>,
     runtime: Option<Runtime>,
     send_tx: Option<mpsc::Sender<OutboundMessage>>,
-    recv_rx: Option<mpsc::Receiver<ReceivedUpdate>>,
+    /// Late-bindable logger shared with every receive task so each task
+    /// stamps `receive_ts` and records the receive on its OWN thread the
+    /// instant a sample arrives (T9.5f). Filled in by `attach_logger`,
+    /// which the driver calls after `connect` returns. The data receive
+    /// channel that used to carry decoded samples to the driver's
+    /// per-tick drain was removed: `poll_receive` is now lifecycle-only
+    /// for data, mirroring the websocket Multi-mode reader-thread
+    /// pattern. EOT observations still flow through their own `eot_rx`
+    /// channel and are unaffected.
+    shared_logger: SharedLogger,
     /// Oneshot sender used to signal both data background tasks to wind
     /// down during `disconnect`. Wrapped in `Option` so it can be taken
     /// on shutdown.
@@ -933,6 +972,7 @@ impl ZenohVariant {
             rest_port,
             self.runner.clone(),
             MessageCodec::decode,
+            self.shared_logger.clone(),
         );
         self.sse_reader = Some(sse_reader);
         trace_if!(
@@ -1014,7 +1054,7 @@ impl ZenohVariant {
             connected_mode: None,
             runtime: None,
             send_tx: None,
-            recv_rx: None,
+            shared_logger: Arc::new(Mutex::new(None)),
             shutdown_tx: None,
             eot_shutdown_tx: None,
             eot_rx: None,
@@ -1513,19 +1553,39 @@ async fn publisher_task(
     }
 }
 
-/// Subscriber-side background task. Awaits incoming samples and forwards
-/// decoded updates over the receive channel. If the channel is full
-/// (consumer can't drain fast enough), the sample is dropped — the
-/// benchmark measures end-to-end delivery, so a drop here looks
-/// equivalent to a wire-level loss in the resulting analysis.
+/// Subscriber-side background task. Awaits incoming samples and, the
+/// instant one is decoded, stamps its arrival time and records the
+/// `receive` event directly via the shared [`LoggerHandle`]
+/// (`record_receive` calls `Utc::now()` internally and pushes into the
+/// compact buffer). This is the T9.5f fix: previously the task forwarded
+/// decoded updates over an mpsc channel and the driver stamped
+/// `receive_ts` only when it drained that channel **once per tick**,
+/// adding up to ~half a tick (~50 ms at 10 Hz) of pure measurement
+/// artifact to every latency sample. Stamping on this task at arrival
+/// removes the artifact. Mirrors the websocket Multi-mode reader thread
+/// (`variants/websocket/src/websocket.rs` `reader_thread_main`).
+///
+/// `logger` is shared late-bindably: the driver calls `attach_logger`
+/// only after `connect` returns, but this task is spawned inside
+/// `connect`. The task therefore reads the holder per sample, caching
+/// the `LoggerHandle` clone locally the first time it observes `Some`,
+/// so steady-state cost is zero locking. Any sample that arrives before
+/// the logger is attached (only possible during the connect-settle /
+/// stabilize window, before peers publish operate-phase data) is
+/// counted as dropped — exactly as websocket treats a pre-`attach`
+/// frame.
 async fn subscriber_task(
     subscriber: Subscriber<FifoChannelHandler<Sample>>,
-    recv_tx: mpsc::Sender<ReceivedUpdate>,
+    logger: SharedLogger,
     self_runner: String,
     mut shutdown_rx: oneshot::Receiver<()>,
     trace: bool,
 ) {
     let mut dropped = 0u64;
+    // Local cache of the shared logger so the hot path locks the holder
+    // at most once (until the driver attaches the logger). After the
+    // first `Some` observation we never touch the mutex again.
+    let mut cached_logger: Option<LoggerHandle> = None;
     // T16.10c: synthetic subscriber-side back-pressure for testing only.
     // When the env var `ZENOH_TEST_SUB_JITTER_MS` is set to a positive
     // u64, the subscriber yields `tokio::time::sleep(jitter_ms)` on every
@@ -1603,19 +1663,62 @@ async fn subscriber_task(
                                 if update.writer == self_runner {
                                     continue;
                                 }
-                                // try_send so a slow consumer (or a backed-up
-                                // channel) doesn't block the subscriber task —
-                                // blocking here would let Zenoh's internal FIFO
-                                // back up and reintroduce the very head-of-line
-                                // pressure Option B is meant to relieve.
-                                if let Err(e) = recv_tx.try_send(update) {
-                                    dropped += 1;
-                                    if trace && dropped.is_multiple_of(1000) {
-                                        trace_now!(
-                                            "subscriber_task: recv channel full; dropped={} (last: {})",
-                                            dropped,
-                                            e,
-                                        );
+                                // T9.5f: stamp arrival + record the
+                                // receive HERE, on the subscriber task,
+                                // the instant the sample is decoded.
+                                // `record_receive` internally captures
+                                // `receive_ts = Utc::now()` and pushes
+                                // into the shared compact buffer, so the
+                                // latency the analysis computes
+                                // (receive_ts - write_ts) reflects true
+                                // arrival time rather than the driver's
+                                // next per-tick drain. Lazily resolve the
+                                // logger from the shared holder (the
+                                // driver attaches it after connect
+                                // returns); cache it locally on first
+                                // sight so the steady-state path never
+                                // locks.
+                                if cached_logger.is_none() {
+                                    if let Ok(guard) = logger.lock() {
+                                        cached_logger = guard.clone();
+                                    }
+                                }
+                                match cached_logger.as_ref() {
+                                    Some(handle) => {
+                                        if let Err(e) = handle.record_receive(
+                                            &update.writer,
+                                            update.seq,
+                                            &update.path,
+                                            update.qos,
+                                            update.payload.len(),
+                                        ) {
+                                            // A failed record is rare
+                                            // (poisoned compact mutex);
+                                            // count it like a drop so the
+                                            // trace still surfaces it.
+                                            dropped += 1;
+                                            if trace && dropped.is_multiple_of(1000) {
+                                                trace_now!(
+                                                    "subscriber_task: record_receive failed; dropped={} (last: {})",
+                                                    dropped,
+                                                    e,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        // Logger not yet attached (pre-
+                                        // operate window). Drop the
+                                        // receive log, same as websocket
+                                        // does for a frame seen before
+                                        // attach_logger.
+                                        dropped += 1;
+                                        if trace && dropped.is_multiple_of(1000) {
+                                            trace_now!(
+                                                "subscriber_task: logger not attached; dropped={}",
+                                                dropped,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1754,6 +1857,23 @@ impl Variant for ZenohVariant {
         // See `variants/zenoh/CUSTOM.md` "Threading modes" and
         // "T14.9b RPC client architecture".
         &[ThreadingMode::Single, ThreadingMode::Multi]
+    }
+
+    /// Receive the driver's thread-safe logger handle (T9.5f).
+    ///
+    /// The driver calls this AFTER `connect` returns but BEFORE the
+    /// operate phase. The Zenoh receive tasks were already spawned
+    /// inside `connect` and hold a clone of `self.shared_logger`; filling
+    /// the holder here makes the logger visible to those tasks so they
+    /// can stamp `receive_ts` at arrival and record receives on their own
+    /// threads. Mirrors `WebSocketVariant::attach_logger`.
+    ///
+    /// Works for both modes: the Multi-mode `subscriber_task` and the
+    /// Single-mode `SseReader` thread both read the same shared holder.
+    fn attach_logger(&mut self, logger: LoggerHandle) {
+        if let Ok(mut guard) = self.shared_logger.lock() {
+            *guard = Some(logger);
+        }
     }
 
     fn connect(&mut self, threading_mode: ThreadingMode) -> Result<()> {
@@ -1940,7 +2060,6 @@ impl Variant for ZenohVariant {
         );
 
         let (send_tx, send_rx) = mpsc::channel::<OutboundMessage>(PUBLISH_CHANNEL_CAPACITY);
-        let (recv_tx, recv_rx) = mpsc::channel::<ReceivedUpdate>(RECEIVE_CHANNEL_CAPACITY);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         // Separate shutdown oneshot for the EOT subscriber so each task
         // owns exactly one Receiver (oneshot::Receiver is single-consumer).
@@ -1961,7 +2080,7 @@ impl Variant for ZenohVariant {
         runtime.spawn(publisher_task(pub_state, send_rx, trace));
         runtime.spawn(subscriber_task(
             subscriber,
-            recv_tx,
+            self.shared_logger.clone(),
             self.runner.clone(),
             shutdown_rx,
             trace,
@@ -1997,7 +2116,6 @@ impl Variant for ZenohVariant {
 
         self.runtime = Some(runtime);
         self.send_tx = Some(send_tx);
-        self.recv_rx = Some(recv_rx);
         self.shutdown_tx = Some(shutdown_tx);
         self.eot_shutdown_tx = Some(eot_shutdown_tx);
         self.eot_rx = Some(eot_rx);
@@ -2196,52 +2314,28 @@ impl Variant for ZenohVariant {
     }
 
     fn poll_receive(&mut self) -> Result<Option<ReceivedUpdate>> {
-        // T14.9b: Single mode drains the SSE reader's mpsc. The
-        // dedicated reader thread (started in connect(Single)) parses
-        // the JSON-wrapped + base64-encoded payload off the SSE
-        // stream and pushes decoded `ReceivedUpdate`s here. Same
-        // try_recv shape as the established log-from-reader (T14.10)
-        // and progress_coord (T15.3) patterns.
-        if self.connected_mode == Some(ThreadingMode::Single) {
-            let reader = self
-                .sse_reader
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Single mode SSE reader not initialised"))?;
-            return reader.try_recv();
-        }
-        let trace = self.zenoh_args.debug_trace;
-        let recv_rx = self
-            .recv_rx
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("not connected"))?;
-
-        match recv_rx.try_recv() {
-            Ok(update) => {
-                if trace {
-                    self.poll_recv_count += 1;
-                    if self.poll_recv_count.is_multiple_of(1000) {
-                        trace_now!(
-                            "poll_receive: recv_count={} poll_count={}",
-                            self.poll_recv_count,
-                            self.poll_count
-                        );
-                    }
-                }
-                Ok(Some(update))
-            }
-            Err(mpsc::error::TryRecvError::Empty) => {
-                if trace {
-                    self.poll_count += 1;
-                }
-                Ok(None)
-            }
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                // Subscriber task ended. Treat as no-data so the driver
-                // can finish its tick gracefully; subsequent calls will
-                // see the same.
-                Ok(None)
-            }
-        }
+        // T9.5f: `poll_receive` is now **lifecycle-only** for data in
+        // BOTH modes. Each receive task (Multi: `subscriber_task`;
+        // Single: the `SseReader` OS thread) stamps `receive_ts` at
+        // arrival and records the receive directly via the shared
+        // `LoggerHandle` the instant a sample is decoded. Routing data
+        // receives back through the driver's per-tick drain is exactly
+        // what added the ~50 ms (half-tick at 10 Hz) measurement
+        // artifact this change removes, so we deliberately return `None`
+        // here and never re-log a data sample on the driver thread.
+        //
+        // This mirrors the websocket Multi-mode contract: its
+        // `poll_peers_once_multi` likewise returns `None` for data after
+        // T14.10. Zenoh's lifecycle channel (EOT) is separate
+        // (`eot_rx` / `poll_peer_eots`) and unaffected. The driver still
+        // calls `poll_receive` every operate iteration; it is now a
+        // near-free no-op, and `progress.received` advancing is no
+        // longer required to keep the idle/stall watchdogs calm because
+        // the local `sent` counter advances every tick during operate
+        // (see `variant-base/src/watchdog.rs`: the watchdog fires only
+        // when BOTH counters are flat).
+        let _ = &self.connected_mode;
+        Ok(None)
     }
 
     // T15.8: signal_end_of_test / poll_peer_eots removed from the Variant
@@ -2309,9 +2403,13 @@ impl Variant for ZenohVariant {
         // session before exiting.
         self.send_tx.take();
 
-        // Drop the receive end before runtime shutdown so the subscriber
-        // task isn't blocked on a try_send.
-        self.recv_rx.take();
+        // T9.5f: the data receive channel was removed — the subscriber
+        // task records receives directly via the shared logger, so there
+        // is no `recv_rx` to drop here. Clear the shared logger so the
+        // task observes `None` if it races shutdown.
+        if let Ok(mut guard) = self.shared_logger.lock() {
+            *guard = None;
+        }
         // Drop the EOT receive end too.
         self.eot_rx.take();
 
@@ -2337,6 +2435,37 @@ impl Variant for ZenohVariant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `LoggerHandle` backed by a temp-dir `Logger` plus a fresh
+    /// shared `CompactSink`, returning both so a test can attach the
+    /// handle to a `ZenohVariant` (via `attach_logger`) and then inspect
+    /// the receives the subscriber task / SSE reader records into the
+    /// sink (T9.5f: receives no longer surface through `poll_receive`).
+    #[allow(dead_code)]
+    fn test_logger_with_sink() -> (
+        LoggerHandle,
+        std::sync::Arc<std::sync::Mutex<variant_base::compact::CompactBuffers>>,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "zenoh-test-log-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp log dir");
+        let logger = variant_base::logger::Logger::new(
+            dir.to_str().expect("utf8 temp dir"),
+            "zenoh",
+            "test-runner",
+            "test-run",
+        )
+        .expect("construct test Logger");
+        let mut handle = LoggerHandle::new(logger);
+        let sink: variant_base::logger::CompactSink = std::sync::Arc::new(std::sync::Mutex::new(
+            variant_base::compact::CompactBuffers::new(),
+        ));
+        handle.attach_compact_sink(sink.clone());
+        (handle, sink)
+    }
 
     #[test]
     fn test_message_codec_roundtrip() {
@@ -3065,7 +3194,12 @@ mod tests {
         // No Multi-mode infrastructure should have been touched.
         assert!(v.runtime.is_none(), "no tokio runtime in Single mode");
         assert!(v.send_tx.is_none(), "no publish channel in Single mode");
-        assert!(v.recv_rx.is_none(), "no receive channel in Single mode");
+        // T9.5f: the data receive channel was removed; the shared logger
+        // holder must still be empty (attach_logger was never called).
+        assert!(
+            v.shared_logger.lock().unwrap().is_none(),
+            "shared logger must be unattached after a failed connect"
+        );
         assert!(v.shutdown_tx.is_none());
         assert!(v.eot_shutdown_tx.is_none());
         assert!(v.eot_rx.is_none());
@@ -3228,6 +3362,12 @@ mod tests {
         variant
             .connect(variant_base::ThreadingMode::Multi)
             .expect("connect");
+        // T9.5f: receives are now recorded by the subscriber task
+        // directly into the shared compact buffer via the LoggerHandle,
+        // not surfaced through `poll_receive`. Attach a logger + compact
+        // sink so the test can inspect the recorded receives.
+        let (logger, sink) = test_logger_with_sink();
+        variant.attach_logger(logger);
 
         // Auxiliary Zenoh session, driven by its own tokio runtime, so
         // a foreign writer can inject samples onto `bench/**` that the
@@ -3266,26 +3406,18 @@ mod tests {
             }
         });
 
-        // Drain receives with a deadline. We tolerate some loss here —
-        // the bridge documents that try_send drops when the receive
-        // channel is full — but require a strong majority to confirm
-        // the bridge isn't deadlocking under sustained pressure.
+        // Wait (with a deadline) for the subscriber task to record the
+        // bulk of the foreign workload into the compact sink. We tolerate
+        // some loss — Zenoh's CongestionControl::Drop is in effect — but
+        // require a strong majority to confirm the receive path isn't
+        // deadlocking under sustained pressure.
         let deadline = Instant::now() + std::time::Duration::from_secs(20);
-        let mut received_total = 0u64;
-        let mut received_self = 0u64;
-        let mut received_ext = 0u64;
-        while Instant::now() < deadline && received_total < N {
-            match variant.poll_receive().expect("poll_receive") {
-                Some(u) => {
-                    received_total += 1;
-                    if u.writer == "stress-runner" {
-                        received_self += 1;
-                    } else if u.writer == "stress-ext" {
-                        received_ext += 1;
-                    }
-                }
-                None => std::thread::sleep(std::time::Duration::from_millis(1)),
+        loop {
+            let n = sink.lock().unwrap().len();
+            if n as u64 >= N || Instant::now() >= deadline {
+                break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
         // Tear down the aux session before disconnecting the variant.
@@ -3295,23 +3427,34 @@ mod tests {
         aux_rt.shutdown_timeout(std::time::Duration::from_secs(2));
         variant.disconnect().expect("disconnect");
 
+        // Count recorded receives by writer from the compact sink.
+        let buf = sink.lock().unwrap();
+        let writers = buf.peers.dict();
+        let mut received_self = 0u64;
+        let mut received_ext = 0u64;
+        for &pidx in &buf.peer_idx {
+            match writers.get(pidx as usize).map(|s| s.as_str()) {
+                Some("stress-runner") => received_self += 1,
+                Some("stress-ext") => received_ext += 1,
+                _ => {}
+            }
+        }
+
         // Self-filter contract: even though Zenoh's wildcard subscriber
-        // matches our own publishes, none of them must have reached
-        // poll_receive (= reached the bridge).
+        // matches our own publishes, none of them must have been
+        // recorded (the subscriber task drops self-writer samples before
+        // `record_receive`).
         assert_eq!(
             received_self, 0,
-            "self-filter regression: variant's own publishes leaked to poll_receive"
+            "self-filter regression: variant's own publishes were recorded as receives"
         );
 
-        // The bridge must not deadlock and must deliver the bulk of
-        // the foreign workload. ≥80 % matches the original tolerance:
-        // Zenoh's CongestionControl::Drop is in effect and the receive
-        // channel can drop under pressure -- both acceptable -- but
-        // a deadlock or a >50 % loss would indicate a real regression.
+        // The receive path must not deadlock and must record the bulk of
+        // the foreign workload. ≥80 % matches the original tolerance.
         assert!(
             received_ext as f64 / N as f64 >= 0.8,
-            "bridge stress test received {received_ext}/{N} foreign samples -- \
-             bridge may be deadlocking or dropping excessively"
+            "bridge stress test recorded {received_ext}/{N} foreign samples -- \
+             receive path may be deadlocking or dropping excessively"
         );
     }
 
@@ -3345,6 +3488,10 @@ mod tests {
         variant
             .connect(variant_base::ThreadingMode::Multi)
             .expect("connect");
+        // T9.5f: receives land in the compact sink via the subscriber
+        // task's `record_receive`, not `poll_receive`.
+        let (logger, sink) = test_logger_with_sink();
+        variant.attach_logger(logger);
 
         let aux_rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -3365,7 +3512,7 @@ mod tests {
         // Publish a self-echo first (writer matches the variant's
         // runner name) and then a foreign one. Order is deliberately
         // self-first so a failure to filter is visible as a stale
-        // self-echo ahead of the foreign sample in the recv channel.
+        // self-echo recorded ahead of the foreign sample.
         let path = "/bench/0";
         let key = path_to_key(path);
         let self_echo = MessageCodec::encode("self-runner", 1, Qos::BestEffort, path, &[0u8; 8]);
@@ -3375,18 +3522,8 @@ mod tests {
             let _ = aux_session.put(key, other.to_vec()).await;
         });
 
-        // Drain for up to ~1 s. We accept that Zenoh's loopback
-        // discovery may not have delivered the foreign sample on
-        // every CI host (multicast routing flakes), but ANY self-echo
-        // delivery is a regression.
-        let deadline = Instant::now() + std::time::Duration::from_millis(1000);
-        let mut delivered: Vec<ReceivedUpdate> = Vec::new();
-        while Instant::now() < deadline {
-            match variant.poll_receive().expect("poll_receive") {
-                Some(u) => delivered.push(u),
-                None => std::thread::sleep(std::time::Duration::from_millis(20)),
-            }
-        }
+        // Give the subscriber task ~1 s to record whatever arrives.
+        std::thread::sleep(std::time::Duration::from_millis(1000));
 
         // Tear down before asserting so a failure doesn't leak the
         // background tasks.
@@ -3396,16 +3533,20 @@ mod tests {
         aux_rt.shutdown_timeout(std::time::Duration::from_secs(2));
         variant.disconnect().expect("disconnect");
 
-        // Filter to the path + seqs we control so a noisy CI host
-        // can't pollute the assertion (Zenoh's default scouting can
-        // pick up unrelated peers).
-        let mine: Vec<_> = delivered
-            .into_iter()
-            .filter(|u| u.path == path && (u.seq == 1 || u.seq == 2))
-            .collect();
-        for u in &mine {
+        // Inspect the compact sink. Restrict to the seqs we control so a
+        // noisy CI host can't pollute the assertion. ANY recorded
+        // receive whose writer == "self-runner" is a filter regression.
+        let buf = sink.lock().unwrap();
+        let writers = buf.peers.dict();
+        for (i, &pidx) in buf.peer_idx.iter().enumerate() {
+            let seq = buf.seq[i];
+            if seq != 1 && seq != 2 {
+                continue;
+            }
+            let writer = writers.get(pidx as usize).map(|s| s.as_str());
             assert_ne!(
-                u.writer, "self-runner",
+                writer,
+                Some("self-runner"),
                 "self-echo leaked through subscriber_task filter; \
                  compact-log-schema.md event kind 1 contract violated"
             );
