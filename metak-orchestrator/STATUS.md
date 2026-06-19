@@ -20157,3 +20157,82 @@ batching, so default behaviour is unchanged.
   the authorised completion report). Runner passthrough is already
   generic — no runner change needed.
 - STATUS.md updated by read-then-append only.
+
+---
+
+## T9.5f — Zenoh receive-timestamp-on-arrival (latency-artifact fix) — DONE (2026-06-19)
+
+**Worker**: variants/zenoh
+
+**Problem**: Latency = receive_ts − write_ts. The Zenoh receive path
+decoded samples onto an mpsc and the driver stamped receive_ts only at
+its **per-tick drain**, adding ~half a tick (~50 ms at 10 Hz) of pure
+measurement artifact to every sample.
+
+**Fix (mirrors websocket Multi-mode)**: receives are now stamped +
+recorded on the receive task/thread the instant a sample is decoded,
+via the existing public `LoggerHandle::record_receive` (captures
+`receive_ts = Utc::now()` internally, writes to the shared compact
+buffer). `poll_receive` is now lifecycle-only for data (returns
+`Ok(None)`) in BOTH modes.
+
+**Files changed (all within variants/zenoh/)**:
+- `src/zenoh.rs`:
+  - Added `SharedLogger = Arc<Mutex<Option<LoggerHandle>>>` + struct
+    field; implemented `Variant::attach_logger` to fill it (driver calls
+    it after `connect`, so the holder bridges the ordering gap to the
+    in-`connect`-spawned `subscriber_task`).
+  - `subscriber_task` now calls `record_receive(...)` on each decoded
+    foreign sample (caches the logger clone locally → no steady-state
+    locking) instead of forwarding over `recv_tx`.
+  - Removed the `recv_tx`/`recv_rx` data channel + `RECEIVE_CHANNEL_CAPACITY`.
+  - `poll_receive` returns `Ok(None)` (data is lifecycle-only); EOT path
+    (`eot_rx`) untouched. `disconnect` clears the shared logger.
+  - Rewrote the two `#[ignore]`d real-Zenoh tests to assert via a test
+    `CompactSink` (helper `test_logger_with_sink`) instead of
+    `poll_receive`. Updated the connect-error test (`recv_rx` → shared
+    logger assertion).
+- `src/rest_client.rs`: `SseReader::start` takes a `SharedLogger`; the
+  SSE reader thread records each decoded sample on arrival; removed the
+  data channel + `try_recv` + `RECEIVE_CHANNEL_CAPACITY`.
+- `CUSTOM.md`: documented the change ("T9.5f" section) with the cited
+  artifact + before/after numbers.
+
+**variant_base**: no change needed — used only the existing public
+`LoggerHandle` API (`attach_logger` + `record_receive`), exactly like
+websocket.
+
+**Validation**:
+- `cargo build --release -p variant-zenoh`: clean.
+- `cargo test --release -p variant-zenoh`: 85 passed, 0 failed, 4
+  ignored (real-Zenoh stress/filter + sidecar) + loopback integration
+  test passed.
+- `cargo clippy --release -p variant-zenoh --all-targets -- -D warnings`:
+  clean. `cargo fmt -p variant-zenoh -- --check`: clean.
+- **End-to-end two-runner localhost proof** (scratch config: one zenoh
+  Multi entry, scalar-flood, 100 vpt × 10 Hz, QoS 1, 10 s operate;
+  alice+bob both `127.0.0.1`; analysed via `python analysis/analyze.py
+  <logdir> --summary`). Same binary, fix stashed for the before-number:
+
+  | Metric       | BEFORE (drain-stamp) | AFTER (arrival-stamp) |
+  | ------------ | -------------------- | --------------------- |
+  | Latency p50  | 50.07 ms             | 0.400 ms              |
+  | Latency mean | 54.7 ± 42.1 ms       | 2.8 ± 4.7 ms          |
+  | p95 / p99    | 60.24 / 260.5 ms     | 14.88 / 16.66 ms      |
+  | Delivery     | 100 %                | 100 %                 |
+
+  Before-p50 ≈ 50 ms = half the 100 ms tick (the artifact); after-p50 =
+  0.4 ms (true loopback latency). Single-digit-ms target met. Scratch
+  config + scratch logs deleted.
+
+**Concern / note**: the per-spawn stdout progress line now shows
+`received=0` because receives no longer flow through `progress.inc_received`
+(they live in compact-Parquet via `record_receive`). This is the same
+behaviour websocket Multi mode already has and is safe — the idle/stall
+watchdogs only trip when BOTH `sent` and `received` are flat, and `sent`
+advances every operate tick. Any downstream tooling that reads the
+live `received` progress counter for Zenoh (rather than the parquet)
+would now see 0; analysis reads the parquet, so the metric is intact.
+
+- STATUS.md updated by read-then-append only; no tracked files outside
+  variants/zenoh/ were modified.
