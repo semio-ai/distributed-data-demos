@@ -370,36 +370,43 @@ Custom-UDP QoS 4 → 0 %.
 
 ### 5.3 Zenoh operating envelope (two machines, WiFi 2.4 GHz, mean latency ms)
 
-Zenoh-only, multi-threaded, across **workload shape × QoS × rate**. All
-cells 100 % delivery except `✗` (68–97 %). The deck renders this as a
-flame heatmap. `⚠` rows are under review (see note below).
+Zenoh-only, multi-threaded, across **workload shape × QoS × rate**, from
+a **single consistent run** (`zenoh-all-20260619_132224`, two machines
+WiFi 2.4 GHz, with the fixed receive-timestamping). All cells 100 %
+delivery except `✗` (93–98 %). The deck renders this as a flame heatmap.
 
 | Rate (vpt×hz) | Sc Q1 | Q2 | Q3 | Q4 | Bl Q1 | Q2 | Q3 | Q4 | Mx Q1 | Q2 | Q3 | Q4 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 10×100hz | 10.3 | 6.3 | 5.8 | 9.4 | 9.0 | 10.5 | 10.2 | 9.8 | 6.2 | 6.0 | 5.5 | 5.6 |
-| 10×1000hz | 6.1 | 6.1 | 4.8 | 5.4 | 6.2 | 6.2 | 5.3 | 5.4 | 5.5 | 5.9 | 4.8 | 4.9 |
-| 100×10hz ⚠ | 50.1 | 51.1 | 50.1 | 54.4 | 50.0 | 49.9 | 50.1 | 50.0 | 50.2 | 99.1 | 50.2 | 63.3 |
-| 100×100hz | 8.0 | 14.6 | 7.7 | 8.8 | 5.9 | 7.2 | 9.8 | 6.5 | 11.1 | 10.6 | 7.3 | 7.0 |
-| 100×1000hz | 14.3 | 12.3 | 12.5 | 12.5 | 6.1 | 5.9 | 5.1 | 5.3 | 601✗ | 587✗ | 415 | 468 |
-| 1000×10hz ⚠ | 51.2 | 76.8 | 90.9 | 50.7 | 49.8 | 53.6 | 49.9 | 75.1 | 812 | 825 | 1010 | 1303 |
-| 1000×100hz | 15.4 | 15.5 | 20.3 | 15.8 | 10.1 | 6.8 | 5.9 | 8.6 | 1053✗ | 1146✗ | 3145✗ | 2942✗ |
+| 10×100hz | 1.9 | 7.0 | 1.8 | 1.7 | 2.2 | 2.1 | 1.9 | 2.0 | 5.1 | 2.2 | 1.7 | 1.9 |
+| 10×1000hz | 5.0 | 5.0 | 3.9 | 4.5 | 4.2 | 4.3 | 4.2 | 4.5 | 4.0 | 4.0 | 3.9 | 5.9 |
+| 100×10hz | 3.5 | 3.6 | 3.8 | 3.7 | 2.0 | 2.5 | 1.7 | 5.4 | 5.3 | 4.4 | 3.6 | 3.4 |
+| 100×100hz | 4.3 | 4.4 | 4.3 | 4.1 | 4.5 | 2.2 | 1.9 | 2.0 | 6.5 | 4.9 | 4.4 | 4.3 |
+| 100×1000hz | 11.1 | 11.1 | 14.1 | 10.8 | 5.3 | 5.4 | 5.4 | 4.6 | 573✗ | 599✗ | 193 | 211 |
+| 1000×10hz | 12.7 | 11.1 | 11.7 | 12.4 | 2.7 | 2.6 | 2.4 | 2.2 | 993 | 998 | 1236 | 1213 |
+| 1000×100hz | 11.9 | 12.7 | 12.6 | 15.3 | 2.8 | 2.9 | 2.4 | 2.6 | 961 | 1202✗ | 1652 | 1415 |
 
 (Sc = scalar-flood, Bl = block-flood, Mx = mixed-types.) Decision
 guidance:
 
-- **Ideal** — scalar or block at tick ≥ 100 Hz: ≤ ~15 ms, 100 %
-  delivery, any QoS.
-- **Avoid** — mixed-types at ≥ 1000 vpt: 0.4–3.1 s latency, and delivery
-  falls to 68–97 % — even reliable QoS 3/4 can't hold it on a real link.
-  The fix is **block-flood packing**, which stays fast and complete.
-- **⚠ Under review** — the 10 Hz (`×10hz`) rows. In the authoritative
-  latency table these spawns show a clean ~one-tick **median** latency
-  (`zenoh-100x10hz-scalar-qos1` p50 = 100.0 ms, p95 100.4, p99 100.5),
-  which Custom-UDP does **not** (its p50 = 4.4 ms, only the tail hits one
-  tick). This Zenoh-specific, tick-aligned median is most likely
-  **publisher batching / flush timing** at low publish rates. Being
-  confirmed by a targeted re-run (toggling the publisher's flush/express
-  setting) before these cells are quoted.
+- **Ideal** — scalar or block at **any rate**: ~2–15 ms, 100 % delivery,
+  any QoS. Zenoh has **no low-rate or reliable-QoS latency penalty**.
+- **Avoid** — mixed-types at high volume (≥ 1000 vpt, or ~100 k
+  leaves/s): 0.2–1.6 s latency. Delivery mostly holds (only a couple of
+  best-effort cells dip to ~93 %), so the mixed problem is **latency,
+  not loss**. The fix is **block-flood packing**, which stays
+  single-digit ms.
+
+**Note — the earlier ×10hz "latency" was a benchmark harness bug, now
+fixed.** Zenoh's multi-mode reader path pushed decoded updates onto an
+mpsc and let the driver stamp `receive_ts` at its **per-tick drain**
+(`variant-base` `record_receive` → `Utc::now()`), adding ~half a tick
+(~50 ms @ 10 Hz). An express A/B (`zenoh-all-20260616_143733`) ruled out
+publisher batching; the fix (commit `5401c93`) makes the Zenoh reader
+thread stamp `receive_ts` **on arrival** (mirroring websocket). Validated
+loopback p50 50.07 ms → 0.400 ms, then this full envelope re-run. Note:
+the cross-variant tables (§5.1, §5.2) still show Zenoh's pre-fix cells,
+so Zenoh's true latency there is ~5 ms lower than printed; a full
+all-variants re-run would refresh those.
 
 ### 5.4 What the results say about Zenoh
 

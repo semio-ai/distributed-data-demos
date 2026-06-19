@@ -179,7 +179,8 @@ delivery (~12 ms / ~4 ms); Custom-UDP 100 % but ~46 ms; WebRTC drops to
 honoured the no-skip contract everywhere — **zero dropped writes**.
 
 _Same-machine loopback, 2026-05-21 · latency = mean over the operate
-window._
+window. Zenoh's cells predate the receive-timestamp fix — its true
+latency is ~5 ms lower than shown (see slide 8)._
 
 ---
 
@@ -187,33 +188,31 @@ window._
 
 Mean latency (ms), Zenoh multi-threaded, across **workload shape × QoS ×
 rate** — flame-coloured in the rendered deck (green = fast → red = slow).
-All cells 100 % delivery except `✗` (68–97 %). ⚠ = under review (see
-note).
+Single consistent run (2026-06-19, fixed receive-timestamping). All
+cells 100 % delivery except `✗` (93–98 %).
 
 | Rate (vpt×hz) | Sc Q1 | Q2 | Q3 | Q4 | Bl Q1 | Q2 | Q3 | Q4 | Mx Q1 | Q2 | Q3 | Q4 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 10×100hz | 10.3 | 6.3 | 5.8 | 9.4 | 9.0 | 10.5 | 10.2 | 9.8 | 6.2 | 6.0 | 5.5 | 5.6 |
-| 10×1000hz | 6.1 | 6.1 | 4.8 | 5.4 | 6.2 | 6.2 | 5.3 | 5.4 | 5.5 | 5.9 | 4.8 | 4.9 |
-| 100×10hz ⚠ | 50.1 | 51.1 | 50.1 | 54.4 | 50.0 | 49.9 | 50.1 | 50.0 | 50.2 | 99.1 | 50.2 | 63.3 |
-| 100×100hz | 8.0 | 14.6 | 7.7 | 8.8 | 5.9 | 7.2 | 9.8 | 6.5 | 11.1 | 10.6 | 7.3 | 7.0 |
-| 100×1000hz | 14.3 | 12.3 | 12.5 | 12.5 | 6.1 | 5.9 | 5.1 | 5.3 | 601✗ | 587✗ | 415 | 468 |
-| 1000×10hz ⚠ | 51.2 | 76.8 | 90.9 | 50.7 | 49.8 | 53.6 | 49.9 | 75.1 | 812 | 825 | 1010 | 1303 |
-| 1000×100hz | 15.4 | 15.5 | 20.3 | 15.8 | 10.1 | 6.8 | 5.9 | 8.6 | 1053✗ | 1146✗ | 3145✗ | 2942✗ |
+| 10×100hz | 1.9 | 7.0 | 1.8 | 1.7 | 2.2 | 2.1 | 1.9 | 2.0 | 5.1 | 2.2 | 1.7 | 1.9 |
+| 10×1000hz | 5.0 | 5.0 | 3.9 | 4.5 | 4.2 | 4.3 | 4.2 | 4.5 | 4.0 | 4.0 | 3.9 | 5.9 |
+| 100×10hz | 3.5 | 3.6 | 3.8 | 3.7 | 2.0 | 2.5 | 1.7 | 5.4 | 5.3 | 4.4 | 3.6 | 3.4 |
+| 100×100hz | 4.3 | 4.4 | 4.3 | 4.1 | 4.5 | 2.2 | 1.9 | 2.0 | 6.5 | 4.9 | 4.4 | 4.3 |
+| 100×1000hz | 11.1 | 11.1 | 14.1 | 10.8 | 5.3 | 5.4 | 5.4 | 4.6 | 573✗ | 599✗ | 193 | 211 |
+| 1000×10hz | 12.7 | 11.1 | 11.7 | 12.4 | 2.7 | 2.6 | 2.4 | 2.2 | 993 | 998 | 1236 | 1213 |
+| 1000×100hz | 11.9 | 12.7 | 12.6 | 15.3 | 2.8 | 2.9 | 2.4 | 2.6 | 961 | 1202✗ | 1652 | 1415 |
 
-- 🟢 **Ideal** — scalar or block, tick ≥ 100 Hz → ≤ ~15 ms, 100 %
-  delivery, any QoS.
-- 🔴 **Avoid** — mixed-types at ≥ 1000 vpt: 0.4–3.1 s latency, and
-  delivery drops to 68–97 % — even reliable QoS 3/4 can't hold it on a
-  real link.
-- ⚠ **Under review** — the 10 Hz (×10hz) rows: low-rate Zenoh shows a
-  clean ~one-tick median latency that Custom-UDP doesn't. Likely Zenoh
-  publisher batching / flush timing; being confirmed by a targeted
-  re-run before we quote it.
+- 🟢 **Ideal** — scalar or block, **any rate** → ~2–15 ms, 100 %
+  delivery, any QoS. No low-rate penalty.
+- 🔴 **Avoid** — mixed-types at high volume (≥ 1000 vpt, or ~100 k
+  leaves/s): 0.2–1.6 s latency. Delivery mostly holds (a couple of
+  best-effort cells dip to ~93 %).
 
-Shape and rate dominate. The real danger is mixed-types at high vpt —
-and on a real link reliable QoS doesn't rescue it. The fix is
-**block-flood packing**, which stays fast and complete everywhere. Two
-machines, WiFi 2.4 GHz, 2026-05-23.
+Scalar & block are uniformly fast across the whole grid — Zenoh has **no
+low-rate or QoS penalty**. The one real danger zone is mixed-types at
+high volume (nested/heterogeneous payloads); the fix is **block-flood
+packing**, which stays single-digit ms everywhere. Two machines, WiFi
+2.4 GHz, 2026-06-19. (The earlier ~50 ms low-rate readings were a
+receive-timestamping harness bug, now fixed.)
 
 ---
 
@@ -242,8 +241,9 @@ delivery but latency balloons to **seconds** (buffering on the
 constrained link); WebRTC ~48 %; single-threaded Custom-UDP QoS 4 → 0 %.
 
 _Two machines over WiFi 2.4 GHz, 2026-05-23 — a constrained link, so
-absolute latency reflects the network. Zenoh's tail is the tightest in
-the field here._
+absolute latency reflects the network. Zenoh's cells predate the
+receive-timestamp fix — its true latency is ~5 ms lower than shown (see
+slide 8)._
 
 ---
 

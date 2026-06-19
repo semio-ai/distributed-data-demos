@@ -296,7 +296,7 @@
         Custom-UDP 100 % but ~46 ms; WebRTC drops to ~48 %; single-threaded Hybrid collapses (79 %, multi-second).
         QoS 3/4 honoured the no-skip contract everywhere — <strong>zero dropped writes</strong>.
       </p>
-      <p class="xsmall muted" style="margin-top:.2em;">Same-machine loopback, 2026-05-21 · latency = mean over the operate window.</p>
+      <p class="xsmall muted" style="margin-top:.2em;">Same-machine loopback, 2026-05-21 · latency = mean over the operate window. <strong>Zenoh's cells predate the receive-timestamp fix — its true latency is ~5 ms lower than shown (see slide 8).</strong></p>
       <aside class="notes">
         Headline read: at the realistic rate every variant delivers ~100 % (WebRTC ~95 % on best-effort), so the
         story is latency consistency. Zenoh sits ~10 ms mean with a tight spread — steadier than QUIC, which is
@@ -309,7 +309,7 @@
     <section>
       <div class="kicker">Zenoh deep-dive · two machines (WiFi 2.4 GHz)</div>
       <h2>Zenoh's operating envelope — where it shines, where to avoid</h2>
-      <p class="xsmall" style="margin:.1em 0 .25em;">Mean latency (ms), Zenoh multi-threaded, <strong>two machines over WiFi 2.4 GHz</strong>, across <strong>workload shape × QoS × rate</strong>. Flame-coloured (green = fast → red = slow). All cells 100 % delivery except <sup>✗</sup> (68–97 %).</p>
+      <p class="xsmall" style="margin:.1em 0 .25em;">Mean latency (ms), Zenoh multi-threaded, <strong>two machines over WiFi 2.4 GHz</strong>, across <strong>workload shape × QoS × rate</strong>. Flame-coloured (green = fast → red = slow). All cells 100 % delivery except <sup>✗</sup> (93–98 %). Full Zenoh envelope — single consistent run (2026-06-19) with fixed receive-timestamping.</p>
       <table class="heat" style="font-size:.4em;">
         <thead>
           <tr><th rowspan="2">Rate (vpt×hz)</th><th colspan="4">Scalar-flood</th><th colspan="4" class="grp">Block-flood</th><th colspan="4" class="grp">Mixed-types</th></tr>
@@ -317,52 +317,51 @@
         </thead>
         <tbody>
           <tr><td>10×100hz</td>
-            <td class="lat">10.3</td><td class="lat">6.3</td><td class="lat">5.8</td><td class="lat">9.4</td>
-            <td class="lat grp">9.0</td><td class="lat">10.5</td><td class="lat">10.2</td><td class="lat">9.8</td>
-            <td class="lat grp">6.2</td><td class="lat">6.0</td><td class="lat">5.5</td><td class="lat">5.6</td></tr>
+            <td class="lat">1.9</td><td class="lat">7.0</td><td class="lat">1.8</td><td class="lat">1.7</td>
+            <td class="lat grp">2.2</td><td class="lat">2.1</td><td class="lat">1.9</td><td class="lat">2.0</td>
+            <td class="lat grp">5.1</td><td class="lat">2.2</td><td class="lat">1.7</td><td class="lat">1.9</td></tr>
           <tr><td>10×1000hz</td>
-            <td class="lat">6.1</td><td class="lat">6.1</td><td class="lat">4.8</td><td class="lat">5.4</td>
-            <td class="lat grp">6.2</td><td class="lat">6.2</td><td class="lat">5.3</td><td class="lat">5.4</td>
-            <td class="lat grp">5.5</td><td class="lat">5.9</td><td class="lat">4.8</td><td class="lat">4.9</td></tr>
-          <tr><td>100×10hz<sup>⚠</sup></td>
-            <td class="rev">50.1</td><td class="rev">51.1</td><td class="rev">50.1</td><td class="rev">54.4</td>
-            <td class="rev grp">50.0</td><td class="rev">49.9</td><td class="rev">50.1</td><td class="rev">50.0</td>
-            <td class="rev grp">50.2</td><td class="rev">99.1</td><td class="rev">50.2</td><td class="rev">63.3</td></tr>
+            <td class="lat">5.0</td><td class="lat">5.0</td><td class="lat">3.9</td><td class="lat">4.5</td>
+            <td class="lat grp">4.2</td><td class="lat">4.3</td><td class="lat">4.2</td><td class="lat">4.5</td>
+            <td class="lat grp">4.0</td><td class="lat">4.0</td><td class="lat">3.9</td><td class="lat">5.9</td></tr>
+          <tr><td>100×10hz</td>
+            <td class="lat">3.5</td><td class="lat">3.6</td><td class="lat">3.8</td><td class="lat">3.7</td>
+            <td class="lat grp">2.0</td><td class="lat">2.5</td><td class="lat">1.7</td><td class="lat">5.4</td>
+            <td class="lat grp">5.3</td><td class="lat">4.4</td><td class="lat">3.6</td><td class="lat">3.4</td></tr>
           <tr><td>100×100hz</td>
-            <td class="lat">8.0</td><td class="lat">14.6</td><td class="lat">7.7</td><td class="lat">8.8</td>
-            <td class="lat grp">5.9</td><td class="lat">7.2</td><td class="lat">9.8</td><td class="lat">6.5</td>
-            <td class="lat grp">11.1</td><td class="lat">10.6</td><td class="lat">7.3</td><td class="lat">7.0</td></tr>
+            <td class="lat">4.3</td><td class="lat">4.4</td><td class="lat">4.3</td><td class="lat">4.1</td>
+            <td class="lat grp">4.5</td><td class="lat">2.2</td><td class="lat">1.9</td><td class="lat">2.0</td>
+            <td class="lat grp">6.5</td><td class="lat">4.9</td><td class="lat">4.4</td><td class="lat">4.3</td></tr>
           <tr><td>100×1000hz</td>
-            <td class="lat">14.3</td><td class="lat">12.3</td><td class="lat">12.5</td><td class="lat">12.5</td>
-            <td class="lat grp">6.1</td><td class="lat">5.9</td><td class="lat">5.1</td><td class="lat">5.3</td>
-            <td class="lat grp">601<sup>✗</sup></td><td class="lat">587<sup>✗</sup></td><td class="lat">415</td><td class="lat">468</td></tr>
-          <tr><td>1000×10hz<sup>⚠</sup></td>
-            <td class="rev">51.2</td><td class="rev">76.8</td><td class="rev">90.9</td><td class="rev">50.7</td>
-            <td class="rev grp">49.8</td><td class="rev">53.6</td><td class="rev">49.9</td><td class="rev">75.1</td>
-            <td class="rev grp">812</td><td class="rev">825</td><td class="rev">1010</td><td class="rev">1303</td></tr>
+            <td class="lat">11.1</td><td class="lat">11.1</td><td class="lat">14.1</td><td class="lat">10.8</td>
+            <td class="lat grp">5.3</td><td class="lat">5.4</td><td class="lat">5.4</td><td class="lat">4.6</td>
+            <td class="lat grp">573<sup>✗</sup></td><td class="lat">599<sup>✗</sup></td><td class="lat">193</td><td class="lat">211</td></tr>
+          <tr><td>1000×10hz</td>
+            <td class="lat">12.7</td><td class="lat">11.1</td><td class="lat">11.7</td><td class="lat">12.4</td>
+            <td class="lat grp">2.7</td><td class="lat">2.6</td><td class="lat">2.4</td><td class="lat">2.2</td>
+            <td class="lat grp">993</td><td class="lat">998</td><td class="lat">1236</td><td class="lat">1213</td></tr>
           <tr><td>1000×100hz</td>
-            <td class="lat">15.4</td><td class="lat">15.5</td><td class="lat">20.3</td><td class="lat">15.8</td>
-            <td class="lat grp">10.1</td><td class="lat">6.8</td><td class="lat">5.9</td><td class="lat">8.6</td>
-            <td class="lat grp">1053<sup>✗</sup></td><td class="lat">1146<sup>✗</sup></td><td class="lat">3145<sup>✗</sup></td><td class="lat">2942<sup>✗</sup></td></tr>
+            <td class="lat">11.9</td><td class="lat">12.7</td><td class="lat">12.6</td><td class="lat">15.3</td>
+            <td class="lat grp">2.8</td><td class="lat">2.9</td><td class="lat">2.4</td><td class="lat">2.6</td>
+            <td class="lat grp">961</td><td class="lat">1202<sup>✗</sup></td><td class="lat">1652</td><td class="lat">1415</td></tr>
         </tbody>
       </table>
       <div class="two-col" style="margin-top:.4em; gap:1.2em;">
         <div class="xsmall">
-          <p style="margin:.12em 0;"><span style="color:#1a9850;">●</span> <strong>Ideal</strong> — scalar or block, tick ≥ 100 Hz → ≤ ~15 ms, 100 % delivery, any QoS.</p>
-          <p style="margin:.12em 0;"><span style="color:#d73027;">●</span> <strong>Avoid</strong> — mixed-types at ≥ 1000 vpt: 0.4–3.1 s latency, and delivery drops to 68–97 % — even reliable QoS 3/4 can't hold it on a real link.</p>
-          <p style="margin:.12em 0;"><span style="color:#94a3b8;">▦</span> <strong>⚠ Under review</strong> — the 10 Hz (×10hz) rows: low-rate Zenoh shows ~one-tick median latency (Zenoh-specific — Custom-UDP's median stays fast). Likely publisher batching / flush timing; being confirmed by a targeted re-run before we quote it.</p>
+          <p style="margin:.12em 0;"><span style="color:#1a9850;">●</span> <strong>Ideal</strong> — scalar or block, <strong>any rate</strong> → <strong>~2–15 ms</strong>, 100 % delivery, any QoS. No low-rate penalty.</p>
+          <p style="margin:.12em 0;"><span style="color:#d73027;">●</span> <strong>Avoid</strong> — mixed-types at high volume (≥ 1000 vpt, or ~100 k leaves/s): <strong>0.2–1.6 s</strong> latency. Delivery mostly holds (a couple of best-effort cells dip to ~93 %).</p>
         </div>
         <div class="xsmall muted">
-          <p style="margin:.12em 0;"><strong>Reading it:</strong> shape and rate dominate. The real danger is <strong>mixed-types (nested/heterogeneous) at high vpt</strong> — and on a real link reliable QoS doesn't rescue it. The fix is <strong>block-flood packing</strong>, which stays fast and complete everywhere.</p>
+          <p style="margin:.12em 0;"><strong>Reading it:</strong> scalar &amp; block are uniformly fast across the whole grid — Zenoh has <strong>no low-rate or QoS penalty</strong>. The one real danger zone is <strong>mixed-types at high volume</strong> (nested/heterogeneous payloads); the fix is <strong>block-flood packing</strong>, which stays in the single-digit ms everywhere.</p>
         </div>
       </div>
       <aside class="notes">
-        The "how to drive Zenoh" slide. (1) Ideal — scalar/block at ≥100 Hz is ~10 ms and complete. (2) The danger
-        zone is mixed-types at high vpt: seconds of latency and, on WiFi, delivery dropping to ~68% even at reliable
-        QoS — pack heterogeneous data into blocks. (3) The 10 Hz rows are flagged: low-rate Zenoh shows a clean
-        ~one-tick median latency that Custom-UDP doesn't — most likely Zenoh publisher batching/flush timing. We're
-        re-running those cells (with the publisher's flush/express setting toggled) to confirm before quoting them.
-        Two machines, WiFi 2.4 GHz, 2026-05-23.
+        The "how to drive Zenoh" slide, now a single consistent fixed run (2026-06-19). (1) scalar/block is ~2–15 ms
+        at every rate × QoS, 100 % delivery — no low-rate penalty, no reliable-QoS penalty. (2) The one real danger
+        zone is mixed-types at high volume (≥1000 vpt or ~100k leaves/s): hundreds of ms to ~1.6 s. Delivery largely
+        holds now (only 3 best-effort mixed cells dip to 93–98%), so the mixed problem is latency, not loss — pack
+        heterogeneous data into blocks. (Earlier ~50 ms low-rate readings were a receive-timestamping harness bug,
+        fixed in commit 5401c93.) Two machines, WiFi 2.4 GHz.
       </aside>
     </section>
 
@@ -394,7 +393,7 @@
         <strong>At saturation (100 k writes/s) over WiFi:</strong> Zenoh holds <strong>100 %</strong> delivery (~15 ms); QUIC 99.5 % (~11 ms).
         Custom-UDP / Hybrid keep delivery but latency balloons to <strong>seconds</strong> (buffering on the constrained link); WebRTC ~48 %; single-threaded Custom-UDP QoS 4 → 0 %.
       </p>
-      <p class="xsmall muted" style="margin-top:.2em;">Two machines over WiFi 2.4 GHz, 2026-05-23 — a constrained link, so absolute latency reflects the network. Zenoh's tail is the tightest in the field here.</p>
+      <p class="xsmall muted" style="margin-top:.2em;">Two machines over WiFi 2.4 GHz, 2026-05-23 — a constrained link, so absolute latency reflects the network. <strong>Zenoh's cells predate the receive-timestamp fix — its true latency is ~5 ms lower than shown (see slide 8).</strong></p>
       <aside class="notes">
         This is a real cross-machine run with both peers' logs, so the pairwise delivery numbers are genuine.
         WiFi 2.4 GHz is a stress link — note Zenoh is actually the steadiest (8 ms / 7.7 ms, small std) where
