@@ -437,17 +437,58 @@ full delivery.
 > — it is the one place the current build could differ from these
 > numbers.
 
-## 6. What's next
+## 6. How to replicate this benchmark
 
-1. **Close the mixed-types latency gap** — Zenoh's clearest limit;
-   determine whether it's batching, congestion control, or serialization.
-2. **Run on a wired link (GbE)** — WiFi 2.4 GHz floors latency; a wired
-   run isolates Zenoh's true tail and confirms the sub-10 ms picture.
-3. **Add a single-threaded / WASM path** (Zenoh router-RPC sidecar) for
-   deployments that require it.
-4. **Write deployment guidance** — where sub-10 ms matters, which QoS /
-   threading / topology to use. The baselines quantify the trade. The
-   question is how to deploy Zenoh well, not whether to use it.
+Anyone with two Windows machines on the same LAN can reproduce these
+results.
+
+**Prerequisites:** the Rust toolchain (`rustup`) and Python 3.12 with
+the analysis deps (`polars`, `matplotlib`).
+
+**1. Both machines — clone & build:**
+
+```powershell
+git clone https://github.com/semio-ai/distributed-data-demos.git
+cd distributed-data-demos
+cargo build --release
+```
+
+**2. Network.** Put both machines on the same subnet. For a WiFi test,
+leave *only* the WiFi adapter up — a second active NIC (e.g. Ethernet on
+the same subnet) makes the discovery multicast bind to the wrong
+interface and the peers won't find each other:
+
+```powershell
+Disable-NetAdapter -Name "Ethernet" -Confirm:$false   # WiFi tests only; Enable-NetAdapter after
+```
+
+**3. Run** — one machine each, logs pointed at a folder both can write.
+The runners agree on the same `<run>-<timestamp>` subfolder name, so a
+shared `--log-dir` auto-collects both peers into one run:
+
+```powershell
+# machine A
+target\release\runner.exe --name alice --config configs\two-runner-all-variants.toml --log-dir z:\shared\ddd
+# machine B
+target\release\runner.exe --name bob   --config configs\two-runner-all-variants.toml --log-dir z:\shared\ddd
+```
+
+`two-runner-all-variants.toml` runs all six variants;
+`two-runner-zenoh-all.toml` is the Zenoh-only subset. With no shared
+drive, use a local `--log-dir` on each machine and copy bob's files into
+alice's run folder before analyzing.
+
+**4. Analyze** (either machine, once the run finishes):
+
+```powershell
+python analysis\analyze.py z:\shared\ddd\<run-folder> --summary --dump --diagrams --output z:\shared\ddd\<run-folder>\analysis
+```
+
+**Worth comparing across links.** Run the identical matrix over **WiFi
+2.4 GHz**, **WiFi 5 GHz**, and **wired gigabit**, changing only the link
+between runs. Comparing the three separates the transport's own
+behaviour from what the network imposes — and is the natural way to see
+how much headroom a better link buys.
 
 ## 7. Suggested slide flow
 
@@ -466,4 +507,5 @@ See `metak-shared/slides.md` and the rendered `metak-shared/presentation.html`.
    watch / avoid (§5.3).
 9. **Results — two machines (WiFi)** — §5.2.
 10. **What we can say about Zenoh** — strengths + limits (§5.4).
-11. **What's next** — §6.
+11. **Replicate it yourself** — two-machine steps + commands; compare
+    2.4 GHz / 5 GHz / wired gigabit (§6).

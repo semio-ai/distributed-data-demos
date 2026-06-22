@@ -51,6 +51,12 @@
     .reveal table.heat td:first-child { text-align: left; font-weight: 600; background: #fff; white-space: nowrap; }
     .reveal table.heat td.na { color: #cbd5e1; background: #f8fafc; }
     .reveal table.heat .grp { border-left: 2px solid #94a3b8; }
+    .reveal .cmd { background: #0f172a; color: #e2e8f0; font-family: 'Consolas','Menlo',monospace;
+                   font-size: .52em; line-height: 1.45; border-radius: 6px; padding: .5em .8em;
+                   margin: .25em 0; white-space: pre-wrap; word-break: break-all; }
+    .reveal .cmd .c { color: #64748b; }
+    .reveal .step { font-size: .62em; margin: .15em 0 0; }
+    .reveal .step b { color: var(--accent); }
     .reveal table.heat td.rev { color: #94a3b8; font-style: italic; background: repeating-linear-gradient(45deg,#f1f5f9,#f1f5f9 4px,#e2e8f0 4px,#e2e8f0 8px); }
     .reveal table.heat sup { font-size: .7em; color: var(--muted); }
     .heat-legend { font-size: .46em; color: var(--muted); margin-top: .4em; line-height: 1.5; }
@@ -423,22 +429,34 @@
       </aside>
     </section>
 
-    <!-- 11 — What's next -->
+    <!-- 11 — Replicate it yourself -->
     <section>
-      <div class="kicker">Next</div>
-      <h2>What's next</h2>
-      <ol class="small">
-        <li><strong>Close the mixed-types latency gap.</strong> It's Zenoh's clearest limit — pin down whether it's batching, congestion control, or serialization, and fix it.</li>
-        <li><strong>Run on a wired link (GbE).</strong> WiFi 2.4 GHz floors latency; a wired run isolates Zenoh's true tail from the network and confirms the sub-10 ms picture.</li>
-        <li><strong>Add a single-threaded / WASM path</strong> for the deployments that need it (Zenoh router-RPC sidecar).</li>
-        <li><strong>Write deployment guidance.</strong> Where sub-10 ms matters, which QoS / threading / topology to use — the baselines quantify the trade.</li>
-      </ol>
-      <p class="small card" style="margin-top:.5em;">
-        <strong>Bottom line:</strong> Zenoh meets our needs at the realistic rate — 100 % delivery, ~10 ms latency on
-        loopback and real WiFi — and degrades gracefully under stress where others collapse. Its main limit is
-        high-rate heterogeneous payloads. The open work is tuning and deployment guidance, not re-selection.
+      <div class="kicker">Replicate it</div>
+      <h2>Run the benchmark yourself — two machines</h2>
+      <p class="step"><b>1. Both machines</b> — clone &amp; build (needs the Rust toolchain, and Python 3.12 with <code>polars</code> + <code>matplotlib</code>):</p>
+      <div class="cmd">git clone https://github.com/semio-ai/distributed-data-demos.git
+cd distributed-data-demos
+cargo build --release</div>
+      <p class="step"><b>2. Network</b> — put both on the same subnet. For a WiFi test, leave <em>only</em> the WiFi adapter up — a second active NIC breaks peer discovery:</p>
+      <div class="cmd">Disable-NetAdapter -Name "Ethernet" -Confirm:$false   <span class="c"># WiFi tests only; Enable-NetAdapter after</span></div>
+      <p class="step"><b>3. Run</b> — one machine each, logs to a folder both can write (auto-collects both peers into one run):</p>
+      <div class="cmd"><span class="c"># machine A</span>
+target\release\runner.exe --name alice --config configs\two-runner-all-variants.toml --log-dir z:\shared\ddd
+<span class="c"># machine B</span>
+target\release\runner.exe --name bob   --config configs\two-runner-all-variants.toml --log-dir z:\shared\ddd</div>
+      <p class="step"><b>4. Analyze</b> (on either machine, once the run finishes):</p>
+      <div class="cmd">python analysis\analyze.py z:\shared\ddd\&lt;run-folder&gt; --summary --dump --diagrams --output z:\shared\ddd\&lt;run-folder&gt;\analysis</div>
+      <p class="small card" style="margin-top:.35em;">
+        <strong>Worth comparing across links:</strong> run the same matrix over <strong>WiFi 2.4 GHz</strong>, <strong>WiFi 5 GHz</strong>, and <strong>wired gigabit</strong> — the three side by side separate the transport's own behaviour from what the network imposes.
       </p>
-      <aside class="notes">Close on the positive, honest note: Zenoh is the right call and the data backs it; the remaining work is the mixed-types fix, a wired-link measurement, and a single-threaded path. Not a re-selection.</aside>
+      <aside class="notes">
+        Prereqs: Rust (rustup), Python 3.12 with the analysis deps (polars, matplotlib). configs\two-runner-all-variants.toml
+        runs all six variants; configs\two-runner-zenoh-all.toml is the Zenoh-only subset. The runners agree on a shared
+        run-subfolder name, so pointing both --log-dir at the same network share auto-merges their logs; with no shared
+        drive, use a local --log-dir on each and copy bob's files into alice's run folder before analyzing. Remember to
+        Enable-NetAdapter the Ethernet again after WiFi tests. For the 2.4/5 GHz/wired comparison, just change the link
+        between runs and keep everything else identical.
+      </aside>
     </section>
 
   </div>

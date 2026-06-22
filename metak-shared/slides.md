@@ -269,21 +269,47 @@ with full delivery.
 
 ---
 
-## Slide 11 — What's next
+## Slide 11 — Replicate it yourself (two machines)
 
-1. **Close the mixed-types latency gap.** Zenoh's clearest limit — pin
-   down whether it's batching, congestion control, or serialization, and
-   fix it.
-2. **Run on a wired link (GbE).** WiFi 2.4 GHz floors latency; a wired
-   run isolates Zenoh's true tail from the network and confirms the
-   sub-10 ms picture.
-3. **Add a single-threaded / WASM path** for the deployments that need
-   it (Zenoh router-RPC sidecar).
-4. **Write deployment guidance.** Where sub-10 ms matters, which QoS /
-   threading / topology to use — the baselines quantify the trade.
+**1. Both machines — clone & build** (needs the Rust toolchain, and
+Python 3.12 with `polars` + `matplotlib`):
 
-**Bottom line:** Zenoh meets our needs at the realistic rate — 100 %
-delivery, ~10 ms latency on loopback and real WiFi — and degrades
-gracefully under stress where others collapse. Its main limit is
-high-rate heterogeneous payloads. The open work is tuning and deployment
-guidance, not re-selection.
+```powershell
+git clone https://github.com/semio-ai/distributed-data-demos.git
+cd distributed-data-demos
+cargo build --release
+```
+
+**2. Network** — put both machines on the same subnet. For a WiFi test,
+leave *only* the WiFi adapter up (a second active NIC breaks peer
+discovery):
+
+```powershell
+Disable-NetAdapter -Name "Ethernet" -Confirm:$false   # WiFi tests only; Enable-NetAdapter after
+```
+
+**3. Run** — one machine each, logs to a folder both can write (the
+runners agree on the same run-subfolder, so a shared `--log-dir`
+auto-collects both peers):
+
+```powershell
+# machine A
+target\release\runner.exe --name alice --config configs\two-runner-all-variants.toml --log-dir z:\shared\ddd
+# machine B
+target\release\runner.exe --name bob   --config configs\two-runner-all-variants.toml --log-dir z:\shared\ddd
+```
+
+**4. Analyze** (either machine, once it finishes):
+
+```powershell
+python analysis\analyze.py z:\shared\ddd\<run-folder> --summary --dump --diagrams --output z:\shared\ddd\<run-folder>\analysis
+```
+
+> `two-runner-all-variants.toml` runs all six variants;
+> `two-runner-zenoh-all.toml` is the Zenoh-only subset. No shared drive?
+> Use a local `--log-dir` on each machine and copy bob's files into
+> alice's run folder before analyzing.
+
+**Worth comparing across links:** run the same matrix over **WiFi
+2.4 GHz**, **WiFi 5 GHz**, and **wired gigabit** — the three side by side
+separate the transport's own behaviour from what the network imposes.
