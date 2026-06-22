@@ -313,3 +313,67 @@ python analysis\analyze.py z:\shared\ddd\<run-folder> --summary --dump --diagram
 **Worth comparing across links:** run the same matrix over **WiFi
 2.4 GHz**, **WiFi 5 GHz**, and **wired gigabit** — the three side by side
 separate the transport's own behaviour from what the network imposes.
+
+---
+
+## Appendix — all variants across all four QoS
+
+Mean latency (ms), scalar-flood, multi-threaded, two machines WiFi
+2.4 GHz (2026-05-23). Flame-coloured in the deck. `✗` = delivery < 100 %.
+`†` hybrid/custom-udp multicast double-counts (delivery = completeness).
+`‡` Zenoh cells predate the receive-timestamp fix (slide 8 has corrected
+Zenoh). **`⚠` the ×10hz columns carry a ~50 ms receive-timestamp
+artifact for every variant *except* WebSocket** (the only on-arrival
+stamped variant) — columns ≥ 100 Hz are unaffected.
+
+### QoS 1 · Best-Effort
+
+| Variant | 10×100 | 10×1000 | 100×10 ⚠ | 100×100 | 100×1000 | 1000×10 ⚠ | 1000×100 |
+|---|---|---|---|---|---|---|---|
+| Custom UDP | 6.6 | 5.1 | 52.5 | 9.7 | 1488 | 56.3 | 2613 |
+| Hybrid † | 3.1 | 3.7 | 29.1 | 7.5 | 13.6 | 44.6 | 3990✗ |
+| QUIC | 8.8 | 6.5 | 51.6 | 11.3 | 6.8 | 76.5 | 11.2 |
+| WebSocket | — | — | — | — | — | — | — |
+| WebRTC | 8.4 | 3.4 | 50✗ | 6.8✗ | 76✗ | 52✗ | 78✗ |
+| Zenoh ‡ | 10.3 | 6.1 | 50.1 | 8.0 | 14.3 | 51.2 | 15.4 |
+
+### QoS 2 · Latest-Value
+
+| Variant | 10×100 | 10×1000 | 100×10 ⚠ | 100×100 | 100×1000 | 1000×10 ⚠ | 1000×100 |
+|---|---|---|---|---|---|---|---|
+| Custom UDP | 6.9 | 6.7 | 54.3 | 10.0 | 2277 | 73.9 | 3375 |
+| Hybrid † | 3.1 | 3.6 | 29.1 | 7.2 | 11.9 | 44.0 | 6752✗ |
+| QUIC | 12.8 | 6.8 | 58.8 | 8.9 | 7.0 | 54.7 | 10.5 |
+| WebSocket | — | — | — | — | — | — | — |
+| WebRTC | 8.2 | 2.8 | 50✗ | 6.1✗ | 77✗ | 51✗ | 79✗ |
+| Zenoh ‡ | 6.3 | 6.1 | 51.1 | 14.6 | 12.3 | 76.8 | 15.5 |
+
+### QoS 3 · Reliable-UDP
+
+| Variant | 10×100 | 10×1000 | 100×10 ⚠ | 100×100 | 100×1000 | 1000×10 ⚠ | 1000×100 |
+|---|---|---|---|---|---|---|---|
+| Custom UDP | 7.0 | 7.3 | 54.0 | 11.3 | 21.2 | 62.3 | 77.2 |
+| Hybrid | 5.4 | 4.8 | 55.2 | 10.0 | 304 | 69.2 | 252 |
+| QUIC | 16.5 | 6.9 | 56.1 | 13.9 | 5.7 | 75.6 | 10.3 |
+| WebSocket | 1.9 | 3.8 | 6.3 | 3.3 | 71.9 | 18.6 | 128 |
+| WebRTC | 5.0 | 2.9 | 50.1 | 7.9 | 73.4 | 53.7 | 86.4 |
+| Zenoh ‡ | 5.8 | 4.8 | 50.1 | 7.7 | 12.5 | 90.9 | 20.3 |
+
+(Reliable QoS — 100 % delivery across the board. WebSocket, stamped on
+arrival, shows the true single-digit-ms low-rate latency the others'
+×10hz numbers mask.)
+
+### QoS 4 · Reliable-TCP
+
+| Variant | 10×100 | 10×1000 | 100×10 ⚠ | 100×100 | 100×1000 | 1000×10 ⚠ | 1000×100 |
+|---|---|---|---|---|---|---|---|
+| Custom UDP | 5.1 | 4.1 | 51.4 | 8.2 | 109✗ | 82.9 | 86✗ |
+| Hybrid | 8.7 | 5.1 | 61.3 | 10.0 | 220 | 84.0 | 95.1 |
+| QUIC | 7.5 | 10.6 | 56.4 | 12.6 | 7.6 | 54.5 | 10.4 |
+| WebSocket | 1.8 | 8.9 | 4.5 | 4.0 | 87.0 | 18.3 | 132 |
+| WebRTC | 8.0 | 3.2 | 50.3 | 5.6 | 79.1 | 51.6 | 83.7 |
+| Zenoh ‡ | 9.4 | 5.4 | 54.4 | 8.8 | 12.5 | 50.7 | 15.8 |
+
+Full delivery %s, percentiles, single-threaded mode, and the
+block-flood / mixed-types shapes are all in each run's
+`analysis/summary_*.md`.

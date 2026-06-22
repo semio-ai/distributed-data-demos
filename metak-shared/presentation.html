@@ -459,6 +459,90 @@ target\release\runner.exe --name bob   --config configs\two-runner-all-variants.
       </aside>
     </section>
 
+    <!-- Appendix A — QoS 1 -->
+    <section>
+      <div class="kicker">Appendix · all variants · two machines (WiFi 2.4 GHz)</div>
+      <h2>QoS 1 · Best-Effort — mean latency (ms)</h2>
+      <table class="heat">
+        <thead><tr><th>Variant</th><th>10×100</th><th>10×1000</th><th>100×10<sup>⚠</sup></th><th>100×100</th><th>100×1000</th><th>1000×10<sup>⚠</sup></th><th>1000×100</th></tr></thead>
+        <tbody>
+          <tr><td>Custom UDP</td><td class="lat">6.6</td><td class="lat">5.1</td><td class="lat">52.5</td><td class="lat">9.7</td><td class="lat">1488</td><td class="lat">56.3</td><td class="lat">2613</td></tr>
+          <tr><td>Hybrid<sup>†</sup></td><td class="lat">3.1</td><td class="lat">3.7</td><td class="lat">29.1</td><td class="lat">7.5</td><td class="lat">13.6</td><td class="lat">44.6</td><td class="lat">3990<sup>✗</sup></td></tr>
+          <tr><td>QUIC</td><td class="lat">8.8</td><td class="lat">6.5</td><td class="lat">51.6</td><td class="lat">11.3</td><td class="lat">6.8</td><td class="lat">76.5</td><td class="lat">11.2</td></tr>
+          <tr><td>WebSocket</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td></tr>
+          <tr><td>WebRTC</td><td class="lat">8.4</td><td class="lat">3.4</td><td class="lat">50<sup>✗</sup></td><td class="lat">6.8<sup>✗</sup></td><td class="lat">76<sup>✗</sup></td><td class="lat">52<sup>✗</sup></td><td class="lat">78<sup>✗</sup></td></tr>
+          <tr><td>Zenoh<sup>‡</sup></td><td class="lat">10.3</td><td class="lat">6.1</td><td class="lat">50.1</td><td class="lat">8.0</td><td class="lat">14.3</td><td class="lat">51.2</td><td class="lat">15.4</td></tr>
+        </tbody>
+      </table>
+      <div class="heat-legend">
+        Scalar-flood · multi-threaded · 2026-05-23. <sup>✗</sup> delivery &lt;100% (best-effort drop / saturation). <sup>†</sup>multicast double-counts — delivery = completeness. <sup>‡</sup>Zenoh pre-fix (slide 8 has corrected values).
+        <br><sup>⚠</sup> the ×10hz columns carry a ~50 ms receive-timestamp artifact for <em>every</em> variant except WebSocket — columns ≥100 Hz are unaffected. Full delivery %s in the analysis output.
+      </div>
+    </section>
+
+    <!-- Appendix B — QoS 2 -->
+    <section>
+      <div class="kicker">Appendix · all variants · two machines (WiFi 2.4 GHz)</div>
+      <h2>QoS 2 · Latest-Value — mean latency (ms)</h2>
+      <table class="heat">
+        <thead><tr><th>Variant</th><th>10×100</th><th>10×1000</th><th>100×10<sup>⚠</sup></th><th>100×100</th><th>100×1000</th><th>1000×10<sup>⚠</sup></th><th>1000×100</th></tr></thead>
+        <tbody>
+          <tr><td>Custom UDP</td><td class="lat">6.9</td><td class="lat">6.7</td><td class="lat">54.3</td><td class="lat">10.0</td><td class="lat">2277</td><td class="lat">73.9</td><td class="lat">3375</td></tr>
+          <tr><td>Hybrid<sup>†</sup></td><td class="lat">3.1</td><td class="lat">3.6</td><td class="lat">29.1</td><td class="lat">7.2</td><td class="lat">11.9</td><td class="lat">44.0</td><td class="lat">6752<sup>✗</sup></td></tr>
+          <tr><td>QUIC</td><td class="lat">12.8</td><td class="lat">6.8</td><td class="lat">58.8</td><td class="lat">8.9</td><td class="lat">7.0</td><td class="lat">54.7</td><td class="lat">10.5</td></tr>
+          <tr><td>WebSocket</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td></tr>
+          <tr><td>WebRTC</td><td class="lat">8.2</td><td class="lat">2.8</td><td class="lat">50<sup>✗</sup></td><td class="lat">6.1<sup>✗</sup></td><td class="lat">77<sup>✗</sup></td><td class="lat">51<sup>✗</sup></td><td class="lat">79<sup>✗</sup></td></tr>
+          <tr><td>Zenoh<sup>‡</sup></td><td class="lat">6.3</td><td class="lat">6.1</td><td class="lat">51.1</td><td class="lat">14.6</td><td class="lat">12.3</td><td class="lat">76.8</td><td class="lat">15.5</td></tr>
+        </tbody>
+      </table>
+      <div class="heat-legend">
+        Scalar-flood · multi-threaded · 2026-05-23. <sup>✗</sup> delivery &lt;100%. <sup>†</sup>multicast double-counts. <sup>‡</sup>Zenoh pre-fix (slide 8).
+        <sup>⚠</sup> ×10hz mean carries a ~50 ms receive-timestamp artifact for all variants except WebSocket; ≥100 Hz unaffected.
+      </div>
+    </section>
+
+    <!-- Appendix C — QoS 3 -->
+    <section>
+      <div class="kicker">Appendix · all variants · two machines (WiFi 2.4 GHz)</div>
+      <h2>QoS 3 · Reliable-UDP — mean latency (ms)</h2>
+      <table class="heat">
+        <thead><tr><th>Variant</th><th>10×100</th><th>10×1000</th><th>100×10<sup>⚠</sup></th><th>100×100</th><th>100×1000</th><th>1000×10<sup>⚠</sup></th><th>1000×100</th></tr></thead>
+        <tbody>
+          <tr><td>Custom UDP</td><td class="lat">7.0</td><td class="lat">7.3</td><td class="lat">54.0</td><td class="lat">11.3</td><td class="lat">21.2</td><td class="lat">62.3</td><td class="lat">77.2</td></tr>
+          <tr><td>Hybrid</td><td class="lat">5.4</td><td class="lat">4.8</td><td class="lat">55.2</td><td class="lat">10.0</td><td class="lat">304</td><td class="lat">69.2</td><td class="lat">252</td></tr>
+          <tr><td>QUIC</td><td class="lat">16.5</td><td class="lat">6.9</td><td class="lat">56.1</td><td class="lat">13.9</td><td class="lat">5.7</td><td class="lat">75.6</td><td class="lat">10.3</td></tr>
+          <tr><td>WebSocket</td><td class="lat">1.9</td><td class="lat">3.8</td><td class="lat">6.3</td><td class="lat">3.3</td><td class="lat">71.9</td><td class="lat">18.6</td><td class="lat">128</td></tr>
+          <tr><td>WebRTC</td><td class="lat">5.0</td><td class="lat">2.9</td><td class="lat">50.1</td><td class="lat">7.9</td><td class="lat">73.4</td><td class="lat">53.7</td><td class="lat">86.4</td></tr>
+          <tr><td>Zenoh<sup>‡</sup></td><td class="lat">5.8</td><td class="lat">4.8</td><td class="lat">50.1</td><td class="lat">7.7</td><td class="lat">12.5</td><td class="lat">90.9</td><td class="lat">20.3</td></tr>
+        </tbody>
+      </table>
+      <div class="heat-legend">
+        Scalar-flood · multi-threaded · 2026-05-23. Reliable QoS — delivery 100 % across the board (no skips). <sup>‡</sup>Zenoh pre-fix (slide 8).
+        <sup>⚠</sup> ×10hz mean carries a ~50 ms receive-timestamp artifact for all variants except WebSocket; ≥100 Hz unaffected. WebSocket — the only on-arrival-stamped variant — shows the true low-rate latency (single-digit ms).
+      </div>
+    </section>
+
+    <!-- Appendix D — QoS 4 -->
+    <section>
+      <div class="kicker">Appendix · all variants · two machines (WiFi 2.4 GHz)</div>
+      <h2>QoS 4 · Reliable-TCP — mean latency (ms)</h2>
+      <table class="heat">
+        <thead><tr><th>Variant</th><th>10×100</th><th>10×1000</th><th>100×10<sup>⚠</sup></th><th>100×100</th><th>100×1000</th><th>1000×10<sup>⚠</sup></th><th>1000×100</th></tr></thead>
+        <tbody>
+          <tr><td>Custom UDP</td><td class="lat">5.1</td><td class="lat">4.1</td><td class="lat">51.4</td><td class="lat">8.2</td><td class="lat">109<sup>✗</sup></td><td class="lat">82.9</td><td class="lat">86<sup>✗</sup></td></tr>
+          <tr><td>Hybrid</td><td class="lat">8.7</td><td class="lat">5.1</td><td class="lat">61.3</td><td class="lat">10.0</td><td class="lat">220</td><td class="lat">84.0</td><td class="lat">95.1</td></tr>
+          <tr><td>QUIC</td><td class="lat">7.5</td><td class="lat">10.6</td><td class="lat">56.4</td><td class="lat">12.6</td><td class="lat">7.6</td><td class="lat">54.5</td><td class="lat">10.4</td></tr>
+          <tr><td>WebSocket</td><td class="lat">1.8</td><td class="lat">8.9</td><td class="lat">4.5</td><td class="lat">4.0</td><td class="lat">87.0</td><td class="lat">18.3</td><td class="lat">132</td></tr>
+          <tr><td>WebRTC</td><td class="lat">8.0</td><td class="lat">3.2</td><td class="lat">50.3</td><td class="lat">5.6</td><td class="lat">79.1</td><td class="lat">51.6</td><td class="lat">83.7</td></tr>
+          <tr><td>Zenoh<sup>‡</sup></td><td class="lat">9.4</td><td class="lat">5.4</td><td class="lat">54.4</td><td class="lat">8.8</td><td class="lat">12.5</td><td class="lat">50.7</td><td class="lat">15.8</td></tr>
+        </tbody>
+      </table>
+      <div class="heat-legend">
+        Scalar-flood · multi-threaded · 2026-05-23. <sup>✗</sup> delivery &lt;100% (Custom-UDP TCP at saturation: ~50 %). <sup>‡</sup>Zenoh pre-fix (slide 8).
+        <sup>⚠</sup> ×10hz mean carries a ~50 ms receive-timestamp artifact for all variants except WebSocket; ≥100 Hz unaffected.
+      </div>
+    </section>
+
   </div>
 </div>
 
